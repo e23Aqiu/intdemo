@@ -1,3 +1,101 @@
+from PyQt5.QtCore import QEvent, QObject, Qt, QTimer
+from PyQt5.QtGui import QCursor
+from PyQt5.QtWidgets import QApplication, QWidget
+
+
+class DisabledCursorFilter(QObject):
+    """让所有禁用控件统一显示禁止指针，并在启用后恢复原指针。"""
+
+    MANAGED_PROPERTY = "_intdemo_disabled_cursor_managed"
+    PREVIOUS_CURSOR_PROPERTY = "_intdemo_previous_cursor"
+    PREVIOUS_EXPLICIT_PROPERTY = "_intdemo_previous_cursor_explicit"
+    SYNC_EVENTS = {
+        QEvent.EnabledChange,
+        QEvent.Enter,
+        QEvent.Polish,
+        QEvent.Show,
+    }
+
+    def __init__(self, application):
+        super().__init__(application)
+        self.application = application
+        self._override_active = False
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setInterval(40)
+        self._hover_timer.timeout.connect(self._sync_hover_cursor)
+        self._hover_timer.start()
+        application.aboutToQuit.connect(self.stop)
+
+    @classmethod
+    def sync_widget(cls, widget):
+        managed = bool(widget.property(cls.MANAGED_PROPERTY))
+        if not widget.isEnabled() and not managed:
+            widget.setProperty(
+                cls.PREVIOUS_EXPLICIT_PROPERTY,
+                widget.testAttribute(Qt.WA_SetCursor),
+            )
+            widget.setProperty(cls.PREVIOUS_CURSOR_PROPERTY, widget.cursor())
+            widget.setCursor(Qt.ForbiddenCursor)
+            widget.setProperty(cls.MANAGED_PROPERTY, True)
+        elif widget.isEnabled() and managed:
+            previous_cursor = widget.property(cls.PREVIOUS_CURSOR_PROPERTY)
+            if (
+                widget.property(cls.PREVIOUS_EXPLICIT_PROPERTY)
+                and previous_cursor is not None
+            ):
+                widget.setCursor(previous_cursor)
+            else:
+                widget.unsetCursor()
+            widget.setProperty(cls.MANAGED_PROPERTY, False)
+            widget.setProperty(cls.PREVIOUS_CURSOR_PROPERTY, None)
+            widget.setProperty(cls.PREVIOUS_EXPLICIT_PROPERTY, None)
+
+    def eventFilter(self, watched, event):
+        if not isinstance(watched, QWidget):
+            return False
+        if event.type() in self.SYNC_EVENTS:
+            self.sync_widget(watched)
+            if event.type() == QEvent.EnabledChange:
+                for child in watched.findChildren(QWidget):
+                    self.sync_widget(child)
+        elif event.type() == QEvent.ChildAdded:
+            child = event.child()
+            if isinstance(child, QWidget):
+                self.sync_widget(child)
+        return False
+
+    def sync_hover_target(self, target):
+        """强制覆盖系统指针，绕过 Windows 不向禁用控件派发进入事件的问题。"""
+        disabled = isinstance(target, QWidget) and not target.isEnabled()
+        if disabled and not self._override_active:
+            QApplication.setOverrideCursor(QCursor(Qt.ForbiddenCursor))
+            self._override_active = True
+        elif not disabled and self._override_active:
+            QApplication.restoreOverrideCursor()
+            self._override_active = False
+
+    def _sync_hover_cursor(self):
+        self.sync_hover_target(QApplication.widgetAt(QCursor.pos()))
+
+    def stop(self):
+        self._hover_timer.stop()
+        if self._override_active:
+            QApplication.restoreOverrideCursor()
+            self._override_active = False
+
+
+def install_disabled_cursor_filter(application):
+    """为当前 QApplication 安装一次全局禁用指针规则。"""
+    filter_instance = getattr(application, "_intdemo_disabled_cursor_filter", None)
+    if filter_instance is None:
+        filter_instance = DisabledCursorFilter(application)
+        application.installEventFilter(filter_instance)
+        application._intdemo_disabled_cursor_filter = filter_instance
+    for widget in application.allWidgets():
+        filter_instance.sync_widget(widget)
+    return filter_instance
+
+
 APP_STYLESHEET = """
 QWidget {
     color: #243047;
@@ -127,6 +225,7 @@ QHeaderView::section {
 QTableWidget, QTableView {
     gridline-color: #edf1f6;
     alternate-background-color: #f8fafd;
+    selection-color: white;
 }
 QTabWidget#DashboardTabs::pane {
     background: white;

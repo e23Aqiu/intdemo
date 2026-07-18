@@ -1,7 +1,7 @@
 import json
-import re
 import sqlite3
 import threading
+import uuid
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +39,19 @@ DEFAULT_STATION_USERS = (
 DEFAULT_STATION_PASSWORD = "123456"
 
 
+def split_violation_reasons(value) -> List[str]:
+    """仅按半角竖线分隔违规原因，并在单条记录内去重。"""
+    reasons = []
+    seen = set()
+    for raw_reason in str(value).split("|"):
+        reason = raw_reason.strip()
+        if not reason or reason in seen:
+            continue
+        seen.add(reason)
+        reasons.append(reason)
+    return reasons
+
+
 class DatabaseError(RuntimeError):
     pass
 
@@ -52,6 +65,10 @@ class Database:
 
     每个操作使用独立连接，避免后续从工作线程记录统计时共享连接。
     """
+
+    STATION_EXPORT_FORMAT = "intdemo-station-data"
+    STATION_EXPORT_VERSION = 1
+    MAX_IMPORT_BYTES = 100 * 1024 * 1024
 
     DEFAULT_METRICS = (
         (WORKFLOW_TOTAL_METRIC, "总计数", "条", 10),
@@ -132,6 +149,7 @@ class Database:
                     amount INTEGER NOT NULL DEFAULT 1,
                     source TEXT NOT NULL DEFAULT '',
                     task_id TEXT,
+                    event_uid TEXT,
                     details_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
                 );
@@ -152,6 +170,26 @@ class Database:
                 conn.execute("ALTER TABLE accounts ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
             conn.execute(
                 "UPDATE accounts SET display_name=username WHERE TRIM(display_name)=''"
+            )
+            activity_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(activity_events)").fetchall()
+            }
+            if "event_uid" not in activity_columns:
+                conn.execute("ALTER TABLE activity_events ADD COLUMN event_uid TEXT")
+            missing_event_uids = conn.execute(
+                "SELECT id FROM activity_events WHERE event_uid IS NULL OR TRIM(event_uid)=''"
+            ).fetchall()
+            conn.executemany(
+                "UPDATE activity_events SET event_uid=? WHERE id=?",
+                [(uuid.uuid4().hex, row["id"]) for row in missing_event_uids],
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_user_event_uid
+                ON activity_events(user_id, event_uid)
+                WHERE event_uid IS NOT NULL
+                """
             )
             conn.executemany(
                 """
@@ -317,6 +355,302 @@ class Database:
             ).fetchall()
             return [self._account_from_row(row) for row in rows]
 
+    def update_account_display_name(
+        self, account_id: int, display_name: str
+    ) -> Account:
+        display_name = (display_name or "").strip()
+        if not 1 <= len(display_name) <= 64:
+            raise ValueError("用户名称长度需要在 1 到 64 个字符之间")
+        with self._connect() as conn:
+            existing = conn.execute(
+                "SELECT id FROM accounts WHERE id=?",
+                (int(account_id),),
+            ).fetchone()
+            if not existing:
+                raise DatabaseError("账号不存在")
+            conn.execute(
+                "UPDATE accounts SET display_name=?, updated_at=? WHERE id=?",
+                (display_name, self._now(), int(account_id)),
+            )
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE id=?",
+                (int(account_id),),
+            ).fetchone()
+            return self._account_from_row(row)
+
+    def update_account_role(self, account_id: int, role: str) -> Account:
+        if role not in {"admin", "user"}:
+            raise ValueError("无效的账号权限")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE id=?",
+                (int(account_id),),
+            ).fetchone()
+            if not row:
+                raise DatabaseError("账号不存在")
+            if row["role"] == role:
+                return self._account_from_row(row)
+            if row["role"] == "admin" and role == "user" and row["is_active"]:
+                active_admins = conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE role='admin' AND is_active=1"
+                ).fetchone()[0]
+                if active_admins <= 1:
+                    raise DatabaseError("不能取消最后一个可用管理员的权限")
+            conn.execute(
+                "UPDATE accounts SET role=?, updated_at=? WHERE id=?",
+                (role, self._now(), int(account_id)),
+            )
+            updated = conn.execute(
+                "SELECT * FROM accounts WHERE id=?",
+                (int(account_id),),
+            ).fetchone()
+            return self._account_from_row(updated)
+
+    @staticmethod
+    def _station_account_row(conn, account_id: int):
+        row = conn.execute(
+            "SELECT * FROM accounts WHERE id=?",
+            (int(account_id),),
+        ).fetchone()
+        if not row:
+            raise DatabaseError("账号不存在")
+        if row["role"] != "user":
+            raise DatabaseError("仅普通用户站点支持数据导入和导出")
+        return row
+
+    def export_station_data(self, account_id: int, file_path: Path) -> Dict:
+        target = Path(file_path)
+        with self._connect() as conn:
+            account = self._station_account_row(conn, account_id)
+            metric_rows = conn.execute(
+                """
+                SELECT DISTINCT m.metric_key, m.label, m.unit, m.sort_order, m.is_active
+                FROM metric_definitions m
+                JOIN activity_events e ON e.metric_key=m.metric_key
+                WHERE e.user_id=?
+                ORDER BY m.sort_order, m.metric_key
+                """,
+                (int(account_id),),
+            ).fetchall()
+            event_rows = conn.execute(
+                """
+                SELECT event_uid, metric_key, amount, source, task_id,
+                       details_json, created_at
+                FROM activity_events
+                WHERE user_id=?
+                ORDER BY id
+                """,
+                (int(account_id),),
+            ).fetchall()
+
+        events = []
+        for row in event_rows:
+            try:
+                details = json.loads(row["details_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                details = {}
+            if not isinstance(details, dict):
+                details = {}
+            events.append(
+                {
+                    "event_uid": row["event_uid"],
+                    "metric_key": row["metric_key"],
+                    "amount": int(row["amount"]),
+                    "source": row["source"] or "",
+                    "task_id": row["task_id"],
+                    "details": details,
+                    "created_at": row["created_at"],
+                }
+            )
+        payload = {
+            "format": self.STATION_EXPORT_FORMAT,
+            "version": self.STATION_EXPORT_VERSION,
+            "exported_at": self._now(),
+            "station": {
+                "username": account["username"],
+                "display_name": account["display_name"] or account["username"],
+            },
+            "metrics": [
+                {
+                    "metric_key": row["metric_key"],
+                    "label": row["label"],
+                    "unit": row["unit"],
+                    "sort_order": int(row["sort_order"]),
+                    "is_active": bool(row["is_active"]),
+                }
+                for row in metric_rows
+            ],
+            "events": events,
+        }
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f"{target.name}.tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            temporary.replace(target)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise DatabaseError(f"导出文件写入失败：{exc}") from exc
+        return {
+            "station": payload["station"],
+            "event_count": len(events),
+            "file_path": str(target),
+        }
+
+    def import_station_data(self, account_id: int, file_path: Path) -> Dict:
+        source_path = Path(file_path)
+        try:
+            if source_path.stat().st_size > self.MAX_IMPORT_BYTES:
+                raise DatabaseError("导入文件超过 100 MB 限制")
+            payload = json.loads(source_path.read_text(encoding="utf-8-sig"))
+        except DatabaseError:
+            raise
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise DatabaseError(f"无法读取导入文件：{exc}") from exc
+        if not isinstance(payload, dict):
+            raise DatabaseError("导入文件格式无效")
+        if payload.get("format") != self.STATION_EXPORT_FORMAT:
+            raise DatabaseError("不是有效的站点数据文件")
+        if payload.get("version") != self.STATION_EXPORT_VERSION:
+            raise DatabaseError("站点数据文件版本不受支持")
+        metrics = payload.get("metrics")
+        events = payload.get("events")
+        station = payload.get("station")
+        if not isinstance(metrics, list) or not isinstance(events, list):
+            raise DatabaseError("站点数据文件内容不完整")
+        if not isinstance(station, dict):
+            station = {}
+
+        normalized_metrics = {}
+        for metric in metrics:
+            if not isinstance(metric, dict):
+                raise DatabaseError("统计指标格式无效")
+            metric_key = str(metric.get("metric_key") or "").strip()
+            if not metric_key:
+                raise DatabaseError("统计指标标识不能为空")
+            try:
+                sort_order = int(metric.get("sort_order", 100))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise DatabaseError("统计指标排序值无效") from exc
+            normalized_metrics[metric_key] = {
+                "label": str(metric.get("label") or metric_key).strip() or metric_key,
+                "unit": str(metric.get("unit") or "条").strip() or "条",
+                "sort_order": sort_order,
+                "is_active": int(bool(metric.get("is_active", True))),
+            }
+
+        normalized_events = []
+        for event in events:
+            if not isinstance(event, dict):
+                raise DatabaseError("统计事件格式无效")
+            event_uid = str(event.get("event_uid") or "").strip()
+            metric_key = str(event.get("metric_key") or "").strip()
+            created_at = str(event.get("created_at") or "").strip()
+            details = event.get("details", {})
+            if not event_uid or len(event_uid) > 128:
+                raise DatabaseError("统计事件唯一标识无效")
+            if not metric_key or not created_at:
+                raise DatabaseError("统计事件缺少必要字段")
+            if not isinstance(details, dict):
+                raise DatabaseError("统计事件明细格式无效")
+            try:
+                amount = int(event.get("amount", 0))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise DatabaseError("统计事件数量无效") from exc
+            normalized_events.append(
+                {
+                    "event_uid": event_uid,
+                    "metric_key": metric_key,
+                    "amount": amount,
+                    "source": str(event.get("source") or ""),
+                    "task_id": (
+                        str(event["task_id"]) if event.get("task_id") is not None else None
+                    ),
+                    "details_json": json.dumps(
+                        details,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    "created_at": created_at,
+                }
+            )
+
+        imported = 0
+        with self._connect() as conn:
+            target_account = self._station_account_row(conn, account_id)
+            for metric_key, metric in normalized_metrics.items():
+                conn.execute(
+                    """
+                    INSERT INTO metric_definitions(
+                        metric_key, label, unit, sort_order, is_active
+                    ) VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(metric_key) DO UPDATE SET
+                        label=excluded.label,
+                        unit=excluded.unit,
+                        sort_order=excluded.sort_order,
+                        is_active=CASE
+                            WHEN metric_definitions.is_active=1 THEN 1
+                            ELSE excluded.is_active
+                        END
+                    """,
+                    (
+                        metric_key,
+                        metric["label"],
+                        metric["unit"],
+                        metric["sort_order"],
+                        metric["is_active"],
+                    ),
+                )
+            for event in normalized_events:
+                if event["metric_key"] not in normalized_metrics:
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO metric_definitions(
+                            metric_key, label, unit, sort_order, is_active
+                        ) VALUES (?, ?, '条', 100, 1)
+                        """,
+                        (event["metric_key"], event["metric_key"]),
+                    )
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO activity_events(
+                        user_id, metric_key, amount, source, task_id, event_uid,
+                        details_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(account_id),
+                        event["metric_key"],
+                        event["amount"],
+                        event["source"],
+                        event["task_id"],
+                        event["event_uid"],
+                        event["details_json"],
+                        event["created_at"],
+                    ),
+                )
+                imported += max(cursor.rowcount, 0)
+
+        total = len(normalized_events)
+        return {
+            "source_station": {
+                "username": str(station.get("username") or ""),
+                "display_name": str(station.get("display_name") or ""),
+            },
+            "target_station": {
+                "username": target_account["username"],
+                "display_name": target_account["display_name"] or target_account["username"],
+            },
+            "total": total,
+            "imported": imported,
+            "skipped": total - imported,
+        }
+
     def change_password(self, account_id: int, new_password: str, must_change: bool = False) -> None:
         validate_password(new_password)
         salt, digest = hash_password(new_password)
@@ -328,6 +662,34 @@ class Database:
                 WHERE id=?
                 """,
                 (salt, digest, int(must_change), self._now(), account_id),
+            )
+
+    def change_own_password(
+        self, account_id: int, current_password: str, new_password: str
+    ) -> None:
+        """校验当前密码后修改本人密码。"""
+        validate_password(new_password)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT password_salt, password_hash FROM accounts WHERE id=?",
+                (account_id,),
+            ).fetchone()
+            if not row:
+                raise DatabaseError("账号不存在")
+            if not verify_password(
+                current_password or "",
+                row["password_salt"],
+                row["password_hash"],
+            ):
+                raise AuthenticationError("原密码不正确")
+            salt, digest = hash_password(new_password)
+            conn.execute(
+                """
+                UPDATE accounts
+                SET password_salt=?, password_hash=?, must_change_password=0, updated_at=?
+                WHERE id=?
+                """,
+                (salt, digest, self._now(), account_id),
             )
 
     def set_account_active(self, account_id: int, active: bool) -> None:
@@ -399,10 +761,20 @@ class Database:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO activity_events(
-                        user_id, metric_key, amount, source, task_id, details_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        user_id, metric_key, amount, source, task_id, event_uid,
+                        details_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (user_id, metric_key, amount, source, task_id, payload, created_at),
+                    (
+                        user_id,
+                        metric_key,
+                        amount,
+                        source,
+                        task_id,
+                        uuid.uuid4().hex,
+                        payload,
+                        created_at,
+                    ),
                 )
 
     def get_metric_definitions(self) -> List[sqlite3.Row]:
@@ -474,25 +846,40 @@ class Database:
                 payload = json.loads(row["details_json"] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            for raw_reason, values in (payload.get("violation_counts") or {}).items():
+            violation_counts = payload.get("violation_counts") or {}
+            if not isinstance(violation_counts, dict):
+                continue
+            event_totals = {}
+            for raw_reason, values in violation_counts.items():
                 if not isinstance(values, dict):
                     continue
-                reasons = []
-                seen = set()
-                for reason in re.split(r"[/／|｜]", str(raw_reason)):
-                    reason = reason.strip()
-                    if not reason or reason in seen:
-                        continue
-                    seen.add(reason)
-                    reasons.append(reason)
-                for reason in reasons:
-                    target = totals.setdefault(
+                for reason in split_violation_reasons(raw_reason):
+                    target = event_totals.setdefault(
                         reason,
-                        {"reason": reason, "total": 0, "has_phone": 0, "other": 0},
+                        {"total": 0, "has_phone": 0, "other": 0},
                     )
                     target["total"] += int(values.get("total", 0) or 0)
                     target["has_phone"] += int(values.get("has_phone", 0) or 0)
                     target["other"] += int(values.get("other", 0) or 0)
+
+            # 旧版本先按斜线拆分、但尚未按竖线拆分，真实历史键可能是
+            # “其它改变缴费路径逃费|恶意U”和“J形行驶”。先展开竖线后，
+            # 再把同一事件内数值完全相同的两个碎片合并，且只计数一次。
+            legacy_u = event_totals.get("恶意U")
+            legacy_j = event_totals.get("J形行驶")
+            if legacy_u is not None and legacy_u == legacy_j:
+                event_totals.pop("恶意U", None)
+                event_totals.pop("J形行驶", None)
+                event_totals.setdefault("恶意U/J形行驶", legacy_u)
+
+            for reason, values in event_totals.items():
+                target = totals.setdefault(
+                    reason,
+                    {"reason": reason, "total": 0, "has_phone": 0, "other": 0},
+                )
+                target["total"] += int(values.get("total", 0) or 0)
+                target["has_phone"] += int(values.get("has_phone", 0) or 0)
+                target["other"] += int(values.get("other", 0) or 0)
         return sorted(totals.values(), key=lambda item: (-item["total"], item["reason"]))
 
     def get_recent_activity(

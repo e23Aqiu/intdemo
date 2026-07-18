@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -42,6 +43,27 @@ class DatabaseTests(unittest.TestCase):
         changed = self.db.authenticate(DEFAULT_ADMIN_USERNAME, "NewAdmin@123")
         self.assertFalse(changed.must_change_password)
 
+    def test_user_must_provide_current_password_to_change_own_password(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+
+        with self.assertRaisesRegex(AuthenticationError, "原密码不正确"):
+            self.db.change_own_password(admin.id, "WrongPassword", "NewAdmin@123")
+        self.assertEqual(
+            self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD).id,
+            admin.id,
+        )
+
+        self.db.change_own_password(
+            admin.id,
+            DEFAULT_ADMIN_PASSWORD,
+            "NewAdmin@123",
+        )
+        with self.assertRaises(AuthenticationError):
+            self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        changed = self.db.authenticate(DEFAULT_ADMIN_USERNAME, "NewAdmin@123")
+        self.assertFalse(changed.must_change_password)
+
     def test_account_lifecycle_and_last_admin_protection(self):
         self.db.ensure_default_admin()
         admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
@@ -58,6 +80,132 @@ class DatabaseTests(unittest.TestCase):
 
         with self.assertRaises(DatabaseError):
             self.db.set_account_active(admin.id, False)
+
+    def test_admin_can_update_account_display_name(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        user = self.db.create_account(
+            "worker_name",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="原用户名称",
+        )
+
+        renamed = self.db.update_account_display_name(user.id, "  新用户名称  ")
+        self.assertEqual(renamed.id, user.id)
+        self.assertEqual(renamed.username, "worker_name")
+        self.assertEqual(renamed.name_label, "新用户名称")
+        self.assertEqual(
+            self.db.authenticate("worker_name", "Worker@123").name_label,
+            "新用户名称",
+        )
+        with self.assertRaises(ValueError):
+            self.db.update_account_display_name(user.id, "   ")
+        with self.assertRaises(ValueError):
+            self.db.update_account_display_name(user.id, "名称" * 33)
+        with self.assertRaises(DatabaseError):
+            self.db.update_account_display_name(999999, "不存在")
+
+    def test_admin_can_update_account_permissions(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        user = self.db.create_account(
+            "permission_user",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="权限测试站",
+        )
+
+        with self.assertRaisesRegex(DatabaseError, "最后一个可用管理员"):
+            self.db.update_account_role(admin.id, "user")
+        promoted = self.db.update_account_role(user.id, "admin")
+        self.assertTrue(promoted.is_admin)
+        demoted = self.db.update_account_role(admin.id, "user")
+        self.assertFalse(demoted.is_admin)
+        with self.assertRaises(ValueError):
+            self.db.update_account_role(user.id, "owner")
+        with self.assertRaises(DatabaseError):
+            self.db.update_account_role(999999, "user")
+
+    def test_station_data_export_import_and_duplicate_protection(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        source = self.db.create_account(
+            "source_station",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="来源站",
+        )
+        target = self.db.create_account(
+            "target_station",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="目标站",
+        )
+        counts = {
+            WORKFLOW_TOTAL_METRIC: 8,
+            WORKFLOW_EMPTY_METRIC: 1,
+            WORKFLOW_NO_TRANSPORT_METRIC: 1,
+            WORKFLOW_NO_OPERATION_METRIC: 1,
+            WORKFLOW_INDIVIDUAL_METRIC: 1,
+            WORKFLOW_NO_PHONE_METRIC: 2,
+            WORKFLOW_HAS_PHONE_METRIC: 2,
+        }
+        self.db.record_activity_batch(
+            source.id,
+            counts,
+            "unified_workflow",
+            details={
+                "violation_counts": {
+                    "证件异常": {"total": 3, "has_phone": 2, "other": 1}
+                }
+            },
+            task_id="station-transfer-task",
+        )
+        self.db.record_activity(source.id, "future_metric", 4, "manual")
+
+        export_path = Path(self.temp_dir.name) / "station-data.json"
+        exported = self.db.export_station_data(source.id, export_path)
+        self.assertEqual(exported["event_count"], 8)
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["format"], Database.STATION_EXPORT_FORMAT)
+        self.assertEqual(payload["station"]["username"], "source_station")
+        self.assertNotIn("password", export_path.read_text(encoding="utf-8").lower())
+        self.assertTrue(all(event["event_uid"] for event in payload["events"]))
+
+        imported = self.db.import_station_data(target.id, export_path)
+        self.assertEqual(imported["imported"], 8)
+        self.assertEqual(imported["skipped"], 0)
+        source_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(source.id)
+        }
+        target_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(target.id)
+        }
+        self.assertEqual(target_totals, source_totals)
+        target_violations = {
+            row["reason"]: row for row in self.db.get_violation_totals(target.id)
+        }
+        self.assertEqual(target_violations["证件异常"]["has_phone"], 2)
+
+        duplicate = self.db.import_station_data(target.id, export_path)
+        self.assertEqual(duplicate["imported"], 0)
+        self.assertEqual(duplicate["skipped"], 8)
+        with self.assertRaisesRegex(DatabaseError, "仅普通用户站点"):
+            self.db.export_station_data(admin.id, export_path)
+        with self.assertRaisesRegex(DatabaseError, "仅普通用户站点"):
+            self.db.import_station_data(admin.id, export_path)
+
+        invalid_path = Path(self.temp_dir.name) / "invalid.json"
+        invalid_path.write_text("{}", encoding="utf-8")
+        with self.assertRaisesRegex(DatabaseError, "不是有效"):
+            self.db.import_station_data(target.id, invalid_path)
 
     def test_station_users_display_names_and_six_character_passwords(self):
         self.db.ensure_default_admin()
@@ -81,6 +229,12 @@ class DatabaseTests(unittest.TestCase):
         self.db.change_password(luogang.id, "654321", must_change=False)
         self.db.ensure_default_station_users()
         self.assertEqual(self.db.authenticate("luogang", "654321").name_label, "萝岗中心站")
+        self.db.update_account_display_name(luogang.id, "萝岗业务站")
+        self.db.ensure_default_station_users()
+        self.assertEqual(
+            self.db.authenticate("luogang", "654321").name_label,
+            "萝岗业务站",
+        )
         with self.assertRaises(AuthenticationError):
             self.db.authenticate("luogang", DEFAULT_STATION_PASSWORD)
 
@@ -110,6 +264,21 @@ class DatabaseTests(unittest.TestCase):
                 "violation_counts": {
                     "超限|证件异常": {"total": 3, "has_phone": 2, "other": 1},
                     "证件异常": {"total": 1, "has_phone": 0, "other": 1},
+                    "其它改变缴费路径逃费|恶意U": {
+                        "total": 2,
+                        "has_phone": 1,
+                        "other": 1,
+                    },
+                    "J形行驶": {
+                        "total": 2,
+                        "has_phone": 1,
+                        "other": 1,
+                    },
+                    "车型异常": {
+                        "total": 2,
+                        "has_phone": 1,
+                        "other": 1,
+                    },
                 }
             },
             task_id="station-a-reasons",
@@ -135,6 +304,15 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(station_rows["证件异常"], {
             "reason": "证件异常", "total": 4, "has_phone": 2, "other": 2
         })
+        self.assertEqual(station_rows["恶意U/J形行驶"], {
+            "reason": "恶意U/J形行驶", "total": 2, "has_phone": 1, "other": 1
+        })
+        self.assertEqual(station_rows["其它改变缴费路径逃费"], {
+            "reason": "其它改变缴费路径逃费", "total": 2,
+            "has_phone": 1, "other": 1
+        })
+        self.assertNotIn("恶意U", station_rows)
+        self.assertNotIn("J形行驶", station_rows)
         all_rows = {row["reason"]: row for row in self.db.get_violation_totals(users_only=True)}
         self.assertEqual(all_rows["超限"]["total"], 5)
         self.assertEqual(all_rows["超限"]["has_phone"], 3)

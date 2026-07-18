@@ -1,4 +1,3 @@
-from collections import defaultdict
 import math
 
 from PyQt5.QtCore import QRect, QRectF, Qt, QTimer
@@ -16,6 +15,7 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QFrame,
     QGridLayout,
+    QHeaderView,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -268,12 +268,12 @@ class WorkflowDistributionChart(AnimatedDonutChart):
     """不依赖额外图表库的完整流程结果环形图。"""
 
     SEGMENTS = (
-        (WORKFLOW_EMPTY_METRIC, "空", QColor("#8a98aa")),
-        (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", QColor("#e35d6a")),
-        (WORKFLOW_NO_OPERATION_METRIC, "无营运信息", QColor("#ed874c")),
-        (WORKFLOW_INDIVIDUAL_METRIC, "个体经营", QColor("#8c6bd8")),
-        (WORKFLOW_NO_PHONE_METRIC, "有公司名、无电话", QColor("#e1b13d")),
         (WORKFLOW_HAS_PHONE_METRIC, "有公司名、有电话", QColor("#31ad76")),
+        (WORKFLOW_NO_PHONE_METRIC, "有公司名、无电话", QColor("#e1b13d")),
+        (WORKFLOW_INDIVIDUAL_METRIC, "个体经营", QColor("#8c6bd8")),
+        (WORKFLOW_NO_OPERATION_METRIC, "无营运信息", QColor("#ed874c")),
+        (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", QColor("#e35d6a")),
+        (WORKFLOW_EMPTY_METRIC, "空", QColor("#8a98aa")),
     )
 
     def __init__(self, parent=None):
@@ -443,10 +443,11 @@ class ViolationReasonChart(AnimatedDonutChart):
         self._rows = []
         self._scope = ""
         self._bar_hitboxes = []
-        self._bar_mode = "split"
-        self.mode_button = QPushButton("切换为原因占比", self)
+        self._bar_mode = "share"
+        self.mode_button = QPushButton("切换为电话拆分", self)
         self.mode_button.setObjectName("ViolationModeButton")
         self.mode_button.setCheckable(True)
+        self.mode_button.setChecked(True)
         self.mode_button.setFixedSize(150, 32)
         self.mode_button.toggled.connect(self._on_mode_button_toggled)
         self.setMinimumHeight(280)
@@ -694,6 +695,285 @@ class ViolationReasonChart(AnimatedDonutChart):
         super().mouseMoveEvent(event)
 
 
+class StationDistributionChart(AnimatedDonutChart):
+    """用双环形图对比各站总计数与有电话数在全部站点中的占比。"""
+
+    TOTAL_COLOR = QColor("#3478f6")
+    PHONE_COLOR = QColor("#20a66a")
+    COLORS = (
+        QColor("#3478f6"),
+        QColor("#20a66a"),
+        QColor("#e1a928"),
+        QColor("#e35d6a"),
+        QColor("#8c6bd8"),
+        QColor("#ed874c"),
+        QColor("#28a7a1"),
+    )
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows = []
+        self._legend_hitboxes = []
+        self.setMinimumHeight(280)
+
+    def set_rows(self, rows):
+        self._rows = list(rows)
+        self._hovered_slice = None
+        self._hover_card.hide()
+        self.update()
+
+    @staticmethod
+    def _format_share(value):
+        return f"{float(value):.1f}%"
+
+    def _draw_series_donut(
+        self,
+        painter,
+        outer,
+        value_key,
+        share_key,
+        title,
+        center_label,
+    ):
+        inner = outer.adjusted(
+            outer.width() * 0.28,
+            outer.height() * 0.28,
+            -outer.width() * 0.28,
+            -outer.height() * 0.28,
+        )
+        total = sum(int(row[value_key]) for row in self._rows)
+        painter.setPen(QColor("#526177"))
+        painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+        painter.drawText(
+            QRectF(outer.left(), outer.top() - 27, outer.width(), 20),
+            Qt.AlignCenter,
+            title,
+        )
+
+        if total:
+            start_degrees = 90.0
+            for index, row in enumerate(self._rows):
+                value = int(row[value_key])
+                span_degrees = -(value / total * 360)
+                if value:
+                    color = self.COLORS[index % len(self.COLORS)]
+                    self._slice_hitboxes.append(
+                        {
+                            "outer": QRectF(outer),
+                            "inner": QRectF(inner),
+                            "start": start_degrees,
+                            "sweep": abs(span_degrees),
+                            "payload": {
+                                "station": row["station"],
+                                "series": title,
+                                "value": value,
+                                "share": row[share_key],
+                                "color": color,
+                            },
+                        }
+                    )
+                    slice_index = len(self._slice_hitboxes) - 1
+                    self._draw_donut_slice(
+                        painter,
+                        outer,
+                        inner,
+                        start_degrees,
+                        span_degrees,
+                        color,
+                        slice_index,
+                    )
+                start_degrees += span_degrees
+        else:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#e9eef5"))
+            painter.drawEllipse(outer)
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawEllipse(inner)
+
+        painter.setPen(QColor("#17233c"))
+        painter.setFont(QFont("Microsoft YaHei UI", 17, QFont.Bold))
+        painter.drawText(
+            QRectF(inner.left(), inner.top() - 5, inner.width(), inner.height()),
+            Qt.AlignCenter,
+            str(total),
+        )
+        painter.setPen(QColor("#708096"))
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
+        painter.drawText(
+            QRectF(inner.left(), inner.center().y() + 14, inner.width(), 18),
+            Qt.AlignHCenter | Qt.AlignTop,
+            center_label,
+        )
+
+    def paintEvent(self, event):
+        self._slice_hitboxes = []
+        self._legend_hitboxes = []
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
+        painter.setPen(QPen(QColor("#e4eaf2"), 1))
+        painter.setBrush(QColor("#ffffff"))
+        painter.drawRoundedRect(bounds, 10, 10)
+
+        painter.setPen(QColor("#17233c"))
+        painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
+        painter.drawText(20, 29, "各站业务分布")
+        painter.setPen(QColor("#708096"))
+        painter.setFont(QFont("Microsoft YaHei UI", 9))
+        painter.drawText(130, 29, "占全部站点对应数据的比例")
+
+        if not self._rows:
+            painter.setPen(QColor("#8a98aa"))
+            painter.drawText(self.rect(), Qt.AlignCenter, "暂无站点数据")
+            return
+
+        chart_area_width = min(450, max(360, int(self.width() * 0.42)))
+        chart_size = min(
+            160,
+            max(120, self.height() - 115),
+            max(120, int((chart_area_width - 70) / 2)),
+        )
+        first_left = 30
+        second_left = first_left + chart_size + 30
+        chart_top = 82
+        self._draw_series_donut(
+            painter,
+            QRectF(first_left, chart_top, chart_size, chart_size),
+            "total",
+            "total_share",
+            "各站总计数占比",
+            "总计数",
+        )
+        self._draw_series_donut(
+            painter,
+            QRectF(second_left, chart_top, chart_size, chart_size),
+            "has_phone",
+            "phone_share",
+            "各站有电话数占比",
+            "有电话数",
+        )
+
+        legend_left = second_left + chart_size + 40
+        legend_width = max(270, self.width() - legend_left - 22)
+        total_column = legend_left + legend_width - 310
+        phone_column = legend_left + legend_width - 150
+        painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
+        painter.setPen(QColor("#718096"))
+        painter.drawText(legend_left + 18, 52, "站点")
+        painter.setPen(self.TOTAL_COLOR)
+        painter.drawText(
+            QRectF(total_column, 40, 145, 18),
+            Qt.AlignRight | Qt.AlignVCenter,
+            "总计数 / 占比",
+        )
+        painter.setPen(self.PHONE_COLOR)
+        painter.drawText(
+            QRectF(phone_column, 40, 145, 18),
+            Qt.AlignRight | Qt.AlignVCenter,
+            "有电话数 / 占比",
+        )
+
+        visible_rows = self._rows[:7]
+        row_height = max(
+            29,
+            min(38, int((self.height() - 58) / max(len(visible_rows), 1))),
+        )
+        top = 59
+        label_width = max(90, total_column - legend_left - 24)
+        painter.setFont(QFont("Microsoft YaHei UI", 9))
+
+        for index, row in enumerate(visible_rows):
+            row_top = top + index * row_height
+            hitbox = QRectF(
+                legend_left, row_top, legend_width, max(27, row_height - 2)
+            )
+            self._legend_hitboxes.append((hitbox, dict(row)))
+            if index % 2:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#f7f9fd"))
+                painter.drawRoundedRect(hitbox, 6, 6)
+
+            color = self.COLORS[index % len(self.COLORS)]
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(
+                QRectF(legend_left + 2, row_top + row_height / 2 - 5, 10, 10),
+                3,
+                3,
+            )
+            painter.setPen(QColor("#526177"))
+            station = painter.fontMetrics().elidedText(
+                str(row["station"]), Qt.ElideRight, label_width
+            )
+            painter.drawText(
+                QRectF(legend_left + 18, row_top, label_width, row_height - 2),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                station,
+            )
+            painter.setPen(self.TOTAL_COLOR)
+            painter.drawText(
+                QRectF(total_column, row_top, 145, row_height - 2),
+                Qt.AlignRight | Qt.AlignVCenter,
+                f'{row["total"]} 条 · {self._format_share(row["total_share"])}',
+            )
+            painter.setPen(self.PHONE_COLOR)
+            painter.drawText(
+                QRectF(phone_column, row_top, 145, row_height - 2),
+                Qt.AlignRight | Qt.AlignVCenter,
+                f'{row["has_phone"]} 条 · {self._format_share(row["phone_share"])}',
+            )
+
+        if len(self._rows) > len(visible_rows):
+            painter.setPen(QColor("#8a98aa"))
+            painter.setFont(QFont("Microsoft YaHei UI", 8))
+            painter.drawText(
+                20,
+                self.height() - 7,
+                f"图表显示前 7 个站点，完整 {len(self._rows)} 个站点见下方表格",
+            )
+
+    def mouseMoveEvent(self, event):
+        slice_index, payload = self._slice_at(event.pos())
+        if payload is not None:
+            self._hovered_slice = slice_index
+            self._hover_card.show_details(
+                payload["station"],
+                [
+                    ("统计指标", payload["series"]),
+                    ("数量", f'{payload["value"]} 条'),
+                    ("占比", self._format_share(payload["share"])),
+                ],
+                payload["color"],
+                event.globalPos(),
+            )
+            self.update()
+            return
+        for rect, row in self._legend_hitboxes:
+            if rect.contains(event.pos()):
+                if self._hovered_slice is not None:
+                    self._hovered_slice = None
+                    self.update()
+                self._hover_card.show_details(
+                    row["station"],
+                    [
+                        ("总计数", f'{row["total"]} 条'),
+                        ("总数占比", self._format_share(row["total_share"])),
+                        ("有电话数", f'{row["has_phone"]} 条'),
+                        ("有电话占比", self._format_share(row["phone_share"])),
+                    ],
+                    self.COLORS[
+                        self._rows.index(row) % len(self.COLORS)
+                    ],
+                    event.globalPos(),
+                )
+                return
+        if self._hovered_slice is not None:
+            self._hovered_slice = None
+            self.update()
+        self._hover_card.hide()
+        super().mouseMoveEvent(event)
+
+
 class StatisticsPage(QWidget):
     def __init__(self, database: Database, account: Account, dependency_warning="", parent=None):
         super().__init__(parent)
@@ -711,7 +991,7 @@ class StatisticsPage(QWidget):
         title_box.addWidget(title)
         subtitle = QLabel(
             "按站点查看完成类型或违规原因统计。" if account.is_admin
-            else "查看当前站点从启用至今累计完成的数据量。"
+            else "默认显示当前站点，可切换查看全部或其他站点的数据。"
         )
         subtitle.setObjectName("Muted")
         title_box.addWidget(subtitle)
@@ -743,15 +1023,22 @@ class StatisticsPage(QWidget):
         filter_layout.addWidget(QLabel("数据分类"))
         self.category_combo = QComboBox()
         self.category_combo.setMinimumWidth(180)
+        self.category_combo.addItem("各站分布", "station_distribution")
         self.category_combo.addItem("按完成类型", "completion")
         self.category_combo.addItem("按违规类型", "violation")
         filter_layout.addWidget(self.category_combo)
         filter_layout.addStretch()
         layout.addWidget(filter_card)
 
+        self._active_category = self.category_combo.currentData()
+        self._station_before_distribution = None
+        self._has_saved_station_before_distribution = False
         self._populate_station_options()
+        if self._active_category == "station_distribution":
+            self._station_before_distribution = self.station_combo.currentData()
+            self._has_saved_station_before_distribution = True
         self.station_combo.currentIndexChanged.connect(self.refresh)
-        self.category_combo.currentIndexChanged.connect(self.refresh)
+        self.category_combo.currentIndexChanged.connect(self._on_category_changed)
 
         self.kpi_layout = QGridLayout()
         self.kpi_layout.setSpacing(10)
@@ -768,68 +1055,169 @@ class StatisticsPage(QWidget):
         chart_layout.setSpacing(0)
         self.distribution_chart = WorkflowDistributionChart()
         self.violation_chart = ViolationReasonChart()
+        self.station_distribution_chart = StationDistributionChart()
         self.violation_mode_button = self.violation_chart.mode_button
         chart_layout.addWidget(self.distribution_chart)
         chart_layout.addWidget(self.violation_chart)
+        chart_layout.addWidget(self.station_distribution_chart)
         chart_layout.addStretch(1)
         self.detail_tabs.addTab(self.chart_tab, "图表分析")
 
         self.data_tab = QWidget()
         data_layout = QVBoxLayout(self.data_tab)
-        data_layout.setContentsMargins(12, 12, 12, 12)
+        data_layout.setContentsMargins(14, 14, 14, 14)
+        data_layout.setSpacing(12)
+
+        data_header = QFrame()
+        data_header.setObjectName("DataSummaryHeader")
+        data_header.setStyleSheet(
+            """
+            QFrame#DataSummaryHeader {
+                background: #f7f9fd;
+                border: 1px solid #e2e8f2;
+                border-radius: 10px;
+            }
+            QLabel#DataTitle {
+                color: #17233c;
+                font-size: 16px;
+                font-weight: 700;
+                border: none;
+                background: transparent;
+            }
+            QLabel#DataDescription {
+                color: #718096;
+                font-size: 12px;
+                border: none;
+                background: transparent;
+            }
+            QLabel#DataCountBadge {
+                color: #1c5ed6;
+                background: #edf4ff;
+                border: 1px solid #cfe0ff;
+                border-radius: 12px;
+                padding: 4px 11px;
+                font-weight: 700;
+            }
+            """
+        )
+        data_header_layout = QHBoxLayout(data_header)
+        data_header_layout.setContentsMargins(16, 11, 16, 11)
+        data_header_layout.setSpacing(12)
+        data_title_layout = QVBoxLayout()
+        data_title_layout.setContentsMargins(0, 0, 0, 0)
+        data_title_layout.setSpacing(3)
+        self.data_title = QLabel("完整数据")
+        self.data_title.setObjectName("DataTitle")
+        self.data_description = QLabel("按当前筛选条件展示详细统计")
+        self.data_description.setObjectName("DataDescription")
+        data_title_layout.addWidget(self.data_title)
+        data_title_layout.addWidget(self.data_description)
+        data_header_layout.addLayout(data_title_layout)
+        data_header_layout.addStretch()
+        self.data_count_label = QLabel("0 行")
+        self.data_count_label.setObjectName("DataCountBadge")
+        self.data_count_label.setAlignment(Qt.AlignCenter)
+        data_header_layout.addWidget(self.data_count_label)
+        data_layout.addWidget(data_header)
+
         self.summary_table = QTableWidget()
         self.summary_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.summary_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.summary_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.summary_table.setAlternatingRowColors(True)
-        self.summary_table.horizontalHeader().setStretchLastSection(True)
+        self.summary_table.setShowGrid(False)
+        self.summary_table.setWordWrap(False)
+        self.summary_table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.summary_table.setVerticalScrollMode(QAbstractItemView.ScrollPerPixel)
+        self.summary_table.verticalHeader().setVisible(False)
+        self.summary_table.verticalHeader().setDefaultSectionSize(42)
+        self.summary_table.horizontalHeader().setMinimumHeight(42)
+        self.summary_table.horizontalHeader().setMinimumSectionSize(80)
+        self.summary_table.setStyleSheet(
+            """
+            QTableWidget {
+                background: #ffffff;
+                alternate-background-color: #f8faff;
+                border: 1px solid #e1e7f0;
+                border-radius: 10px;
+                color: #26344d;
+                selection-background-color: #e8f1ff;
+                selection-color: #173b73;
+            }
+            QTableWidget::item {
+                border-bottom: 1px solid #edf1f6;
+                padding: 7px 10px;
+            }
+            QHeaderView::section {
+                background: #f2f5fa;
+                color: #53627a;
+                border: none;
+                border-bottom: 1px solid #dde4ee;
+                padding: 8px 10px;
+                font-weight: 700;
+            }
+            QTableCornerButton::section {
+                background: #f2f5fa;
+                border: none;
+                border-bottom: 1px solid #dde4ee;
+            }
+            """
+        )
         data_layout.addWidget(self.summary_table)
         self.detail_tabs.addTab(self.data_tab, "完整数据")
-
-        self.recent_tab = QWidget()
-        recent_layout = QVBoxLayout(self.recent_tab)
-        recent_layout.setContentsMargins(12, 12, 12, 12)
-        self.recent_table = QTableWidget(0, 5)
-        self.recent_table.setHorizontalHeaderLabels(
-            ["时间", "用户名称", "统计项目", "数量", "来源"]
-        )
-        self.recent_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.recent_table.setAlternatingRowColors(True)
-        self.recent_table.horizontalHeader().setStretchLastSection(True)
-        recent_layout.addWidget(self.recent_table)
-        self.detail_tabs.addTab(self.recent_tab, "最近统计记录")
 
         layout.addWidget(self.detail_tabs, 1)
         self.refresh()
 
     def _populate_station_options(self):
+        had_options = self.station_combo.count() > 0
         current_id = self.station_combo.currentData()
         self.station_combo.blockSignals(True)
         self.station_combo.clear()
-        if self.account.is_admin:
-            self.station_combo.addItem("全部站点", None)
-            order = {username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)}
-            accounts = [account for account in self.database.list_accounts() if not account.is_admin]
-            accounts.sort(key=lambda item: (order.get(item.username, 999), item.name_label))
-            for station in accounts:
-                self.station_combo.addItem(station.name_label, station.id)
-                self.station_combo.setItemData(
-                    self.station_combo.count() - 1,
-                    f"账号：{station.username}",
-                    Qt.ToolTipRole,
-                )
-            index = self.station_combo.findData(current_id)
-            self.station_combo.setCurrentIndex(index if index >= 0 else 0)
-            self.station_combo.setEnabled(True)
-        else:
-            self.station_combo.addItem(self.account.name_label, self.account.id)
-            self.station_combo.setEnabled(False)
+        self.station_combo.addItem("全部站点", None)
+        order = {username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)}
+        accounts = [account for account in self.database.list_accounts() if not account.is_admin]
+        accounts.sort(key=lambda item: (order.get(item.username, 999), item.name_label))
+        for station in accounts:
+            self.station_combo.addItem(station.name_label, station.id)
+            self.station_combo.setItemData(
+                self.station_combo.count() - 1,
+                f"账号：{station.username}",
+                Qt.ToolTipRole,
+            )
+        target_id = current_id if had_options else (
+            None if self.account.is_admin else self.account.id
+        )
+        index = self.station_combo.findData(target_id)
+        self.station_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.station_combo.setEnabled(True)
         self.station_combo.blockSignals(False)
 
     def _selected_user_id(self):
-        return self.account.id if not self.account.is_admin else self.station_combo.currentData()
+        return self.station_combo.currentData()
 
     def _selected_scope(self):
-        return self.account.name_label if not self.account.is_admin else self.station_combo.currentText()
+        return self.station_combo.currentText()
+
+    def _on_category_changed(self, _index):
+        category = self.category_combo.currentData()
+        if category == "station_distribution" and self._active_category != category:
+            self._station_before_distribution = self.station_combo.currentData()
+            self._has_saved_station_before_distribution = True
+        elif (
+            self._active_category == "station_distribution"
+            and category != "station_distribution"
+            and self._has_saved_station_before_distribution
+        ):
+            station_index = self.station_combo.findData(
+                self._station_before_distribution
+            )
+            self.station_combo.blockSignals(True)
+            self.station_combo.setCurrentIndex(station_index if station_index >= 0 else 0)
+            self.station_combo.blockSignals(False)
+            self._has_saved_station_before_distribution = False
+        self._active_category = category
+        self.refresh()
 
     def _clear_kpis(self):
         while self.kpi_layout.count():
@@ -857,82 +1245,140 @@ class StatisticsPage(QWidget):
                 self._metric_card(label, value, unit), index // 4, index % 4
             )
 
+    def _finish_summary_table(self, scope, detail, stretch_columns=(0,)):
+        self.data_description.setText(f"{scope} · {detail}")
+        self.data_count_label.setText(f"{self.summary_table.rowCount()} 行")
+        header = self.summary_table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in range(self.summary_table.columnCount()):
+            mode = (
+                QHeaderView.Stretch
+                if column in stretch_columns
+                else QHeaderView.ResizeToContents
+            )
+            header.setSectionResizeMode(column, mode)
+        self.summary_table.scrollToTop()
+
+    @staticmethod
+    def _ordered_completion_metrics(metrics):
+        """总计保持在首位，其余完成类型与图表使用同一反向顺序。"""
+        metrics_by_key = {metric["metric_key"]: metric for metric in metrics}
+        ordered_keys = [WORKFLOW_TOTAL_METRIC]
+        ordered_keys.extend(
+            metric_key for metric_key, _, _ in WorkflowDistributionChart.SEGMENTS
+        )
+        ordered = [
+            metrics_by_key.pop(metric_key)
+            for metric_key in ordered_keys
+            if metric_key in metrics_by_key
+        ]
+        ordered.extend(metrics_by_key.values())
+        return ordered
+
+    def _get_station_distribution_rows(self):
+        default_order = {
+            username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
+        }
+        stations = {}
+        for row in self.database.get_all_account_totals():
+            if row["role"] != "user":
+                continue
+            station = stations.setdefault(
+                row["user_id"],
+                {
+                    "user_id": row["user_id"],
+                    "station": row["display_name"] or row["username"],
+                    "username": row["username"],
+                    "total": 0,
+                    "has_phone": 0,
+                },
+            )
+            if row["metric_key"] == WORKFLOW_TOTAL_METRIC:
+                station["total"] = int(row["total"])
+            elif row["metric_key"] == WORKFLOW_HAS_PHONE_METRIC:
+                station["has_phone"] = int(row["total"])
+
+        rows = sorted(
+            stations.values(),
+            key=lambda row: (
+                default_order.get(row["username"], 999),
+                row["station"],
+            ),
+        )
+        all_total = sum(row["total"] for row in rows)
+        all_has_phone = sum(row["has_phone"] for row in rows)
+        for row in rows:
+            row["total_share"] = row["total"] / all_total * 100 if all_total else 0
+            row["phone_share"] = (
+                row["has_phone"] / all_has_phone * 100 if all_has_phone else 0
+            )
+        return rows
+
     def _render_completion(self, user_id, scope):
-        metrics = list(self.database.get_metric_definitions())
+        metrics = self._ordered_completion_metrics(
+            self.database.get_metric_definitions()
+        )
         self.distribution_chart.show()
         self.violation_chart.hide()
+        self.station_distribution_chart.hide()
 
-        if self.account.is_admin and user_id is None:
-            rows = [
-                row for row in self.database.get_all_account_totals()
-                if row["role"] == "user"
-            ]
-            totals_by_metric = defaultdict(int)
-            accounts = {}
-            for row in rows:
-                totals_by_metric[row["metric_key"]] += int(row["total"])
-                account_row = accounts.setdefault(
-                    row["user_id"],
-                    {
-                        "display_name": row["display_name"] or row["username"],
-                        "username": row["username"],
-                        "active": bool(row["is_active"]),
-                        "metrics": {},
-                    },
-                )
-                account_row["metrics"][row["metric_key"]] = int(row["total"])
+        if user_id is None:
+            totals_by_metric = {metric["metric_key"]: 0 for metric in metrics}
+            for row in self.database.get_all_account_totals():
+                if row["role"] == "user":
+                    totals_by_metric[row["metric_key"]] = (
+                        totals_by_metric.get(row["metric_key"], 0)
+                        + int(row["total"])
+                    )
+        else:
+            totals_by_metric = {
+                row["metric_key"]: int(row["total"])
+                for row in self.database.get_user_totals(user_id)
+            }
 
-            self._add_kpis(
-                [
-                    (metric["label"], totals_by_metric[metric["metric_key"]], metric["unit"])
-                    for metric in metrics
-                ]
-            )
-            self.distribution_chart.set_values(totals_by_metric, f"{scope}累计")
-            headers = ["用户名称", "账号", "状态"] + [metric["label"] for metric in metrics]
-            self.summary_table.setColumnCount(len(headers))
-            self.summary_table.setHorizontalHeaderLabels(headers)
-            self.summary_table.setRowCount(len(accounts))
-            for row_index, account_data in enumerate(accounts.values()):
-                values = [
-                    account_data["display_name"],
-                    account_data["username"],
-                    "正常" if account_data["active"] else "停用",
-                ]
-                values.extend(
-                    account_data["metrics"].get(metric["metric_key"], 0)
-                    for metric in metrics
-                )
-                for column, value in enumerate(values):
-                    item = QTableWidgetItem(str(value))
-                    if column >= 3:
-                        item.setTextAlignment(Qt.AlignCenter)
-                    self.summary_table.setItem(row_index, column, item)
-            return
-
-        totals = list(self.database.get_user_totals(user_id))
         self._add_kpis(
-            [(metric["label"], metric["total"], metric["unit"]) for metric in totals]
+            [
+                (
+                    metric["label"],
+                    totals_by_metric.get(metric["metric_key"], 0),
+                    metric["unit"],
+                )
+                for metric in metrics
+            ]
         )
-        self.distribution_chart.set_values(
-            {metric["metric_key"]: metric["total"] for metric in totals}, scope
-        )
+        self.distribution_chart.set_values(totals_by_metric, scope)
         self.summary_table.setColumnCount(3)
         self.summary_table.setHorizontalHeaderLabels(["完成类型", "累计数量", "单位"])
-        self.summary_table.setRowCount(len(totals))
-        for row_index, metric in enumerate(totals):
+        self.summary_table.setRowCount(len(metrics))
+        for row_index, metric in enumerate(metrics):
             for column, value in enumerate(
-                [metric["label"], metric["total"], metric["unit"]]
+                [
+                    metric["label"],
+                    totals_by_metric.get(metric["metric_key"], 0),
+                    metric["unit"],
+                ]
             ):
-                self.summary_table.setItem(row_index, column, QTableWidgetItem(str(value)))
+                item = QTableWidgetItem(str(value))
+                if column == 1:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#1c5ed6"))
+                    item.setTextAlignment(Qt.AlignCenter)
+                elif column == 2:
+                    item.setForeground(QColor("#718096"))
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.summary_table.setItem(row_index, column, item)
+        self._finish_summary_table(scope, "完成类型累计明细")
 
     def _render_violation(self, user_id, scope):
         rows = self.database.get_violation_totals(
             user_id,
-            users_only=(self.account.is_admin and user_id is None),
+            users_only=(user_id is None),
         )
         self.distribution_chart.hide()
         self.violation_chart.show()
+        self.station_distribution_chart.hide()
 
         total = sum(row["total"] for row in rows)
         has_phone = sum(row["has_phone"] for row in rows)
@@ -959,37 +1405,95 @@ class StatisticsPage(QWidget):
                 item = QTableWidgetItem(str(value))
                 if column > 0:
                     item.setTextAlignment(Qt.AlignCenter)
+                if column == 1:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#26344d"))
+                elif column == 2:
+                    item.setForeground(QColor("#15946c"))
+                elif column == 3:
+                    item.setForeground(QColor("#d17a22"))
+                elif column == 4:
+                    item.setForeground(QColor("#1c5ed6"))
                 self.summary_table.setItem(row_index, column, item)
+        self._finish_summary_table(scope, "违规原因明细")
 
-    def _refresh_recent(self, user_id):
-        recent = self.database.get_recent_activity(
-            user_id,
-            limit=50,
-            users_only=(self.account.is_admin and user_id is None),
+    def _render_station_distribution(self):
+        rows = self._get_station_distribution_rows()
+        self.distribution_chart.hide()
+        self.violation_chart.hide()
+        self.station_distribution_chart.show()
+        self.station_distribution_chart.set_rows(rows)
+
+        all_total = sum(row["total"] for row in rows)
+        all_has_phone = sum(row["has_phone"] for row in rows)
+        overall_phone_rate = all_has_phone / all_total * 100 if all_total else 0
+        self._add_kpis(
+            [
+                ("站点数量", len(rows), "个"),
+                ("总计数", all_total, "条"),
+                ("有电话数", all_has_phone, "条"),
+                ("有电话占总计数", f"{overall_phone_rate:.1f}", "%"),
+            ]
         )
-        self.recent_table.setRowCount(len(recent))
-        for row_index, event in enumerate(recent):
-            display_name = event["display_name"] or event["username"]
+
+        headers = [
+            "站点",
+            "总计数",
+            "总数占比",
+            "有电话数",
+            "有电话数占比",
+        ]
+        self.summary_table.setColumnCount(len(headers))
+        self.summary_table.setHorizontalHeaderLabels(headers)
+        self.summary_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
             values = [
-                event["created_at"].replace("T", " ")[:19],
-                display_name,
-                event["label"],
-                f'{event["amount"]} {event["unit"]}',
-                "三步完整流程" if event["source"] == "unified_workflow" else (event["source"] or "-"),
+                row["station"],
+                row["total"],
+                f'{row["total_share"]:.1f}%',
+                row["has_phone"],
+                f'{row["phone_share"]:.1f}%',
             ]
             for column, value in enumerate(values):
-                self.recent_table.setItem(row_index, column, QTableWidgetItem(str(value)))
-        self.recent_table.resizeColumnsToContents()
+                item = QTableWidgetItem(str(value))
+                if column in (1, 2):
+                    item.setForeground(QColor("#3478f6"))
+                    item.setTextAlignment(Qt.AlignCenter)
+                elif column in (3, 4):
+                    item.setForeground(QColor("#15946c"))
+                    item.setTextAlignment(Qt.AlignCenter)
+                if column in (1, 3):
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self.summary_table.setItem(row_index, column, item)
+        self._finish_summary_table(
+            "全部站点",
+            "各站总计数占比与有电话数占比",
+            (0,),
+        )
 
     def refresh(self):
         self._populate_station_options()
         self._clear_kpis()
+        category = self.category_combo.currentData()
+        is_station_distribution = category == "station_distribution"
+        if is_station_distribution:
+            self.station_combo.blockSignals(True)
+            self.station_combo.setCurrentIndex(0)
+            self.station_combo.blockSignals(False)
+            self.station_combo.setEnabled(False)
+            self.station_combo.setToolTip("各站分布固定统计全部站点")
+            self._render_station_distribution()
+            return
+
+        self.station_combo.setEnabled(True)
+        self.station_combo.setToolTip("")
         user_id = self._selected_user_id()
         scope = self._selected_scope()
-        is_violation = self.category_combo.currentData() == "violation"
-        if is_violation:
+        if category == "violation":
             self._render_violation(user_id, scope)
         else:
             self._render_completion(user_id, scope)
-        self.summary_table.resizeColumnsToContents()
-        self._refresh_recent(user_id)

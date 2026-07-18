@@ -1,5 +1,8 @@
+from dataclasses import replace
+
 from PyQt5.QtCore import Qt, pyqtSignal
 from PyQt5.QtWidgets import (
+    QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -18,7 +21,9 @@ from ..models import Account
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
 from .account_page import AccountPage
 from .auth_dialogs import PasswordDialog
+from .personal_center_page import PersonalCenterPage
 from .statistics_page import StatisticsPage
+from .theme import install_disabled_cursor_filter
 from .workflow_page import WorkflowPage
 
 
@@ -28,6 +33,9 @@ class MainWindow(QMainWindow):
 
     def __init__(self, database: Database, account: Account, parent=None):
         super().__init__(parent)
+        application = QApplication.instance()
+        if application is not None:
+            install_disabled_cursor_filter(application)
         self.database = database
         self.account = account
         self._prepared_to_close = False
@@ -65,16 +73,29 @@ class MainWindow(QMainWindow):
             )
         self.statistics_page = StatisticsPage(database, account, warning)
         self.workflow_page = WorkflowPage(self._record_workflow_summary)
+        self.personal_center_page = PersonalCenterPage(account)
+        self.personal_center_page.change_password_requested.connect(self._change_password)
+        self.personal_center_page.logout_requested.connect(self._request_logout)
 
         self._add_page("home", self.statistics_page)
         self._add_page("workflow", self.workflow_page)
         if account.is_admin:
             self.account_page = AccountPage(database, account)
+            self.account_page.account_name_changed.connect(
+                self._account_name_changed
+            )
+            self.account_page.account_permission_changed.connect(
+                self._account_data_changed
+            )
+            self.account_page.station_data_changed.connect(
+                self._account_data_changed
+            )
             self._add_page("accounts", self.account_page)
         else:
             self.account_page = None
+        self._add_page("personal", self.personal_center_page)
 
-        self.show_page("home")
+        self.show_page("home" if account.is_admin else "workflow")
 
     def _build_sidebar(self):
         sidebar = QFrame()
@@ -98,6 +119,7 @@ class MainWindow(QMainWindow):
         ]
         if self.account.is_admin:
             nav_items.append(("accounts", "♙  账号管理"))
+        nav_items.append(("personal", "●  个人中心"))
 
         for key, text in nav_items:
             button = QPushButton(text)
@@ -109,17 +131,9 @@ class MainWindow(QMainWindow):
             layout.addWidget(button)
 
         layout.addStretch()
-        identity_lines = [self.account.name_label]
-        if self.account.name_label != self.account.username:
-            identity_lines.append(self.account.username)
-        identity_lines.append(self.account.role_label)
-        user = QLabel("\n".join(identity_lines))
-        user.setObjectName("SidebarUser")
-        layout.addWidget(user)
-        logout = QPushButton("退出登录")
-        logout.setObjectName("NavButton")
-        logout.clicked.connect(self._request_logout)
-        layout.addWidget(logout)
+        self.sidebar_user = QLabel(self.account.name_label)
+        self.sidebar_user.setObjectName("SidebarUser")
+        layout.addWidget(self.sidebar_user)
         return sidebar
 
     def _build_top_bar(self):
@@ -132,19 +146,35 @@ class MainWindow(QMainWindow):
         self.page_title.setStyleSheet("font-size:16px;font-weight:700;color:#17233c;")
         layout.addWidget(self.page_title)
         layout.addStretch()
-        identity = QLabel(
-            f"{self.account.role_label} · {self.account.name_label}（{self.account.username}）"
+        self.top_identity = QLabel(
+            f"{self.account.role_label} · {self.account.name_label}"
         )
-        identity.setObjectName("Muted")
-        layout.addWidget(identity)
-        change_password = QPushButton("修改密码")
-        change_password.clicked.connect(self._change_password)
-        layout.addWidget(change_password)
+        self.top_identity.setObjectName("Muted")
+        layout.addWidget(self.top_identity)
         return bar
 
     def _add_page(self, key, widget):
         self._pages[key] = widget
         self.stack.addWidget(widget)
+
+    def _account_name_changed(self, account_id, display_name):
+        self.statistics_page.refresh()
+        if account_id != self.account.id:
+            return
+        self.account = replace(self.account, display_name=display_name)
+        self.statistics_page.account = self.account
+        self.personal_center_page.account = self.account
+        self.personal_center_page.name_value.setText(self.account.name_label)
+        if self.account_page is not None:
+            self.account_page.current_account = self.account
+        self.sidebar_user.setText(self.account.name_label)
+        self.top_identity.setText(
+            f"{self.account.role_label} · {self.account.name_label}"
+        )
+        self.setWindowTitle(f"{APP_NAME} - {self.account.name_label}")
+
+    def _account_data_changed(self, *_args):
+        self.statistics_page.refresh()
 
     def show_page(self, key):
         if key not in self._pages:
@@ -153,6 +183,7 @@ class MainWindow(QMainWindow):
             "home": "数据仪表盘",
             "workflow": "一键业务处理",
             "accounts": "账号管理",
+            "personal": "个人中心",
         }
         self.stack.setCurrentWidget(self._pages[key])
         self.page_title.setText(titles.get(key, APP_NAME))
@@ -193,7 +224,12 @@ class MainWindow(QMainWindow):
             return False
 
     def _change_password(self):
-        PasswordDialog(self.database, self.account.id, parent=self).exec_()
+        PasswordDialog(
+            self.database,
+            self.account.id,
+            require_current=True,
+            parent=self,
+        ).exec_()
 
     def _shutdown_tools(self):
         if not self.workflow_page.shutdown(8000):

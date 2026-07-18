@@ -1,5 +1,4 @@
 import os
-import re
 import uuid
 from datetime import datetime
 
@@ -49,6 +48,7 @@ from ..database import (
     WORKFLOW_NO_PHONE_METRIC,
     WORKFLOW_NO_TRANSPORT_METRIC,
     WORKFLOW_TOTAL_METRIC,
+    split_violation_reasons,
 )
 from ..tools.transport_tool import (
     BusinessBackfillWorker,
@@ -626,7 +626,7 @@ class WorkflowPage(QWidget):
 
     @classmethod
     def calculate_violation_counts(cls, dataframe):
-        """按 / 或 ／ 拆分原因，并区分有电话与其他完成类型。"""
+        """仅按半角竖线拆分原因，并区分有电话与其他完成类型。"""
         totals = {}
         if dataframe is None or "原因" not in dataframe.columns:
             return totals
@@ -634,14 +634,7 @@ class WorkflowPage(QWidget):
             reason_text = str(row.get("原因", "")).strip()
             if reason_text.lower() in {"", "nan", "none", "null", "无", "暂无"}:
                 continue
-            reasons = []
-            seen = set()
-            for reason in re.split(r"[/／|｜]", reason_text):
-                reason = reason.strip()
-                if not reason or reason in seen:
-                    continue
-                seen.add(reason)
-                reasons.append(reason)
+            reasons = split_violation_reasons(reason_text)
             has_phone = cls.classify_workflow_row(row) == WORKFLOW_HAS_PHONE_METRIC
             for reason in reasons:
                 target = totals.setdefault(
