@@ -20,13 +20,15 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
     QProgressBar, QFileDialog, QMessageBox, QGroupBox, QTextEdit,
-    QSplitter, QFrame, QComboBox, QCheckBox, QRadioButton, QButtonGroup,
+    QSplitter, QFrame, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont, QColor
 import pandas as pd
 import openpyxl
 from DrissionPage import ChromiumPage, ChromiumOptions
+
+from ..browser import get_builtin_chromium_path
 
 
 # ==================== 配置 ====================
@@ -53,103 +55,8 @@ def has_meaningful_value(value):
 
 # ==================== 浏览器控制与信息提取 ====================
 
-# 候选浏览器列表 —— Windows
-_BROWSER_CANDIDATES_WIN = [
-    ("Google Chrome",        r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-    ("Google Chrome (x86)",  r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-    ("Microsoft Edge",       r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-    ("Microsoft Edge (x86)", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-    ("360安全浏览器",         r"C:\Program Files (x86)\360\360se\360se.exe"),
-    ("360安全浏览器",         r"C:\Program Files\360\360se\360se.exe"),
-    ("360极速浏览器",         r"C:\Program Files (x86)\360\360ee\360ee.exe"),
-    ("360极速浏览器",         r"C:\Program Files\360\360ee\360ee.exe"),
-    ("QQ浏览器",              r"C:\Program Files (x86)\Tencent\QQBrowser\QQBrowser.exe"),
-    ("QQ浏览器",              r"C:\Program Files\Tencent\QQBrowser\QQBrowser.exe"),
-    ("猎豹浏览器",            r"C:\Program Files (x86)\Liebao\LBBrowser\liebao.exe"),
-    ("搜狗浏览器",            r"C:\Program Files (x86)\Sogou\SogouExplorer\SogouExplorer.exe"),
-    ("搜狗浏览器",            r"C:\Program Files\Sogou\SogouExplorer\SogouExplorer.exe"),
-    ("Brave",                r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe"),
-    ("Vivaldi",              r"C:\Users\{user}\AppData\Local\Vivaldi\Application\vivaldi.exe"),
-    ("Opera",                r"C:\Users\{user}\AppData\Local\Programs\Opera\launcher.exe"),
-]
-
-# 平台判断：是否为 Windows（Linux/统信 时为 False）
-_IS_WINDOWS = sys.platform.startswith("win")
-
-
-def _get_linux_browsers():
-    """
-    Linux/统信：检测系统已安装的浏览器，返回 [(名称, 路径), ...]。
-    用于 find_all_browsers 的候选列表，也用于 UI 单选框。
-    """
-    import shutil
-    # deepin 浏览器候选路径
-    deepin_paths = [
-        "/usr/bin/org.deepin.browser",
-        "/opt/apps/org.deepin.browser/files/browser",
-    ]
-    # Chromium 候选路径
-    chromium_paths = [
-        "/usr/bin/chromium",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium-stable",
-        "/opt/apps/org.chromium.Chromium/files/chromium",
-    ]
-    # which 动态补充
-    for cmd in ["chromium", "chromium-browser"]:
-        p = shutil.which(cmd)
-        if p and p not in chromium_paths:
-            chromium_paths.append(p)
-
-    candidates = []
-    for p in deepin_paths:
-        if os.path.exists(p):
-            candidates.append(("deepin浏览器", p))
-            break
-    for p in chromium_paths:
-        if os.path.exists(p):
-            candidates.append(("Chromium", p))
-            break
-    return candidates
-
-
-def find_all_browsers():
-    """
-    扫描本机已安装的 Chromium 系浏览器。
-    返回列表：[(显示名称, 可执行路径), ...]，首位为"自动检测"兜底项。
-    同路径/同名去重。
-    Windows 扫描常见安装路径；Linux/统信优先 deepin 浏览器，再找系统 Chromium。
-    """
-    if _IS_WINDOWS:
-        candidates = _BROWSER_CANDIDATES_WIN
-    else:
-        candidates = _get_linux_browsers()
-
-    user = os.environ.get("USERNAME", "") or os.environ.get("USER", "")
-    seen_paths = set()
-    seen_names = set()
-    found = []
-
-    for name, path in candidates:
-        real_path = path.replace("{user}", user)
-        if not real_path:
-            continue
-        if real_path in seen_paths:
-            continue
-        if os.path.exists(real_path):
-            seen_paths.add(real_path)
-            # 同名只保留第一个
-            display = name if name not in seen_names else f"{name} ({os.path.basename(real_path)})"
-            seen_names.add(name)
-            found.append((display, real_path))
-
-    # "自动检测"放在第一位，作为默认选项
-    found.insert(0, ("自动检测（默认）", ""))
-    return found
-
-
-def create_browser(browser_path=None):
-    """创建浏览器实例，browser_path 为空则让 DrissionPage 自行决定"""
+def create_browser():
+    """使用项目随 Playwright 安装的内置 Chromium 创建浏览器实例。"""
     co = ChromiumOptions()
     co.set_argument('--disable-blink-features=AutomationControlled')
     co.set_argument('--no-sandbox')
@@ -169,8 +76,7 @@ def create_browser(browser_path=None):
             'Chrome/131.0.0.0 Safari/537.36'
         )
     co.set_user_agent(ua)
-    if browser_path:
-        co.set_browser_path(browser_path)
+    co.set_browser_path(get_builtin_chromium_path())
     return ChromiumPage(co)
 
 
@@ -434,11 +340,10 @@ class QueryWorker(QThread):
     login_confirmed_signal = pyqtSignal()        # 用户处理完，继续执行
     finished_signal = pyqtSignal(bool)           # 完成(bool=是否有错误)
     
-    def __init__(self, df, company_col, browser_path=""):
+    def __init__(self, df, company_col):
         super().__init__()
         self.df = df
         self.company_col = company_col
-        self.browser_path = browser_path
         self.page = None
         self._should_stop = False
         self._login_wait = threading.Event()
@@ -582,7 +487,7 @@ class QueryWorker(QThread):
         try:
             # 1. 创建浏览器
             self.log_signal.emit("🚀 正在启动浏览器...")
-            self.page = create_browser(self.browser_path)
+            self.page = create_browser()
             self.log_signal.emit("✅ 浏览器已启动")
             
             # 2. 打开首页，等待登录
@@ -751,9 +656,6 @@ class MainWindow(QMainWindow):
         self._is_paused = False   # 当前是否处于暂停状态
         self._is_saved = True   # 是否已保存（无未保存变更）
 
-        # 扫描本机已安装的浏览器
-        self._browsers = find_all_browsers()   # [(name, path), ...]
-
         self._setup_ui()
     
     def _setup_ui(self):
@@ -864,60 +766,12 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(save_opt_layout)
 
-        # ===== 浏览器选择 =====
+        # ===== 浏览器信息 =====
         browser_layout = QHBoxLayout()
-
-        if _IS_WINDOWS:
-            # Windows：下拉框 + 刷新 + 手动添加
-            browser_layout.addWidget(QLabel("🌐 使用浏览器:"))
-            self.browser_combo = QComboBox()
-            self.browser_combo.setMinimumHeight(32)
-            self.browser_combo.setStyleSheet("font-size: 13px; padding: 2px 6px;")
-            for name, path in self._browsers:
-                self.browser_combo.addItem(name, userData=path)
-                idx = self.browser_combo.count() - 1
-                tip = path if path else "由程序自动选择系统默认 Chromium 浏览器"
-                self.browser_combo.setItemData(idx, tip, Qt.ToolTipRole)
-            self.browser_combo.setCurrentIndex(0)
-            browser_layout.addWidget(self.browser_combo, stretch=1)
-
-            self.refresh_browser_btn = QPushButton("🔄 刷新")
-            self.refresh_browser_btn.setMinimumHeight(32)
-            self.refresh_browser_btn.setFixedWidth(72)
-            self.refresh_browser_btn.setToolTip("重新扫描本机已安装的浏览器")
-            self.refresh_browser_btn.setStyleSheet("font-size: 13px;")
-            self.refresh_browser_btn.clicked.connect(self._refresh_browsers)
-            browser_layout.addWidget(self.refresh_browser_btn)
-
-            self.add_browser_btn = QPushButton("➕ 手动添加")
-            self.add_browser_btn.setMinimumHeight(32)
-            self.add_browser_btn.setFixedWidth(96)
-            self.add_browser_btn.setToolTip("手动选择未被识别的浏览器 .exe 文件")
-            self.add_browser_btn.setStyleSheet("font-size: 13px;")
-            self.add_browser_btn.clicked.connect(self._add_browser_manually)
-            browser_layout.addWidget(self.add_browser_btn)
-        else:
-            # Linux/统信：单选框（deepin浏览器 / Chromium），无浏览器则提示
-            self.browser_combo = None
-            self._browser_radio_group = QButtonGroup(self)
-            self._browser_radio_paths = {}  # {radio_button_object: path_string}
-            linux_browsers = _get_linux_browsers()
-            if linux_browsers:
-                browser_layout.addWidget(QLabel("🌐 使用浏览器:"))
-                for i, (name, path) in enumerate(linux_browsers):
-                    radio = QRadioButton(name)
-                    radio.setStyleSheet("font-size: 13px;")
-                    radio.setToolTip(path)
-                    self._browser_radio_group.addButton(radio, i)
-                    self._browser_radio_paths[radio] = path
-                    if i == 0:
-                        radio.setChecked(True)  # 默认选第一个
-                    browser_layout.addWidget(radio)
-                browser_layout.addStretch(1)  # 靠左紧凑排列
-            else:
-                hint_label = QLabel("⚠️ 未检测到浏览器，请先安装 Chromium 或 deepin 浏览器")
-                hint_label.setStyleSheet("font-size: 13px; color: #cc0000;")
-                browser_layout.addWidget(hint_label)
+        browser_label = QLabel("🌐 使用浏览器：内置 Chromium")
+        browser_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #2d7d46;")
+        browser_layout.addWidget(browser_label)
+        browser_layout.addStretch(1)
 
         main_layout.addLayout(browser_layout)
 
@@ -1035,51 +889,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
     
-    def _refresh_browsers(self):
-        """重新扫描本机浏览器，刷新下拉框"""
-        self._browsers = find_all_browsers()
-        self.browser_combo.clear()
-        for name, path in self._browsers:
-            self.browser_combo.addItem(name, userData=path)
-            idx = self.browser_combo.count() - 1
-            tip = path if path else "由程序自动选择系统默认 Chromium 浏览器"
-            self.browser_combo.setItemData(idx, tip, Qt.ToolTipRole)
-        self.browser_combo.setCurrentIndex(0)
-        count = len(self._browsers) - 1  # 去掉"自动检测"那个兜底项
-        self._log(f"🔄 已刷新浏览器列表，检测到 {count} 个浏览器")
-
-    def _add_browser_manually(self):
-        """用户手动选择浏览器可执行文件，加入下拉框并自动选中"""
-        is_win = sys.platform.startswith("win")
-        start_dir = r"C:\Program Files" if is_win else "/usr/bin"
-        file_filter = "可执行文件 (*.exe);;所有文件 (*)" if is_win else "所有文件 (*)"
-
-        path, _ = QFileDialog.getOpenFileName(
-            self, "选择浏览器可执行文件",
-            start_dir,
-            file_filter
-        )
-        if not path:
-            return
-
-        # 用文件名作为显示名称
-        exe_name = os.path.splitext(os.path.basename(path))[0]
-        display_name = f"{exe_name}（手动添加）"
-
-        # 检查是否已在列表中（避免重复）
-        for i in range(self.browser_combo.count()):
-            if self.browser_combo.itemData(i) == path:
-                self.browser_combo.setCurrentIndex(i)
-                self._log(f"ℹ️ 该浏览器已在列表中：{display_name}")
-                return
-
-        # 插入到"自动检测"之后的第一位，方便切换
-        insert_idx = 1
-        self.browser_combo.insertItem(insert_idx, display_name, userData=path)
-        self.browser_combo.setItemData(insert_idx, path, Qt.ToolTipRole)
-        self.browser_combo.setCurrentIndex(insert_idx)
-        self._log(f"➕ 已添加浏览器：{display_name}  ({path})")
-
     def _log(self, msg):
         """追加日志"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1253,22 +1062,8 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: orange; font-weight: bold;")
         
         # 启动工作线程
-        if _IS_WINDOWS:
-            selected_path = self.browser_combo.currentData() or ""
-            selected_name = self.browser_combo.currentText()
-            self._log(f"🌐 使用浏览器：{selected_name}" + (f"  ({selected_path})" if selected_path else ""))
-        else:
-            # Linux/统信：从单选框获取选中的浏览器路径
-            checked_radio = self._browser_radio_group.checkedButton()
-            if checked_radio:
-                selected_path = self._browser_radio_paths.get(checked_radio, "")
-                selected_name = checked_radio.text()
-                self._log(f"🌐 使用浏览器：{selected_name}  ({selected_path})")
-            else:
-                selected_path = ""
-                self._log("⚠️ 未选择浏览器，请先安装 Chromium 或 deepin 浏览器")
-                return
-        self.worker = QueryWorker(self.df.copy(), COMPANY_COL_NAME, browser_path=selected_path)
+        self._log("🌐 使用浏览器：内置 Chromium")
+        self.worker = QueryWorker(self.df.copy(), COMPANY_COL_NAME)
         self.worker.log_signal.connect(self._log)
         self.worker.progress_signal.connect(self._on_progress)
         self.worker.row_done_signal.connect(self._on_row_done)

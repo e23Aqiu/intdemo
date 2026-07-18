@@ -23,7 +23,7 @@ IntDemo 是一个面向运输业务处理场景的 Windows 桌面客户端。项
 
 - Windows 10/11（项目当前主要支持的平台）
 - 64 位 Python 3.9，推荐 Python 3.9.13
-- 可用的现代浏览器和网络连接（执行在线查询时需要）
+- 网络连接（执行在线查询时需要；浏览器统一使用项目内置 Chromium）
 - Git（仅克隆和参与开发时需要）
 
 ## 安装方法
@@ -56,7 +56,12 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 ```powershell
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+$env:PLAYWRIGHT_BROWSERS_PATH='0'
+python -m playwright install chromium
+Remove-Item Env:PLAYWRIGHT_BROWSERS_PATH
 ```
+
+最后三条命令会将业务处理统一使用的 Chromium 安装到项目虚拟环境中；无需选择或依赖系统浏览器。
 
 如需构建安装包，再安装开发依赖：
 

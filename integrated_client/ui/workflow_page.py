@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import uuid
 from datetime import datetime
 
@@ -39,9 +38,9 @@ from ..tools.aiqicha_tool import (
     PHONE_COL_NAME,
     QueryWorker,
     TARGET_COLUMNS,
-    find_all_browsers,
     has_meaningful_value,
 )
+from ..browser import get_builtin_chromium_path
 from ..database import (
     WORKFLOW_EMPTY_METRIC,
     WORKFLOW_HAS_PHONE_METRIC,
@@ -54,7 +53,6 @@ from ..database import (
 from ..tools.transport_tool import (
     BusinessBackfillWorker,
     Worker,
-    get_all_browsers,
     is_excel_file_open,
 )
 
@@ -145,7 +143,6 @@ class WorkflowPage(QWidget):
         self._retired_workers = []
 
         self._build_ui()
-        self._refresh_browsers()
         self._sync_mode_controls()
 
         self.preview_timer = QTimer(self)
@@ -186,12 +183,8 @@ class WorkflowPage(QWidget):
 
         settings_group = QGroupBox("运行设置")
         settings = QGridLayout(settings_group)
-        self.browser_combo = QComboBox()
-        self.browser_combo.setMinimumWidth(230)
-        browser_refresh = QPushButton("刷新浏览器")
-        browser_refresh.clicked.connect(self._refresh_browsers)
-        browser_add = QPushButton("手动添加")
-        browser_add.clicked.connect(self._add_browser)
+        self.browser_info = QLabel("内置 Chromium（统一使用）")
+        self.browser_info.setObjectName("Muted")
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("人工接管模式", False)
         self.mode_combo.addItem("全自动模式", True)
@@ -213,9 +206,7 @@ class WorkflowPage(QWidget):
         self.captcha_retry.setValue(10)
 
         settings.addWidget(QLabel("统一浏览器"), 0, 0)
-        settings.addWidget(self.browser_combo, 0, 1, 1, 2)
-        settings.addWidget(browser_refresh, 0, 3)
-        settings.addWidget(browser_add, 0, 4)
+        settings.addWidget(self.browser_info, 0, 1, 1, 4)
         settings.addWidget(QLabel("运行模式"), 1, 0)
         settings.addWidget(self.mode_combo, 1, 1)
         settings.addWidget(self.manual_captcha, 1, 2)
@@ -330,34 +321,6 @@ class WorkflowPage(QWidget):
         self.infinite_captcha.setEnabled(retry_enabled)
         self.captcha_retry.setEnabled(retry_enabled and not self.infinite_captcha.isChecked())
 
-    def _refresh_browsers(self):
-        current_path = self.browser_combo.currentData()
-        self.browser_combo.clear()
-        if sys.platform.startswith("win"):
-            browsers = list(get_all_browsers().items())
-        else:
-            browsers = [(name, path) for name, path in find_all_browsers() if path]
-        for name, path in browsers:
-            self.browser_combo.addItem(name, path)
-        if not browsers:
-            self.browser_combo.addItem("未检测到浏览器，请手动添加", None)
-        elif current_path:
-            index = self.browser_combo.findData(current_path)
-            if index >= 0:
-                self.browser_combo.setCurrentIndex(index)
-
-    def _add_browser(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "选择浏览器可执行文件",
-            "",
-            "浏览器程序 (*.exe *.AppImage);;所有文件 (*.*)",
-        )
-        if not path:
-            return
-        self.browser_combo.addItem(f"{os.path.basename(path)}（手动）", path)
-        self.browser_combo.setCurrentIndex(self.browser_combo.count() - 1)
-
     def _choose_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择业务表格", "", "Excel 工作簿 (*.xlsx)"
@@ -402,12 +365,6 @@ class WorkflowPage(QWidget):
         if self.current_step in {1, 2} or not self.pipeline_running:
             self._reload_preview(force=False)
 
-    def _selected_browser_path(self):
-        path = self.browser_combo.currentData()
-        if sys.platform.startswith("win") and not path:
-            return None
-        return path
-
     def _captcha_retry_count(self):
         return 9999 if self.infinite_captcha.isChecked() else self.captcha_retry.value()
 
@@ -430,8 +387,10 @@ class WorkflowPage(QWidget):
         if is_excel_file_open(self.file_path):
             QMessageBox.warning(self, "表格被占用", "请先关闭 Excel/WPS 中打开的业务表格。")
             return
-        if sys.platform.startswith("win") and not self._selected_browser_path():
-            QMessageBox.warning(self, "缺少浏览器", "未检测到浏览器，请手动添加浏览器程序。")
+        try:
+            get_builtin_chromium_path()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "内置浏览器不可用", str(exc))
             return
         if not self._reload_preview(force=True):
             return
@@ -464,7 +423,6 @@ class WorkflowPage(QWidget):
             self.auto_continue.isChecked(),
             self._captcha_retry_count(),
             self.only_yellow.isChecked(),
-            self._selected_browser_path(),
         )
         self.current_worker = worker
         worker.log.connect(self._log)
@@ -499,7 +457,6 @@ class WorkflowPage(QWidget):
             auto_mode,
             self._captcha_retry_count(),
             self.manual_captcha.isChecked() if not auto_mode else False,
-            self._selected_browser_path(),
         )
         self.current_worker = worker
         worker.log.connect(self._log)
@@ -543,7 +500,6 @@ class WorkflowPage(QWidget):
         worker = QueryWorker(
             self.df.copy(),
             COMPANY_COL_NAME,
-            browser_path=self._selected_browser_path() or "",
         )
         self.current_worker = worker
         worker.log_signal.connect(self._log)

@@ -19,6 +19,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
 
 USING_PYQT6 = False
+from ..browser import get_builtin_chromium_path
 from playwright.sync_api import sync_playwright, Page, Browser
 try:
     from ddddocr import DdddOcr
@@ -34,51 +35,13 @@ from PIL import Image, ImageFilter, ImageEnhance, ImageOps, ImageFont, ImageDraw
 
 os.environ["DDDOCR_NO_LOG"] = "1"
 os.environ["PLAYWRIGHT_LOG"] = "none"
-os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
 os.environ["PLAYWRIGHT_LOCAL_LOG_DIR"] = os.devnull
-
-# 修复 playwright 打包路径，让EXE在任何电脑直接运行
-def fix_playwright_env():
-    if hasattr(sys, 'frozen') and sys.frozen:
-        os.environ['PLAYWRIGHT_BROWSERS_PATH'] = os.path.join(sys._MEIPASS, "playwright", "driver", "package",
-                                                              ".local-browsers")
-
-fix_playwright_env()
 # ==============================================
 # 【关键】强制让 ddddocr 从 exe 内部加载模型
 # ==============================================
 def fix_ddddocr_in_exe():
     if hasattr(sys, 'frozen'):
         os.environ['DDDCR_MODEL_PATH'] = sys._MEIPASS
-
-def get_all_browsers():
-    """返回Windows系统检测到的所有可用浏览器 {显示名: 路径}（非Windows不使用）"""
-    detected = {}
-
-    if sys.platform == "win32":
-        browsers = [
-            ("Chrome", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
-            ("Chrome", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
-            ("Microsoft Edge", r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
-            ("Microsoft Edge", r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
-            ("360安全浏览器", r"C:\Program Files (x86)\360\360se\360se.exe"),
-            ("360安全浏览器", r"C:\Program Files\360\360se\360se.exe"),
-            ("QQ浏览器", r"C:\Program Files (x86)\Tencent\QQBrowser\QQBrowser.exe"),
-            ("QQ浏览器", r"C:\Program Files\Tencent\QQBrowser\QQBrowser.exe"),
-            ("猎豹浏览器", r"C:\Program Files (x86)\Liebao\LBBrowser\liebao.exe"),
-            ("搜狗浏览器", r"C:\Program Files (x86)\Sogou\SogouExplorer\SogouExplorer.exe"),
-            ("搜狗浏览器", r"C:\Program Files\Sogou\SogouExplorer\SogouExplorer.exe"),
-        ]
-
-        for name, path in browsers:
-            if os.path.exists(path) and name not in detected:
-                detected[name] = path
-
-    return detected
-
-
-# 系统默认浏览器（兼容旧逻辑）
-SYSTEM_BROWSER = next((p for _, p in get_all_browsers().items()), None)
 
 fix_ddddocr_in_exe()
 
@@ -286,7 +249,7 @@ class Worker(QThread):
     input_result = ""
 
     # 接收所有运行参数
-    def __init__(self, src_path, is_auto_mode, manual_at_captcha, page_retry, auto_continue, captcha_retry, only_yellow_card, browser_path):
+    def __init__(self, src_path, is_auto_mode, manual_at_captcha, page_retry, auto_continue, captcha_retry, only_yellow_card):
         super().__init__()
         self.src = src_path
         self.auto_mode = is_auto_mode
@@ -300,7 +263,6 @@ class Worker(QThread):
         self.PAGE_RETRY = page_retry
         self.DETAIL_RETRY = 9999
         self.CAPTCHA_RETRY = captcha_retry
-        self.browser_path = browser_path
 
         # 自动继续配置
         self.auto_continue = auto_continue
@@ -325,11 +287,6 @@ class Worker(QThread):
             raise Exception("手动停止")
 
     def run(self):
-        # 非Windows系统(统信UOS等)使用Playwright内置Chromium，不需要browser_path
-        if sys.platform == "win32" and not self.browser_path:
-            self.log.emit("❌ 未选择或未检测到任何浏览器")
-            self.finished.emit("失败")
-            return
         playwright = None
         try:
             try:
@@ -365,19 +322,13 @@ class Worker(QThread):
                     raise
 
             playwright = sync_playwright().start()
-            # Windows：使用用户选择的浏览器；非Windows(统信UOS等)：使用Playwright内置Chromium
-            if sys.platform == "win32":
-                self.browser = playwright.chromium.launch(
-                    headless=False,
-                    slow_mo=600,
-                    executable_path=self.browser_path
-                )
-            else:
-                self.browser = playwright.chromium.launch(
-                    headless=False,
-                    slow_mo=600,
-                )
-                self.log.emit("🔧 使用Playwright内置Chromium浏览器")
+            browser_path = get_builtin_chromium_path(playwright)
+            self.browser = playwright.chromium.launch(
+                headless=False,
+                slow_mo=600,
+                executable_path=browser_path,
+            )
+            self.log.emit("🔧 使用内置 Chromium 浏览器")
             # ============= 仅运输证查询：手机布局 =============
             # 模拟iPhone移动端，解决验证码扁平问题
             self.context = self.browser.new_context(
@@ -823,14 +774,13 @@ class BusinessBackfillWorker(QThread):
 
     input_result = ""
 
-    def __init__(self, original_file, auto_continue, auto_mode, captcha_retry, manual_at_captcha, browser_path):
+    def __init__(self, original_file, auto_continue, auto_mode, captcha_retry, manual_at_captcha):
         super().__init__()
         self.original_file = original_file
         self.auto_continue = auto_continue
         self.auto_mode = auto_mode
         self.web_timeout = 30000
         self.captcha_retry = captcha_retry
-        self.browser_path = browser_path
         self.manual_at_captcha = manual_at_captcha
         self._running = True
         self._paused = False
@@ -876,23 +826,13 @@ class BusinessBackfillWorker(QThread):
         self._close_browser()
         try:
             self.playwright = sync_playwright().start()
-
-            # Windows：使用用户选择的浏览器；非Windows(统信UOS等)：使用Playwright内置Chromium
-            if sys.platform == "win32":
-                launch_kwargs = {
-                    "headless": False,
-                    "slow_mo": 600,
-                    "executable_path": self.browser_path,
-                }
-            else:
-                launch_kwargs = {
-                    "headless": False,
-                    "slow_mo": 600,
-                }
-
+            launch_kwargs = {
+                "headless": False,
+                "slow_mo": 600,
+                "executable_path": get_builtin_chromium_path(self.playwright),
+            }
             self.browser = self.playwright.chromium.launch(**launch_kwargs)
-            if sys.platform != "win32":
-                self.log.emit("🔧 使用Playwright内置Chromium浏览器")
+            self.log.emit("🔧 使用内置 Chromium 浏览器")
             self.context = self.browser.new_context(
                 no_viewport=True  # ← 禁用固定视口，窗口可调整
             )
@@ -1128,11 +1068,6 @@ class BusinessBackfillWorker(QThread):
             return False
 
     def run(self):
-        # 非Windows系统(统信UOS等)使用Playwright内置Chromium，不需要browser_path
-        if sys.platform == "win32" and not self.browser_path:
-            self.log.emit("❌ 未选择或未检测到任何浏览器")
-            self.finished.emit("失败")
-            return
         try:
             try:
                 df_original = pd.read_excel(
@@ -1616,34 +1551,13 @@ class MainWindow(QMainWindow):
         file_layout.addWidget(self.src_btn)
         main_layout.addWidget(file_group)
 
-        if sys.platform == "win32":
-            browser_group = QGroupBox("浏览器选择")
-            browser_layout = QHBoxLayout(browser_group)
-            browser_layout.addWidget(QLabel("浏览器："))
-            self.browser_combo = QComboBox()
-            self.browser_combo.setMinimumWidth(200)
-            browser_layout.addWidget(self.browser_combo)
-            self.refresh_browser_btn = QPushButton("🔄 刷新")
-            self.refresh_browser_btn.clicked.connect(self._refresh_browser_combo)
-            browser_layout.addWidget(self.refresh_browser_btn)
-            self.add_browser_btn = QPushButton("+ 手动添加")
-            self.add_browser_btn.clicked.connect(self._add_custom_browser)
-            browser_layout.addWidget(self.add_browser_btn)
-            browser_layout.addStretch()
-            main_layout.addWidget(browser_group)
-        else:
-            # 统信UOS等系统：使用Playwright内置Chromium，不需要选择浏览器
-            browser_group = QGroupBox("浏览器")
-            browser_layout = QHBoxLayout(browser_group)
-            builtin_label = QLabel("🔧 正在使用内置Chromium浏览器")
-            builtin_label.setStyleSheet("font-weight: bold; color: #2d7d46;")
-            browser_layout.addWidget(builtin_label)
-            browser_layout.addStretch()
-            main_layout.addWidget(browser_group)
-            # 占位对象，避免后续代码报错
-            self.browser_combo = None
-            self.refresh_browser_btn = None
-            self.add_browser_btn = None
+        browser_group = QGroupBox("浏览器")
+        browser_layout = QHBoxLayout(browser_group)
+        builtin_label = QLabel("🔧 正在使用内置 Chromium 浏览器")
+        builtin_label.setStyleSheet("font-weight: bold; color: #2d7d46;")
+        browser_layout.addWidget(builtin_label)
+        browser_layout.addStretch()
+        main_layout.addWidget(browser_group)
 
         retry_group = QGroupBox("次数设置")
         retry_layout = QHBoxLayout(retry_group)
@@ -1726,10 +1640,6 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log_text)
         main_layout.addWidget(log_group, stretch=1)
 
-        # 初始化下拉框（仅Windows需要，需在 log_text 初始化之后）
-        if sys.platform == "win32":
-            self._refresh_browser_combo()
-
         self.start_btn.clicked.connect(self.start_task)
         self.backfill_btn.clicked.connect(self.start_backfill)
         self.pause_btn.clicked.connect(self.pause_task)
@@ -1807,68 +1717,6 @@ class MainWindow(QMainWindow):
         if f:
             self.src_edit.setText(f)
 
-    def _refresh_browser_combo(self):
-        """刷新浏览器下拉框"""
-        self.browser_combo.blockSignals(True)
-        self.browser_combo.clear()
-        browsers = get_all_browsers()
-        count = len(browsers)
-        # 顶部插入"自动检测"选项
-        self.browser_combo.addItem("🔍 自动检测（推荐）", "__auto__")
-        if not browsers:
-            self.browser_combo.addItem("未检测到浏览器", None)
-            self.browser_combo.setEnabled(True)
-            self.log("🔄 刷新完成，未检测到任何系统浏览器")
-        else:
-            # 按固定顺序排列，检测到的在前
-            priority = ["Chrome", "Microsoft Edge", "360安全浏览器", "QQ浏览器",
-                        "猎豹浏览器", "搜狗浏览器", "Chromium"]
-            ordered = []
-            for name in priority:
-                if name in browsers:
-                    ordered.append((name, browsers.pop(name)))
-            ordered.extend(browsers.items())  # 其余自定义浏览器
-            for name, path in ordered:
-                self.browser_combo.addItem(name, path)
-        self.log(f"🔄 刷新完成，共检测到 {count} 个系统浏览器")
-        # 默认选中"自动检测"
-        self.browser_combo.setCurrentIndex(0)
-        self.browser_combo.blockSignals(False)
-
-    def _add_custom_browser(self):
-        """手动添加自定义浏览器（仅本次有效，不持久化）"""
-        f, _ = QFileDialog.getOpenFileName(
-            self, "选择浏览器可执行文件", "",
-            "可执行文件 (*.exe *.AppImage);;所有文件 (*.*)"
-        )
-        if not f:
-            return
-        # 直接用文件名作为显示名
-        name = os.path.splitext(os.path.basename(f))[0]
-        # 名称冲突时加序号区分
-        existing = {self.browser_combo.itemText(i) for i in range(self.browser_combo.count())}
-        final_name = name
-        idx = 1
-        while final_name in existing:
-            final_name = f"{name} ({idx})"
-            idx += 1
-        self.browser_combo.addItem(final_name, f)
-        self.browser_combo.setCurrentText(final_name)
-        self.log(f"已添加自定义浏览器：{final_name}")
-
-    def _get_selected_browser_path(self):
-        """获取当前选中的浏览器实际路径，非Windows系统返回None(使用内置Chromium)"""
-        if sys.platform != "win32" or self.browser_combo is None:
-            return None
-        data = self.browser_combo.currentData()
-        if data == "__auto__":
-            browsers = get_all_browsers()
-            if browsers:
-                return next(iter(browsers.values()))
-            return None
-        return data
-
-
     def start_task(self):
         src = self.src_edit.text().strip()
         if not src:
@@ -1900,7 +1748,6 @@ class MainWindow(QMainWindow):
             auto_cont,
             captcha_retry,
             self.only_yellow_card_check.isChecked(),
-            self._get_selected_browser_path()
         )
         self.worker.log.connect(self.log)
         self.worker.progress.connect(self.progress_bar.setValue)
@@ -1934,7 +1781,7 @@ class MainWindow(QMainWindow):
 
         self.backfill_worker = BusinessBackfillWorker(
             src, auto_cont, self.auto_rdo.isChecked(), captcha_retry,
-            self.manual_at_captcha.isChecked(), self._get_selected_browser_path()
+            self.manual_at_captcha.isChecked()
         )
         self.backfill_worker.log.connect(self.log)
         self.backfill_worker.progress.connect(self.progress_bar.setValue)
@@ -1962,9 +1809,6 @@ class MainWindow(QMainWindow):
             self.auto_rdo, self.manual_rdo, self.manual_at_captcha,
             self.only_yellow_card_check, self.auto_continue_check,
         ]
-        if sys.platform == "win32":
-            # Windows：禁用浏览器选择控件
-            widgets.extend([self.browser_combo, self.refresh_browser_btn, self.add_browser_btn])
         for w in widgets:
             w.setEnabled(enabled)
         self.start_btn.setEnabled(enabled)

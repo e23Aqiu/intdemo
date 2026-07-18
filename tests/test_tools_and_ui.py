@@ -89,6 +89,11 @@ class ToolAndUiTests(unittest.TestCase):
             window.statistics_page.detail_tabs.widget(0),
             window.statistics_page.chart_tab,
         )
+        self.assertFalse(hasattr(window.workflow_page, "browser_combo"))
+        self.assertEqual(
+            window.workflow_page.browser_info.text(),
+            "内置 Chromium（统一使用）",
+        )
         self.assertIs(
             window.statistics_page.detail_tabs.widget(1),
             window.statistics_page.data_tab,
