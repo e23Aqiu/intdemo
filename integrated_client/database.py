@@ -1,0 +1,519 @@
+import json
+import re
+import sqlite3
+import threading
+from contextlib import contextmanager
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Iterable, List, Mapping, Optional
+
+from .config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME, get_database_path
+from .models import Account
+from .security import hash_password, validate_password, verify_password
+
+
+WORKFLOW_TOTAL_METRIC = "workflow_detail_total"
+WORKFLOW_EMPTY_METRIC = "workflow_detail_empty"
+WORKFLOW_NO_TRANSPORT_METRIC = "workflow_detail_no_transport"
+WORKFLOW_NO_OPERATION_METRIC = "workflow_detail_no_operation"
+WORKFLOW_INDIVIDUAL_METRIC = "workflow_detail_individual"
+WORKFLOW_NO_PHONE_METRIC = "workflow_detail_company_no_phone"
+WORKFLOW_HAS_PHONE_METRIC = "workflow_detail_company_has_phone"
+WORKFLOW_METRIC_KEYS = (
+    WORKFLOW_TOTAL_METRIC,
+    WORKFLOW_EMPTY_METRIC,
+    WORKFLOW_NO_TRANSPORT_METRIC,
+    WORKFLOW_NO_OPERATION_METRIC,
+    WORKFLOW_INDIVIDUAL_METRIC,
+    WORKFLOW_NO_PHONE_METRIC,
+    WORKFLOW_HAS_PHONE_METRIC,
+)
+
+DEFAULT_STATION_USERS = (
+    ("萝岗中心站", "luogang"),
+    ("太平中心站", "taiping"),
+    ("道滘中心站", "daojiao"),
+    ("宝安中心站", "baoan"),
+    ("南头中心站", "nantou"),
+)
+DEFAULT_STATION_PASSWORD = "123456"
+
+
+class DatabaseError(RuntimeError):
+    pass
+
+
+class AuthenticationError(DatabaseError):
+    pass
+
+
+class Database:
+    """SQLite 数据访问层。
+
+    每个操作使用独立连接，避免后续从工作线程记录统计时共享连接。
+    """
+
+    DEFAULT_METRICS = (
+        (WORKFLOW_TOTAL_METRIC, "总计数", "条", 10),
+        (WORKFLOW_EMPTY_METRIC, "空", "条", 20),
+        (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", "条", 30),
+        (WORKFLOW_NO_OPERATION_METRIC, "无营运信息", "条", 40),
+        (WORKFLOW_INDIVIDUAL_METRIC, "个体经营", "条", 50),
+        (WORKFLOW_NO_PHONE_METRIC, "无电话（有公司名）", "条", 60),
+        (WORKFLOW_HAS_PHONE_METRIC, "有电话（有公司名）", "条", 70),
+    )
+    LEGACY_METRICS = (
+        "transport_query_completed",
+        "business_backfill_completed",
+        "aiqicha_query_completed",
+        "workflow_total_completed",
+        "workflow_no_transport",
+        "workflow_no_phone_with_transport",
+        "workflow_has_phone",
+    )
+
+    def __init__(self, path: Optional[Path] = None):
+        self.path = Path(path or get_database_path())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._schema_lock = threading.Lock()
+        self.initialize()
+
+    @staticmethod
+    def _now() -> str:
+        return datetime.now().astimezone().isoformat(timespec="seconds")
+
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(str(self.path), timeout=20)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA busy_timeout = 20000")
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def initialize(self) -> None:
+        with self._schema_lock, self._connect() as conn:
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                    display_name TEXT NOT NULL DEFAULT '',
+                    password_salt TEXT NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    role TEXT NOT NULL CHECK (role IN ('admin', 'user')),
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1)),
+                    must_change_password INTEGER NOT NULL DEFAULT 0 CHECK (must_change_password IN (0, 1)),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_login TEXT,
+                    created_by INTEGER REFERENCES accounts(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS metric_definitions (
+                    metric_key TEXT PRIMARY KEY,
+                    label TEXT NOT NULL,
+                    unit TEXT NOT NULL DEFAULT '条',
+                    sort_order INTEGER NOT NULL DEFAULT 100,
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0, 1))
+                );
+
+                CREATE TABLE IF NOT EXISTS activity_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES accounts(id),
+                    metric_key TEXT NOT NULL REFERENCES metric_definitions(metric_key),
+                    amount INTEGER NOT NULL DEFAULT 1,
+                    source TEXT NOT NULL DEFAULT '',
+                    task_id TEXT,
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_activity_user_time
+                    ON activity_events(user_id, created_at);
+                CREATE INDEX IF NOT EXISTS idx_activity_metric_time
+                    ON activity_events(metric_key, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_task_metric
+                    ON activity_events(user_id, metric_key, task_id)
+                    WHERE task_id IS NOT NULL;
+                """
+            )
+            account_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+            }
+            if "display_name" not in account_columns:
+                conn.execute("ALTER TABLE accounts ADD COLUMN display_name TEXT NOT NULL DEFAULT ''")
+            conn.execute(
+                "UPDATE accounts SET display_name=username WHERE TRIM(display_name)=''"
+            )
+            conn.executemany(
+                """
+                INSERT INTO metric_definitions(metric_key, label, unit, sort_order)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(metric_key) DO UPDATE SET
+                    label=excluded.label,
+                    unit=excluded.unit,
+                    sort_order=excluded.sort_order,
+                    is_active=1
+                """,
+                self.DEFAULT_METRICS,
+            )
+            placeholders = ",".join("?" for _ in self.LEGACY_METRICS)
+            conn.execute(
+                f"UPDATE metric_definitions SET is_active=0 WHERE metric_key IN ({placeholders})",
+                self.LEGACY_METRICS,
+            )
+
+    @staticmethod
+    def _account_from_row(row: sqlite3.Row) -> Account:
+        return Account(
+            id=int(row["id"]),
+            username=row["username"],
+            display_name=row["display_name"] or row["username"],
+            role=row["role"],
+            is_active=bool(row["is_active"]),
+            created_at=row["created_at"],
+            last_login=row["last_login"],
+            must_change_password=bool(row["must_change_password"]),
+        )
+
+    @staticmethod
+    def _validate_username(username: str) -> str:
+        username = (username or "").strip()
+        if not 3 <= len(username) <= 32:
+            raise ValueError("账号长度需要在 3 到 32 个字符之间")
+        if any(ch.isspace() for ch in username):
+            raise ValueError("账号中不能包含空格")
+        return username
+
+    def ensure_default_admin(self) -> bool:
+        """确保至少存在一个管理员；返回是否创建/恢复了默认管理员。"""
+        with self._connect() as conn:
+            active_admin = conn.execute(
+                "SELECT id FROM accounts WHERE role='admin' AND is_active=1 LIMIT 1"
+            ).fetchone()
+            if active_admin:
+                return False
+
+            salt, digest = hash_password(DEFAULT_ADMIN_PASSWORD)
+            now = self._now()
+            existing = conn.execute(
+                "SELECT id FROM accounts WHERE username=? COLLATE NOCASE",
+                (DEFAULT_ADMIN_USERNAME,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET password_salt=?, password_hash=?, role='admin', is_active=1,
+                        must_change_password=1, updated_at=?
+                    WHERE id=?
+                    """,
+                    (salt, digest, now, existing["id"]),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO accounts(
+                        username, display_name, password_salt, password_hash, role, is_active,
+                        must_change_password, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'admin', 1, 1, ?, ?)
+                    """,
+                    (DEFAULT_ADMIN_USERNAME, "系统管理员", salt, digest, now, now),
+                )
+            return True
+
+    def ensure_default_station_users(self) -> int:
+        """幂等创建预置中心站普通用户，返回本次新建数量。"""
+        with self._connect() as conn:
+            admin_row = conn.execute(
+                "SELECT id FROM accounts WHERE role='admin' ORDER BY id LIMIT 1"
+            ).fetchone()
+            created_by = admin_row["id"] if admin_row else None
+            created = 0
+            for display_name, username in DEFAULT_STATION_USERS:
+                existing = conn.execute(
+                    "SELECT id, display_name FROM accounts WHERE username=? COLLATE NOCASE",
+                    (username,),
+                ).fetchone()
+                if existing:
+                    current_name = (existing["display_name"] or "").strip()
+                    if not current_name or current_name.casefold() == username.casefold():
+                        conn.execute(
+                            "UPDATE accounts SET display_name=?, updated_at=? WHERE id=?",
+                            (display_name, self._now(), existing["id"]),
+                        )
+                    continue
+                salt, digest = hash_password(DEFAULT_STATION_PASSWORD)
+                now = self._now()
+                conn.execute(
+                    """
+                    INSERT INTO accounts(
+                        username, display_name, password_salt, password_hash, role,
+                        is_active, must_change_password, created_at, updated_at, created_by
+                    ) VALUES (?, ?, ?, ?, 'user', 1, 0, ?, ?, ?)
+                    """,
+                    (username, display_name, salt, digest, now, now, created_by),
+                )
+                created += 1
+            return created
+
+    def authenticate(self, username: str, password: str) -> Account:
+        username = (username or "").strip()
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE username=? COLLATE NOCASE", (username,)
+            ).fetchone()
+            if not row or not verify_password(password or "", row["password_salt"], row["password_hash"]):
+                raise AuthenticationError("账号或密码不正确")
+            if not row["is_active"]:
+                raise AuthenticationError("账号已停用，请联系管理员")
+            now = self._now()
+            conn.execute("UPDATE accounts SET last_login=? WHERE id=?", (now, row["id"]))
+            refreshed = dict(row)
+            refreshed["last_login"] = now
+            return self._account_from_row(refreshed)
+
+    def create_account(
+        self, username: str, password: str, role: str, created_by: int,
+        display_name: str = ""
+    ) -> Account:
+        username = self._validate_username(username)
+        display_name = (display_name or username).strip()
+        if not 1 <= len(display_name) <= 64:
+            raise ValueError("用户名称长度需要在 1 到 64 个字符之间")
+        validate_password(password)
+        if role not in {"admin", "user"}:
+            raise ValueError("无效的账号角色")
+        salt, digest = hash_password(password)
+        now = self._now()
+        try:
+            with self._connect() as conn:
+                cur = conn.execute(
+                    """
+                    INSERT INTO accounts(
+                        username, display_name, password_salt, password_hash, role, is_active,
+                        must_change_password, created_at, updated_at, created_by
+                    ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+                    """,
+                    (username, display_name, salt, digest, role, now, now, created_by),
+                )
+                row = conn.execute("SELECT * FROM accounts WHERE id=?", (cur.lastrowid,)).fetchone()
+                return self._account_from_row(row)
+        except sqlite3.IntegrityError as exc:
+            raise DatabaseError("该账号已存在") from exc
+
+    def list_accounts(self) -> List[Account]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM accounts ORDER BY role, username COLLATE NOCASE"
+            ).fetchall()
+            return [self._account_from_row(row) for row in rows]
+
+    def change_password(self, account_id: int, new_password: str, must_change: bool = False) -> None:
+        validate_password(new_password)
+        salt, digest = hash_password(new_password)
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE accounts
+                SET password_salt=?, password_hash=?, must_change_password=?, updated_at=?
+                WHERE id=?
+                """,
+                (salt, digest, int(must_change), self._now(), account_id),
+            )
+
+    def set_account_active(self, account_id: int, active: bool) -> None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT role, is_active FROM accounts WHERE id=?", (account_id,)).fetchone()
+            if not row:
+                raise DatabaseError("账号不存在")
+            if row["role"] == "admin" and row["is_active"] and not active:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE role='admin' AND is_active=1"
+                ).fetchone()[0]
+                if count <= 1:
+                    raise DatabaseError("不能停用最后一个可用管理员账号")
+            conn.execute(
+                "UPDATE accounts SET is_active=?, updated_at=? WHERE id=?",
+                (int(active), self._now(), account_id),
+            )
+
+    def record_activity(
+        self,
+        user_id: int,
+        metric_key: str,
+        amount: int = 1,
+        source: str = "",
+        details: Optional[Dict] = None,
+        task_id: Optional[str] = None,
+    ) -> None:
+        self.record_activity_batch(
+            user_id,
+            {metric_key: amount},
+            source=source,
+            details=details,
+            task_id=task_id,
+        )
+
+    def record_activity_batch(
+        self,
+        user_id: int,
+        activities: Mapping[str, int],
+        source: str = "",
+        details: Optional[Dict] = None,
+        task_id: Optional[str] = None,
+    ) -> None:
+        """在一个事务内记录一次完整流程的多个统计指标。"""
+        normalized = []
+        for metric_key, amount in activities.items():
+            key = (metric_key or "").strip()
+            if not key:
+                raise ValueError("统计指标不能为空")
+            if key in self.LEGACY_METRICS:
+                continue
+            value = int(amount)
+            if value:
+                normalized.append((key, value))
+        if not normalized:
+            return
+
+        payload = json.dumps(details or {}, ensure_ascii=False, separators=(",", ":"))
+        created_at = self._now()
+        with self._connect() as conn:
+            for metric_key, amount in normalized:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO metric_definitions(metric_key, label, unit, sort_order)
+                    VALUES (?, ?, '条', 100)
+                    """,
+                    (metric_key, metric_key),
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO activity_events(
+                        user_id, metric_key, amount, source, task_id, details_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (user_id, metric_key, amount, source, task_id, payload, created_at),
+                )
+
+    def get_metric_definitions(self) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT metric_key, label, unit, sort_order
+                FROM metric_definitions WHERE is_active=1
+                ORDER BY sort_order, metric_key
+                """
+            ).fetchall()
+
+    def get_user_totals(self, user_id: int) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT m.metric_key, m.label, m.unit,
+                       COALESCE(SUM(e.amount), 0) AS total
+                FROM metric_definitions m
+                LEFT JOIN activity_events e
+                  ON e.metric_key=m.metric_key AND e.user_id=?
+                WHERE m.is_active=1
+                GROUP BY m.metric_key, m.label, m.unit, m.sort_order
+                ORDER BY m.sort_order, m.metric_key
+                """,
+                (user_id,),
+            ).fetchall()
+
+    def get_all_account_totals(self) -> List[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                """
+                SELECT a.id AS user_id, a.username, a.display_name, a.role, a.is_active,
+                       m.metric_key, m.label, m.unit,
+                       COALESCE(SUM(e.amount), 0) AS total
+                FROM accounts a
+                CROSS JOIN metric_definitions m
+                LEFT JOIN activity_events e
+                  ON e.user_id=a.id AND e.metric_key=m.metric_key
+                WHERE m.is_active=1
+                GROUP BY a.id, a.username, a.display_name, a.role, a.is_active,
+                         m.metric_key, m.label, m.unit, m.sort_order
+                ORDER BY a.username COLLATE NOCASE, m.sort_order, m.metric_key
+                """
+            ).fetchall()
+
+    def get_violation_totals(
+        self, user_id: Optional[int] = None, users_only: bool = False
+    ) -> List[Dict]:
+        """汇总完整流程“原因”列拆分后的违规类型及电话分类。"""
+        sql = """
+            SELECT e.details_json
+            FROM activity_events e
+            JOIN accounts a ON a.id=e.user_id
+            WHERE e.metric_key=? AND e.source='unified_workflow'
+        """
+        params = [WORKFLOW_TOTAL_METRIC]
+        if user_id is not None:
+            sql += " AND e.user_id=?"
+            params.append(int(user_id))
+        elif users_only:
+            sql += " AND a.role='user'"
+
+        totals = {}
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["details_json"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            for raw_reason, values in (payload.get("violation_counts") or {}).items():
+                if not isinstance(values, dict):
+                    continue
+                reasons = []
+                seen = set()
+                for reason in re.split(r"[/／|｜]", str(raw_reason)):
+                    reason = reason.strip()
+                    if not reason or reason in seen:
+                        continue
+                    seen.add(reason)
+                    reasons.append(reason)
+                for reason in reasons:
+                    target = totals.setdefault(
+                        reason,
+                        {"reason": reason, "total": 0, "has_phone": 0, "other": 0},
+                    )
+                    target["total"] += int(values.get("total", 0) or 0)
+                    target["has_phone"] += int(values.get("has_phone", 0) or 0)
+                    target["other"] += int(values.get("other", 0) or 0)
+        return sorted(totals.values(), key=lambda item: (-item["total"], item["reason"]))
+
+    def get_recent_activity(
+        self, user_id: Optional[int] = None, limit: int = 50,
+        users_only: bool = False
+    ) -> List[sqlite3.Row]:
+        sql = """
+            SELECT e.created_at, a.username, a.display_name, m.label, m.unit,
+                   e.amount, e.source, e.details_json
+            FROM activity_events e
+            JOIN accounts a ON a.id=e.user_id
+            JOIN metric_definitions m ON m.metric_key=e.metric_key
+            WHERE m.is_active=1
+        """
+        params: Iterable = ()
+        if user_id is not None:
+            sql += " AND e.user_id=?"
+            params = (user_id,)
+        elif users_only:
+            sql += " AND a.role='user'"
+        sql += " ORDER BY e.id DESC LIMIT ?"
+        params = tuple(params) + (int(limit),)
+        with self._connect() as conn:
+            return conn.execute(sql, params).fetchall()

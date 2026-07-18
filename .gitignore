@@ -1,0 +1,71 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Test and coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Packaging and PyInstaller output
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# IDE and editor settings
+.idea/
+.vscode/
+*.iml
+*.swp
+*~
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Runtime data, logs, and local databases
+*.log
+logs/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+
+# Local business inputs and generated exports
+data/
+input/
+output/
+exports/
+downloads/
+*.xls
+*.xlsx
+~$*
+
+# Temporary and backup files
+*.bak
+*.tmp
+*.temp
