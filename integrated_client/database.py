@@ -3,7 +3,7 @@ import sqlite3
 import threading
 import uuid
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Mapping, Optional
 
@@ -99,6 +99,51 @@ class Database:
     def _now() -> str:
         return datetime.now().astimezone().isoformat(timespec="seconds")
 
+    @staticmethod
+    def _coerce_date(value, label: str):
+        if value is None or value == "":
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        try:
+            return date.fromisoformat(str(value).strip())
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label}格式无效") from exc
+
+    @classmethod
+    def _normalize_date_range(cls, start_date=None, end_date=None):
+        start_day = cls._coerce_date(start_date, "开始日期")
+        end_day = cls._coerce_date(end_date, "结束日期")
+        if start_day and end_day and start_day > end_day:
+            raise ValueError("开始日期不能晚于结束日期")
+        return start_day, end_day
+
+    @classmethod
+    def _date_range_clause(
+        cls,
+        column: str,
+        start_date=None,
+        end_date=None,
+    ):
+        start_day, end_day = cls._normalize_date_range(start_date, end_date)
+        clauses = []
+        params = []
+        if start_day:
+            clauses.append(f"{column}>=?")
+            params.append(f"{start_day.isoformat()}T00:00:00")
+        if end_day:
+            try:
+                end_exclusive = end_day + timedelta(days=1)
+                clauses.append(f"{column}<?")
+                params.append(f"{end_exclusive.isoformat()}T00:00:00")
+            except OverflowError:
+                clauses.append(f"{column}<=?")
+                params.append(f"{end_day.isoformat()}T23:59:59.999999")
+        sql = "".join(f" AND {clause}" for clause in clauses)
+        return sql, params, start_day, end_day
+
     @contextmanager
     def _connect(self):
         conn = sqlite3.connect(str(self.path), timeout=20)
@@ -152,6 +197,11 @@ class Database:
                     event_uid TEXT,
                     details_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS deleted_default_accounts (
+                    username TEXT PRIMARY KEY COLLATE NOCASE,
+                    deleted_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_activity_user_time
@@ -277,6 +327,12 @@ class Database:
             created_by = admin_row["id"] if admin_row else None
             created = 0
             for display_name, username in DEFAULT_STATION_USERS:
+                deleted = conn.execute(
+                    "SELECT 1 FROM deleted_default_accounts WHERE username=? COLLATE NOCASE",
+                    (username,),
+                ).fetchone()
+                if deleted:
+                    continue
                 existing = conn.execute(
                     "SELECT id, display_name FROM accounts WHERE username=? COLLATE NOCASE",
                     (username,),
@@ -343,6 +399,10 @@ class Database:
                     """,
                     (username, display_name, salt, digest, role, now, now, created_by),
                 )
+                conn.execute(
+                    "DELETE FROM deleted_default_accounts WHERE username=? COLLATE NOCASE",
+                    (username,),
+                )
                 row = conn.execute("SELECT * FROM accounts WHERE id=?", (cur.lastrowid,)).fetchone()
                 return self._account_from_row(row)
         except sqlite3.IntegrityError as exc:
@@ -406,8 +466,56 @@ class Database:
             ).fetchone()
             return self._account_from_row(updated)
 
+    def delete_account(self, account_id: int) -> Dict:
+        """Permanently delete an account and its statistics in one transaction."""
+        target_id = int(account_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM accounts WHERE id=?",
+                (target_id,),
+            ).fetchone()
+            if not row:
+                raise DatabaseError("账号不存在")
+            if row["role"] == "admin":
+                admin_count = conn.execute(
+                    "SELECT COUNT(*) FROM accounts WHERE role='admin'"
+                ).fetchone()[0]
+                if admin_count <= 1:
+                    raise DatabaseError("不能删除系统中的最后一个管理员账号")
+
+            event_cursor = conn.execute(
+                "DELETE FROM activity_events WHERE user_id=?",
+                (target_id,),
+            )
+            conn.execute(
+                "UPDATE accounts SET created_by=NULL WHERE created_by=?",
+                (target_id,),
+            )
+            default_usernames = {username.casefold() for _, username in DEFAULT_STATION_USERS}
+            if row["username"].casefold() in default_usernames:
+                conn.execute(
+                    """
+                    INSERT INTO deleted_default_accounts(username, deleted_at)
+                    VALUES (?, ?)
+                    ON CONFLICT(username) DO UPDATE SET deleted_at=excluded.deleted_at
+                    """,
+                    (row["username"], self._now()),
+                )
+            conn.execute("DELETE FROM accounts WHERE id=?", (target_id,))
+            return {
+                "account": {
+                    "id": target_id,
+                    "username": row["username"],
+                    "display_name": row["display_name"] or row["username"],
+                    "role": row["role"],
+                },
+                "deleted_events": max(event_cursor.rowcount, 0),
+            }
+
     @staticmethod
-    def _station_account_row(conn, account_id: int):
+    def _station_account_row(
+        conn, account_id: int, operation: str = "数据导入和导出"
+    ):
         row = conn.execute(
             "SELECT * FROM accounts WHERE id=?",
             (int(account_id),),
@@ -415,32 +523,43 @@ class Database:
         if not row:
             raise DatabaseError("账号不存在")
         if row["role"] != "user":
-            raise DatabaseError("仅普通用户站点支持数据导入和导出")
+            raise DatabaseError(f"仅普通用户站点支持{operation}")
         return row
 
-    def export_station_data(self, account_id: int, file_path: Path) -> Dict:
+    def export_station_data(
+        self,
+        account_id: int,
+        file_path: Path,
+        start_date=None,
+        end_date=None,
+    ) -> Dict:
         target = Path(file_path)
+        date_sql, date_params, start_day, end_day = self._date_range_clause(
+            "e.created_at",
+            start_date,
+            end_date,
+        )
         with self._connect() as conn:
             account = self._station_account_row(conn, account_id)
             metric_rows = conn.execute(
-                """
+                f"""
                 SELECT DISTINCT m.metric_key, m.label, m.unit, m.sort_order, m.is_active
                 FROM metric_definitions m
                 JOIN activity_events e ON e.metric_key=m.metric_key
-                WHERE e.user_id=?
+                WHERE e.user_id=?{date_sql}
                 ORDER BY m.sort_order, m.metric_key
                 """,
-                (int(account_id),),
+                (int(account_id), *date_params),
             ).fetchall()
             event_rows = conn.execute(
-                """
+                f"""
                 SELECT event_uid, metric_key, amount, source, task_id,
                        details_json, created_at
-                FROM activity_events
-                WHERE user_id=?
-                ORDER BY id
+                FROM activity_events e
+                WHERE e.user_id=?{date_sql}
+                ORDER BY e.id
                 """,
-                (int(account_id),),
+                (int(account_id), *date_params),
             ).fetchall()
 
         events = []
@@ -470,6 +589,10 @@ class Database:
                 "username": account["username"],
                 "display_name": account["display_name"] or account["username"],
             },
+            "date_range": {
+                "start": start_day.isoformat() if start_day else None,
+                "end": end_day.isoformat() if end_day else None,
+            },
             "metrics": [
                 {
                     "metric_key": row["metric_key"],
@@ -498,11 +621,19 @@ class Database:
             raise DatabaseError(f"导出文件写入失败：{exc}") from exc
         return {
             "station": payload["station"],
+            "date_range": payload["date_range"],
             "event_count": len(events),
             "file_path": str(target),
         }
 
-    def import_station_data(self, account_id: int, file_path: Path) -> Dict:
+    def import_station_data(
+        self,
+        account_id: int,
+        file_path: Path,
+        start_date=None,
+        end_date=None,
+    ) -> Dict:
+        start_day, end_day = self._normalize_date_range(start_date, end_date)
         source_path = Path(file_path)
         try:
             if source_path.stat().st_size > self.MAX_IMPORT_BYTES:
@@ -545,6 +676,7 @@ class Database:
             }
 
         normalized_events = []
+        filtered_out = 0
         for event in events:
             if not isinstance(event, dict):
                 raise DatabaseError("统计事件格式无效")
@@ -559,9 +691,19 @@ class Database:
             if not isinstance(details, dict):
                 raise DatabaseError("统计事件明细格式无效")
             try:
+                event_day = date.fromisoformat(created_at[:10])
+            except (TypeError, ValueError) as exc:
+                raise DatabaseError("统计事件日期格式无效") from exc
+            try:
                 amount = int(event.get("amount", 0))
             except (TypeError, ValueError, OverflowError) as exc:
                 raise DatabaseError("统计事件数量无效") from exc
+            if (
+                (start_day and event_day < start_day)
+                or (end_day and event_day > end_day)
+            ):
+                filtered_out += 1
+                continue
             normalized_events.append(
                 {
                     "event_uid": event_uid,
@@ -646,10 +788,51 @@ class Database:
                 "username": target_account["username"],
                 "display_name": target_account["display_name"] or target_account["username"],
             },
+            "date_range": {
+                "start": start_day.isoformat() if start_day else None,
+                "end": end_day.isoformat() if end_day else None,
+            },
+            "file_total": len(events),
+            "filtered_out": filtered_out,
             "total": total,
             "imported": imported,
             "skipped": total - imported,
         }
+
+    def reset_station_statistics(
+        self,
+        account_id: int,
+        start_date=None,
+        end_date=None,
+    ) -> Dict:
+        """Delete one ordinary user's statistical events while preserving the account."""
+        date_sql, date_params, start_day, end_day = self._date_range_clause(
+            "created_at",
+            start_date,
+            end_date,
+        )
+        with self._connect() as conn:
+            account = self._station_account_row(
+                conn,
+                account_id,
+                operation="重置统计数据",
+            )
+            cursor = conn.execute(
+                f"DELETE FROM activity_events WHERE user_id=?{date_sql}",
+                (int(account_id), *date_params),
+            )
+            deleted = max(cursor.rowcount, 0)
+            return {
+                "station": {
+                    "username": account["username"],
+                    "display_name": account["display_name"] or account["username"],
+                },
+                "date_range": {
+                    "start": start_day.isoformat() if start_day else None,
+                    "end": end_day.isoformat() if end_day else None,
+                },
+                "deleted": deleted,
+            }
 
     def change_password(self, account_id: int, new_password: str, must_change: bool = False) -> None:
         validate_password(new_password)
@@ -787,42 +970,66 @@ class Database:
                 """
             ).fetchall()
 
-    def get_user_totals(self, user_id: int) -> List[sqlite3.Row]:
+    def get_user_totals(
+        self,
+        user_id: int,
+        start_date=None,
+        end_date=None,
+    ) -> List[sqlite3.Row]:
+        date_sql, date_params, _, _ = self._date_range_clause(
+            "e.created_at",
+            start_date,
+            end_date,
+        )
         with self._connect() as conn:
             return conn.execute(
-                """
+                f"""
                 SELECT m.metric_key, m.label, m.unit,
                        COALESCE(SUM(e.amount), 0) AS total
                 FROM metric_definitions m
                 LEFT JOIN activity_events e
-                  ON e.metric_key=m.metric_key AND e.user_id=?
+                  ON e.metric_key=m.metric_key AND e.user_id=?{date_sql}
                 WHERE m.is_active=1
                 GROUP BY m.metric_key, m.label, m.unit, m.sort_order
                 ORDER BY m.sort_order, m.metric_key
                 """,
-                (user_id,),
+                (user_id, *date_params),
             ).fetchall()
 
-    def get_all_account_totals(self) -> List[sqlite3.Row]:
+    def get_all_account_totals(
+        self,
+        start_date=None,
+        end_date=None,
+    ) -> List[sqlite3.Row]:
+        date_sql, date_params, _, _ = self._date_range_clause(
+            "e.created_at",
+            start_date,
+            end_date,
+        )
         with self._connect() as conn:
             return conn.execute(
-                """
+                f"""
                 SELECT a.id AS user_id, a.username, a.display_name, a.role, a.is_active,
                        m.metric_key, m.label, m.unit,
                        COALESCE(SUM(e.amount), 0) AS total
                 FROM accounts a
                 CROSS JOIN metric_definitions m
                 LEFT JOIN activity_events e
-                  ON e.user_id=a.id AND e.metric_key=m.metric_key
+                  ON e.user_id=a.id AND e.metric_key=m.metric_key{date_sql}
                 WHERE m.is_active=1
                 GROUP BY a.id, a.username, a.display_name, a.role, a.is_active,
                          m.metric_key, m.label, m.unit, m.sort_order
                 ORDER BY a.username COLLATE NOCASE, m.sort_order, m.metric_key
-                """
+                """,
+                date_params,
             ).fetchall()
 
     def get_violation_totals(
-        self, user_id: Optional[int] = None, users_only: bool = False
+        self,
+        user_id: Optional[int] = None,
+        users_only: bool = False,
+        start_date=None,
+        end_date=None,
     ) -> List[Dict]:
         """汇总完整流程“原因”列拆分后的违规类型及电话分类。"""
         sql = """
@@ -837,6 +1044,13 @@ class Database:
             params.append(int(user_id))
         elif users_only:
             sql += " AND a.role='user'"
+        date_sql, date_params, _, _ = self._date_range_clause(
+            "e.created_at",
+            start_date,
+            end_date,
+        )
+        sql += date_sql
+        params.extend(date_params)
 
         totals = {}
         with self._connect() as conn:
@@ -884,7 +1098,7 @@ class Database:
 
     def get_recent_activity(
         self, user_id: Optional[int] = None, limit: int = 50,
-        users_only: bool = False
+        users_only: bool = False, start_date=None, end_date=None
     ) -> List[sqlite3.Row]:
         sql = """
             SELECT e.created_at, a.username, a.display_name, m.label, m.unit,
@@ -900,7 +1114,13 @@ class Database:
             params = (user_id,)
         elif users_only:
             sql += " AND a.role='user'"
+        date_sql, date_params, _, _ = self._date_range_clause(
+            "e.created_at",
+            start_date,
+            end_date,
+        )
+        sql += date_sql
         sql += " ORDER BY e.id DESC LIMIT ?"
-        params = tuple(params) + (int(limit),)
+        params = tuple(params) + tuple(date_params) + (int(limit),)
         with self._connect() as conn:
             return conn.execute(sql, params).fetchall()

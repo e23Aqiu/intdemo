@@ -10,7 +10,6 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QTableWidget,
     QTableWidgetItem,
@@ -26,11 +25,14 @@ from .auth_dialogs import (
     PasswordDialog,
     RenameAccountDialog,
 )
+from .date_range import DateRangeSelector
+from .frameless import FramelessMessageBox as QMessageBox
 
 
 class AccountPage(QWidget):
     account_name_changed = pyqtSignal(int, str)
     account_permission_changed = pyqtSignal(int, str)
+    account_deleted = pyqtSignal(int)
     station_data_changed = pyqtSignal(int)
 
     def __init__(self, database: Database, current_account: Account, parent=None):
@@ -98,21 +100,48 @@ class AccountPage(QWidget):
         self.rename_btn.clicked.connect(self._rename_account)
         self.permission_btn = QPushButton("修改权限")
         self.permission_btn.clicked.connect(self._change_permission)
+        self.delete_btn = QPushButton("删除账号")
+        self.delete_btn.setObjectName("DangerButton")
+        self.delete_btn.clicked.connect(self._delete_account)
         self.export_btn = QPushButton("导出数据")
         self.export_btn.clicked.connect(self._export_station_data)
         self.import_btn = QPushButton("导入数据")
         self.import_btn.clicked.connect(self._import_station_data)
+        self.reset_stats_btn = QPushButton("重置统计")
+        self.reset_stats_btn.setObjectName("DangerButton")
+        self.reset_stats_btn.clicked.connect(self._reset_station_statistics)
         self.toggle_btn = QPushButton("停用/启用")
         self.toggle_btn.clicked.connect(self._toggle_active)
         action_layout.addWidget(self.create_btn)
-        action_layout.addWidget(self.export_btn)
-        action_layout.addWidget(self.import_btn)
         action_layout.addStretch()
         action_layout.addWidget(self.rename_btn)
         action_layout.addWidget(self.permission_btn)
         action_layout.addWidget(self.reset_btn)
         action_layout.addWidget(self.toggle_btn)
+        action_layout.addWidget(self.delete_btn)
         card_layout.addLayout(action_layout)
+
+        data_bar = QFrame()
+        data_bar.setObjectName("DataActionBar")
+        data_bar.setStyleSheet(
+            "QFrame#DataActionBar{background:#f7f9fd;border:1px solid #e2e8f2;"
+            "border-radius:8px;}"
+            "QLabel#DataActionTitle{border:none;background:transparent;"
+            "font-weight:700;color:#34435c;}"
+        )
+        data_layout = QHBoxLayout(data_bar)
+        data_layout.setContentsMargins(12, 8, 10, 8)
+        data_layout.setSpacing(8)
+        data_title = QLabel("统计数据")
+        data_title.setObjectName("DataActionTitle")
+        data_layout.addWidget(data_title)
+        self.data_range_selector = DateRangeSelector()
+        data_layout.addWidget(self.data_range_selector)
+        data_layout.addStretch()
+        data_layout.addWidget(self.export_btn)
+        data_layout.addWidget(self.import_btn)
+        data_layout.addWidget(self.reset_stats_btn)
+        card_layout.addWidget(data_bar)
 
         self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
@@ -220,8 +249,11 @@ class AccountPage(QWidget):
         self.permission_btn.setEnabled(can_manage)
         self.export_btn.setEnabled(is_station)
         self.import_btn.setEnabled(is_station)
+        self.reset_stats_btn.setEnabled(is_station)
+        self.data_range_selector.setEnabled(is_station)
         self.reset_btn.setEnabled(can_manage)
         self.toggle_btn.setEnabled(can_manage)
+        self.delete_btn.setEnabled(can_manage)
         if account:
             status = "正常" if account.is_active else "已停用"
             suffix = " · 当前登录账号" if account.id == self.current_account.id else ""
@@ -239,13 +271,21 @@ class AccountPage(QWidget):
                 if account.id == self.current_account.id
                 else "切换管理员或普通用户权限"
             )
+            self.delete_btn.setToolTip(
+                "当前登录账号不能删除"
+                if account.id == self.current_account.id
+                else "永久删除所选账号及其全部统计数据"
+            )
             station_tip = (
                 f"所选站点：{account.name_label}"
                 if is_station
-                else "仅普通用户站点支持数据导入和导出"
+                else "仅普通用户站点支持统计数据操作"
             )
-            self.export_btn.setToolTip(f"导出统计数据。{station_tip}")
-            self.import_btn.setToolTip(f"导入统计数据。{station_tip}")
+            self.export_btn.setToolTip(f"按当前日期范围导出统计数据。{station_tip}")
+            self.import_btn.setToolTip(f"按当前日期范围导入统计数据。{station_tip}")
+            self.reset_stats_btn.setToolTip(
+                f"清除当前日期范围内的统计事件和业务明细。{station_tip}"
+            )
             if account.id == self.current_account.id:
                 self.reset_btn.setToolTip("请在个人中心修改当前账号密码")
                 self.toggle_btn.setToolTip("当前登录账号不能在此停用")
@@ -259,8 +299,10 @@ class AccountPage(QWidget):
             self.reset_btn.setToolTip("")
             self.rename_btn.setToolTip("")
             self.permission_btn.setToolTip("")
+            self.delete_btn.setToolTip("")
             self.export_btn.setToolTip("")
             self.import_btn.setToolTip("")
+            self.reset_stats_btn.setToolTip("")
             self.toggle_btn.setToolTip("")
         self.toggle_btn.style().unpolish(self.toggle_btn)
         self.toggle_btn.style().polish(self.toggle_btn)
@@ -352,8 +394,15 @@ class AccountPage(QWidget):
         account = self._selected_account()
         if not account or account.is_admin:
             return
+        start_date, end_date = self.data_range_selector.date_range()
+        range_label = self.data_range_selector.range_label()
+        range_suffix = (
+            "all"
+            if start_date is None
+            else f"{start_date:%Y%m%d}-{end_date:%Y%m%d}"
+        )
         default_name = (
-            f"{account.username}_data_{datetime.now():%Y%m%d_%H%M%S}.json"
+            f"{account.username}_data_{range_suffix}_{datetime.now():%Y%m%d_%H%M%S}.json"
         )
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -367,13 +416,19 @@ class AccountPage(QWidget):
         if target.suffix.lower() != ".json":
             target = target.with_suffix(".json")
         try:
-            result = self.database.export_station_data(account.id, target)
+            result = self.database.export_station_data(
+                account.id,
+                target,
+                start_date,
+                end_date,
+            )
         except (ValueError, DatabaseError) as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
             return
         QMessageBox.information(
             self,
             "导出成功",
+            f"日期范围：{range_label}\n"
             f"已导出 {result['event_count']} 条统计事件。\n{result['file_path']}",
         )
 
@@ -389,17 +444,26 @@ class AccountPage(QWidget):
         )
         if not file_path:
             return
+        start_date, end_date = self.data_range_selector.date_range()
+        range_label = self.data_range_selector.range_label()
         reply = QMessageBox.question(
             self,
             "确认导入",
             f"确定将文件中的统计数据导入“{account.name_label}”吗？\n"
+            f"日期范围：{range_label}\n"
             "已存在的相同事件会自动跳过。",
             QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
         try:
-            result = self.database.import_station_data(account.id, Path(file_path))
+            result = self.database.import_station_data(
+                account.id,
+                Path(file_path),
+                start_date,
+                end_date,
+            )
         except (ValueError, DatabaseError) as exc:
             QMessageBox.warning(self, "导入失败", str(exc))
             return
@@ -410,7 +474,73 @@ class AccountPage(QWidget):
             self,
             "导入完成",
             f"来源：{source_name}\n"
-            f"新增 {result['imported']} 条，跳过 {result['skipped']} 条重复事件。",
+            f"日期范围：{range_label}\n"
+            f"新增 {result['imported']} 条，跳过 {result['skipped']} 条重复事件，"
+            f"范围外 {result['filtered_out']} 条。",
+        )
+
+    def _reset_station_statistics(self):
+        account = self._selected_account()
+        if not account or account.is_admin:
+            return
+        start_date, end_date = self.data_range_selector.date_range()
+        range_label = self.data_range_selector.range_label()
+        reply = QMessageBox.question(
+            self,
+            "确认重置统计数据",
+            f"确定清除“{account.name_label}”（{account.username}）的统计数据吗？\n"
+            f"日期范围：{range_label}\n\n"
+            "所选范围内的统计事件及业务明细将永久删除；"
+            "账号、密码、权限和状态会保留。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            result = self.database.reset_station_statistics(
+                account.id,
+                start_date,
+                end_date,
+            )
+        except (ValueError, DatabaseError) as exc:
+            QMessageBox.warning(self, "重置失败", str(exc))
+            return
+        self.station_data_changed.emit(account.id)
+        QMessageBox.information(
+            self,
+            "重置完成",
+            f"日期范围：{range_label}\n"
+            f"已清除 {result['deleted']} 条统计事件。\n"
+            f"“{account.name_label}”的账号信息保持不变。",
+        )
+
+    def _delete_account(self):
+        account = self._selected_account()
+        if not account or account.id == self.current_account.id:
+            return
+        reply = QMessageBox.question(
+            self,
+            "确认删除账号",
+            f"确定永久删除“{account.name_label}”（{account.username}）吗？\n\n"
+            "该账号及其全部统计事件和业务明细都会被删除，此操作无法恢复。",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            result = self.database.delete_account(account.id)
+        except DatabaseError as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self.account_deleted.emit(account.id)
+        self.refresh()
+        QMessageBox.information(
+            self,
+            "删除完成",
+            f"账号“{account.name_label}”已删除，同时清除 "
+            f"{result['deleted_events']} 条统计事件。",
         )
 
     def _toggle_active(self):

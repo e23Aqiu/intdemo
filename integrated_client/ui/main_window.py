@@ -6,8 +6,6 @@ from PyQt5.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QMainWindow,
-    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -21,13 +19,18 @@ from ..models import Account
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
 from .account_page import AccountPage
 from .auth_dialogs import PasswordDialog
+from .frameless import (
+    FramelessMainWindow,
+    FramelessMessageBox as QMessageBox,
+    WindowControls,
+)
 from .personal_center_page import PersonalCenterPage
 from .statistics_page import StatisticsPage
 from .theme import install_disabled_cursor_filter
 from .workflow_page import WorkflowPage
 
 
-class MainWindow(QMainWindow):
+class MainWindow(FramelessMainWindow):
     logout_requested = pyqtSignal()
     window_closed = pyqtSignal()
 
@@ -85,6 +88,9 @@ class MainWindow(QMainWindow):
                 self._account_name_changed
             )
             self.account_page.account_permission_changed.connect(
+                self._account_data_changed
+            )
+            self.account_page.account_deleted.connect(
                 self._account_data_changed
             )
             self.account_page.station_data_changed.connect(
@@ -151,6 +157,10 @@ class MainWindow(QMainWindow):
         )
         self.top_identity.setObjectName("Muted")
         layout.addWidget(self.top_identity)
+        layout.addSpacing(8)
+        self.window_controls = WindowControls(self, bar)
+        layout.addWidget(self.window_controls)
+        self.register_window_drag_region(bar)
         return bar
 
     def _add_page(self, key, widget):

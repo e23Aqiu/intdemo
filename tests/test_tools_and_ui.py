@@ -1,3 +1,5 @@
+import json
+import math
 import os
 import tempfile
 import unittest
@@ -7,13 +9,24 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pandas as pd
-from PyQt5.QtCore import QEvent, QPoint, Qt
-from PyQt5.QtGui import QMouseEvent
-from PyQt5.QtWidgets import QApplication, QMessageBox, QPushButton
-from openpyxl import Workbook
+from PyQt5.QtCore import QDate, QEvent, QPoint, QRect, Qt
+from PyQt5.QtGui import QMouseEvent, QPalette
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QFrame,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QTableView,
+    QToolButton,
+)
+from openpyxl import Workbook, load_workbook
 
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import (
+    DEFAULT_STATION_PASSWORD,
     DEFAULT_STATION_USERS,
     Database,
     WORKFLOW_EMPTY_METRIC,
@@ -33,12 +46,21 @@ from integrated_client.tools.aiqicha_tool import (
     has_meaningful_value,
 )
 from integrated_client.ui.main_window import MainWindow
-from integrated_client.ui.auth_dialogs import PasswordDialog
+from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
+from integrated_client.ui.frameless import (
+    FramelessMessageBox,
+    HTBOTTOMRIGHT,
+    HTCAPTION,
+    HTCLIENT,
+    HTTOPLEFT,
+    MINMAXINFO,
+)
 from integrated_client.ui.statistics_page import (
     StationDistributionChart,
     ViolationReasonChart,
     WorkflowDistributionChart,
 )
+from integrated_client.ui.theme import APP_STYLESHEET, _control_asset_path
 from integrated_client.ui.workflow_page import DataFrameTableModel, WorkflowPage
 
 
@@ -137,6 +159,11 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(window.page_title.text(), "个人中心")
         window.show_page("home")
         self.assertEqual(window.statistics_page.detail_tabs.count(), 2)
+        self.assertFalse(window.statistics_page.detail_tabs.documentMode())
+        self.assertIn(
+            "border-top-left-radius: 0;",
+            APP_STYLESHEET,
+        )
         self.assertEqual(
             [
                 window.statistics_page.detail_tabs.tabText(index)
@@ -153,6 +180,72 @@ class ToolAndUiTests(unittest.TestCase):
             window.workflow_page.browser_info.text(),
             "内置 Chromium（统一使用）",
         )
+        self.app.processEvents()
+        self.assertEqual(
+            window.workflow_page.mode_combo.view().window().frameShape(),
+            QFrame.NoFrame,
+        )
+        workflow_popup = window.workflow_page.mode_combo.view().window()
+        self.assertIs(
+            workflow_popup.property("_intdemo_combo_owner"),
+            window.workflow_page.mode_combo,
+        )
+        self.assertTrue(workflow_popup.windowFlags() & Qt.FramelessWindowHint)
+        self.assertTrue(workflow_popup.windowFlags() & Qt.NoDropShadowWindowHint)
+        self.assertTrue(workflow_popup.testAttribute(Qt.WA_TranslucentBackground))
+        self.assertEqual(
+            (
+                workflow_popup.contentsMargins().left(),
+                workflow_popup.contentsMargins().top(),
+                workflow_popup.contentsMargins().right(),
+                workflow_popup.contentsMargins().bottom(),
+            ),
+            (0, 0, 0, 0),
+        )
+        self.assertEqual(
+            window.statistics_page.category_combo.view().window().frameShape(),
+            QFrame.NoFrame,
+        )
+        window.show()
+        self.app.processEvents()
+        category_combo = window.statistics_page.category_combo
+        category_combo.showPopup()
+        self.app.processEvents()
+        self.app.processEvents()
+        category_popup = category_combo.view().window()
+        combo_rect = QRect(
+            category_combo.mapToGlobal(QPoint(0, 0)),
+            category_combo.size(),
+        )
+        popup_rect = category_popup.frameGeometry()
+        self.assertTrue(combo_rect.intersects(popup_rect))
+        view_margins = category_combo.view().contentsMargins()
+        if popup_rect.top() >= combo_rect.top():
+            popup_overlap = combo_rect.bottom() - popup_rect.top() + 1
+            expected_overlap = view_margins.top() + 1
+        else:
+            popup_overlap = popup_rect.bottom() - combo_rect.top() + 1
+            expected_overlap = view_margins.bottom() + 1
+        self.assertEqual(popup_overlap, expected_overlap)
+        self.assertFalse(category_popup.mask().isEmpty())
+        self.assertFalse(category_popup.mask().contains(QPoint(0, 0)))
+        self.assertTrue(
+            category_popup.mask().contains(category_popup.rect().center())
+        )
+        category_combo.hidePopup()
+        self.assertEqual(
+            [
+                window.workflow_page.page_tabs.tabText(index)
+                for index in range(window.workflow_page.page_tabs.count())
+            ],
+            ["业务处理", "运行设置"],
+        )
+        self.assertEqual(
+            window.workflow_page.page_tabs.objectName(),
+            "WorkflowTabs",
+        )
+        self.assertFalse(window.workflow_page.page_tabs.documentMode())
+        self.assertIn("QTabWidget#WorkflowTabs::pane", APP_STYLESHEET)
         self.assertIs(
             window.statistics_page.detail_tabs.widget(1),
             window.statistics_page.data_tab,
@@ -179,6 +272,82 @@ class ToolAndUiTests(unittest.TestCase):
             42,
         )
         self.assertTrue(window.workflow_page.shutdown())
+        window._prepared_to_close = True
+        window.close()
+
+    def test_frameless_controls_are_embedded_without_an_extra_title_bar(self):
+        window = MainWindow(self.db, self.admin)
+        window.show()
+        self.app.processEvents()
+
+        self.assertTrue(window.windowFlags() & Qt.FramelessWindowHint)
+        top_bar = window.window_controls.parentWidget()
+        self.assertEqual(top_bar.objectName(), "TopBar")
+        self.assertEqual(top_bar.height(), 62)
+        self.assertEqual(window.centralWidget().layout().count(), 2)
+        self.assertFalse(window.window_controls.minimize_button.isHidden())
+        self.assertFalse(window.window_controls.maximize_button.isHidden())
+        self.assertFalse(window.window_controls.close_button.isHidden())
+        self.assertEqual(window.minimumSize().width(), 1280)
+        self.assertEqual(window.minimumSize().height(), 820)
+        native_limits = MINMAXINFO()
+        window._update_minimum_track_size(native_limits)
+        scale = max(1.0, float(window.devicePixelRatioF()))
+        self.assertEqual(
+            native_limits.ptMinTrackSize.x,
+            math.ceil(window.minimumWidth() * scale),
+        )
+        self.assertEqual(
+            native_limits.ptMinTrackSize.y,
+            math.ceil(window.minimumHeight() * scale),
+        )
+
+        caption_point = top_bar.mapTo(window, QPoint(320, top_bar.height() // 2))
+        control_point = window.window_controls.mapTo(
+            window, window.window_controls.rect().center()
+        )
+        self.assertEqual(window._window_hit_test(caption_point), HTCAPTION)
+        self.assertEqual(window._window_hit_test(control_point), HTCLIENT)
+        self.assertEqual(window._window_hit_test(QPoint(0, 0)), HTTOPLEFT)
+        self.assertEqual(
+            window._window_hit_test(QPoint(window.width() - 1, window.height() - 1)),
+            HTBOTTOMRIGHT,
+        )
+
+        window.window_controls.toggle_maximized()
+        self.app.processEvents()
+        self.assertTrue(window.isMaximized())
+        self.assertEqual(window.window_controls.maximize_button.toolTip(), "还原")
+        window.window_controls.toggle_maximized()
+        self.app.processEvents()
+        self.assertFalse(window.isMaximized())
+
+        login = LoginDialog(self.db)
+        login.show()
+        self.app.processEvents()
+        self.assertTrue(login.windowFlags() & Qt.FramelessWindowHint)
+        self.assertTrue(login.window_controls.minimize_button.isHidden())
+        self.assertTrue(login.window_controls.maximize_button.isHidden())
+        self.assertEqual(login.minimumSize(), login.maximumSize())
+        self.assertEqual(login._window_hit_test(QPoint(60, 20)), HTCAPTION)
+        login.close()
+
+        message_box = FramelessMessageBox(window)
+        message_box.setWindowTitle("确认操作")
+        message_box.setText("确认操作")
+        message_box.setInformativeText("确定继续吗？")
+        message_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+        message_box.show()
+        self.app.processEvents()
+        self.assertTrue(message_box.windowFlags() & Qt.FramelessWindowHint)
+        self.assertTrue(message_box.window_controls.minimize_button.isHidden())
+        self.assertTrue(message_box.window_controls.maximize_button.isHidden())
+        self.assertFalse(message_box.window_controls.close_button.isHidden())
+        self.assertEqual(message_box.button(QMessageBox.Yes).text(), "是")
+        self.assertEqual(message_box.button(QMessageBox.No).text(), "否")
+        message_box.close()
+
+        window.workflow_page.shutdown()
         window._prepared_to_close = True
         window.close()
 
@@ -392,7 +561,297 @@ class ToolAndUiTests(unittest.TestCase):
         window._prepared_to_close = True
         window.close()
 
+    def test_dashboard_date_range_filters_all_chart_categories(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        luogang = next(
+            account for account in self.db.list_accounts()
+            if account.username == "luogang"
+        )
+        for task_id, created_at, total, reason in (
+            ("ui-date-early", "2025-01-01T09:00:00+08:00", 2, "早期异常"),
+            ("ui-date-middle", "2025-01-15T09:00:00+08:00", 4, "中期异常"),
+        ):
+            self.db.record_activity_batch(
+                luogang.id,
+                {
+                    WORKFLOW_TOTAL_METRIC: total,
+                    WORKFLOW_HAS_PHONE_METRIC: total - 1,
+                },
+                "unified_workflow",
+                details={
+                    "violation_counts": {
+                        reason: {
+                            "total": total,
+                            "has_phone": total - 1,
+                            "other": 1,
+                        }
+                    }
+                },
+                task_id=task_id,
+            )
+            with self.db._connect() as conn:
+                conn.execute(
+                    "UPDATE activity_events SET created_at=? WHERE task_id=?",
+                    (created_at, task_id),
+                )
+
+        window = MainWindow(self.db, self.admin)
+        window.show()
+        self.app.processEvents()
+        page = window.statistics_page
+        selector = page.date_range_selector
+        self.assertTrue(selector.all_dates_check.isChecked())
+        for editor in (selector.start_edit, selector.end_edit):
+            self.assertGreaterEqual(editor.minimumWidth(), 160)
+            calendar = editor.calendarWidget()
+            self.assertGreaterEqual(calendar.minimumWidth(), 332)
+            self.assertEqual(calendar.firstDayOfWeek(), Qt.Monday)
+            self.assertEqual(
+                calendar.findChild(QToolButton, "qt_calendar_prevmonth").text(),
+                "‹",
+            )
+            self.assertEqual(
+                calendar.findChild(QToolButton, "qt_calendar_nextmonth").text(),
+                "›",
+            )
+            calendar_view = calendar.findChild(
+                QTableView, "qt_calendar_calendarview"
+            )
+            self.assertTrue(calendar_view.hasMouseTracking())
+            self.assertTrue(calendar_view.viewport().hasMouseTracking())
+            self.assertEqual(
+                calendar_view.itemDelegate().__class__.__name__,
+                "CalendarHoverDelegate",
+            )
+
+        selector.all_dates_check.setChecked(False)
+        click_editor = selector.end_edit
+        stable_date = QDate(2031, 7, 19)
+        click_editor.setDate(stable_date)
+        line_edit = click_editor.lineEdit()
+        self.assertTrue(line_edit.isReadOnly())
+        QTest.mouseClick(
+            click_editor,
+            Qt.LeftButton,
+            pos=QPoint(20, click_editor.height() // 2),
+        )
+        self.app.processEvents()
+        self.assertTrue(click_editor.calendarWidget().isVisible())
+        self.assertEqual(click_editor.date(), stable_date)
+        QTest.keyClick(click_editor.calendarWidget(), Qt.Key_Escape)
+        QTest.keyClicks(click_editor, "2024-01-01")
+        QTest.keyClick(click_editor, Qt.Key_Up)
+        self.assertEqual(click_editor.date(), stable_date)
+        self.assertLess(
+            selector.layout().indexOf(selector.end_edit),
+            selector.layout().indexOf(selector.all_dates_panel),
+        )
+        self.assertLess(
+            selector.layout().indexOf(selector.range_separator),
+            selector.layout().indexOf(selector.all_dates_panel),
+        )
+        selector.start_edit.setDate(QDate(2025, 1, 15))
+        selector.end_edit.setDate(QDate(2025, 1, 15))
+        self.app.processEvents()
+
+        station_rows = {
+            row["username"]: row for row in page.station_distribution_chart._rows
+        }
+        self.assertEqual(station_rows["luogang"]["total"], 4)
+        self.assertIn("2025-01-15 至 2025-01-15", page.data_description.text())
+
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("completion")
+        )
+        page.station_combo.setCurrentIndex(page.station_combo.findData(luogang.id))
+        self.app.processEvents()
+        self.assertEqual(
+            page.distribution_chart._values[WORKFLOW_TOTAL_METRIC],
+            4,
+        )
+
+        page.category_combo.setCurrentIndex(page.category_combo.findData("violation"))
+        self.app.processEvents()
+        self.assertEqual(page.violation_chart._rows[0]["reason"], "中期异常")
+        self.assertEqual(page.violation_chart._rows[0]["total"], 4)
+
+        self.assertTrue(window.workflow_page.shutdown())
+        window._prepared_to_close = True
+        window.close()
+
+    def test_dashboard_exports_current_station_and_date_range_to_excel(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        accounts = {account.username: account for account in self.db.list_accounts()}
+        station = accounts["luogang"]
+        self.db.record_activity_batch(
+            station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 7,
+                WORKFLOW_HAS_PHONE_METRIC: 4,
+            },
+            "unified_workflow",
+            task_id="dashboard-excel-export",
+        )
+        with self.db._connect() as conn:
+            conn.execute(
+                "UPDATE activity_events SET created_at=? WHERE task_id=?",
+                ("2025-03-15 10:00:00", "dashboard-excel-export"),
+            )
+
+        window = MainWindow(self.db, self.admin)
+        page = window.statistics_page
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("completion")
+        )
+        page.station_combo.setCurrentIndex(
+            page.station_combo.findData(station.id)
+        )
+        selector = page.date_range_selector
+        selector.all_dates_check.setChecked(False)
+        selector.start_edit.setDate(QDate(2025, 3, 1))
+        selector.end_edit.setDate(QDate(2025, 3, 31))
+        self.app.processEvents()
+
+        self.assertEqual(page.export_btn.text(), "导出 Excel")
+        self.assertEqual(page.export_btn.objectName(), "PrimaryButton")
+        export_base = Path(self.temp_dir.name) / "dashboard-export"
+        with patch(
+            "integrated_client.ui.statistics_page.QFileDialog.getSaveFileName",
+            return_value=(str(export_base), "Excel 工作簿 (*.xlsx)"),
+        ), patch(
+            "integrated_client.ui.statistics_page.QMessageBox.information"
+        ) as information:
+            page._export_dashboard_excel()
+
+        export_path = export_base.with_suffix(".xlsx")
+        self.assertTrue(export_path.exists())
+        workbook = load_workbook(export_path, data_only=True)
+        sheet = workbook["仪表盘数据"]
+        self.assertEqual(sheet["A1"].value, "数据仪表盘导出")
+        self.assertEqual(sheet["B2"].value, station.name_label)
+        self.assertEqual(sheet["D2"].value, "按完成类型")
+        self.assertEqual(sheet["F2"].value, "2025-03-01 至 2025-03-31")
+        self.assertEqual(
+            [sheet.cell(5, column).value for column in range(1, 6)],
+            ["站名", "时间范围", "完成类型", "累计数量", "单位"],
+        )
+        self.assertEqual(sheet["A6"].value, station.name_label)
+        self.assertEqual(sheet["B6"].value, "2025-03-01 至 2025-03-31")
+        self.assertEqual(sheet["C6"].value, "总计数")
+        self.assertEqual(sheet["D6"].value, 7)
+        self.assertEqual(sheet["E6"].value, "条")
+        self.assertEqual(sheet.freeze_panes, "A6")
+        self.assertGreaterEqual(sheet.column_dimensions["F"].width, 25)
+        workbook.close()
+        information.assert_called_once()
+
+        self.assertTrue(window.workflow_page.shutdown())
+        window._prepared_to_close = True
+        window.close()
+
+    def test_workflow_settings_browser_check_and_collapsible_panels(self):
+        page = WorkflowPage()
+        page.resize(1400, 900)
+        page.show()
+        self.app.processEvents()
+        self.assertIs(page.page_tabs.widget(0), page.workflow_tab)
+        self.assertIs(page.page_tabs.widget(1), page.settings_tab)
+        self.assertEqual(page.browser_check_state, "unchecked")
+        self.assertIn("尚未检测", page.browser_status_label.text())
+        self.assertTrue(page.browser_detail_label.isHidden())
+        self.assertEqual(page.browser_detail_toggle_btn.text(), "查看详情")
+        for selector in (
+            "QComboBox::down-arrow",
+            "QComboBox::drop-down:on",
+            "QCheckBox::indicator:checked",
+            "QSpinBox::up-button",
+        ):
+            self.assertIn(selector, APP_STYLESHEET)
+        for asset_name in (
+            "check.svg",
+            "minus.svg",
+            "chevron-down.svg",
+            "chevron-up.svg",
+        ):
+            self.assertTrue(Path(_control_asset_path(asset_name)).is_file())
+        self.assertEqual(
+            [
+                page.mode_card.objectName(),
+                page.captcha_card.objectName(),
+                page.query_card.objectName(),
+            ],
+            ["SettingCard", "SettingCard", "SettingCard"],
+        )
+        self.assertIn("人工接管", page.mode_hint.text())
+        page.mode_combo.setCurrentIndex(page.mode_combo.findData(True))
+        self.assertIn("全自动运行", page.mode_hint.text())
+        self.assertFalse(page.manual_captcha.isEnabled())
+        page.mode_combo.setCurrentIndex(page.mode_combo.findData(False))
+
+        with patch.object(page, "check_browser") as automatic_check:
+            page.page_tabs.setCurrentWidget(page.settings_tab)
+            page.page_tabs.setCurrentWidget(page.workflow_tab)
+            page.page_tabs.setCurrentWidget(page.settings_tab)
+        automatic_check.assert_called_once_with()
+
+        with patch(
+            "integrated_client.ui.workflow_page.check_builtin_chromium",
+            return_value=(r"C:\\browser\\chrome.exe", "123.0"),
+        ) as browser_check:
+            page.check_browser()
+            worker = page.browser_check_worker
+            self.assertIsNotNone(worker)
+            self.assertTrue(worker.wait(3000))
+            self.app.processEvents()
+
+        browser_check.assert_called_once_with()
+        self.assertEqual(page.browser_check_state, "ready")
+        self.assertIn("运行正常", page.browser_status_label.text())
+        self.assertIn("Chromium 123.0", page.browser_status_label.text())
+        self.assertIn("chrome.exe", page.browser_detail_label.text())
+        self.assertTrue(page.browser_detail_label.isHidden())
+        page.browser_detail_toggle_btn.click()
+        self.assertFalse(page.browser_detail_label.isHidden())
+        self.assertEqual(page.browser_detail_toggle_btn.text(), "收起详情")
+        page.browser_detail_toggle_btn.click()
+        self.assertTrue(page.browser_detail_label.isHidden())
+        self.assertEqual(page.browser_detail_toggle_btn.text(), "查看详情")
+
+        self.assertTrue(page.preview_panel.is_expanded())
+        self.assertTrue(page.log_panel.is_expanded())
+        file_group_height = page.file_group.height()
+        step_card_heights = [card.height() for card in page.step_cards]
+        page.preview_toggle_btn.click()
+        self.assertFalse(page.preview_panel.is_expanded())
+        self.assertTrue(page.table.isHidden())
+        self.assertIn("展开", page.preview_toggle_btn.text())
+        page.preview_toggle_btn.click()
+        self.assertTrue(page.preview_panel.is_expanded())
+        self.assertFalse(page.table.isHidden())
+
+        page.preview_toggle_btn.click()
+        page.log_toggle_btn.click()
+        self.assertFalse(page.log_panel.is_expanded())
+        self.assertTrue(page.log_text.isHidden())
+        self.assertIn("展开", page.log_toggle_btn.text())
+        self.app.processEvents()
+        self.assertFalse(page.collapsed_content_spacer.isHidden())
+        self.assertEqual(page.file_group.height(), file_group_height)
+        self.assertEqual(
+            [card.height() for card in page.step_cards],
+            step_card_heights,
+        )
+        page.log_toggle_btn.click()
+        self.assertTrue(page.log_panel.is_expanded())
+        self.assertFalse(page.log_text.isHidden())
+        self.assertTrue(page.collapsed_content_spacer.isHidden())
+        self.assertTrue(page.shutdown())
+        page.close()
+
     def test_disabled_widgets_use_forbidden_cursor(self):
+        previous_stylesheet = self.app.styleSheet()
+        self.addCleanup(self.app.setStyleSheet, previous_stylesheet)
+        self.app.setStyleSheet(APP_STYLESHEET)
         window = MainWindow(self.db, self.admin)
         self.assertFalse(window.statistics_page.station_combo.isEnabled())
         self.assertEqual(
@@ -404,6 +863,53 @@ class ToolAndUiTests(unittest.TestCase):
             window.workflow_page.pause_btn.cursor().shape(),
             Qt.ForbiddenCursor,
         )
+        window.show()
+        self.app.processEvents()
+
+        disabled_button = QPushButton("禁用按钮")
+        disabled_button.setEnabled(False)
+        disabled_button.show()
+        disabled_combo = QComboBox()
+        disabled_combo.addItem("禁用内容")
+        disabled_combo.setEnabled(False)
+        disabled_combo.show()
+        disabled_label = QLabel("禁用内容")
+        disabled_label.setEnabled(False)
+        disabled_label.show()
+        self.app.processEvents()
+        self.assertEqual(
+            disabled_button.palette()
+            .color(QPalette.Disabled, QPalette.Button)
+            .name(),
+            "#f3f5f8",
+        )
+        self.assertEqual(
+            disabled_button.palette()
+            .color(QPalette.Disabled, QPalette.ButtonText)
+            .name(),
+            "#aab3bf",
+        )
+        self.assertEqual(
+            disabled_combo.palette()
+            .color(QPalette.Disabled, QPalette.Base)
+            .name(),
+            "#f5f7fa",
+        )
+        self.assertEqual(
+            disabled_combo.palette()
+            .color(QPalette.Disabled, QPalette.Text)
+            .name(),
+            "#a3adba",
+        )
+        self.assertEqual(
+            disabled_label.palette()
+            .color(QPalette.Disabled, QPalette.WindowText)
+            .name(),
+            "#a3adba",
+        )
+        disabled_button.close()
+        disabled_combo.close()
+        disabled_label.close()
 
         window.workflow_page.pause_btn.setEnabled(True)
         self.assertNotEqual(
@@ -503,6 +1009,58 @@ class ToolAndUiTests(unittest.TestCase):
             },
             {"各站总计数占比", "各站有电话数占比"},
         )
+        chart = page.station_distribution_chart
+        slice_item = chart._slice_hitboxes[0]
+        outer = slice_item["outer"]
+        inner = slice_item["inner"]
+        slice_local = QPoint(
+            int(outer.center().x() + (outer.width() + inner.width()) / 4),
+            int(outer.center().y()),
+        )
+        slice_event = QMouseEvent(
+            QEvent.MouseMove,
+            slice_local,
+            chart.mapToGlobal(slice_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        chart.mouseMoveEvent(slice_event)
+        slice_payload = slice_item["payload"]
+        self.assertEqual(
+            chart._hover_card.details,
+            [
+                ("数量", f'{slice_payload["value"]} 条'),
+                ("占比", chart._format_share(slice_payload["share"])),
+            ],
+        )
+        self.assertEqual(chart._hover_card.width(), 240)
+
+        legend_rect, legend_row = chart._legend_hitboxes[0]
+        legend_local = legend_rect.center().toPoint()
+        legend_event = QMouseEvent(
+            QEvent.MouseMove,
+            legend_local,
+            chart.mapToGlobal(legend_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        chart.mouseMoveEvent(legend_event)
+        self.app.processEvents()
+        self.assertEqual(
+            chart._hover_card.details,
+            [
+                ("总计数", f'{legend_row["total"]} 条'),
+                ("总数占比", chart._format_share(legend_row["total_share"])),
+                ("有电话数", f'{legend_row["has_phone"]} 条'),
+                ("有电话占比", chart._format_share(legend_row["phone_share"])),
+            ],
+        )
+        self.assertEqual(chart._hover_card.width(), 288)
+        for index in range(chart._hover_card._details_layout.count()):
+            detail_label = chart._hover_card._details_layout.itemAt(index).widget()
+            self.assertGreaterEqual(detail_label.width(), detail_label.sizeHint().width())
         self.assertEqual(page.summary_table.rowCount(), 5)
         self.assertEqual(
             [
@@ -560,8 +1118,11 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.permission_btn.isEnabled())
         self.assertTrue(page.export_btn.isEnabled())
         self.assertTrue(page.import_btn.isEnabled())
+        self.assertTrue(page.reset_stats_btn.isEnabled())
+        self.assertTrue(page.data_range_selector.isEnabled())
         self.assertTrue(page.reset_btn.isEnabled())
         self.assertTrue(page.toggle_btn.isEnabled())
+        self.assertTrue(page.delete_btn.isEnabled())
         self.assertEqual(page.toggle_btn.text(), "停用账号")
         self.assertEqual(page.toggle_btn.objectName(), "DangerButton")
 
@@ -577,9 +1138,50 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(page.permission_btn.isEnabled())
         self.assertFalse(page.export_btn.isEnabled())
         self.assertFalse(page.import_btn.isEnabled())
+        self.assertFalse(page.reset_stats_btn.isEnabled())
+        self.assertFalse(page.data_range_selector.isEnabled())
         self.assertFalse(page.reset_btn.isEnabled())
         self.assertFalse(page.toggle_btn.isEnabled())
+        self.assertFalse(page.delete_btn.isEnabled())
         self.assertIn("个人中心", page.reset_btn.toolTip())
+
+        self.assertTrue(window.workflow_page.shutdown())
+        window._prepared_to_close = True
+        window.close()
+
+    def test_admin_can_delete_an_account_and_refresh_dashboard(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        window = MainWindow(self.db, self.admin)
+        page = window.account_page
+        target = next(
+            account for account in page.accounts if account.username == "luogang"
+        )
+        self.db.record_activity(target.id, WORKFLOW_TOTAL_METRIC, 3, "manual")
+        page.table.selectRow(page.accounts.index(target))
+
+        with (
+            patch(
+                "integrated_client.ui.account_page.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ) as question,
+            patch(
+                "integrated_client.ui.account_page.QMessageBox.information"
+            ) as information,
+        ):
+            page._delete_account()
+
+        confirmation = question.call_args.args[2]
+        self.assertIn(target.name_label, confirmation)
+        self.assertIn(target.username, confirmation)
+        self.assertIn("无法恢复", confirmation)
+        self.assertIn("清除 1 条统计事件", information.call_args.args[2])
+        self.assertNotIn(target.id, [account.id for account in page.accounts])
+        self.assertEqual(page.summary_values["total"].text(), "5")
+        self.assertEqual(
+            window.statistics_page.station_combo.findData(target.id),
+            -1,
+        )
+        self.assertEqual(self.db.ensure_default_station_users(), 0)
 
         self.assertTrue(window.workflow_page.shutdown())
         window._prepared_to_close = True
@@ -723,6 +1325,10 @@ class ToolAndUiTests(unittest.TestCase):
             if account.id == luogang.id
         )
         page.table.selectRow(luogang_row)
+        today = QDate.currentDate()
+        page.data_range_selector.all_dates_check.setChecked(False)
+        page.data_range_selector.start_edit.setDate(today)
+        page.data_range_selector.end_edit.setDate(today)
         export_base = Path(self.temp_dir.name) / "ui-station-transfer"
 
         with (
@@ -735,6 +1341,14 @@ class ToolAndUiTests(unittest.TestCase):
             page._export_station_data()
         export_path = export_base.with_suffix(".json")
         self.assertTrue(export_path.exists())
+        exported_payload = json.loads(export_path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            exported_payload["date_range"],
+            {
+                "start": today.toString("yyyy-MM-dd"),
+                "end": today.toString("yyyy-MM-dd"),
+            },
+        )
 
         taiping_row = next(
             index
@@ -767,6 +1381,47 @@ class ToolAndUiTests(unittest.TestCase):
         }
         self.assertEqual(station_rows["taiping"]["total"], 5)
         self.assertEqual(station_rows["taiping"]["has_phone"], 3)
+
+        self.assertTrue(page.reset_stats_btn.isEnabled())
+        with (
+            patch(
+                "integrated_client.ui.account_page.QMessageBox.question",
+                return_value=QMessageBox.Yes,
+            ) as question,
+            patch(
+                "integrated_client.ui.account_page.QMessageBox.information"
+            ) as information,
+        ):
+            page._reset_station_statistics()
+
+        confirmation_text = question.call_args.args[2]
+        self.assertIn(taiping.name_label, confirmation_text)
+        self.assertIn(taiping.username, confirmation_text)
+        self.assertIn("永久删除", confirmation_text)
+        self.assertIn("已清除 2 条统计事件", information.call_args.args[2])
+        reset_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(taiping.id)
+        }
+        self.assertEqual(reset_totals[WORKFLOW_TOTAL_METRIC], 0)
+        self.assertEqual(reset_totals[WORKFLOW_HAS_PHONE_METRIC], 0)
+        self.assertEqual(
+            self.db.authenticate("taiping", DEFAULT_STATION_PASSWORD).id,
+            taiping.id,
+        )
+        station_rows = {
+            row["username"]: row
+            for row in window.statistics_page.station_distribution_chart._rows
+        }
+        self.assertEqual(station_rows["taiping"]["total"], 0)
+
+        admin_row = next(
+            index
+            for index, account in enumerate(page.accounts)
+            if account.id == self.admin.id
+        )
+        page.table.selectRow(admin_row)
+        self.assertFalse(page.reset_stats_btn.isEnabled())
 
         self.assertTrue(window.workflow_page.shutdown())
         window._prepared_to_close = True
@@ -837,6 +1492,19 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertTrue(chart._hover_card.isVisible())
         self.assertTrue(chart._hover_card.isWindow())
+        self.assertTrue(
+            chart._hover_card.windowFlags() & Qt.NoDropShadowWindowHint
+        )
+        self.assertTrue(
+            chart._hover_card.testAttribute(Qt.WA_TranslucentBackground)
+        )
+        self.assertTrue(chart._hover_card.testAttribute(Qt.WA_StyledBackground))
+        hover_card_image = chart._hover_card.grab().toImage()
+        self.assertEqual(hover_card_image.pixelColor(0, 0).alpha(), 0)
+        self.assertGreater(
+            hover_card_image.pixelColor(hover_card_image.rect().center()).alpha(),
+            0,
+        )
         self.assertGreaterEqual(
             chart._hover_card.height(),
             50 + chart._hover_card._detail_row_count * 22,
@@ -872,7 +1540,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(chart._animation_timer.isActive())
         chart.close()
 
-    def test_completion_donut_hover_exposes_category_details(self):
+    def test_completion_donut_and_bar_hover_expose_category_details(self):
         chart = WorkflowDistributionChart()
         self.assertEqual(
             [metric_key for metric_key, _, _ in chart.SEGMENTS],
@@ -927,6 +1595,28 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertTrue(chart._hover_card.isVisible())
         self.assertTrue(chart._hover_card.isWindow())
+
+        empty_bar = chart._bar_rects[-1]
+        bar_local = QPoint(
+            int(empty_bar.center().x()),
+            int(empty_bar.center().y()),
+        )
+        bar_event = QMouseEvent(
+            QEvent.MouseMove,
+            bar_local,
+            chart.mapToGlobal(bar_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        chart.mouseMoveEvent(bar_event)
+        self.assertIsNone(chart._hovered_slice)
+        self.assertEqual(chart._hover_card.title_text, "空")
+        self.assertEqual(
+            chart._hover_card.details,
+            [("数量", "4 条"), ("占比", "100.0%")],
+        )
+        self.assertTrue(chart._hover_card.isVisible())
         chart.close()
 
     def test_violation_chart_can_switch_to_reason_share_bars(self):
@@ -949,6 +1639,14 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(chart.mode_button.isChecked())
         self.assertEqual(chart.mode_button.text(), "切换为电话拆分")
         self.assertEqual(chart._format_bar_label(2, 10), "2 条  ·  20.0%")
+        self.assertEqual(len(chart._bar_hitboxes), 2)
+        self.assertEqual(
+            int(
+                chart._bar_hitboxes[1][0].top()
+                - chart._bar_hitboxes[0][0].top()
+            ),
+            chart.BAR_ROW_HEIGHT,
+        )
         bar_rect, _ = chart._bar_hitboxes[0]
         self.assertLess(chart.mode_button.geometry().bottom(), int(bar_rect.top()))
         bar_y = int(bar_rect.center().y())

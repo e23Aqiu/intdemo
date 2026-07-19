@@ -38,3 +38,23 @@ def get_builtin_chromium_path(playwright=None) -> str:
             "python -m playwright install chromium"
         )
     return str(executable)
+
+
+def check_builtin_chromium() -> tuple:
+    """实际启动一次内置 Chromium，返回可执行文件路径和浏览器版本。"""
+    with sync_playwright() as runtime:
+        executable = get_builtin_chromium_path(runtime)
+        browser = None
+        try:
+            browser = runtime.chromium.launch(
+                headless=True,
+                executable_path=executable,
+            )
+            page = browser.new_page()
+            page.goto("about:blank", wait_until="load", timeout=10_000)
+            return executable, browser.version
+        except Exception as exc:
+            raise RuntimeError(f"内置 Chromium 启动检查失败：{exc}") from exc
+        finally:
+            if browser is not None:
+                browser.close()

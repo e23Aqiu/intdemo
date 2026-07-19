@@ -207,6 +207,212 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(DatabaseError, "不是有效"):
             self.db.import_station_data(target.id, invalid_path)
 
+    def test_date_ranges_filter_dashboard_transfer_and_reset_data(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        source = self.db.create_account(
+            "dated_source",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="日期来源站",
+        )
+        target = self.db.create_account(
+            "dated_target",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="日期目标站",
+        )
+        dated_batches = (
+            ("range-early", "2025-01-01T09:00:00+08:00", 2, 1, "早期异常"),
+            ("range-middle", "2025-01-15T10:00:00+08:00", 4, 3, "中期异常"),
+            ("range-late", "2025-02-01T11:00:00+08:00", 8, 5, "后期异常"),
+        )
+        for task_id, created_at, total, has_phone, reason in dated_batches:
+            self.db.record_activity_batch(
+                source.id,
+                {
+                    WORKFLOW_TOTAL_METRIC: total,
+                    WORKFLOW_HAS_PHONE_METRIC: has_phone,
+                },
+                "unified_workflow",
+                details={
+                    "violation_counts": {
+                        reason: {
+                            "total": total,
+                            "has_phone": has_phone,
+                            "other": total - has_phone,
+                        }
+                    }
+                },
+                task_id=task_id,
+            )
+            with self.db._connect() as conn:
+                conn.execute(
+                    "UPDATE activity_events SET created_at=? WHERE task_id=?",
+                    (created_at, task_id),
+                )
+
+        middle_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(
+                source.id,
+                "2025-01-15",
+                "2025-01-15",
+            )
+        }
+        self.assertEqual(middle_totals[WORKFLOW_TOTAL_METRIC], 4)
+        self.assertEqual(middle_totals[WORKFLOW_HAS_PHONE_METRIC], 3)
+        all_rows = self.db.get_all_account_totals("2025-01-15", "2025-01-15")
+        source_total = next(
+            row["total"]
+            for row in all_rows
+            if row["user_id"] == source.id
+            and row["metric_key"] == WORKFLOW_TOTAL_METRIC
+        )
+        self.assertEqual(source_total, 4)
+        self.assertEqual(
+            self.db.get_violation_totals(
+                source.id,
+                start_date="2025-01-15",
+                end_date="2025-01-15",
+            )[0]["reason"],
+            "中期异常",
+        )
+        recent = self.db.get_recent_activity(
+            source.id,
+            start_date="2025-01-15",
+            end_date="2025-01-15",
+        )
+        self.assertEqual(len(recent), 2)
+
+        export_path = Path(self.temp_dir.name) / "dated-all.json"
+        exported = self.db.export_station_data(source.id, export_path)
+        self.assertEqual(exported["event_count"], 6)
+        imported = self.db.import_station_data(
+            target.id,
+            export_path,
+            "2025-01-15",
+            "2025-01-15",
+        )
+        self.assertEqual(imported["file_total"], 6)
+        self.assertEqual(imported["filtered_out"], 4)
+        self.assertEqual(imported["imported"], 2)
+        target_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(target.id)
+        }
+        self.assertEqual(target_totals[WORKFLOW_TOTAL_METRIC], 4)
+        self.assertEqual(target_totals[WORKFLOW_HAS_PHONE_METRIC], 3)
+
+        reset = self.db.reset_station_statistics(
+            source.id,
+            "2025-01-15",
+            "2025-01-15",
+        )
+        self.assertEqual(reset["deleted"], 2)
+        remaining_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(source.id)
+        }
+        self.assertEqual(remaining_totals[WORKFLOW_TOTAL_METRIC], 10)
+        self.assertEqual(remaining_totals[WORKFLOW_HAS_PHONE_METRIC], 6)
+        with self.assertRaisesRegex(ValueError, "开始日期不能晚于结束日期"):
+            self.db.get_user_totals(source.id, "2025-02-01", "2025-01-01")
+
+    def test_delete_account_removes_statistics_and_preserves_default_deletion(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        target = next(
+            account for account in self.db.list_accounts()
+            if account.username == "luogang"
+        )
+        child = self.db.create_account(
+            "created_child",
+            "Worker@123",
+            "user",
+            target.id,
+        )
+        self.db.record_activity(target.id, WORKFLOW_TOTAL_METRIC, 7, "manual")
+
+        result = self.db.delete_account(target.id)
+
+        self.assertEqual(result["deleted_events"], 1)
+        self.assertEqual(result["account"]["username"], "luogang")
+        with self.assertRaises(AuthenticationError):
+            self.db.authenticate("luogang", DEFAULT_STATION_PASSWORD)
+        self.assertEqual(self.db.ensure_default_station_users(), 0)
+        accounts = {account.id: account for account in self.db.list_accounts()}
+        self.assertIn(child.id, accounts)
+        with self.db._connect() as conn:
+            created_by = conn.execute(
+                "SELECT created_by FROM accounts WHERE id=?",
+                (child.id,),
+            ).fetchone()["created_by"]
+        self.assertIsNone(created_by)
+        with self.assertRaisesRegex(DatabaseError, "最后一个管理员"):
+            self.db.delete_account(admin.id)
+        with self.assertRaisesRegex(DatabaseError, "账号不存在"):
+            self.db.delete_account(999999)
+
+    def test_reset_station_statistics_preserves_account_and_other_users(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        target = self.db.create_account(
+            "reset_target",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="待重置站",
+        )
+        other = self.db.create_account(
+            "reset_other",
+            "Worker@123",
+            "user",
+            admin.id,
+            display_name="保留站",
+        )
+        self.db.record_activity_batch(
+            target.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 6,
+                WORKFLOW_HAS_PHONE_METRIC: 4,
+            },
+            "unified_workflow",
+            details={
+                "violation_counts": {
+                    "证件异常": {"total": 2, "has_phone": 1, "other": 1}
+                }
+            },
+            task_id="reset-target-task",
+        )
+        self.db.record_activity(other.id, WORKFLOW_TOTAL_METRIC, 9, "manual")
+
+        result = self.db.reset_station_statistics(target.id)
+
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(result["station"]["display_name"], "待重置站")
+        target_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(target.id)
+        }
+        other_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(other.id)
+        }
+        self.assertEqual(target_totals[WORKFLOW_TOTAL_METRIC], 0)
+        self.assertEqual(target_totals[WORKFLOW_HAS_PHONE_METRIC], 0)
+        self.assertEqual(self.db.get_violation_totals(target.id), [])
+        self.assertEqual(other_totals[WORKFLOW_TOTAL_METRIC], 9)
+        self.assertEqual(
+            self.db.authenticate("reset_target", "Worker@123").id,
+            target.id,
+        )
+        with self.assertRaisesRegex(DatabaseError, "仅普通用户站点支持重置"):
+            self.db.reset_station_statistics(admin.id)
+
     def test_station_users_display_names_and_six_character_passwords(self):
         self.db.ensure_default_admin()
         self.assertEqual(self.db.ensure_default_station_users(), 5)

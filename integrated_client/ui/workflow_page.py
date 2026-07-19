@@ -4,7 +4,14 @@ from datetime import datetime
 
 import openpyxl
 import pandas as pd
-from PyQt5.QtCore import QAbstractTableModel, QModelIndex, Qt, QTimer
+from PyQt5.QtCore import (
+    QAbstractTableModel,
+    QModelIndex,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -18,12 +25,12 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QProgressBar,
     QPushButton,
     QSpinBox,
     QSplitter,
     QTableView,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -39,7 +46,7 @@ from ..tools.aiqicha_tool import (
     TARGET_COLUMNS,
     has_meaningful_value,
 )
-from ..browser import get_builtin_chromium_path
+from ..browser import check_builtin_chromium, get_builtin_chromium_path
 from ..database import (
     WORKFLOW_EMPTY_METRIC,
     WORKFLOW_HAS_PHONE_METRIC,
@@ -55,6 +62,7 @@ from ..tools.transport_tool import (
     Worker,
     is_excel_file_open,
 )
+from .frameless import FramelessMessageBox as QMessageBox
 
 
 class DataFrameTableModel(QAbstractTableModel):
@@ -121,6 +129,65 @@ class DataFrameTableModel(QAbstractTableModel):
             self.dataChanged.emit(left, right, [Qt.DisplayRole, Qt.BackgroundRole])
 
 
+class BrowserCheckWorker(QThread):
+    """在后台实际启动内置 Chromium，避免健康检查阻塞界面。"""
+
+    result_ready = pyqtSignal(bool, str, str)
+
+    def run(self):
+        try:
+            executable, version = check_builtin_chromium()
+            self.result_ready.emit(True, f"Chromium {version}", executable)
+        except Exception as exc:
+            self.result_ready.emit(False, "启动失败", str(exc))
+
+
+class CollapsiblePanel(QFrame):
+    """供 QSplitter 使用的可收起内容面板。"""
+
+    expanded_changed = pyqtSignal(bool)
+
+    def __init__(self, title, content, parent=None):
+        super().__init__(parent)
+        self.setObjectName("Card")
+        self._expanded = True
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 12)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        heading = QLabel(title)
+        heading.setStyleSheet("font-size:14px;font-weight:700;color:#26344d;")
+        self.toggle_button = QPushButton("▾ 收起")
+        self.toggle_button.setFixedWidth(78)
+        self.toggle_button.clicked.connect(self.toggle)
+        header.addWidget(heading)
+        header.addStretch()
+        header.addWidget(self.toggle_button)
+        layout.addLayout(header)
+
+        self.content = content
+        layout.addWidget(content, 1)
+
+    def is_expanded(self):
+        return self._expanded
+
+    def toggle(self):
+        self.set_expanded(not self._expanded)
+
+    def set_expanded(self, expanded):
+        expanded = bool(expanded)
+        if expanded == self._expanded:
+            return
+        self._expanded = expanded
+        self.content.setVisible(expanded)
+        self.toggle_button.setText("▾ 收起" if expanded else "▸ 展开")
+        self.setMaximumHeight(16_777_215 if expanded else self.sizeHint().height())
+        self.updateGeometry()
+        self.expanded_changed.emit(expanded)
+
+
 class WorkflowPage(QWidget):
     """统一编排运输证、营运回填、爱企查查询的三步流水线。"""
 
@@ -141,6 +208,9 @@ class WorkflowPage(QWidget):
         self._stats_recorded = False
         self._last_file_mtime = None
         self._retired_workers = []
+        self.browser_check_worker = None
+        self.browser_check_state = "unchecked"
+        self._settings_browser_check_requested = False
 
         self._build_ui()
         self._sync_mode_controls()
@@ -166,7 +236,24 @@ class WorkflowPage(QWidget):
         header.addStretch()
         root.addLayout(header)
 
+        self.page_tabs = QTabWidget()
+        self.page_tabs.setObjectName("WorkflowTabs")
+        self.page_tabs.setDocumentMode(False)
+        self.workflow_tab = QWidget()
+        workflow_root = QVBoxLayout(self.workflow_tab)
+        workflow_root.setContentsMargins(8, 10, 8, 8)
+        workflow_root.setSpacing(10)
+        self.settings_tab = QWidget()
+        settings_root = QVBoxLayout(self.settings_tab)
+        settings_root.setContentsMargins(14, 14, 14, 14)
+        settings_root.setSpacing(12)
+        self.page_tabs.addTab(self.workflow_tab, "业务处理")
+        self.page_tabs.addTab(self.settings_tab, "运行设置")
+        self.page_tabs.currentChanged.connect(self._on_page_tab_changed)
+        root.addWidget(self.page_tabs, 1)
+
         file_group = QGroupBox("业务表格")
+        self.file_group = file_group
         file_layout = QHBoxLayout(file_group)
         self.file_edit = QLineEdit()
         self.file_edit.setReadOnly(True)
@@ -179,15 +266,44 @@ class WorkflowPage(QWidget):
         file_layout.addWidget(self.file_edit, 1)
         file_layout.addWidget(choose_btn)
         file_layout.addWidget(reload_btn)
-        root.addWidget(file_group)
+        workflow_root.addWidget(file_group)
 
-        settings_group = QGroupBox("运行设置")
-        settings = QGridLayout(settings_group)
+        browser_group = QGroupBox("内置浏览器状态")
+        browser_layout = QGridLayout(browser_group)
         self.browser_info = QLabel("内置 Chromium（统一使用）")
-        self.browser_info.setObjectName("Muted")
+        self.browser_info.setStyleSheet("font-size:14px;font-weight:700;color:#26344d;")
+        self.browser_status_label = QLabel("● 尚未检测")
+        self.browser_status_label.setStyleSheet("color:#708096;font-weight:600;")
+        self.browser_detail_label = QLabel("打开本页面时会自动执行启动检查。")
+        self.browser_detail_label.setObjectName("Muted")
+        self.browser_detail_label.setWordWrap(True)
+        self.browser_detail_label.hide()
+        self.browser_check_btn = QPushButton("立即检测")
+        self.browser_check_btn.clicked.connect(self.check_browser)
+        self.browser_detail_toggle_btn = QPushButton("查看详情")
+        self.browser_detail_toggle_btn.clicked.connect(
+            self._toggle_browser_details
+        )
+        browser_layout.addWidget(self.browser_info, 0, 0)
+        browser_layout.addWidget(self.browser_status_label, 0, 1)
+        browser_layout.addWidget(self.browser_check_btn, 0, 2)
+        browser_layout.addWidget(self.browser_detail_toggle_btn, 0, 3)
+        browser_layout.addWidget(self.browser_detail_label, 1, 0, 1, 4)
+        browser_layout.setColumnStretch(1, 1)
+        settings_root.addWidget(browser_group)
+
+        settings_group = QGroupBox("处理参数")
+        settings_layout = QVBoxLayout(settings_group)
+        settings_layout.setContentsMargins(16, 18, 16, 16)
+        settings_layout.setSpacing(12)
+        settings_intro = QLabel("根据业务场景配置自动化程度、验证码处理方式和查询范围。")
+        settings_intro.setObjectName("Muted")
+        settings_layout.addWidget(settings_intro)
+
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("人工接管模式", False)
         self.mode_combo.addItem("全自动模式", True)
+        self.mode_combo.setMinimumHeight(36)
         self.mode_combo.currentIndexChanged.connect(self._sync_mode_controls)
         self.manual_captcha = QCheckBox("验证码人工处理")
         self.manual_captcha.setChecked(True)
@@ -201,27 +317,76 @@ class WorkflowPage(QWidget):
         self.page_retry = QSpinBox()
         self.page_retry.setRange(1, 99)
         self.page_retry.setValue(5)
+        self.page_retry.setSuffix(" 次")
+        self.page_retry.setMinimumWidth(100)
         self.captcha_retry = QSpinBox()
         self.captcha_retry.setRange(1, 9999)
         self.captcha_retry.setValue(10)
+        self.captcha_retry.setSuffix(" 次")
+        self.captcha_retry.setMinimumWidth(100)
 
-        settings.addWidget(QLabel("统一浏览器"), 0, 0)
-        settings.addWidget(self.browser_info, 0, 1, 1, 4)
-        settings.addWidget(QLabel("运行模式"), 1, 0)
-        settings.addWidget(self.mode_combo, 1, 1)
-        settings.addWidget(self.manual_captcha, 1, 2)
-        settings.addWidget(self.auto_continue, 1, 3)
-        settings.addWidget(self.only_yellow, 1, 4)
-        settings.addWidget(QLabel("列表重试"), 2, 0)
-        settings.addWidget(self.page_retry, 2, 1)
-        settings.addWidget(QLabel("验证码重试"), 2, 2)
-        settings.addWidget(self.captcha_retry, 2, 3)
-        settings.addWidget(self.infinite_captcha, 2, 4)
+        cards_layout = QHBoxLayout()
+        cards_layout.setSpacing(12)
+
+        self.mode_card, mode_layout = self._create_setting_card(
+            "运行模式",
+            "选择自动化程度，运行期间仍可随时暂停或停止流水线。",
+        )
+        mode_label = QLabel("自动化模式")
+        mode_label.setObjectName("SettingFieldLabel")
+        mode_layout.addWidget(mode_label)
+        mode_layout.addWidget(self.mode_combo)
+        self.mode_hint = QLabel()
+        self.mode_hint.setObjectName("ModeHint")
+        self.mode_hint.setWordWrap(True)
+        mode_layout.addWidget(self.mode_hint)
+        mode_layout.addStretch()
+        cards_layout.addWidget(self.mode_card, 1)
+
+        self.captcha_card, captcha_layout = self._create_setting_card(
+            "验证码策略",
+            "设置验证码由人工接管还是自动识别，以及识别失败后的重试方式。",
+        )
+        captcha_layout.addWidget(self.manual_captcha)
+        captcha_layout.addWidget(self.auto_continue)
+        captcha_retry_row = QHBoxLayout()
+        captcha_retry_label = QLabel("识别重试")
+        captcha_retry_label.setObjectName("SettingFieldLabel")
+        captcha_retry_row.addWidget(captcha_retry_label)
+        captcha_retry_row.addStretch()
+        captcha_retry_row.addWidget(self.captcha_retry)
+        captcha_layout.addLayout(captcha_retry_row)
+        captcha_layout.addWidget(self.infinite_captcha)
+        captcha_layout.addStretch()
+        cards_layout.addWidget(self.captcha_card, 1)
+
+        self.query_card, query_layout = self._create_setting_card(
+            "查询策略",
+            "控制运输证查询的车牌范围，以及结果列表加载失败时的重试次数。",
+        )
+        query_layout.addWidget(self.only_yellow)
+        page_retry_row = QHBoxLayout()
+        page_retry_label = QLabel("列表重试")
+        page_retry_label.setObjectName("SettingFieldLabel")
+        page_retry_row.addWidget(page_retry_label)
+        page_retry_row.addStretch()
+        page_retry_row.addWidget(self.page_retry)
+        query_layout.addLayout(page_retry_row)
+        query_hint = QLabel("关闭黄牌限制后，将按表格中的实际车牌颜色查询。")
+        query_hint.setObjectName("SettingCardDescription")
+        query_hint.setWordWrap(True)
+        query_layout.addWidget(query_hint)
+        query_layout.addStretch()
+        cards_layout.addWidget(self.query_card, 1)
+
+        settings_layout.addLayout(cards_layout)
         self.settings_group = settings_group
-        root.addWidget(settings_group)
+        settings_root.addWidget(settings_group)
+        settings_root.addStretch()
 
         steps_layout = QHBoxLayout()
         self.step_labels = {}
+        self.step_cards = []
         step_definitions = (
             (1, "步骤 1", "查询运输证号"),
             (2, "步骤 2", "回填营运企业"),
@@ -241,8 +406,9 @@ class WorkflowPage(QWidget):
             card_layout.addWidget(name)
             card_layout.addWidget(status)
             steps_layout.addWidget(card, 1)
+            self.step_cards.append(card)
             self.step_labels[step] = status
-        root.addLayout(steps_layout)
+        workflow_root.addLayout(steps_layout)
 
         action_layout = QHBoxLayout()
         self.start_btn = QPushButton("▶ 一键执行三个步骤")
@@ -263,16 +429,16 @@ class WorkflowPage(QWidget):
         action_layout.addWidget(self.pause_btn)
         action_layout.addWidget(self.continue_btn)
         action_layout.addWidget(self.stop_btn)
-        root.addLayout(action_layout)
+        workflow_root.addLayout(action_layout)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setFormat("整体进度 %p%")
-        root.addWidget(self.progress_bar)
+        workflow_root.addWidget(self.progress_bar)
 
         splitter = QSplitter(Qt.Vertical)
-        preview_group = QGroupBox("数据预览（随处理结果实时刷新）")
-        preview_layout = QVBoxLayout(preview_group)
+        splitter.setChildrenCollapsible(False)
+        self.content_splitter = splitter
         self.table = QTableView()
         self.table.setModel(self.model)
         self.table.setAlternatingRowColors(True)
@@ -280,19 +446,113 @@ class WorkflowPage(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
         self.table.horizontalHeader().setStretchLastSection(True)
-        preview_layout.addWidget(self.table)
-        splitter.addWidget(preview_group)
+        self.preview_panel = CollapsiblePanel(
+            "数据预览（随处理结果实时刷新）",
+            self.table,
+        )
+        self.preview_toggle_btn = self.preview_panel.toggle_button
+        self.preview_panel.expanded_changed.connect(self._rebalance_content_panels)
+        splitter.addWidget(self.preview_panel)
 
-        log_group = QGroupBox("流水线日志")
-        log_layout = QVBoxLayout(log_group)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        log_layout.addWidget(self.log_text)
-        splitter.addWidget(log_group)
+        self.log_panel = CollapsiblePanel("流水线日志", self.log_text)
+        self.log_toggle_btn = self.log_panel.toggle_button
+        self.log_panel.expanded_changed.connect(self._rebalance_content_panels)
+        splitter.addWidget(self.log_panel)
         splitter.setStretchFactor(0, 4)
         splitter.setStretchFactor(1, 2)
         splitter.setSizes([480, 220])
-        root.addWidget(splitter, 1)
+        self.collapsed_content_spacer = QWidget()
+        self.collapsed_content_spacer.hide()
+        workflow_root.addWidget(splitter, 1)
+        workflow_root.addWidget(self.collapsed_content_spacer, 1)
+
+    def _on_page_tab_changed(self, index):
+        if (
+            self.page_tabs.widget(index) is self.settings_tab
+            and not self._settings_browser_check_requested
+        ):
+            self._settings_browser_check_requested = True
+            self.check_browser()
+
+    @staticmethod
+    def _create_setting_card(title, description):
+        card = QFrame()
+        card.setObjectName("SettingCard")
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(11)
+        heading = QLabel(title)
+        heading.setObjectName("SettingCardTitle")
+        detail = QLabel(description)
+        detail.setObjectName("SettingCardDescription")
+        detail.setWordWrap(True)
+        layout.addWidget(heading)
+        layout.addWidget(detail)
+        layout.addSpacing(3)
+        return card, layout
+
+    def _toggle_browser_details(self):
+        show_details = self.browser_detail_label.isHidden()
+        self.browser_detail_label.setVisible(show_details)
+        self.browser_detail_toggle_btn.setText(
+            "收起详情" if show_details else "查看详情"
+        )
+
+    def check_browser(self):
+        worker = self.browser_check_worker
+        if worker is not None and worker.isRunning():
+            return
+        if self.pipeline_running:
+            return
+        self.browser_check_state = "checking"
+        self.browser_status_label.setText("● 正在启动检测…")
+        self.browser_status_label.setStyleSheet("color:#1c5ed6;font-weight:600;")
+        self.browser_detail_label.setText("正在实际启动内置 Chromium 并访问空白页。")
+        self.browser_check_btn.setEnabled(False)
+
+        worker = BrowserCheckWorker(self)
+        self.browser_check_worker = worker
+        worker.result_ready.connect(self._browser_check_finished)
+        worker.finished.connect(
+            lambda checked_worker=worker: self._browser_check_worker_finished(
+                checked_worker
+            )
+        )
+        worker.start()
+
+    def _browser_check_finished(self, success, summary, details):
+        self.browser_check_state = "ready" if success else "failed"
+        if success:
+            self.browser_status_label.setText(f"● 运行正常 · {summary}")
+            self.browser_status_label.setStyleSheet("color:#188b57;font-weight:600;")
+            self.browser_detail_label.setText(f"已成功启动并关闭测试实例。\n{details}")
+        else:
+            self.browser_status_label.setText("● 检测失败")
+            self.browser_status_label.setStyleSheet("color:#d33f49;font-weight:600;")
+            self.browser_detail_label.setText(details)
+        self.browser_check_btn.setEnabled(not self.pipeline_running)
+
+    def _browser_check_worker_finished(self, worker):
+        if self.browser_check_worker is worker:
+            self.browser_check_worker = None
+        worker.deleteLater()
+
+    def _rebalance_content_panels(self, _expanded=None):
+        preview_expanded = self.preview_panel.is_expanded()
+        log_expanded = self.log_panel.is_expanded()
+        self.collapsed_content_spacer.setVisible(
+            not preview_expanded and not log_expanded
+        )
+        if preview_expanded and log_expanded:
+            self.content_splitter.setSizes([480, 220])
+        elif preview_expanded:
+            self.content_splitter.setSizes([1_000, 1])
+        elif log_expanded:
+            self.content_splitter.setSizes([1, 1_000])
+        else:
+            self.content_splitter.setSizes([1, 1])
 
     def _log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -315,6 +575,11 @@ class WorkflowPage(QWidget):
 
     def _sync_mode_controls(self):
         auto_mode = bool(self.mode_combo.currentData())
+        self.mode_hint.setText(
+            "全自动运行：优先自动识别验证码，重试耗尽后按当前步骤规则跳过或停止。"
+            if auto_mode
+            else "人工接管：可选择直接人工处理，或先自动识别、失败后再由人工接管。"
+        )
         self.manual_captcha.setEnabled(not auto_mode)
         self.auto_continue.setEnabled(not auto_mode)
         retry_enabled = auto_mode or not self.manual_captcha.isChecked()
@@ -372,6 +637,7 @@ class WorkflowPage(QWidget):
         self.pipeline_running = running
         self.choose_btn.setEnabled(not running)
         self.settings_group.setEnabled(not running)
+        self.browser_check_btn.setEnabled(not running and self.browser_check_state != "checking")
         self.start_btn.setEnabled(not running)
         self.pause_btn.setEnabled(running)
         self.stop_btn.setEnabled(running)
@@ -380,6 +646,19 @@ class WorkflowPage(QWidget):
 
     def start_pipeline(self):
         if self.pipeline_running:
+            return
+        if self.browser_check_state == "checking":
+            QMessageBox.information(self, "浏览器检测中", "正在检测内置浏览器，请稍候再开始。")
+            return
+        if self.browser_check_state != "ready":
+            self.page_tabs.setCurrentWidget(self.settings_tab)
+            self.check_browser()
+            QMessageBox.warning(
+                self,
+                "请先检测浏览器",
+                "开始业务处理前需要确认内置 Chromium 可以正常启动。\n"
+                "检测完成后请重新点击开始。",
+            )
             return
         if not self.file_path or not os.path.exists(self.file_path):
             QMessageBox.warning(self, "缺少表格", "请先选择业务表格。")
@@ -790,6 +1069,10 @@ class WorkflowPage(QWidget):
 
     def shutdown(self, timeout_ms=8000):
         self.preview_timer.stop()
+        browser_check_worker = self.browser_check_worker
+        if browser_check_worker and browser_check_worker.isRunning():
+            if not browser_check_worker.wait(timeout_ms):
+                return False
         worker = self.current_worker
         if worker and worker.isRunning():
             self.stopping = True

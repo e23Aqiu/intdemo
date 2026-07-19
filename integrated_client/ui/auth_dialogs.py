@@ -9,16 +9,16 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QMessageBox,
     QPushButton,
     QVBoxLayout,
 )
 
 from ..config import APP_NAME, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from ..database import AuthenticationError, Database
+from .frameless import FramelessDialog, FramelessMessageBox as QMessageBox
 
 
-class PasswordDialog(QDialog):
+class PasswordDialog(FramelessDialog):
     def __init__(
         self, database: Database, account_id: int, forced=False,
         must_change_after=False, require_current=False, parent=None
@@ -107,9 +107,14 @@ class PasswordDialog(QDialog):
         super().accept()
 
 
-class LoginDialog(QDialog):
+class LoginDialog(FramelessDialog):
     def __init__(self, database: Database, bootstrap_created=False, parent=None):
-        super().__init__(parent)
+        super().__init__(
+            parent,
+            resizable=False,
+            show_minimize=False,
+            show_maximize=False,
+        )
         self.database = database
         self.bootstrap_created = bootstrap_created
         self.account = None
@@ -183,7 +188,7 @@ class LoginDialog(QDialog):
         self.accept()
 
 
-class RenameAccountDialog(QDialog):
+class RenameAccountDialog(FramelessDialog):
     def __init__(self, account, parent=None):
         super().__init__(parent)
         self.setWindowTitle("修改用户名称")
@@ -232,7 +237,7 @@ class RenameAccountDialog(QDialog):
         return self.name_edit.text().strip()
 
 
-class AccountPermissionDialog(QDialog):
+class AccountPermissionDialog(FramelessDialog):
     def __init__(self, account, parent=None):
         super().__init__(parent)
         self.setWindowTitle("修改账号权限")
@@ -274,7 +279,7 @@ class AccountPermissionDialog(QDialog):
         return self.role_combo.currentData()
 
 
-class CreateAccountDialog(QDialog):
+class CreateAccountDialog(FramelessDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("新建账号")

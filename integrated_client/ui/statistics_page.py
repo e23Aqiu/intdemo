@@ -1,5 +1,11 @@
 import math
+import re
+from datetime import datetime
+from pathlib import Path
 
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 from PyQt5.QtCore import QRect, QRectF, Qt, QTimer
 from PyQt5.QtGui import (
     QColor,
@@ -13,6 +19,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHeaderView,
@@ -38,6 +45,8 @@ from ..database import (
     WORKFLOW_TOTAL_METRIC,
 )
 from ..models import Account
+from .date_range import DateRangeSelector
+from .frameless import FramelessMessageBox as QMessageBox
 
 
 class ChartHoverCard(QFrame):
@@ -46,21 +55,22 @@ class ChartHoverCard(QFrame):
     def __init__(self, parent=None):
         super().__init__(
             parent,
-            Qt.ToolTip | Qt.FramelessWindowHint,
+            Qt.ToolTip | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint,
         )
         self.title_text = ""
         self.details = []
         self._detail_row_count = 0
         self.setObjectName("ChartHoverCard")
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setFixedWidth(240)
         self.setStyleSheet(
             """
             QFrame#ChartHoverCard {
-                background: rgba(23, 35, 60, 245);
-                border: 1px solid #40506b;
-                border-radius: 10px;
+                background: transparent;
+                border: none;
             }
             QLabel#HoverCardTitle {
                 color: #ffffff;
@@ -101,16 +111,30 @@ class ChartHoverCard(QFrame):
         outer.addLayout(content, 1)
         self.hide()
 
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        card_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        card_path = QPainterPath()
+        card_path.addRoundedRect(card_rect, 10, 10)
+        painter.fillPath(card_path, QColor(23, 35, 60, 245))
+        painter.setPen(QPen(QColor("#40506b"), 1))
+        painter.drawPath(card_path)
+
     def _clear_details(self):
         while self._details_layout.count():
             item = self._details_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-    def show_details(self, title, details, accent_color, anchor):
+    def show_details(self, title, details, accent_color, anchor, card_width=240):
         """在全局坐标 anchor 附近显示，并保持在当前屏幕可用区域内。"""
         self.title_text = str(title)
         self.details = [(str(key), str(value)) for key, value in details]
+        card_width = max(240, int(card_width))
+        self.setFixedWidth(card_width)
+        self._title.setFixedWidth(card_width - 38)
         self._title.setText(self.title_text)
         self._title.ensurePolished()
         title_rect = self._title.fontMetrics().boundingRect(
@@ -126,6 +150,7 @@ class ChartHoverCard(QFrame):
         )
         self._clear_details()
         compact_grid = len(self.details) > 2
+        self._details_layout.setHorizontalSpacing(12 if compact_grid else 18)
         self._detail_row_count = (
             math.ceil(len(self.details) / 2) if compact_grid else len(self.details)
         )
@@ -400,19 +425,46 @@ class WorkflowDistributionChart(AnimatedDonutChart):
                 painter.drawPath(value_path)
                 self._draw_flow_highlight(painter, value_path, value_rect)
 
+    def _show_category_details(self, label, value, total, color, anchor):
+        percent = value / max(total, 1) * 100
+        self._hover_card.show_details(
+            label,
+            [("数量", f"{value} 条"), ("占比", f"{percent:.1f}%")],
+            color,
+            anchor,
+        )
+
     def mouseMoveEvent(self, event):
         index, payload = self._slice_at(event.pos())
         if payload is not None:
             self._hovered_slice = index
-            percent = payload["value"] / max(payload["total"], 1) * 100
-            self._hover_card.show_details(
+            self._show_category_details(
                 payload["label"],
-                [("数量", f"{payload['value']} 条"), ("占比", f"{percent:.1f}%")],
+                payload["value"],
+                payload["total"],
                 payload["color"],
                 event.globalPos(),
             )
             self.update()
             return
+        classified_total = sum(
+            self._values.get(metric_key, 0)
+            for metric_key, _, _ in self.SEGMENTS
+        )
+        for bar_index, bar_rect in enumerate(self._bar_rects):
+            if bar_rect.contains(event.pos()):
+                if self._hovered_slice is not None:
+                    self._hovered_slice = None
+                    self.update()
+                metric_key, label, color = self.SEGMENTS[bar_index]
+                self._show_category_details(
+                    label,
+                    self._values.get(metric_key, 0),
+                    classified_total,
+                    color,
+                    event.globalPos(),
+                )
+                return
         if self._hovered_slice is not None:
             self._hovered_slice = None
             self.update()
@@ -423,6 +475,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
 class ViolationReasonChart(AnimatedDonutChart):
     """违规原因环形图及可切换的电话拆分/原因占比计量条。"""
 
+    BAR_ROW_HEIGHT = 33
     COLORS = (
         QColor("#3478f6"),
         QColor("#31ad76"),
@@ -583,7 +636,7 @@ class ViolationReasonChart(AnimatedDonutChart):
         legend_left = pie_rect.right() + 46
         legend_width = max(120, self.width() - legend_left - 28)
         label_width = max(90, int(legend_width * 0.56))
-        row_height = 30
+        row_height = self.BAR_ROW_HEIGHT
         top = 46
         painter.setFont(QFont("Microsoft YaHei UI", 9))
 
@@ -939,7 +992,6 @@ class StationDistributionChart(AnimatedDonutChart):
             self._hover_card.show_details(
                 payload["station"],
                 [
-                    ("统计指标", payload["series"]),
                     ("数量", f'{payload["value"]} 条'),
                     ("占比", self._format_share(payload["share"])),
                 ],
@@ -965,6 +1017,7 @@ class StationDistributionChart(AnimatedDonutChart):
                         self._rows.index(row) % len(self.COLORS)
                     ],
                     event.globalPos(),
+                    card_width=288,
                 )
                 return
         if self._hovered_slice is not None:
@@ -997,6 +1050,11 @@ class StatisticsPage(QWidget):
         title_box.addWidget(subtitle)
         header.addLayout(title_box)
         header.addStretch()
+        self.export_btn = QPushButton("导出 Excel")
+        self.export_btn.setObjectName("PrimaryButton")
+        self.export_btn.setToolTip("按当前站点、数据分类和日期范围导出表格数据")
+        self.export_btn.clicked.connect(self._export_dashboard_excel)
+        header.addWidget(self.export_btn)
         refresh = QPushButton("刷新统计")
         refresh.clicked.connect(self.refresh)
         header.addWidget(refresh)
@@ -1027,6 +1085,10 @@ class StatisticsPage(QWidget):
         self.category_combo.addItem("按完成类型", "completion")
         self.category_combo.addItem("按违规类型", "violation")
         filter_layout.addWidget(self.category_combo)
+        filter_layout.addSpacing(22)
+        filter_layout.addWidget(QLabel("日期范围"))
+        self.date_range_selector = DateRangeSelector()
+        filter_layout.addWidget(self.date_range_selector)
         filter_layout.addStretch()
         layout.addWidget(filter_card)
 
@@ -1039,6 +1101,7 @@ class StatisticsPage(QWidget):
             self._has_saved_station_before_distribution = True
         self.station_combo.currentIndexChanged.connect(self.refresh)
         self.category_combo.currentIndexChanged.connect(self._on_category_changed)
+        self.date_range_selector.range_changed.connect(self.refresh)
 
         self.kpi_layout = QGridLayout()
         self.kpi_layout.setSpacing(10)
@@ -1046,7 +1109,7 @@ class StatisticsPage(QWidget):
 
         self.detail_tabs = QTabWidget()
         self.detail_tabs.setObjectName("DashboardTabs")
-        self.detail_tabs.setDocumentMode(True)
+        self.detail_tabs.setDocumentMode(False)
         self.detail_tabs.setMinimumHeight(350)
 
         self.chart_tab = QWidget()
@@ -1197,7 +1260,187 @@ class StatisticsPage(QWidget):
         return self.station_combo.currentData()
 
     def _selected_scope(self):
-        return self.station_combo.currentText()
+        scope = self.station_combo.currentText()
+        if not self.date_range_selector.all_dates_check.isChecked():
+            scope = f"{scope} · {self.date_range_selector.range_label()}"
+        return scope
+
+    def _date_range(self):
+        return self.date_range_selector.date_range()
+
+    @staticmethod
+    def _excel_value(text):
+        value = str(text).strip()
+        if value.endswith("%"):
+            try:
+                return float(value[:-1]) / 100, "0.0%"
+            except ValueError:
+                return value, None
+        if re.fullmatch(r"[-+]?\d+", value):
+            return int(value), "0"
+        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\d*\.\d+)", value):
+            return float(value), "0.00"
+        return value, None
+
+    def _save_dashboard_excel(self, file_path):
+        """Export the currently displayed dashboard table to one workbook."""
+        station_name = self.station_combo.currentText() or "全部站点"
+        category_name = self.category_combo.currentText()
+        range_label = self.date_range_selector.range_label()
+        table_headers = [
+            self.summary_table.horizontalHeaderItem(column).text()
+            for column in range(self.summary_table.columnCount())
+        ]
+        headers = ["站名", "时间范围", *table_headers]
+
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "仪表盘数据"
+        sheet.sheet_view.showGridLines = False
+
+        final_column = max(6, len(headers))
+        sheet.merge_cells(
+            start_row=1,
+            start_column=1,
+            end_row=1,
+            end_column=final_column,
+        )
+        title_cell = sheet.cell(1, 1, "数据仪表盘导出")
+        title_cell.font = Font(color="FFFFFF", bold=True, size=15)
+        title_cell.fill = PatternFill("solid", fgColor="1C5ED6")
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        sheet.row_dimensions[1].height = 30
+
+        metadata = (
+            ("站名", station_name),
+            ("数据分类", category_name),
+            ("时间范围", range_label),
+        )
+        for index, (label, value) in enumerate(metadata):
+            label_cell = sheet.cell(2, index * 2 + 1, label)
+            value_cell = sheet.cell(2, index * 2 + 2, value)
+            label_cell.font = Font(bold=True, color="526177")
+            label_cell.fill = PatternFill("solid", fgColor="EDF4FF")
+            value_cell.fill = PatternFill("solid", fgColor="F8FAFD")
+            for cell in (label_cell, value_cell):
+                cell.alignment = Alignment(vertical="center")
+
+        sheet.cell(3, 1, "导出时间").font = Font(bold=True, color="526177")
+        sheet.cell(3, 2, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+        header_row = 5
+        header_fill = PatternFill("solid", fgColor="3478F6")
+        header_font = Font(color="FFFFFF", bold=True)
+        thin_border = Border(
+            left=Side(style="thin", color="DCE4EF"),
+            right=Side(style="thin", color="DCE4EF"),
+            top=Side(style="thin", color="DCE4EF"),
+            bottom=Side(style="thin", color="DCE4EF"),
+        )
+        for column, header_text in enumerate(headers, 1):
+            cell = sheet.cell(header_row, column, header_text)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+        sheet.row_dimensions[header_row].height = 25
+
+        for source_row in range(self.summary_table.rowCount()):
+            target_row = header_row + source_row + 1
+            row_values = [station_name, range_label]
+            row_values.extend(
+                self.summary_table.item(source_row, column).text()
+                if self.summary_table.item(source_row, column) is not None
+                else ""
+                for column in range(self.summary_table.columnCount())
+            )
+            for column, raw_value in enumerate(row_values, 1):
+                value, number_format = self._excel_value(raw_value)
+                cell = sheet.cell(target_row, column, value)
+                if number_format:
+                    cell.number_format = number_format
+                cell.border = thin_border
+                cell.alignment = Alignment(
+                    horizontal="center" if column > 2 else "left",
+                    vertical="center",
+                )
+                if source_row % 2:
+                    cell.fill = PatternFill("solid", fgColor="F7F9FD")
+
+        last_row = max(header_row, sheet.max_row)
+        last_column_letter = get_column_letter(len(headers))
+        sheet.auto_filter.ref = f"A{header_row}:{last_column_letter}{last_row}"
+        sheet.freeze_panes = f"A{header_row + 1}"
+
+        for column in range(1, final_column + 1):
+            letter = get_column_letter(column)
+            content_width = max(
+                len(str(sheet.cell(row, column).value or ""))
+                for row in range(1, sheet.max_row + 1)
+            )
+            sheet.column_dimensions[letter].width = min(
+                36,
+                max(12, content_width + 3),
+            )
+        sheet.column_dimensions["B"].width = max(
+            sheet.column_dimensions["B"].width,
+            25,
+        )
+        sheet.column_dimensions["F"].width = max(
+            sheet.column_dimensions["F"].width,
+            25,
+        )
+
+        target = Path(file_path)
+        workbook.save(target)
+        return {
+            "file_path": str(target),
+            "row_count": self.summary_table.rowCount(),
+            "station_name": station_name,
+            "category_name": category_name,
+            "range_label": range_label,
+        }
+
+    def _export_dashboard_excel(self):
+        start_date, end_date = self._date_range()
+        range_suffix = (
+            "all"
+            if start_date is None
+            else f"{start_date:%Y%m%d}-{end_date:%Y%m%d}"
+        )
+        station_part = re.sub(
+            r'[\\/:*?"<>|]+',
+            "_",
+            self.station_combo.currentText() or "全部站点",
+        )
+        default_name = (
+            f"仪表盘_{station_part}_{range_suffix}_"
+            f"{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+        )
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出数据仪表盘",
+            default_name,
+            "Excel 工作簿 (*.xlsx)",
+        )
+        if not file_path:
+            return
+        target = Path(file_path)
+        if target.suffix.lower() != ".xlsx":
+            target = target.with_suffix(".xlsx")
+        try:
+            result = self._save_dashboard_excel(target)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "导出成功",
+            f"站点：{result['station_name']}\n"
+            f"时间范围：{result['range_label']}\n"
+            f"已导出 {result['row_count']} 行数据。\n"
+            f"{result['file_path']}",
+        )
 
     def _on_category_changed(self, _index):
         category = self.category_combo.currentData()
@@ -1280,7 +1523,8 @@ class StatisticsPage(QWidget):
             username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
         }
         stations = {}
-        for row in self.database.get_all_account_totals():
+        start_date, end_date = self._date_range()
+        for row in self.database.get_all_account_totals(start_date, end_date):
             if row["role"] != "user":
                 continue
             station = stations.setdefault(
@@ -1321,10 +1565,11 @@ class StatisticsPage(QWidget):
         self.distribution_chart.show()
         self.violation_chart.hide()
         self.station_distribution_chart.hide()
+        start_date, end_date = self._date_range()
 
         if user_id is None:
             totals_by_metric = {metric["metric_key"]: 0 for metric in metrics}
-            for row in self.database.get_all_account_totals():
+            for row in self.database.get_all_account_totals(start_date, end_date):
                 if row["role"] == "user":
                     totals_by_metric[row["metric_key"]] = (
                         totals_by_metric.get(row["metric_key"], 0)
@@ -1333,7 +1578,11 @@ class StatisticsPage(QWidget):
         else:
             totals_by_metric = {
                 row["metric_key"]: int(row["total"])
-                for row in self.database.get_user_totals(user_id)
+                for row in self.database.get_user_totals(
+                    user_id,
+                    start_date,
+                    end_date,
+                )
             }
 
         self._add_kpis(
@@ -1372,9 +1621,12 @@ class StatisticsPage(QWidget):
         self._finish_summary_table(scope, "完成类型累计明细")
 
     def _render_violation(self, user_id, scope):
+        start_date, end_date = self._date_range()
         rows = self.database.get_violation_totals(
             user_id,
             users_only=(user_id is None),
+            start_date=start_date,
+            end_date=end_date,
         )
         self.distribution_chart.hide()
         self.violation_chart.show()
@@ -1470,7 +1722,7 @@ class StatisticsPage(QWidget):
                     item.setFont(font)
                 self.summary_table.setItem(row_index, column, item)
         self._finish_summary_table(
-            "全部站点",
+            self._selected_scope(),
             "各站总计数占比与有电话数占比",
             (0,),
         )

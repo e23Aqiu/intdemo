@@ -3,6 +3,12 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
+datas += [
+    ('integrated_client/ui/assets/check.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/minus.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/chevron-down.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/chevron-up.svg', 'integrated_client/ui/assets'),
+]
 hiddenimports = [
     'PyQt5', 'PyQt5.sip',
     'pandas', 'pandas._libs', 'openpyxl', 'xlrd',
