@@ -37,6 +37,7 @@ WM_GETMINMAXINFO = 0x0024
 WM_NCCALCSIZE = 0x0083
 WM_NCHITTEST = 0x0084
 WM_NCACTIVATE = 0x0086
+WVR_REDRAW = 0x0300
 MONITOR_DEFAULTTONEAREST = 0x00000002
 DWMWA_WINDOW_CORNER_PREFERENCE = 33
 DWMWA_BORDER_COLOR = 34
@@ -180,6 +181,10 @@ class FramelessWindowMixin:
             and application.platformName().lower() == "windows"
         )
 
+    @staticmethod
+    def _windows_nccalcsize_result(wparam):
+        return WVR_REDRAW if wparam else 0
+
     def nativeEvent(self, event_type, message):
         if self._uses_windows_qpa():
             try:
@@ -187,7 +192,13 @@ class FramelessWindowMixin:
                 if native_message.message == WM_NCCALCSIZE:
                     # WS_THICKFRAME is kept for native edge resizing, but its
                     # visible non-client inset must not consume application UI.
-                    return True, 0
+                    # When the client rectangle grows, keeping the old client
+                    # image leaves the newly exposed area to be painted later.
+                    # Requesting a full redraw prevents that area from briefly
+                    # showing the DWM background during live edge resizing.
+                    return True, self._windows_nccalcsize_result(
+                        native_message.wParam
+                    )
                 if native_message.message == WM_NCACTIVATE:
                     # Do not let Windows repaint the retained resize frame when
                     # a native dialog takes focus.  Its default inactive frame

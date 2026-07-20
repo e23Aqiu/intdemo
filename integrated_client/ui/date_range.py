@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QStyle,
     QStyledItemDelegate,
     QTableView,
@@ -80,8 +81,33 @@ class StableDateEdit(QDateEdit):
     def __init__(self, value, parent=None):
         super().__init__(value, parent)
         self._redirected_calendar_click = False
-        self.lineEdit().setReadOnly(True)
+        self._date_line_edit = self.lineEdit()
+        self._date_line_edit.setReadOnly(True)
+        self._date_line_edit.setCursor(Qt.PointingHandCursor)
+        self._date_line_edit.installEventFilter(self)
         self.setCursor(Qt.PointingHandCursor)
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self._date_line_edit
+            and self.isEnabled()
+            and event.type() in (
+                QEvent.MouseButtonPress,
+                QEvent.MouseButtonRelease,
+                QEvent.MouseButtonDblClick,
+            )
+            and event.button() == Qt.LeftButton
+        ):
+            if event.type() == QEvent.MouseButtonPress:
+                self.mousePressEvent(event)
+                return event.isAccepted()
+            if event.type() == QEvent.MouseButtonRelease:
+                self.mouseReleaseEvent(event)
+                return event.isAccepted()
+            if event.type() == QEvent.MouseButtonDblClick:
+                self.mouseDoubleClickEvent(event)
+                return event.isAccepted()
+        return super().eventFilter(watched, event)
 
     def _calendar_button_event(self, event_type, source_event):
         position = QPoint(
@@ -152,9 +178,11 @@ class DateRangeSelector(QWidget):
         first_day = QDate(today.year(), today.month(), 1)
         self.start_edit = self._date_edit("StartDateEdit", first_day)
         self.end_edit = self._date_edit("EndDateEdit", today)
-        layout.addWidget(QLabel("从"))
+        self.start_label = QLabel("从")
+        self.end_label = QLabel("至")
+        layout.addWidget(self.start_label)
         layout.addWidget(self.start_edit)
-        layout.addWidget(QLabel("至"))
+        layout.addWidget(self.end_label)
         layout.addWidget(self.end_edit)
 
         self.range_separator = QFrame()
@@ -172,7 +200,16 @@ class DateRangeSelector(QWidget):
         self.all_dates_check = QCheckBox("全部日期")
         self.all_dates_check.setObjectName("AllDatesCheck")
         self.all_dates_check.setChecked(True)
+        self.all_dates_check.setMinimumWidth(
+            self.all_dates_check.sizeHint().width()
+        )
         all_dates_layout.addWidget(self.all_dates_check)
+        self.all_dates_panel.setMinimumWidth(
+            self.all_dates_check.minimumWidth()
+            + all_dates_layout.contentsMargins().left()
+            + all_dates_layout.contentsMargins().right()
+            + 2
+        )
         layout.addWidget(self.all_dates_panel)
 
         self.setStyleSheet(
@@ -189,6 +226,9 @@ class DateRangeSelector(QWidget):
         self.start_edit.dateChanged.connect(self._start_changed)
         self.end_edit.dateChanged.connect(self._end_changed)
         self._set_date_edits_enabled(False)
+        layout.activate()
+        self.setFixedWidth(layout.minimumSize().width())
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
     @staticmethod
     def _date_edit(object_name, value):
@@ -198,8 +238,7 @@ class DateRangeSelector(QWidget):
         editor.setDisplayFormat("yyyy-MM-dd")
         editor.setLocale(QLocale(QLocale.Chinese, QLocale.China))
         editor.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        date_text_width = editor.fontMetrics().horizontalAdvance("0000-00-00")
-        editor.setMinimumWidth(max(160, date_text_width + 52))
+        editor.setFixedWidth(160)
         editor._calendar_hover_delegate = DateRangeSelector._polish_calendar(
             editor.calendarWidget()
         )

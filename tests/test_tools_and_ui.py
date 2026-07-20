@@ -54,6 +54,7 @@ from integrated_client.ui.frameless import (
     HTCLIENT,
     HTTOPLEFT,
     MINMAXINFO,
+    WVR_REDRAW,
 )
 from integrated_client.ui.statistics_page import (
     StationDistributionChart,
@@ -123,6 +124,17 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertNotIn("statistics", window._nav_buttons)
         self.assertIn("workflow", window._nav_buttons)
         self.assertIn("personal", window._nav_buttons)
+        self.assertIs(window.page_scroll_area.widget(), window.stack)
+        self.assertTrue(window.page_scroll_area.widgetResizable())
+        self.assertEqual(
+            window.page_scroll_area.horizontalScrollBarPolicy(),
+            Qt.ScrollBarAsNeeded,
+        )
+        self.assertEqual(
+            window.page_scroll_area.verticalScrollBarPolicy(),
+            Qt.ScrollBarAsNeeded,
+        )
+        self.assertEqual(window.stack.minimumSize(), window.PAGE_CANVAS_SIZE)
         self.assertIs(window.stack.currentWidget(), window.statistics_page)
         self.assertTrue(window._nav_buttons["home"].isChecked())
         self.assertEqual(window.page_title.text(), "数据仪表盘")
@@ -288,8 +300,16 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(window.window_controls.minimize_button.isHidden())
         self.assertFalse(window.window_controls.maximize_button.isHidden())
         self.assertFalse(window.window_controls.close_button.isHidden())
-        self.assertEqual(window.minimumSize().width(), 1280)
-        self.assertEqual(window.minimumSize().height(), 820)
+        self.assertEqual(window.minimumSize().width(), 800)
+        self.assertEqual(window.minimumSize().height(), 600)
+        self.assertFalse(window.page_scroll_area.horizontalScrollBar().isVisible())
+        self.assertFalse(window.page_scroll_area.verticalScrollBar().isVisible())
+        window.resize(800, 600)
+        self.app.processEvents()
+        self.assertTrue(window.page_scroll_area.horizontalScrollBar().isVisible())
+        self.assertTrue(window.page_scroll_area.verticalScrollBar().isVisible())
+        self.assertIn("QScrollBar::handle:horizontal:hover", APP_STYLESHEET)
+        self.assertIn("QScrollBar::handle:vertical:pressed", APP_STYLESHEET)
         native_limits = MINMAXINFO()
         window._update_minimum_track_size(native_limits)
         scale = max(1.0, float(window.devicePixelRatioF()))
@@ -301,6 +321,8 @@ class ToolAndUiTests(unittest.TestCase):
             native_limits.ptMinTrackSize.y,
             math.ceil(window.minimumHeight() * scale),
         )
+        self.assertEqual(window._windows_nccalcsize_result(1), WVR_REDRAW)
+        self.assertEqual(window._windows_nccalcsize_result(0), 0)
 
         caption_point = top_bar.mapTo(window, QPoint(320, top_bar.height() // 2))
         control_point = window.window_controls.mapTo(
@@ -435,8 +457,20 @@ class ToolAndUiTests(unittest.TestCase):
                 "个体经营",
                 "无营运信息",
                 "无运输证号",
-                "空",
             ],
+        )
+        self.assertTrue(
+            all(
+                window.statistics_page.kpi_layout.itemAtPosition(
+                    index // 3,
+                    index % 3,
+                )
+                is not None
+                for index in range(6)
+            )
+        )
+        self.assertIsNone(
+            window.statistics_page.kpi_layout.itemAtPosition(0, 3)
         )
 
         accounts = {account.username: account for account in self.db.list_accounts()}
@@ -597,12 +631,46 @@ class ToolAndUiTests(unittest.TestCase):
 
         window = MainWindow(self.db, self.admin)
         window.show()
+        window.resize(800, 600)
         self.app.processEvents()
         page = window.statistics_page
         selector = page.date_range_selector
         self.assertTrue(selector.all_dates_check.isChecked())
+        filter_groups = (
+            page.station_filter_group,
+            page.category_filter_group,
+            page.date_filter_group,
+        )
+        self.assertEqual(
+            [group.objectName() for group in filter_groups],
+            ["DashboardFilterGroup"] * 3,
+        )
+        self.assertEqual(len({group.y() for group in filter_groups}), 1)
+        self.assertLess(
+            page.station_filter_group.x(),
+            page.category_filter_group.x(),
+        )
+        self.assertLess(
+            page.category_filter_group.x(),
+            page.date_filter_group.x(),
+        )
+        self.assertEqual(page.date_filter_label.text(), "日期范围")
+        self.assertEqual(
+            page.date_filter_label.objectName(),
+            "DashboardFilterLabel",
+        )
+        self.assertGreaterEqual(selector.width(), selector.minimumWidth())
+        self.assertGreaterEqual(
+            selector.all_dates_panel.width(),
+            selector.all_dates_panel.minimumWidth(),
+        )
+        self.assertGreaterEqual(
+            selector.all_dates_check.width(),
+            selector.all_dates_check.sizeHint().width(),
+        )
         for editor in (selector.start_edit, selector.end_edit):
             self.assertGreaterEqual(editor.minimumWidth(), 160)
+            self.assertGreaterEqual(editor.width(), editor.minimumWidth())
             calendar = editor.calendarWidget()
             self.assertGreaterEqual(calendar.minimumWidth(), 332)
             self.assertEqual(calendar.firstDayOfWeek(), Qt.Monday)
@@ -631,9 +699,9 @@ class ToolAndUiTests(unittest.TestCase):
         line_edit = click_editor.lineEdit()
         self.assertTrue(line_edit.isReadOnly())
         QTest.mouseClick(
-            click_editor,
+            line_edit,
             Qt.LeftButton,
-            pos=QPoint(20, click_editor.height() // 2),
+            pos=line_edit.rect().center(),
         )
         self.app.processEvents()
         self.assertTrue(click_editor.calendarWidget().isVisible())
@@ -847,6 +915,31 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.collapsed_content_spacer.isHidden())
         self.assertTrue(page.shutdown())
         page.close()
+
+    def test_workflow_start_browser_check_dialog_actions(self):
+        self.assertFalse(
+            WorkflowPage._browser_start_result_allows_pipeline(
+                QMessageBox.Cancel
+            )
+        )
+        self.assertTrue(
+            WorkflowPage._browser_start_result_allows_pipeline(
+                QMessageBox.Ignore
+            )
+        )
+        self.assertTrue(
+            WorkflowPage._browser_start_result_allows_pipeline(QMessageBox.Ok)
+        )
+        self.assertEqual(
+            WorkflowPage.BROWSER_CHECK_ANIMATION_FRAMES,
+            (
+                "正在检测内置浏览器",
+                "正在检测内置浏览器 ·",
+                "正在检测内置浏览器 ··",
+                "正在检测内置浏览器 ···",
+            ),
+        )
+        self.assertIn("QProgressBar#BrowserCheckProgress", APP_STYLESHEET)
 
     def test_disabled_widgets_use_forbidden_cursor(self):
         previous_stylesheet = self.app.styleSheet()
@@ -1550,7 +1643,6 @@ class ToolAndUiTests(unittest.TestCase):
                 WORKFLOW_INDIVIDUAL_METRIC,
                 WORKFLOW_NO_OPERATION_METRIC,
                 WORKFLOW_NO_TRANSPORT_METRIC,
-                WORKFLOW_EMPTY_METRIC,
             ],
         )
         chart.resize(900, 280)
@@ -1562,7 +1654,7 @@ class ToolAndUiTests(unittest.TestCase):
                 WORKFLOW_NO_OPERATION_METRIC: 0,
                 WORKFLOW_INDIVIDUAL_METRIC: 0,
                 WORKFLOW_NO_PHONE_METRIC: 0,
-                WORKFLOW_HAS_PHONE_METRIC: 0,
+                WORKFLOW_HAS_PHONE_METRIC: 4,
             },
             "测试站点",
         )
@@ -1588,7 +1680,7 @@ class ToolAndUiTests(unittest.TestCase):
         )
         chart.mouseMoveEvent(donut_event)
         self.assertEqual(chart._hovered_slice, 0)
-        self.assertEqual(chart._hover_card.title_text, "空")
+        self.assertEqual(chart._hover_card.title_text, "有公司名、有电话")
         self.assertEqual(
             chart._hover_card.details,
             [("数量", "4 条"), ("占比", "100.0%")],
@@ -1596,10 +1688,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(chart._hover_card.isVisible())
         self.assertTrue(chart._hover_card.isWindow())
 
-        empty_bar = chart._bar_rects[-1]
+        has_phone_bar = chart._bar_rects[0]
         bar_local = QPoint(
-            int(empty_bar.center().x()),
-            int(empty_bar.center().y()),
+            int(has_phone_bar.center().x()),
+            int(has_phone_bar.center().y()),
         )
         bar_event = QMouseEvent(
             QEvent.MouseMove,
@@ -1611,7 +1703,7 @@ class ToolAndUiTests(unittest.TestCase):
         )
         chart.mouseMoveEvent(bar_event)
         self.assertIsNone(chart._hovered_slice)
-        self.assertEqual(chart._hover_card.title_text, "空")
+        self.assertEqual(chart._hover_card.title_text, "有公司名、有电话")
         self.assertEqual(
             chart._hover_card.details,
             [("数量", "4 条"), ("占比", "100.0%")],

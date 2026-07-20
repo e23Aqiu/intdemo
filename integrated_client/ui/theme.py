@@ -246,6 +246,21 @@ QLabel#MessageBoxText {
 QFrame#Card {
     padding: 8px;
 }
+QFrame#DashboardFilterGroup {
+    background: #f7f9fd;
+    border: 1px solid #dfe6f1;
+    border-radius: 8px;
+}
+QFrame#DashboardFilterGroup:hover {
+    background: #f3f7fd;
+    border-color: #c8d6e8;
+}
+QLabel#DashboardFilterLabel {
+    color: #526177;
+    background: transparent;
+    border: none;
+    font-weight: 700;
+}
 QFrame#SettingCard {
     background: #f7f9fd;
     border: 1px solid #dfe6f1;
@@ -689,15 +704,70 @@ QProgressBar::chunk {
     background: #38b779;
     border-radius: 5px;
 }
+QProgressBar#BrowserCheckProgress {
+    min-height: 7px;
+    max-height: 7px;
+    border: none;
+    border-radius: 3px;
+    background: #e3ebf7;
+}
+QProgressBar#BrowserCheckProgress::chunk {
+    border-radius: 3px;
+    background: #3478f6;
+}
+QScrollArea#PageScrollArea {
+    background: transparent;
+    border: none;
+}
+QScrollArea#PageScrollArea > QWidget > QWidget {
+    background: transparent;
+}
 QScrollBar:vertical {
-    background: #f1f4f8;
-    width: 10px;
-    margin: 0;
+    background: transparent;
+    width: 12px;
+    margin: 3px 2px;
 }
 QScrollBar::handle:vertical {
-    background: #bcc8d8;
-    border-radius: 5px;
-    min-height: 28px;
+    background: #b9c6d7;
+    border-radius: 4px;
+    min-height: 32px;
+}
+QScrollBar::handle:vertical:hover {
+    background: #91a5bf;
+}
+QScrollBar::handle:vertical:pressed {
+    background: #718aa9;
+}
+QScrollBar:horizontal {
+    background: transparent;
+    height: 12px;
+    margin: 2px 3px;
+}
+QScrollBar::handle:horizontal {
+    background: #b9c6d7;
+    border-radius: 4px;
+    min-width: 32px;
+}
+QScrollBar::handle:horizontal:hover {
+    background: #91a5bf;
+}
+QScrollBar::handle:horizontal:pressed {
+    background: #718aa9;
+}
+QScrollBar::add-line,
+QScrollBar::sub-line {
+    width: 0;
+    height: 0;
+    background: transparent;
+    border: none;
+}
+QScrollBar::add-page,
+QScrollBar::sub-page {
+    background: transparent;
+}
+QAbstractScrollArea::corner {
+    background: #f4f7fb;
+    border: none;
 }
 QWidget:disabled {
     color: #a3adba;

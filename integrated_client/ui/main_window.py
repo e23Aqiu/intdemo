@@ -1,12 +1,13 @@
 from dataclasses import replace
 
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
@@ -33,6 +34,7 @@ from .workflow_page import WorkflowPage
 class MainWindow(FramelessMainWindow):
     logout_requested = pyqtSignal()
     window_closed = pyqtSignal()
+    PAGE_CANVAS_SIZE = QSize(1220, 700)
 
     def __init__(self, database: Database, account: Account, parent=None):
         super().__init__(parent)
@@ -46,7 +48,7 @@ class MainWindow(FramelessMainWindow):
         self._pages = {}
 
         self.setWindowTitle(f"{APP_NAME} - {account.name_label}")
-        self.setMinimumSize(1280, 820)
+        self.setMinimumSize(800, 600)
         self.resize(1450, 920)
 
         root = QWidget()
@@ -65,7 +67,16 @@ class MainWindow(FramelessMainWindow):
         content_layout.addWidget(self._build_top_bar())
 
         self.stack = QStackedWidget()
-        content_layout.addWidget(self.stack, 1)
+        self.stack.setMinimumSize(self.PAGE_CANVAS_SIZE)
+        self.page_scroll_area = QScrollArea()
+        self.page_scroll_area.setObjectName("PageScrollArea")
+        self.page_scroll_area.setFrameShape(QFrame.NoFrame)
+        self.page_scroll_area.setWidgetResizable(True)
+        self.page_scroll_area.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.page_scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.page_scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.page_scroll_area.setWidget(self.stack)
+        content_layout.addWidget(self.page_scroll_area, 1)
         root_layout.addWidget(content, 1)
 
         warning = ""

@@ -298,7 +298,6 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         (WORKFLOW_INDIVIDUAL_METRIC, "个体经营", QColor("#8c6bd8")),
         (WORKFLOW_NO_OPERATION_METRIC, "无营运信息", QColor("#ed874c")),
         (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", QColor("#e35d6a")),
-        (WORKFLOW_EMPTY_METRIC, "空", QColor("#8a98aa")),
     )
 
     def __init__(self, parent=None):
@@ -1069,28 +1068,43 @@ class StatisticsPage(QWidget):
             )
             layout.addWidget(warning)
 
-        filter_card = QFrame()
-        filter_card.setObjectName("Card")
-        filter_layout = QHBoxLayout(filter_card)
-        filter_layout.setContentsMargins(16, 10, 16, 10)
-        filter_layout.addWidget(QLabel("站点"))
+        self.filter_card = QFrame()
+        self.filter_card.setObjectName("Card")
+        self.filter_layout = QHBoxLayout(self.filter_card)
+        self.filter_layout.setContentsMargins(12, 8, 12, 8)
+        self.filter_layout.setSpacing(10)
         self.station_combo = QComboBox()
         self.station_combo.setMinimumWidth(210)
-        filter_layout.addWidget(self.station_combo)
-        filter_layout.addSpacing(22)
-        filter_layout.addWidget(QLabel("数据分类"))
         self.category_combo = QComboBox()
         self.category_combo.setMinimumWidth(180)
         self.category_combo.addItem("各站分布", "station_distribution")
         self.category_combo.addItem("按完成类型", "completion")
         self.category_combo.addItem("按违规类型", "violation")
-        filter_layout.addWidget(self.category_combo)
-        filter_layout.addSpacing(22)
-        filter_layout.addWidget(QLabel("日期范围"))
         self.date_range_selector = DateRangeSelector()
-        filter_layout.addWidget(self.date_range_selector)
-        filter_layout.addStretch()
-        layout.addWidget(filter_card)
+        (
+            self.station_filter_group,
+            self.station_filter_label,
+        ) = self._create_filter_group("站点", self.station_combo)
+        (
+            self.category_filter_group,
+            self.category_filter_label,
+        ) = self._create_filter_group("数据分类", self.category_combo)
+        (
+            self.date_filter_group,
+            self.date_filter_label,
+        ) = self._create_filter_group(
+            "日期范围",
+            self.date_range_selector,
+        )
+        self.filter_layout.addWidget(self.station_filter_group)
+        self.filter_layout.addWidget(self.category_filter_group)
+        self.filter_layout.addWidget(self.date_filter_group)
+        self.filter_layout.addStretch(1)
+        self.filter_layout.activate()
+        self.filter_card.setMinimumWidth(
+            self.filter_layout.minimumSize().width()
+        )
+        layout.addWidget(self.filter_card)
 
         self._active_category = self.category_combo.currentData()
         self._station_before_distribution = None
@@ -1231,6 +1245,19 @@ class StatisticsPage(QWidget):
 
         layout.addWidget(self.detail_tabs, 1)
         self.refresh()
+
+    @staticmethod
+    def _create_filter_group(label, control):
+        group = QFrame()
+        group.setObjectName("DashboardFilterGroup")
+        group_layout = QHBoxLayout(group)
+        group_layout.setContentsMargins(10, 6, 10, 6)
+        group_layout.setSpacing(8)
+        label_widget = QLabel(label)
+        label_widget.setObjectName("DashboardFilterLabel")
+        group_layout.addWidget(label_widget)
+        group_layout.addWidget(control)
+        return group, label_widget
 
     def _populate_station_options(self):
         had_options = self.station_combo.count() > 0
@@ -1482,10 +1509,17 @@ class StatisticsPage(QWidget):
         box.addWidget(number)
         return card
 
-    def _add_kpis(self, values):
+    def _add_kpis(self, values, columns=4):
+        for column in range(max(columns, self.kpi_layout.columnCount())):
+            self.kpi_layout.setColumnStretch(
+                column,
+                1 if column < columns else 0,
+            )
         for index, (label, value, unit) in enumerate(values):
             self.kpi_layout.addWidget(
-                self._metric_card(label, value, unit), index // 4, index % 4
+                self._metric_card(label, value, unit),
+                index // columns,
+                index % columns,
             )
 
     def _finish_summary_table(self, scope, detail, stretch_columns=(0,)):
@@ -1506,6 +1540,7 @@ class StatisticsPage(QWidget):
     def _ordered_completion_metrics(metrics):
         """总计保持在首位，其余完成类型与图表使用同一反向顺序。"""
         metrics_by_key = {metric["metric_key"]: metric for metric in metrics}
+        metrics_by_key.pop(WORKFLOW_EMPTY_METRIC, None)
         ordered_keys = [WORKFLOW_TOTAL_METRIC]
         ordered_keys.extend(
             metric_key for metric_key, _, _ in WorkflowDistributionChart.SEGMENTS
@@ -1593,7 +1628,8 @@ class StatisticsPage(QWidget):
                     metric["unit"],
                 )
                 for metric in metrics
-            ]
+            ],
+            columns=3,
         )
         self.distribution_chart.set_values(totals_by_metric, scope)
         self.summary_table.setColumnCount(3)

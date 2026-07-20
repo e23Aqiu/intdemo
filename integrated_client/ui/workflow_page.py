@@ -191,7 +191,14 @@ class CollapsiblePanel(QFrame):
 class WorkflowPage(QWidget):
     """统一编排运输证、营运回填、爱企查查询的三步流水线。"""
 
+    browser_check_completed = pyqtSignal(bool, str, str)
     REQUIRED_COLUMNS = ("车辆标识", "已协助补缴")
+    BROWSER_CHECK_ANIMATION_FRAMES = (
+        "正在检测内置浏览器",
+        "正在检测内置浏览器 ·",
+        "正在检测内置浏览器 ··",
+        "正在检测内置浏览器 ···",
+    )
 
     def __init__(self, stats_recorder=None, parent=None):
         super().__init__(parent)
@@ -211,6 +218,7 @@ class WorkflowPage(QWidget):
         self.browser_check_worker = None
         self.browser_check_state = "unchecked"
         self._settings_browser_check_requested = False
+        self._browser_start_dialog = None
 
         self._build_ui()
         self._sync_mode_controls()
@@ -533,6 +541,7 @@ class WorkflowPage(QWidget):
             self.browser_status_label.setStyleSheet("color:#d33f49;font-weight:600;")
             self.browser_detail_label.setText(details)
         self.browser_check_btn.setEnabled(not self.pipeline_running)
+        self.browser_check_completed.emit(success, summary, details)
 
     def _browser_check_worker_finished(self, worker):
         if self.browser_check_worker is worker:
@@ -644,21 +653,85 @@ class WorkflowPage(QWidget):
         if not running:
             self.continue_btn.setEnabled(False)
 
+    @staticmethod
+    def _browser_start_result_allows_pipeline(result):
+        return result in (QMessageBox.Ok, QMessageBox.Ignore)
+
+    def _run_browser_start_check_dialog(self):
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("启动前浏览器检测")
+        dialog.setText("正在检测内置浏览器")
+        dialog.setInformativeText(
+            "正在实际启动内置 Chromium。检测成功后将自动开始业务处理。"
+        )
+        dialog.setIcon(QMessageBox.Information)
+        dialog.setStandardButtons(QMessageBox.Ignore | QMessageBox.Cancel)
+        progress = QProgressBar(dialog)
+        progress.setObjectName("BrowserCheckProgress")
+        progress.setRange(0, 0)
+        progress.setTextVisible(False)
+        progress.setFixedHeight(7)
+        dialog.layout().insertWidget(dialog.layout().count() - 1, progress)
+
+        animation_frames = self.BROWSER_CHECK_ANIMATION_FRAMES
+        animation_state = {"index": 0}
+        animation_timer = QTimer(dialog)
+        animation_timer.setObjectName("BrowserCheckAnimationTimer")
+
+        def advance_animation():
+            animation_state["index"] = (
+                animation_state["index"] + 1
+            ) % len(animation_frames)
+            dialog.setText(animation_frames[animation_state["index"]])
+
+        animation_timer.timeout.connect(advance_animation)
+        animation_timer.start(320)
+
+        direct_start_btn = dialog.button(QMessageBox.Ignore)
+        direct_start_btn.setText("直接开始")
+        direct_start_btn.setObjectName("PrimaryButton")
+        cancel_btn = dialog.button(QMessageBox.Cancel)
+        dialog.button_layout.removeWidget(direct_start_btn)
+        dialog.button_layout.addWidget(direct_start_btn)
+        dialog.setDefaultButton(cancel_btn)
+        self._browser_start_dialog = dialog
+
+        def browser_check_completed(success, summary, details):
+            if self._browser_start_dialog is not dialog:
+                return
+            animation_timer.stop()
+            progress.hide()
+            if success:
+                dialog.setText("浏览器检测完成")
+                dialog.setInformativeText(
+                    f"{summary} 运行正常，正在自动开始业务处理。"
+                )
+                dialog.done(QMessageBox.Ok)
+                return
+            dialog.setIcon(QMessageBox.Warning)
+            dialog.setText("浏览器检测失败")
+            dialog.setInformativeText(
+                f"{details}\n\n你可以取消本次启动，或跳过检测直接开始。"
+            )
+
+        self.browser_check_completed.connect(browser_check_completed)
+        self.check_browser()
+        if self.browser_check_state == "ready":
+            result = QMessageBox.Ok
+        else:
+            result = dialog.exec_()
+        animation_timer.stop()
+        try:
+            self.browser_check_completed.disconnect(browser_check_completed)
+        except TypeError:
+            pass
+        if self._browser_start_dialog is dialog:
+            self._browser_start_dialog = None
+        dialog.deleteLater()
+        return self._browser_start_result_allows_pipeline(result)
+
     def start_pipeline(self):
         if self.pipeline_running:
-            return
-        if self.browser_check_state == "checking":
-            QMessageBox.information(self, "浏览器检测中", "正在检测内置浏览器，请稍候再开始。")
-            return
-        if self.browser_check_state != "ready":
-            self.page_tabs.setCurrentWidget(self.settings_tab)
-            self.check_browser()
-            QMessageBox.warning(
-                self,
-                "请先检测浏览器",
-                "开始业务处理前需要确认内置 Chromium 可以正常启动。\n"
-                "检测完成后请重新点击开始。",
-            )
             return
         if not self.file_path or not os.path.exists(self.file_path):
             QMessageBox.warning(self, "缺少表格", "请先选择业务表格。")
@@ -666,16 +739,21 @@ class WorkflowPage(QWidget):
         if is_excel_file_open(self.file_path):
             QMessageBox.warning(self, "表格被占用", "请先关闭 Excel/WPS 中打开的业务表格。")
             return
-        try:
-            get_builtin_chromium_path()
-        except RuntimeError as exc:
-            QMessageBox.warning(self, "内置浏览器不可用", str(exc))
-            return
         if not self._reload_preview(force=True):
             return
         missing = [name for name in self.REQUIRED_COLUMNS if name not in self.df.columns]
         if missing:
             QMessageBox.warning(self, "表格列不完整", f"业务表格缺少：{', '.join(missing)}")
+            return
+        if (
+            self.browser_check_state != "ready"
+            and not self._run_browser_start_check_dialog()
+        ):
+            return
+        try:
+            get_builtin_chromium_path()
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "内置浏览器不可用", str(exc))
             return
 
         self.log_text.clear()
