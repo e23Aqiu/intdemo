@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
+from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication,
     QFrame,
@@ -27,7 +28,7 @@ from .frameless import (
 )
 from .personal_center_page import PersonalCenterPage
 from .statistics_page import StatisticsPage
-from .theme import install_disabled_cursor_filter
+from .theme import _control_asset_path, install_disabled_cursor_filter
 from .workflow_page import WorkflowPage
 
 
@@ -118,40 +119,95 @@ class MainWindow(FramelessMainWindow):
         sidebar = QFrame()
         sidebar.setObjectName("Sidebar")
         sidebar.setFixedWidth(230)
+        self.sidebar = sidebar
         layout = QVBoxLayout(sidebar)
-        layout.setContentsMargins(18, 24, 18, 18)
-        layout.setSpacing(7)
+        layout.setContentsMargins(16, 22, 16, 16)
+        layout.setSpacing(8)
 
+        brand_row = QHBoxLayout()
+        brand_row.setContentsMargins(2, 0, 2, 0)
+        brand_row.setSpacing(11)
+        self.sidebar_brand_badge = QLabel("运")
+        self.sidebar_brand_badge.setObjectName("BrandBadge")
+        self.sidebar_brand_badge.setAlignment(Qt.AlignCenter)
+        self.sidebar_brand_badge.setFixedSize(44, 44)
+        brand_row.addWidget(self.sidebar_brand_badge)
+
+        brand_text = QVBoxLayout()
+        brand_text.setContentsMargins(0, 0, 0, 0)
+        brand_text.setSpacing(1)
         brand = QLabel("运输业务平台")
         brand.setObjectName("BrandTitle")
-        sub = QLabel(f"一体化客户端  v{APP_VERSION}")
+        sub = QLabel(f"INTDEMO  ·  v{APP_VERSION}")
         sub.setObjectName("BrandSubTitle")
-        layout.addWidget(brand)
-        layout.addWidget(sub)
-        layout.addSpacing(24)
+        brand_text.addWidget(brand)
+        brand_text.addWidget(sub)
+        brand_row.addLayout(brand_text, 1)
+        layout.addLayout(brand_row)
+        layout.addSpacing(25)
+
+        nav_label = QLabel("工作导航")
+        nav_label.setObjectName("SidebarSectionLabel")
+        layout.addWidget(nav_label)
+        layout.addSpacing(2)
 
         nav_items = [
-            ("home", "▦  数据仪表盘"),
-            ("workflow", "▣  一键业务处理"),
+            ("home", "数据仪表盘", "nav-dashboard.svg"),
+            ("workflow", "一键业务处理", "nav-workflow.svg"),
         ]
         if self.account.is_admin:
-            nav_items.append(("accounts", "♙  账号管理"))
-        nav_items.append(("personal", "●  个人中心"))
+            nav_items.append(("accounts", "账号管理", "nav-accounts.svg"))
+        nav_items.append(("personal", "个人中心", "nav-user.svg"))
 
-        for key, text in nav_items:
+        for key, text, icon_name in nav_items:
             button = QPushButton(text)
             button.setObjectName("NavButton")
             button.setCheckable(True)
+            button.setIcon(QIcon(_control_asset_path(icon_name)))
+            button.setIconSize(QSize(19, 19))
+            button.setMinimumHeight(46)
             button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
             button.clicked.connect(lambda checked=False, page_key=key: self.show_page(page_key))
             self._nav_buttons[key] = button
             layout.addWidget(button)
 
         layout.addStretch()
+
+        status = QLabel("●  本地数据已连接")
+        status.setObjectName("SidebarStatus")
+        layout.addWidget(status)
+
+        profile = QFrame()
+        profile.setObjectName("SidebarProfile")
+        profile_layout = QHBoxLayout(profile)
+        profile_layout.setContentsMargins(11, 10, 11, 10)
+        profile_layout.setSpacing(10)
+        self.sidebar_avatar = QLabel(self._sidebar_avatar_text(self.account.name_label))
+        self.sidebar_avatar.setObjectName("SidebarAvatar")
+        self.sidebar_avatar.setAlignment(Qt.AlignCenter)
+        self.sidebar_avatar.setFixedSize(36, 36)
+        profile_layout.addWidget(self.sidebar_avatar)
+
+        identity_layout = QVBoxLayout()
+        identity_layout.setContentsMargins(0, 0, 0, 0)
+        identity_layout.setSpacing(1)
         self.sidebar_user = QLabel(self.account.name_label)
         self.sidebar_user.setObjectName("SidebarUser")
-        layout.addWidget(self.sidebar_user)
+        self.sidebar_user.setToolTip(self.account.name_label)
+        self.sidebar_role = QLabel(
+            f"{self.account.role_label}  ·  {self.account.username}"
+        )
+        self.sidebar_role.setObjectName("SidebarRole")
+        identity_layout.addWidget(self.sidebar_user)
+        identity_layout.addWidget(self.sidebar_role)
+        profile_layout.addLayout(identity_layout, 1)
+        layout.addWidget(profile)
         return sidebar
+
+    @staticmethod
+    def _sidebar_avatar_text(name):
+        text = str(name or "").strip()
+        return text[:1].upper() if text else "用"
 
     def _build_top_bar(self):
         bar = QFrame()
@@ -160,15 +216,9 @@ class MainWindow(FramelessMainWindow):
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(22, 10, 22, 10)
         self.page_title = QLabel("工作台")
-        self.page_title.setStyleSheet("font-size:16px;font-weight:700;color:#17233c;")
+        self.page_title.setStyleSheet("font-size:16px;font-weight:700;color:#173a3d;")
         layout.addWidget(self.page_title)
         layout.addStretch()
-        self.top_identity = QLabel(
-            f"{self.account.role_label} · {self.account.name_label}"
-        )
-        self.top_identity.setObjectName("Muted")
-        layout.addWidget(self.top_identity)
-        layout.addSpacing(8)
         self.window_controls = WindowControls(self, bar)
         layout.addWidget(self.window_controls)
         self.register_window_drag_region(bar)
@@ -189,8 +239,9 @@ class MainWindow(FramelessMainWindow):
         if self.account_page is not None:
             self.account_page.current_account = self.account
         self.sidebar_user.setText(self.account.name_label)
-        self.top_identity.setText(
-            f"{self.account.role_label} · {self.account.name_label}"
+        self.sidebar_user.setToolTip(self.account.name_label)
+        self.sidebar_avatar.setText(
+            self._sidebar_avatar_text(self.account.name_label)
         )
         self.setWindowTitle(f"{APP_NAME} - {self.account.name_label}")
 

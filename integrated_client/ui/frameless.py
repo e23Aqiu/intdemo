@@ -11,7 +11,7 @@ import sys
 from ctypes import wintypes
 
 from PyQt5.QtCore import QEvent, QPoint, QRect, Qt
-from PyQt5.QtGui import QCursor
+from PyQt5.QtGui import QColor, QCursor, QFont, QPainter, QPixmap
 from PyQt5.QtWidgets import (
     QAbstractButton,
     QAbstractSpinBox,
@@ -26,7 +26,6 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollBar,
     QSlider,
-    QStyle,
     QTabBar,
     QVBoxLayout,
     QWidget,
@@ -512,11 +511,11 @@ class FramelessMessageBox(FramelessDialog):
         Ignore: "忽略",
     }
     BUTTON_ORDER = (Ok, Save, Discard, Yes, No, Retry, Ignore, Cancel, Close)
-    ICONS = {
-        Information: QStyle.SP_MessageBoxInformation,
-        Warning: QStyle.SP_MessageBoxWarning,
-        Critical: QStyle.SP_MessageBoxCritical,
-        Question: QStyle.SP_MessageBoxQuestion,
+    ICON_STYLES = {
+        Information: ("i", "#1d8178"),
+        Warning: ("!", "#d18400"),
+        Critical: ("!", "#d9534f"),
+        Question: ("?", "#1d8178"),
     }
 
     def __init__(self, parent=None):
@@ -589,12 +588,23 @@ class FramelessMessageBox(FramelessDialog):
         return self.message_label.text()
 
     def setIcon(self, icon):
-        standard_pixmap = self.ICONS.get(icon)
-        if standard_pixmap is None:
+        icon_style = self.ICON_STYLES.get(icon)
+        if icon_style is None:
             self.icon_label.clear()
             self.icon_label.hide()
             return
-        pixmap = self.style().standardIcon(standard_pixmap).pixmap(32, 32)
+        glyph, background = icon_style
+        pixmap = QPixmap(32, 32)
+        pixmap.fill(Qt.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(background))
+        painter.drawEllipse(1, 1, 30, 30)
+        painter.setPen(QColor("#ffffff"))
+        painter.setFont(QFont("Segoe UI", 17, QFont.Bold))
+        painter.drawText(pixmap.rect(), Qt.AlignCenter, glyph)
+        painter.end()
         self.icon_label.setPixmap(pixmap)
         self.icon_label.show()
 

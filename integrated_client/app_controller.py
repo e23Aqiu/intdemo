@@ -12,7 +12,7 @@ class ApplicationController(QObject):
         self.application = application
         self.database = database
         self.window = None
-        self._bootstrap_created = self.database.ensure_default_admin()
+        self.database.ensure_default_admin()
         self.database.ensure_default_station_users()
         self._logging_out = False
 
@@ -20,11 +20,7 @@ class ApplicationController(QObject):
         QTimer.singleShot(0, self._show_login)
 
     def _show_login(self):
-        dialog = LoginDialog(
-            self.database,
-            bootstrap_created=self._bootstrap_created,
-        )
-        self._bootstrap_created = False
+        dialog = LoginDialog(self.database)
         if dialog.exec_() != QDialog.Accepted:
             self.application.quit()
             return

@@ -67,8 +67,8 @@ class CalendarHoverDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setRenderHint(QPainter.Antialiasing, True)
-        painter.setPen(QPen(QColor("#b8d0fb"), 1))
-        painter.setBrush(QColor(52, 120, 246, 34))
+        painter.setPen(QPen(QColor("#9fd7cc"), 1))
+        painter.setBrush(QColor(29, 129, 120, 34))
         painter.drawRoundedRect(option.rect.adjusted(3, 3, -3, -3), 6, 6)
         painter.restore()
 
@@ -213,12 +213,12 @@ class DateRangeSelector(QWidget):
         layout.addWidget(self.all_dates_panel)
 
         self.setStyleSheet(
-            "QFrame#DateRangeSeparator{background:#d8e1ed;border:none;}"
-            "QFrame#AllDatesPanel{background:#edf4ff;border:1px solid #cfe0ff;"
+            "QFrame#DateRangeSeparator{background:#d4e4e0;border:none;}"
+            "QFrame#AllDatesPanel{background:#e7f6f2;border:1px solid #bfe1d9;"
             "border-radius:7px;}"
             "QFrame#AllDatesPanel:disabled{background:#f3f5f8;"
             "border-color:#e4e9f0;}"
-            "QCheckBox#AllDatesCheck{color:#1c5ed6;font-weight:600;}"
+            "QCheckBox#AllDatesCheck{color:#176f68;font-weight:600;}"
             "QCheckBox#AllDatesCheck:disabled{color:#a3adba;}"
         )
 
@@ -268,13 +268,13 @@ class DateRangeSelector(QWidget):
 
         palette = calendar.palette()
         palette.setColor(QPalette.Base, QColor("#ffffff"))
-        palette.setColor(QPalette.Text, QColor("#243047"))
-        palette.setColor(QPalette.Highlight, QColor("#3478f6"))
+        palette.setColor(QPalette.Text, QColor("#173a3d"))
+        palette.setColor(QPalette.Highlight, QColor("#1d8178"))
         palette.setColor(QPalette.HighlightedText, QColor("#ffffff"))
         calendar.setPalette(palette)
 
         weekday_format = QTextCharFormat()
-        weekday_format.setForeground(QColor("#243047"))
+        weekday_format.setForeground(QColor("#173a3d"))
         weekend_format = QTextCharFormat()
         weekend_format.setForeground(QColor("#e45454"))
         for weekday in (

@@ -293,11 +293,11 @@ class WorkflowDistributionChart(AnimatedDonutChart):
     """不依赖额外图表库的完整流程结果环形图。"""
 
     SEGMENTS = (
-        (WORKFLOW_HAS_PHONE_METRIC, "有公司名、有电话", QColor("#31ad76")),
-        (WORKFLOW_NO_PHONE_METRIC, "有公司名、无电话", QColor("#e1b13d")),
-        (WORKFLOW_INDIVIDUAL_METRIC, "个体经营", QColor("#8c6bd8")),
-        (WORKFLOW_NO_OPERATION_METRIC, "无营运信息", QColor("#ed874c")),
-        (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", QColor("#e35d6a")),
+        (WORKFLOW_HAS_PHONE_METRIC, "有公司名、有电话", QColor("#1d9a84")),
+        (WORKFLOW_NO_PHONE_METRIC, "有公司名、无电话", QColor("#e2a64a")),
+        (WORKFLOW_INDIVIDUAL_METRIC, "个体经营", QColor("#6f8f89")),
+        (WORKFLOW_NO_OPERATION_METRIC, "无营运信息", QColor("#df8b55")),
+        (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", QColor("#d86464")),
     )
 
     def __init__(self, parent=None):
@@ -318,14 +318,14 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        painter.setPen(QPen(QColor("#e4eaf2"), 1))
+        painter.setPen(QPen(QColor("#d8e7e3"), 1))
         painter.setBrush(QColor("#ffffff"))
         painter.drawRoundedRect(bounds, 10, 10)
 
-        painter.setPen(QColor("#17233c"))
+        painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
         painter.drawText(20, 29, "完整流程结果分布")
-        painter.setPen(QColor("#708096"))
+        painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
         painter.drawText(160, 29, self._scope)
 
@@ -378,10 +378,10 @@ class WorkflowDistributionChart(AnimatedDonutChart):
             painter.setBrush(QColor("#ffffff"))
             painter.drawEllipse(inner)
         total = self._values.get(WORKFLOW_TOTAL_METRIC, classified_total)
-        painter.setPen(QColor("#17233c"))
+        painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 18, QFont.Bold))
         painter.drawText(inner, Qt.AlignCenter, str(total))
-        painter.setPen(QColor("#708096"))
+        painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 8))
         painter.drawText(
             QRectF(inner.left(), inner.center().y() + 17, inner.width(), 20),
@@ -397,11 +397,11 @@ class WorkflowDistributionChart(AnimatedDonutChart):
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(QRectF(legend_left, top + 2, 10, 10), 3, 3)
-            painter.setPen(QColor("#526177"))
+            painter.setPen(QColor("#526e6d"))
             painter.setFont(QFont("Microsoft YaHei UI", 9))
             painter.drawText(int(legend_left + 18), int(top + 12), label)
             percent = value / classified_total * 100 if classified_total else 0
-            painter.setPen(QColor("#17233c"))
+            painter.setPen(QColor("#173a3d"))
             painter.setFont(QFont("Microsoft YaHei UI", 10, QFont.Bold))
             painter.drawText(
                 QRectF(legend_left, top - 3, legend_width, 20),
@@ -413,7 +413,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
             )
             self._bar_rects.append(QRectF(bar_rect))
             painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#edf1f6"))
+            painter.setBrush(QColor("#e8f1ef"))
             painter.drawRoundedRect(bar_rect, 5, 5)
             if classified_total and value:
                 value_rect = QRectF(bar_rect)
@@ -476,19 +476,19 @@ class ViolationReasonChart(AnimatedDonutChart):
 
     BAR_ROW_HEIGHT = 33
     COLORS = (
-        QColor("#3478f6"),
-        QColor("#31ad76"),
-        QColor("#e1b13d"),
-        QColor("#e35d6a"),
-        QColor("#8c6bd8"),
-        QColor("#ed874c"),
-        QColor("#28a7a1"),
+        QColor("#1d8178"),
+        QColor("#1d9a84"),
+        QColor("#e2a64a"),
+        QColor("#d86464"),
+        QColor("#6f8f89"),
+        QColor("#df8b55"),
+        QColor("#4a9c91"),
         QColor("#7f93ad"),
         QColor("#c765a7"),
         QColor("#65a84f"),
     )
-    PHONE_COLOR = QColor("#16a66a")
-    OTHER_COLOR = QColor("#f28c28")
+    PHONE_COLOR = QColor("#1d9a84")
+    OTHER_COLOR = QColor("#df8b55")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -550,14 +550,14 @@ class ViolationReasonChart(AnimatedDonutChart):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        painter.setPen(QPen(QColor("#e4eaf2"), 1))
+        painter.setPen(QPen(QColor("#d8e7e3"), 1))
         painter.setBrush(QColor("#ffffff"))
         painter.drawRoundedRect(bounds, 10, 10)
 
-        painter.setPen(QColor("#17233c"))
+        painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
         painter.drawText(20, 29, "违规原因分布")
-        painter.setPen(QColor("#708096"))
+        painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
         painter.drawText(130, 29, self._scope)
 
@@ -566,15 +566,15 @@ class ViolationReasonChart(AnimatedDonutChart):
             painter.setPen(Qt.NoPen)
             painter.setBrush(self.PHONE_COLOR)
             painter.drawRoundedRect(QRectF(legend_x, 19, 9, 9), 3, 3)
-            painter.setPen(QColor("#708096"))
+            painter.setPen(QColor("#647c7b"))
             painter.drawText(legend_x + 14, 29, "有电话")
             painter.setPen(Qt.NoPen)
             painter.setBrush(self.OTHER_COLOR)
             painter.drawRoundedRect(QRectF(legend_x + 82, 19, 9, 9), 3, 3)
-            painter.setPen(QColor("#708096"))
+            painter.setPen(QColor("#647c7b"))
             painter.drawText(legend_x + 96, 29, "其他数据")
         else:
-            painter.setPen(QColor("#708096"))
+            painter.setPen(QColor("#647c7b"))
             painter.drawText(
                 QRectF(legend_x, 14, 186, 20),
                 Qt.AlignRight | Qt.AlignVCenter,
@@ -620,10 +620,10 @@ class ViolationReasonChart(AnimatedDonutChart):
                     slice_index,
                 )
             start_degrees += span_degrees
-        painter.setPen(QColor("#17233c"))
+        painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 18, QFont.Bold))
         painter.drawText(inner, Qt.AlignCenter, str(total))
-        painter.setPen(QColor("#708096"))
+        painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 8))
         painter.drawText(
             QRectF(inner.left(), inner.center().y() + 17, inner.width(), 20),
@@ -650,10 +650,10 @@ class ViolationReasonChart(AnimatedDonutChart):
                 str(row["reason"]), Qt.ElideRight, label_width - 24
             )
             label_rect = QRectF(legend_left + 18, row_top, label_width - 18, 16)
-            painter.setPen(QColor("#526177"))
+            painter.setPen(QColor("#526e6d"))
             painter.drawText(label_rect, Qt.AlignVCenter, reason)
 
-            painter.setPen(QColor("#17233c"))
+            painter.setPen(QColor("#173a3d"))
             painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
             painter.drawText(
                 QRectF(legend_left, row_top, legend_width, 16),
@@ -683,7 +683,7 @@ class ViolationReasonChart(AnimatedDonutChart):
                 painter.restore()
                 self._draw_flow_highlight(painter, bar_path, bar_rect)
             else:
-                painter.setBrush(QColor("#edf1f6"))
+                painter.setBrush(QColor("#e8f1ef"))
                 painter.drawPath(bar_path)
                 if int(row["total"]):
                     value_rect = QRectF(bar_rect)
@@ -750,16 +750,16 @@ class ViolationReasonChart(AnimatedDonutChart):
 class StationDistributionChart(AnimatedDonutChart):
     """用双环形图对比各站总计数与有电话数在全部站点中的占比。"""
 
-    TOTAL_COLOR = QColor("#3478f6")
-    PHONE_COLOR = QColor("#20a66a")
+    TOTAL_COLOR = QColor("#1d8178")
+    PHONE_COLOR = QColor("#f0a45d")
     COLORS = (
-        QColor("#3478f6"),
-        QColor("#20a66a"),
-        QColor("#e1a928"),
-        QColor("#e35d6a"),
-        QColor("#8c6bd8"),
-        QColor("#ed874c"),
-        QColor("#28a7a1"),
+        QColor("#1d8178"),
+        QColor("#f0a45d"),
+        QColor("#d2a441"),
+        QColor("#d86464"),
+        QColor("#6f8f89"),
+        QColor("#df8b55"),
+        QColor("#4a9c91"),
     )
 
     def __init__(self, parent=None):
@@ -794,7 +794,7 @@ class StationDistributionChart(AnimatedDonutChart):
             -outer.height() * 0.28,
         )
         total = sum(int(row[value_key]) for row in self._rows)
-        painter.setPen(QColor("#526177"))
+        painter.setPen(QColor("#526e6d"))
         painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
         painter.drawText(
             QRectF(outer.left(), outer.top() - 27, outer.width(), 20),
@@ -842,14 +842,14 @@ class StationDistributionChart(AnimatedDonutChart):
             painter.setBrush(QColor("#ffffff"))
             painter.drawEllipse(inner)
 
-        painter.setPen(QColor("#17233c"))
+        painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 17, QFont.Bold))
         painter.drawText(
             QRectF(inner.left(), inner.top() - 5, inner.width(), inner.height()),
             Qt.AlignCenter,
             str(total),
         )
-        painter.setPen(QColor("#708096"))
+        painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 8))
         painter.drawText(
             QRectF(inner.left(), inner.center().y() + 14, inner.width(), 18),
@@ -863,14 +863,14 @@ class StationDistributionChart(AnimatedDonutChart):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
-        painter.setPen(QPen(QColor("#e4eaf2"), 1))
+        painter.setPen(QPen(QColor("#d8e7e3"), 1))
         painter.setBrush(QColor("#ffffff"))
         painter.drawRoundedRect(bounds, 10, 10)
 
-        painter.setPen(QColor("#17233c"))
+        painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
         painter.drawText(20, 29, "各站业务分布")
-        painter.setPen(QColor("#708096"))
+        painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
         painter.drawText(130, 29, "占全部站点对应数据的比例")
 
@@ -942,7 +942,7 @@ class StationDistributionChart(AnimatedDonutChart):
             self._legend_hitboxes.append((hitbox, dict(row)))
             if index % 2:
                 painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor("#f7f9fd"))
+                painter.setBrush(QColor("#f5f8f7"))
                 painter.drawRoundedRect(hitbox, 6, 6)
 
             color = self.COLORS[index % len(self.COLORS)]
@@ -953,7 +953,7 @@ class StationDistributionChart(AnimatedDonutChart):
                 3,
                 3,
             )
-            painter.setPen(QColor("#526177"))
+            painter.setPen(QColor("#526e6d"))
             station = painter.fontMetrics().elidedText(
                 str(row["station"]), Qt.ElideRight, label_width
             )
@@ -1049,6 +1049,15 @@ class StatisticsPage(QWidget):
         title_box.addWidget(subtitle)
         header.addLayout(title_box)
         header.addStretch()
+        self._showing_anomalies = False
+        if account.is_admin:
+            self.anomaly_button = QPushButton("异常数据（0）")
+            self.anomaly_button.setObjectName("AnomalyButton")
+            self.anomaly_button.setCheckable(True)
+            self.anomaly_button.setToolTip("查看空单元格异常的数量和来源站点")
+            self.anomaly_button.clicked.connect(self._toggle_anomaly_view)
+            self.anomaly_button.hide()
+            header.addWidget(self.anomaly_button)
         self.export_btn = QPushButton("导出 Excel")
         self.export_btn.setObjectName("PrimaryButton")
         self.export_btn.setToolTip("按当前站点、数据分类和日期范围导出表格数据")
@@ -1150,27 +1159,27 @@ class StatisticsPage(QWidget):
         data_header.setStyleSheet(
             """
             QFrame#DataSummaryHeader {
-                background: #f7f9fd;
-                border: 1px solid #e2e8f2;
+                background: #f5f8f7;
+                border: 1px solid #d8e7e3;
                 border-radius: 10px;
             }
             QLabel#DataTitle {
-                color: #17233c;
+                color: #173a3d;
                 font-size: 16px;
                 font-weight: 700;
                 border: none;
                 background: transparent;
             }
             QLabel#DataDescription {
-                color: #718096;
+                color: #647c7b;
                 font-size: 12px;
                 border: none;
                 background: transparent;
             }
             QLabel#DataCountBadge {
-                color: #1c5ed6;
-                background: #edf4ff;
-                border: 1px solid #cfe0ff;
+                color: #176f68;
+                background: #e7f6f2;
+                border: 1px solid #bfe1d9;
                 border-radius: 12px;
                 padding: 4px 11px;
                 font-weight: 700;
@@ -1214,29 +1223,29 @@ class StatisticsPage(QWidget):
             """
             QTableWidget {
                 background: #ffffff;
-                alternate-background-color: #f8faff;
-                border: 1px solid #e1e7f0;
+                alternate-background-color: #f7faf9;
+                border: 1px solid #d8e7e3;
                 border-radius: 10px;
-                color: #26344d;
-                selection-background-color: #e8f1ff;
-                selection-color: #173b73;
+                color: #264b4c;
+                selection-background-color: #e1f2ee;
+                selection-color: #145f58;
             }
             QTableWidget::item {
-                border-bottom: 1px solid #edf1f6;
+                border-bottom: 1px solid #e8f1ef;
                 padding: 7px 10px;
             }
             QHeaderView::section {
-                background: #f2f5fa;
-                color: #53627a;
+                background: #eef5f3;
+                color: #536e6c;
                 border: none;
-                border-bottom: 1px solid #dde4ee;
+                border-bottom: 1px solid #d8e7e3;
                 padding: 8px 10px;
                 font-weight: 700;
             }
             QTableCornerButton::section {
-                background: #f2f5fa;
+                background: #eef5f3;
                 border: none;
-                border-bottom: 1px solid #dde4ee;
+                border-bottom: 1px solid #d8e7e3;
             }
             """
         )
@@ -1312,7 +1321,11 @@ class StatisticsPage(QWidget):
     def _save_dashboard_excel(self, file_path):
         """Export the currently displayed dashboard table to one workbook."""
         station_name = self.station_combo.currentText() or "全部站点"
-        category_name = self.category_combo.currentText()
+        category_name = (
+            "异常数据"
+            if self._showing_anomalies
+            else self.category_combo.currentText()
+        )
         range_label = self.date_range_selector.range_label()
         table_headers = [
             self.summary_table.horizontalHeaderItem(column).text()
@@ -1471,6 +1484,11 @@ class StatisticsPage(QWidget):
 
     def _on_category_changed(self, _index):
         category = self.category_combo.currentData()
+        if category != "completion":
+            self._showing_anomalies = False
+            anomaly_button = getattr(self, "anomaly_button", None)
+            if anomaly_button is not None:
+                anomaly_button.setChecked(False)
         if category == "station_distribution" and self._active_category != category:
             self._station_before_distribution = self.station_combo.currentData()
             self._has_saved_station_before_distribution = True
@@ -1488,6 +1506,16 @@ class StatisticsPage(QWidget):
             self._has_saved_station_before_distribution = False
         self._active_category = category
         self.refresh()
+
+    def _toggle_anomaly_view(self, checked):
+        if not self.account.is_admin:
+            return
+        self._showing_anomalies = bool(checked)
+        if self._showing_anomalies:
+            self.detail_tabs.setCurrentWidget(self.data_tab)
+        self.refresh()
+        if not self._showing_anomalies:
+            self.detail_tabs.setCurrentWidget(self.chart_tab)
 
     def _clear_kpis(self):
         while self.kpi_layout.count():
@@ -1593,6 +1621,93 @@ class StatisticsPage(QWidget):
             )
         return rows
 
+    def _get_anomaly_rows(self, user_id=None):
+        """Return empty-cell anomaly totals grouped by ordinary user station."""
+        default_order = {
+            username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
+        }
+        stations = {}
+        start_date, end_date = self._date_range()
+        for row in self.database.get_all_account_totals(start_date, end_date):
+            if row["role"] != "user":
+                continue
+            if user_id is not None and row["user_id"] != user_id:
+                continue
+            station = stations.setdefault(
+                row["user_id"],
+                {
+                    "user_id": row["user_id"],
+                    "station": row["display_name"] or row["username"],
+                    "username": row["username"],
+                    "total": 0,
+                    "empty": 0,
+                },
+            )
+            if row["metric_key"] == WORKFLOW_TOTAL_METRIC:
+                station["total"] = int(row["total"])
+            elif row["metric_key"] == WORKFLOW_EMPTY_METRIC:
+                station["empty"] = int(row["total"])
+
+        rows = [row for row in stations.values() if row["empty"] > 0]
+        rows.sort(
+            key=lambda row: (
+                default_order.get(row["username"], 999),
+                row["station"],
+            )
+        )
+        for row in rows:
+            row["empty_rate"] = (
+                row["empty"] / row["total"] * 100 if row["total"] else 0
+            )
+        return rows
+
+    def _render_anomalies(self, user_id, scope, rows=None):
+        rows = self._get_anomaly_rows(user_id) if rows is None else rows
+        self.distribution_chart.hide()
+        self.violation_chart.hide()
+        self.station_distribution_chart.hide()
+        self.detail_tabs.setTabEnabled(0, False)
+        self.detail_tabs.setCurrentWidget(self.data_tab)
+        self.data_title.setText("异常数据")
+
+        anomaly_total = sum(row["empty"] for row in rows)
+        workflow_total = sum(row["total"] for row in rows)
+        anomaly_rate = anomaly_total / workflow_total * 100 if workflow_total else 0
+        self._add_kpis(
+            [
+                ("空单元格异常", anomaly_total, "条"),
+                ("涉及站点", len(rows), "个"),
+                ("涉及站点总数据", workflow_total, "条"),
+                ("异常占比", f"{anomaly_rate:.1f}", "%"),
+            ]
+        )
+
+        headers = ["用户（站）", "登录账号", "异常条数", "本站总计数", "异常占比"]
+        self.summary_table.setColumnCount(len(headers))
+        self.summary_table.setHorizontalHeaderLabels(headers)
+        self.summary_table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [
+                row["station"],
+                row["username"],
+                row["empty"],
+                row["total"],
+                f'{row["empty_rate"]:.1f}%',
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column >= 2:
+                    item.setTextAlignment(Qt.AlignCenter)
+                if column == 2:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                    item.setForeground(QColor("#d17a22"))
+                elif column == 4:
+                    item.setForeground(QColor("#d18400"))
+                self.summary_table.setItem(row_index, column, item)
+        self._finish_summary_table(scope, "空单元格异常来源", (0,))
+
     def _render_completion(self, user_id, scope):
         metrics = self._ordered_completion_metrics(
             self.database.get_metric_definitions()
@@ -1600,6 +1715,8 @@ class StatisticsPage(QWidget):
         self.distribution_chart.show()
         self.violation_chart.hide()
         self.station_distribution_chart.hide()
+        self.detail_tabs.setTabEnabled(0, True)
+        self.data_title.setText("完整数据")
         start_date, end_date = self._date_range()
 
         if user_id is None:
@@ -1648,7 +1765,7 @@ class StatisticsPage(QWidget):
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
-                    item.setForeground(QColor("#1c5ed6"))
+                    item.setForeground(QColor("#176f68"))
                     item.setTextAlignment(Qt.AlignCenter)
                 elif column == 2:
                     item.setForeground(QColor("#718096"))
@@ -1667,6 +1784,8 @@ class StatisticsPage(QWidget):
         self.distribution_chart.hide()
         self.violation_chart.show()
         self.station_distribution_chart.hide()
+        self.detail_tabs.setTabEnabled(0, True)
+        self.data_title.setText("完整数据")
 
         total = sum(row["total"] for row in rows)
         has_phone = sum(row["has_phone"] for row in rows)
@@ -1703,7 +1822,7 @@ class StatisticsPage(QWidget):
                 elif column == 3:
                     item.setForeground(QColor("#d17a22"))
                 elif column == 4:
-                    item.setForeground(QColor("#1c5ed6"))
+                    item.setForeground(QColor("#176f68"))
                 self.summary_table.setItem(row_index, column, item)
         self._finish_summary_table(scope, "违规原因明细")
 
@@ -1712,6 +1831,8 @@ class StatisticsPage(QWidget):
         self.distribution_chart.hide()
         self.violation_chart.hide()
         self.station_distribution_chart.show()
+        self.detail_tabs.setTabEnabled(0, True)
+        self.data_title.setText("完整数据")
         self.station_distribution_chart.set_rows(rows)
 
         all_total = sum(row["total"] for row in rows)
@@ -1747,7 +1868,7 @@ class StatisticsPage(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if column in (1, 2):
-                    item.setForeground(QColor("#3478f6"))
+                    item.setForeground(QColor("#1d8178"))
                     item.setTextAlignment(Qt.AlignCenter)
                 elif column in (3, 4):
                     item.setForeground(QColor("#15946c"))
@@ -1767,6 +1888,9 @@ class StatisticsPage(QWidget):
         self._populate_station_options()
         self._clear_kpis()
         category = self.category_combo.currentData()
+        anomaly_button = getattr(self, "anomaly_button", None)
+        if anomaly_button is not None:
+            anomaly_button.setVisible(category == "completion")
         is_station_distribution = category == "station_distribution"
         if is_station_distribution:
             self.station_combo.blockSignals(True)
@@ -1781,6 +1905,17 @@ class StatisticsPage(QWidget):
         self.station_combo.setToolTip("")
         user_id = self._selected_user_id()
         scope = self._selected_scope()
+        if anomaly_button is not None and category == "completion":
+            anomaly_rows = self._get_anomaly_rows(user_id)
+            anomaly_total = sum(row["empty"] for row in anomaly_rows)
+            anomaly_button.setText(
+                ("返回完成类型" if self._showing_anomalies else "异常数据")
+                + f"（{anomaly_total}）"
+            )
+            anomaly_button.setChecked(self._showing_anomalies)
+            if self._showing_anomalies:
+                self._render_anomalies(user_id, scope, anomaly_rows)
+                return
         if category == "violation":
             self._render_violation(user_id, scope)
         else:

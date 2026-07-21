@@ -64,10 +64,10 @@ class AccountPage(QWidget):
         summary_layout.setSpacing(10)
         self.summary_values = {}
         for key, label, color in (
-            ("total", "账号总数", "#3478f6"),
-            ("admin", "管理员", "#7557d3"),
-            ("user", "普通用户", "#2785a5"),
-            ("active", "正常账号", "#188b57"),
+            ("total", "账号总数", "#1d8178"),
+            ("admin", "管理员", "#d18400"),
+            ("user", "普通用户", "#3f8f88"),
+            ("active", "正常账号", "#1d8d70"),
         ):
             card, value = self._summary_card(label, color)
             self.summary_values[key] = value
@@ -82,7 +82,7 @@ class AccountPage(QWidget):
 
         list_header = QHBoxLayout()
         list_title = QLabel("账号列表")
-        list_title.setStyleSheet("font-size:16px;font-weight:700;color:#17233c;")
+        list_title.setStyleSheet("font-size:16px;font-weight:700;color:#173a3d;")
         list_header.addWidget(list_title)
         list_header.addStretch()
         self.selection_hint = QLabel("请选择一个账号进行管理")
@@ -124,10 +124,10 @@ class AccountPage(QWidget):
         data_bar = QFrame()
         data_bar.setObjectName("DataActionBar")
         data_bar.setStyleSheet(
-            "QFrame#DataActionBar{background:#f7f9fd;border:1px solid #e2e8f2;"
+            "QFrame#DataActionBar{background:#f5f8f7;border:1px solid #d8e7e3;"
             "border-radius:8px;}"
             "QLabel#DataActionTitle{border:none;background:transparent;"
-            "font-weight:700;color:#34435c;}"
+            "font-weight:700;color:#315453;}"
         )
         data_layout = QHBoxLayout(data_bar)
         data_layout.setContentsMargins(12, 8, 10, 8)

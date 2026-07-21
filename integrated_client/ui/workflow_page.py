@@ -158,7 +158,7 @@ class CollapsiblePanel(QFrame):
 
         header = QHBoxLayout()
         heading = QLabel(title)
-        heading.setStyleSheet("font-size:14px;font-weight:700;color:#26344d;")
+        heading.setStyleSheet("font-size:14px;font-weight:700;color:#264b4c;")
         self.toggle_button = QPushButton("▾ 收起")
         self.toggle_button.setFixedWidth(78)
         self.toggle_button.clicked.connect(self.toggle)
@@ -279,9 +279,9 @@ class WorkflowPage(QWidget):
         browser_group = QGroupBox("内置浏览器状态")
         browser_layout = QGridLayout(browser_group)
         self.browser_info = QLabel("内置 Chromium（统一使用）")
-        self.browser_info.setStyleSheet("font-size:14px;font-weight:700;color:#26344d;")
+        self.browser_info.setStyleSheet("font-size:14px;font-weight:700;color:#264b4c;")
         self.browser_status_label = QLabel("● 尚未检测")
-        self.browser_status_label.setStyleSheet("color:#708096;font-weight:600;")
+        self.browser_status_label.setStyleSheet("color:#647c7b;font-weight:600;")
         self.browser_detail_label = QLabel("打开本页面时会自动执行启动检查。")
         self.browser_detail_label.setObjectName("Muted")
         self.browser_detail_label.setWordWrap(True)
@@ -405,11 +405,11 @@ class WorkflowPage(QWidget):
             card.setObjectName("Card")
             card_layout = QVBoxLayout(card)
             heading = QLabel(caption)
-            heading.setStyleSheet("font-size:13px;font-weight:700;color:#526177;")
+            heading.setStyleSheet("font-size:13px;font-weight:700;color:#526e6d;")
             name = QLabel(description)
-            name.setStyleSheet("font-size:15px;font-weight:700;color:#17233c;")
+            name.setStyleSheet("font-size:15px;font-weight:700;color:#173a3d;")
             status = QLabel("等待执行")
-            status.setStyleSheet("color:#708096;")
+            status.setStyleSheet("color:#647c7b;")
             card_layout.addWidget(heading)
             card_layout.addWidget(name)
             card_layout.addWidget(status)
@@ -516,7 +516,7 @@ class WorkflowPage(QWidget):
             return
         self.browser_check_state = "checking"
         self.browser_status_label.setText("● 正在启动检测…")
-        self.browser_status_label.setStyleSheet("color:#1c5ed6;font-weight:600;")
+        self.browser_status_label.setStyleSheet("color:#176f68;font-weight:600;")
         self.browser_detail_label.setText("正在实际启动内置 Chromium 并访问空白页。")
         self.browser_check_btn.setEnabled(False)
 
@@ -534,7 +534,7 @@ class WorkflowPage(QWidget):
         self.browser_check_state = "ready" if success else "failed"
         if success:
             self.browser_status_label.setText(f"● 运行正常 · {summary}")
-            self.browser_status_label.setStyleSheet("color:#188b57;font-weight:600;")
+            self.browser_status_label.setStyleSheet("color:#1d8d70;font-weight:600;")
             self.browser_detail_label.setText(f"已成功启动并关闭测试实例。\n{details}")
         else:
             self.browser_status_label.setText("● 检测失败")
@@ -571,10 +571,10 @@ class WorkflowPage(QWidget):
 
     def _set_step_status(self, step, text, state="waiting"):
         colors = {
-            "waiting": "#708096",
-            "running": "#1c5ed6",
+            "waiting": "#647c7b",
+            "running": "#176f68",
             "paused": "#d18400",
-            "success": "#188b57",
+            "success": "#1d8d70",
             "failed": "#d33f49",
             "stopped": "#9a6415",
         }

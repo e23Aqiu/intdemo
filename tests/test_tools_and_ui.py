@@ -9,7 +9,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pandas as pd
-from PyQt5.QtCore import QDate, QEvent, QPoint, QRect, Qt
+from PyQt5.QtCore import QCoreApplication, QDate, QEvent, QPoint, QRect, QSize, Qt
 from PyQt5.QtGui import QMouseEvent, QPalette
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -23,6 +23,7 @@ from PyQt5.QtWidgets import (
     QToolButton,
 )
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
 
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import (
@@ -45,6 +46,7 @@ from integrated_client.tools.aiqicha_tool import (
     TARGET_COLUMNS,
     has_meaningful_value,
 )
+from integrated_client.tools.transport_tool import TargetedWorkbookWriter, Worker
 from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
 from integrated_client.ui.frameless import (
@@ -57,6 +59,7 @@ from integrated_client.ui.frameless import (
     WVR_REDRAW,
 )
 from integrated_client.ui.statistics_page import (
+    StatisticsPage,
     StationDistributionChart,
     ViolationReasonChart,
     WorkflowDistributionChart,
@@ -96,6 +99,20 @@ class ToolAndUiTests(unittest.TestCase):
         self.admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
 
     def tearDown(self):
+        for widget in list(self.app.topLevelWidgets()):
+            workflow = getattr(widget, "workflow_page", None)
+            if workflow is not None:
+                workflow.shutdown()
+            else:
+                shutdown = getattr(widget, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            if hasattr(widget, "_prepared_to_close"):
+                widget._prepared_to_close = True
+            widget.close()
+            widget.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.app.processEvents()
         self.temp_dir.cleanup()
 
     def test_value_detection_and_target_header_creation(self):
@@ -111,6 +128,161 @@ class ToolAndUiTests(unittest.TestCase):
             self.assertIn(name, header)
             self.assertEqual(sheet.cell(1, header[name]).value, name)
 
+    def test_targeted_writer_preserves_rows_below_a_blank_row_and_workbook_layout(self):
+        file_path = Path(self.temp_dir.name) / "targeted-write.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "业务数据"
+        sheet.append(["车辆标识", "已协助补缴", "查询状态", "金额"])
+        sheet.append(["粤A10001(黄色)", "", "已完成", 10])
+        sheet.append([None, None, None, None])
+        sheet.append(
+            [
+                "粤A10002(黄色)",
+                "保留下方数据",
+                "待处理",
+                "=1+2",
+                "无表头列也要保留",
+            ]
+        )
+        sheet.freeze_panes = "A2"
+        sheet.column_dimensions["A"].width = 28
+        sheet["A4"].fill = PatternFill("solid", fgColor="FFF2CC")
+        notes = workbook.create_sheet("说明")
+        notes["A1"] = "这个工作表必须保留"
+        notes.merge_cells("A1:B1")
+        workbook.save(file_path)
+        workbook.close()
+
+        writer = TargetedWorkbookWriter(
+            file_path,
+            ("运输证号_纯数字", "查询状态"),
+        )
+        writer.write_row(
+            1,
+            {
+                "运输证号_纯数字": "",
+                "查询状态": "中间空行停止",
+            },
+        )
+        writer.save()
+        writer.close()
+
+        saved = load_workbook(file_path, data_only=False)
+        sheet = saved["业务数据"]
+        headers = {
+            cell.value: cell.column
+            for cell in sheet[1]
+            if cell.value is not None
+        }
+        self.assertEqual(sheet.cell(3, headers["查询状态"]).value, "中间空行停止")
+        self.assertEqual(sheet["A4"].value, "粤A10002(黄色)")
+        self.assertEqual(sheet["B4"].value, "保留下方数据")
+        self.assertEqual(sheet["C4"].value, "待处理")
+        self.assertEqual(sheet["D4"].value, "=1+2")
+        self.assertEqual(sheet["E4"].value, "无表头列也要保留")
+        self.assertEqual(headers["运输证号_纯数字"], 6)
+        self.assertEqual(sheet["A4"].fill.fgColor.rgb, "00FFF2CC")
+        self.assertEqual(sheet.freeze_panes, "A2")
+        self.assertEqual(sheet.column_dimensions["A"].width, 28)
+        self.assertEqual(saved["说明"]["A1"].value, "这个工作表必须保留")
+        self.assertIn("A1:B1", {str(cell_range) for cell_range in saved["说明"].merged_cells.ranges})
+        saved.close()
+        self.assertEqual(
+            list(file_path.parent.glob(f".{file_path.stem}.*.tmp{file_path.suffix}")),
+            [],
+        )
+
+    def test_transport_worker_skips_rows_with_existing_company_data(self):
+        file_path = Path(self.temp_dir.name) / "existing-company.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["车辆标识", "已协助补缴", "车辆所有人/企业"])
+        sheet.append(["冀T2892_黄色", "", "无运输证号"])
+        workbook.save(file_path)
+        workbook.close()
+
+        class FakePage:
+            def __init__(self):
+                self.goto_calls = 0
+
+            def goto(self, *_args, **_kwargs):
+                self.goto_calls += 1
+                raise AssertionError("已有企业信息时不应访问运输证查询网站")
+
+        class FakeContext:
+            def __init__(self, page):
+                self.page = page
+
+            def new_page(self):
+                return self.page
+
+        class FakeBrowser:
+            def __init__(self, page):
+                self.page = page
+
+            def new_context(self, **_kwargs):
+                return FakeContext(self.page)
+
+            def close(self):
+                return None
+
+        class FakeChromium:
+            def __init__(self, page):
+                self.page = page
+
+            def launch(self, **_kwargs):
+                return FakeBrowser(self.page)
+
+        class FakeRuntime:
+            def __init__(self, page):
+                self.chromium = FakeChromium(page)
+
+            def stop(self):
+                return None
+
+        class FakePlaywrightManager:
+            def __init__(self, runtime):
+                self.runtime = runtime
+
+            def start(self):
+                return self.runtime
+
+        fake_page = FakePage()
+        runtime = FakeRuntime(fake_page)
+        worker = Worker(
+            str(file_path),
+            True,
+            False,
+            2,
+            True,
+            2,
+            False,
+        )
+        finished_results = []
+        worker.finished.connect(finished_results.append)
+        with patch(
+            "integrated_client.tools.transport_tool.sync_playwright",
+            return_value=FakePlaywrightManager(runtime),
+        ), patch(
+            "integrated_client.tools.transport_tool.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ):
+            worker.run()
+
+        self.assertEqual(fake_page.goto_calls, 0)
+        self.assertEqual(finished_results, ["完成"])
+        saved = load_workbook(file_path)
+        sheet = saved.active
+        headers = {
+            cell.value: cell.column
+            for cell in sheet[1]
+            if cell.value is not None
+        }
+        self.assertEqual(sheet.cell(2, headers["车辆所有人/企业"]).value, "无运输证号")
+        self.assertEqual(sheet.cell(2, headers["查询状态"]).value, "已有企业信息（跳过）")
+        saved.close()
+
     def test_main_window_contains_integrated_pages(self):
         window = MainWindow(self.db, self.admin)
         self.assertIs(window._pages["home"], window.statistics_page)
@@ -124,6 +296,36 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertNotIn("statistics", window._nav_buttons)
         self.assertIn("workflow", window._nav_buttons)
         self.assertIn("personal", window._nav_buttons)
+        self.assertEqual(window.sidebar.width(), 230)
+        self.assertEqual(window.sidebar_brand_badge.text(), "运")
+        self.assertEqual(window.sidebar_brand_badge.objectName(), "BrandBadge")
+        self.assertEqual(window.sidebar_role.text(), "管理员  ·  admin")
+        self.assertEqual(window.sidebar_avatar.text(), "系")
+        expected_nav = {
+            "home": ("数据仪表盘", "nav-dashboard.svg"),
+            "workflow": ("一键业务处理", "nav-workflow.svg"),
+            "accounts": ("账号管理", "nav-accounts.svg"),
+            "personal": ("个人中心", "nav-user.svg"),
+        }
+        for key, (label, icon_name) in expected_nav.items():
+            button = window._nav_buttons[key]
+            self.assertEqual(button.text(), label)
+            self.assertEqual(button.iconSize(), QSize(19, 19))
+            self.assertFalse(button.icon().isNull())
+            self.assertTrue(Path(_control_asset_path(icon_name)).is_file())
+        spec_text = (
+            Path(__file__).resolve().parents[1] / "integrated_client.spec"
+        ).read_text(encoding="utf-8")
+        for _, icon_name in expected_nav.values():
+            self.assertIn(icon_name, spec_text)
+        for selector in (
+            "QLabel#BrandBadge",
+            "QFrame#SidebarProfile",
+            "QLabel#SidebarAvatar",
+            "QLabel#SidebarRole",
+            "border-left: 4px solid #8ce3d1",
+        ):
+            self.assertIn(selector, APP_STYLESHEET)
         self.assertIs(window.page_scroll_area.widget(), window.stack)
         self.assertTrue(window.page_scroll_area.widgetResizable())
         self.assertEqual(
@@ -151,7 +353,7 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertFalse(window.statistics_page.station_combo.isEnabled())
         self.assertFalse(window.statistics_page.station_distribution_chart.isHidden())
-        self.assertEqual(window.top_identity.text(), "管理员 · 系统管理员")
+        self.assertFalse(hasattr(window, "top_identity"))
         self.assertEqual(window.sidebar_user.text(), "系统管理员")
         self.assertEqual(window.personal_center_page.identity_value.text(), "管理员")
         self.assertEqual(window.personal_center_page.name_value.text(), "系统管理员")
@@ -352,12 +554,29 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(login.window_controls.maximize_button.isHidden())
         self.assertEqual(login.minimumSize(), login.maximumSize())
         self.assertEqual(login._window_hit_test(QPoint(60, 20)), HTCAPTION)
+        self.assertEqual(login.username_edit.text(), "")
+        self.assertFalse(
+            any(
+                "首次启动已创建管理员" in label.text()
+                for label in login.findChildren(QLabel)
+            )
+        )
+        login_title = login.findChild(QLabel, "PageTitle")
+        login_button = login.findChild(QPushButton, "PrimaryButton")
+        self.assertLessEqual(
+            abs(
+                login_title.geometry().top()
+                - (login.height() - login_button.geometry().bottom())
+            ),
+            1,
+        )
         login.close()
 
         message_box = FramelessMessageBox(window)
         message_box.setWindowTitle("确认操作")
         message_box.setText("确认操作")
         message_box.setInformativeText("确定继续吗？")
+        message_box.setIcon(QMessageBox.Information)
         message_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
         message_box.show()
         self.app.processEvents()
@@ -365,6 +584,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(message_box.window_controls.minimize_button.isHidden())
         self.assertTrue(message_box.window_controls.maximize_button.isHidden())
         self.assertFalse(message_box.window_controls.close_button.isHidden())
+        self.assertFalse(message_box.icon_label.pixmap().isNull())
+        self.assertEqual(
+            message_box.ICON_STYLES[QMessageBox.Information][1], "#1d8178"
+        )
         self.assertEqual(message_box.button(QMessageBox.Yes).text(), "是")
         self.assertEqual(message_box.button(QMessageBox.No).text(), "否")
         message_box.close()
@@ -387,8 +610,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(window._nav_buttons["workflow"].isChecked())
         self.assertFalse(window._nav_buttons["home"].isChecked())
         self.assertEqual(window.page_title.text(), "一键业务处理")
-        self.assertEqual(window.top_identity.text(), "用户 · 测试站点")
+        self.assertFalse(hasattr(window, "top_identity"))
         self.assertEqual(window.sidebar_user.text(), "测试站点")
+        self.assertEqual(window.sidebar_role.text(), "用户  ·  normal01")
+        self.assertEqual(window.sidebar_avatar.text(), "测")
         self.assertEqual(window.personal_center_page.identity_value.text(), "用户")
         self.assertEqual(window.personal_center_page.name_value.text(), "测试站点")
         self.assertEqual(window.personal_center_page.username_value.text(), "normal01")
@@ -594,6 +819,107 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(window.workflow_page.shutdown())
         window._prepared_to_close = True
         window.close()
+
+    def test_only_admin_can_view_empty_anomalies_grouped_by_station(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        accounts = {account.username: account for account in self.db.list_accounts()}
+        luogang = accounts["luogang"]
+        taiping = accounts["taiping"]
+        for station, total, empty, task_id in (
+            (luogang, 5, 2, "admin-anomaly-luogang"),
+            (taiping, 4, 1, "admin-anomaly-taiping"),
+        ):
+            self.db.record_activity_batch(
+                station.id,
+                {
+                    WORKFLOW_TOTAL_METRIC: total,
+                    WORKFLOW_EMPTY_METRIC: empty,
+                    WORKFLOW_HAS_PHONE_METRIC: total - empty,
+                },
+                "unified_workflow",
+                task_id=task_id,
+            )
+
+        page = StatisticsPage(self.db, self.admin)
+        self.assertTrue(page.anomaly_button.isHidden())
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("completion")
+        )
+        self.app.processEvents()
+
+        self.assertFalse(page.anomaly_button.isHidden())
+        self.assertEqual(page.anomaly_button.objectName(), "AnomalyButton")
+        self.assertEqual(page.anomaly_button.text(), "异常数据（3）")
+        page.anomaly_button.click()
+        self.app.processEvents()
+
+        self.assertTrue(page.anomaly_button.isChecked())
+        self.assertEqual(page.anomaly_button.text(), "返回完成类型（3）")
+        self.assertEqual(page.data_title.text(), "异常数据")
+        self.assertIs(page.detail_tabs.currentWidget(), page.data_tab)
+        self.assertFalse(page.detail_tabs.isTabEnabled(0))
+        self.assertEqual(
+            [
+                page.summary_table.horizontalHeaderItem(column).text()
+                for column in range(page.summary_table.columnCount())
+            ],
+            ["用户（站）", "登录账号", "异常条数", "本站总计数", "异常占比"],
+        )
+        anomaly_rows = {
+            page.summary_table.item(row, 1).text(): [
+                page.summary_table.item(row, column).text()
+                for column in range(page.summary_table.columnCount())
+            ]
+            for row in range(page.summary_table.rowCount())
+        }
+        self.assertEqual(
+            anomaly_rows["luogang"],
+            ["萝岗中心站", "luogang", "2", "5", "40.0%"],
+        )
+        self.assertEqual(
+            anomaly_rows["taiping"],
+            ["太平中心站", "taiping", "1", "4", "25.0%"],
+        )
+        self.assertEqual(page.data_count_label.text(), "2 行")
+
+        anomaly_export = Path(self.temp_dir.name) / "anomaly-dashboard.xlsx"
+        export_result = page._save_dashboard_excel(anomaly_export)
+        self.assertEqual(export_result["category_name"], "异常数据")
+        export_workbook = load_workbook(anomaly_export)
+        self.assertEqual(export_workbook.active["D2"].value, "异常数据")
+        export_workbook.close()
+
+        page.station_combo.setCurrentIndex(page.station_combo.findData(luogang.id))
+        self.app.processEvents()
+        self.assertEqual(page.anomaly_button.text(), "返回完成类型（2）")
+        self.assertEqual(page.summary_table.rowCount(), 1)
+        self.assertEqual(page.summary_table.item(0, 1).text(), "luogang")
+
+        page.anomaly_button.click()
+        self.app.processEvents()
+        self.assertFalse(page.anomaly_button.isChecked())
+        self.assertTrue(page.detail_tabs.isTabEnabled(0))
+        self.assertIs(page.detail_tabs.currentWidget(), page.chart_tab)
+        self.assertEqual(page.data_title.text(), "完整数据")
+        self.assertNotIn(
+            "空",
+            [
+                page.summary_table.item(row, 0).text()
+                for row in range(page.summary_table.rowCount())
+            ],
+        )
+
+        user_page = StatisticsPage(self.db, luogang)
+        user_page.category_combo.setCurrentIndex(
+            user_page.category_combo.findData("completion")
+        )
+        self.app.processEvents()
+        self.assertFalse(hasattr(user_page, "anomaly_button"))
+
+        for widget in (user_page, page):
+            widget.close()
+            widget.deleteLater()
+        self.app.processEvents()
 
     def test_dashboard_date_range_filters_all_chart_categories(self):
         self.assertEqual(self.db.ensure_default_station_users(), 5)
@@ -1328,8 +1654,9 @@ class ToolAndUiTests(unittest.TestCase):
 
             self.assertEqual(window.account.name_label, "主管理员")
             self.assertEqual(page.current_account.name_label, "主管理员")
-            self.assertEqual(window.top_identity.text(), "管理员 · 主管理员")
             self.assertEqual(window.sidebar_user.text(), "主管理员")
+            self.assertEqual(window.sidebar_user.toolTip(), "主管理员")
+            self.assertEqual(window.sidebar_avatar.text(), "主")
             self.assertEqual(window.personal_center_page.name_value.text(), "主管理员")
             self.assertIn("主管理员", window.windowTitle())
             self.assertEqual(information.call_count, 2)
@@ -1747,7 +2074,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             image.pixelColor(value_x, bar_y).name(), chart.COLORS[0].name()
         )
-        self.assertEqual(image.pixelColor(empty_x, bar_y).name(), "#edf1f6")
+        self.assertEqual(image.pixelColor(empty_x, bar_y).name(), "#e8f1ef")
         chart.set_bar_mode("split")
         self.assertEqual(chart._format_bar_label(2, 10), "2 条")
         self.assertFalse(chart.mode_button.isChecked())

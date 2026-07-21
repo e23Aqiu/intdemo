@@ -66,7 +66,7 @@ class PersonalCenterPage(QWidget):
         caption = QLabel(label)
         caption.setObjectName("Muted")
         content = QLabel(value)
-        content.setStyleSheet("font-size:15px;font-weight:600;color:#17233c;")
+        content.setStyleSheet("font-size:15px;font-weight:600;color:#173a3d;")
         layout.addWidget(caption, row, 0)
         layout.addWidget(content, row, 1)
         return content

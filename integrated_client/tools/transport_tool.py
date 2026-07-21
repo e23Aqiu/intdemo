@@ -14,6 +14,10 @@ import numpy as np
 import sys
 import subprocess
 import difflib
+import uuid
+from pathlib import Path
+
+import openpyxl
 from PyQt5.QtWidgets import *
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QFont
@@ -36,6 +40,71 @@ from PIL import Image, ImageFilter, ImageEnhance, ImageOps, ImageFont, ImageDraw
 os.environ["DDDOCR_NO_LOG"] = "1"
 os.environ["PLAYWRIGHT_LOG"] = "none"
 os.environ["PLAYWRIGHT_LOCAL_LOG_DIR"] = os.devnull
+
+
+class TargetedWorkbookWriter:
+    """只更新指定结果单元格，并通过同目录原子替换保存工作簿。"""
+
+    def __init__(self, file_path, target_columns):
+        self.file_path = Path(file_path)
+        self.workbook = openpyxl.load_workbook(self.file_path)
+        self.sheet = self.workbook.active
+        self.column_indexes = {
+            str(cell.value).strip(): cell.column
+            for cell in self.sheet[1]
+            if cell.value is not None and str(cell.value).strip()
+        }
+        self.dirty = False
+        next_column = max(
+            self.sheet.max_column,
+            max(self.column_indexes.values(), default=0),
+        ) + 1
+        for column_name in target_columns:
+            if column_name in self.column_indexes:
+                continue
+            self.sheet.cell(1, next_column, column_name)
+            self.column_indexes[column_name] = next_column
+            next_column += 1
+            self.dirty = True
+
+    @staticmethod
+    def _cell_value(value):
+        try:
+            if pd.isna(value):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return value
+
+    def write_row(self, dataframe_row_index, values):
+        excel_row = int(dataframe_row_index) + 2
+        for column_name, value in values.items():
+            column_index = self.column_indexes[column_name]
+            self.sheet.cell(
+                excel_row,
+                column_index,
+                self._cell_value(value),
+            )
+        self.dirty = True
+
+    def save(self):
+        if not self.dirty:
+            return
+        temporary_path = self.file_path.with_name(
+            f".{self.file_path.stem}.{uuid.uuid4().hex}.tmp{self.file_path.suffix}"
+        )
+        try:
+            self.workbook.save(temporary_path)
+            os.replace(temporary_path, self.file_path)
+            self.dirty = False
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+
+    def close(self):
+        self.workbook.close()
+
+
 # ==============================================
 # 【关键】强制让 ddddocr 从 exe 内部加载模型
 # ==============================================
@@ -109,6 +178,18 @@ def clean_transport_id(s):
     if pd.isna(s):
         return ""
     return re.sub(r"[^0-9]", "", str(s))
+
+
+def has_nonempty_cell_value(value):
+    """判断 Excel 单元格是否包含可见内容，排除常见空值文本。"""
+    if value is None:
+        return False
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return str(value).strip().lower() not in {"", "nan", "none", "null", "nat"}
 
 
 # 普通验证码 OCR（纯数字·自动识别线条+延长补全·全流程可视化版）
@@ -288,6 +369,8 @@ class Worker(QThread):
 
     def run(self):
         playwright = None
+        workbook_writer = None
+        current_row_index = None
         try:
             try:
                 df = pd.read_excel(self.src, engine='openpyxl', dtype=str)
@@ -309,14 +392,26 @@ class Worker(QThread):
             if "查询状态" not in df.columns:
                 df["查询状态"] = ""
 
+            workbook_writer = TargetedWorkbookWriter(
+                self.src,
+                ("运输证号_纯数字", "查询状态"),
+            )
+
             total = len(df)
             self.log.emit(f"📌 共 {total} 条记录待处理")
             self.log.emit("📌 直接在原始表上查询运输证号")
 
-            # 保存函数：直接保存原始表
-            def save_results():
+            # 仅回写当前行的结果列，不重建原始工作簿。
+            def save_results(row_index):
                 try:
-                    df.to_excel(self.src, index=False, engine='openpyxl')
+                    workbook_writer.write_row(
+                        row_index,
+                        {
+                            "运输证号_纯数字": df.at[row_index, "运输证号_纯数字"],
+                            "查询状态": df.at[row_index, "查询状态"],
+                        },
+                    )
+                    workbook_writer.save()
                 except PermissionError:
                     self.log.emit("❌ 无法保存原始表，请先关闭 Excel/WPS 表格后再运行程序！")
                     raise
@@ -339,6 +434,7 @@ class Worker(QThread):
             # ================================================
 
             for idx, (_, row) in enumerate(df.iterrows()):
+                current_row_index = idx
                 self._check_stopped()
 
                 progress = round((idx + 1) / total * 100)
@@ -353,14 +449,22 @@ class Worker(QThread):
                 if existing_cert not in ["", "nan", "NaN", "None"]:
                     self.log.emit("✅ 已有运输证号，跳过查询")
                     df.at[idx, "查询状态"] = "已存在（跳过）"
-                    save_results()
+                    save_results(idx)
+                    continue
+
+                # 已有企业信息说明该行已完成后续回填，不再重复查询运输证号。
+                existing_company = row.get("车辆所有人/企业", "")
+                if has_nonempty_cell_value(existing_company):
+                    self.log.emit("✅ 已有企业信息，跳过运输证查询")
+                    df.at[idx, "查询状态"] = "已有企业信息（跳过）"
+                    save_results(idx)
                     continue
 
                 # 检查是否已补缴
                 if pd.notna(has_paid) and str(has_paid).strip() != "":
                     df.at[idx, "查询状态"] = "已补缴（无需查询）"
                     self.log.emit("✅ 已补缴，无需查询")
-                    save_results()
+                    save_results(idx)
                     try:
                         self.page.goto(CONFIG["TARGET_URL"], timeout=30000)
                         self.page.wait_for_timeout(1000)
@@ -373,14 +477,14 @@ class Worker(QThread):
                 if not province:
                     df.at[idx, "查询状态"] = "车牌格式错误（解析失败）"
                     self.log.emit(f"⚠️ 车牌解析失败")
-                    save_results()
+                    save_results(idx)
                     continue
 
                 # 黄牌过滤
                 if self.only_yellow_card:
                     if plate_color != "黄色":
                         df.at[idx, "查询状态"] = "已跳过（非黄牌）"
-                        save_results()
+                        save_results(idx)
                         self.log.emit(f"⏭️ 非黄牌，已跳过")
                         continue
 
@@ -606,7 +710,7 @@ class Worker(QThread):
                                 else:
                                     self.log.emit(f"❌ 验证码重试{self.CAPTCHA_RETRY}次全部失败，跳过当前车牌！")
                                     df.at[idx, "查询状态"] = "验证码识别失败"
-                                    save_results()
+                                    save_results(idx)
                                     list_loaded = False
                                     break
                         # ======================================================================================
@@ -728,7 +832,7 @@ class Worker(QThread):
                         df.at[idx, "查询状态"] = error_msg or "失败"
                 elif query_success:
                     df.at[idx, "查询状态"] = "查询成功"
-                save_results()
+                save_results(idx)
                 if tr_clean:
                     self.stat_event.emit("transport_query_completed", 1)
 
@@ -737,7 +841,8 @@ class Worker(QThread):
         except Exception as e:
             if "手动停止" in str(e):
                 self.log.emit("🛑 已手动立即停止任务")
-                save_results()
+                if workbook_writer is not None and current_row_index is not None:
+                    save_results(current_row_index)
                 self.log.emit("✅ 已保存所有已处理结果到原始表！")
             elif isinstance(e, PermissionError):
                 self.log.emit("❌ 无法读写文件，请先关闭 Excel/WPS 表格后再运行程序！")
@@ -758,6 +863,8 @@ class Worker(QThread):
                     playwright.stop()
             except:
                 pass
+            if workbook_writer is not None:
+                workbook_writer.close()
             self._running = False
 
         self.finished.emit("完成")
@@ -1068,6 +1175,7 @@ class BusinessBackfillWorker(QThread):
             return False
 
     def run(self):
+        workbook_writer = None
         try:
             try:
                 df_original = pd.read_excel(
@@ -1086,8 +1194,28 @@ class BusinessBackfillWorker(QThread):
                 self.finished.emit("失败")
                 return
 
+            if "车辆所有人/企业" not in df_original.columns:
+                df_original["车辆所有人/企业"] = ""
             if "回填状态" not in df_original.columns:
                 df_original["回填状态"] = ""
+
+            workbook_writer = TargetedWorkbookWriter(
+                self.original_file,
+                ("车辆所有人/企业", "回填状态"),
+            )
+
+            def save_results(row_index):
+                workbook_writer.write_row(
+                    row_index,
+                    {
+                        "车辆所有人/企业": df_original.at[
+                            row_index,
+                            "车辆所有人/企业",
+                        ],
+                        "回填状态": df_original.at[row_index, "回填状态"],
+                    },
+                )
+                workbook_writer.save()
 
             # 直接从原始表提取"车辆标识→运输证号"映射
             plate_to_cert = dict(zip(
@@ -1128,15 +1256,10 @@ class BusinessBackfillWorker(QThread):
                     self.log.emit(f"✅ 已补缴，跳过：{car_full}")
                     df_original.at[idx, "车辆所有人/企业"] = "已补缴"
                     df_original.at[idx, "回填状态"] = "已补缴"
+                    save_results(idx)
                     idx += 1
                     progress = int((idx / total) * 100)
                     self.progress.emit(progress)
-                    try:
-                        df_original.to_excel(self.original_file, index=False,engine='openpyxl')
-                    except PermissionError:
-                        self.log.emit("❌ 无法保存文件，请先关闭 Excel/WPS 表格后再运行程序！")
-                        self.finished.emit("失败")
-                        return
                     continue
 
                 # 然后再判断 车辆所有人/企业
@@ -1153,15 +1276,10 @@ class BusinessBackfillWorker(QThread):
                     self.log.emit(f"ℹ️ 无运输证号：{car_full} → 无运输证号")
                     df_original.at[idx, "车辆所有人/企业"] = "无运输证号"
                     df_original.at[idx, "回填状态"] = "查询成功"
+                    save_results(idx)
                     idx += 1
                     progress = int((idx / total) * 100)
                     self.progress.emit(progress)
-                    try:
-                        df_original.to_excel(self.original_file, index=False,engine='openpyxl')
-                    except PermissionError:
-                        self.log.emit("❌ 无法保存文件，请先关闭 Excel/WPS 表格后再运行程序！")
-                        self.finished.emit("失败")
-                        return
                     continue
 
                 try:
@@ -1196,10 +1314,10 @@ class BusinessBackfillWorker(QThread):
                             self.log.emit("❌ 验证码识别全部失败！")
                             df_original.at[idx, "车辆所有人/企业"] = ""
                             df_original.at[idx, "回填状态"] = "验证码识别失败"
+                            save_results(idx)
                             idx += 1
                             progress = int((idx / total) * 100)
                             self.progress.emit(progress)
-                            df_original.to_excel(self.original_file, index=False,engine='openpyxl')
                             continue
                         else:
                             is_captcha_fail = False
@@ -1430,22 +1548,12 @@ class BusinessBackfillWorker(QThread):
                     if company:
                         self.stat_event.emit("business_backfill_completed", 1)
 
+                    save_results(idx)
                     idx += 1
                     progress = int((idx / total) * 100)
                     self.progress.emit(progress)
-                    try:
-                        df_original.to_excel(self.original_file, index=False,engine='openpyxl')
-                    except PermissionError:
-                        self.log.emit("❌ 无法保存文件，请先关闭 Excel/WPS 表格后再运行程序！")
-                        self.finished.emit("失败")
-                        return
 
-            try:
-                df_original.to_excel(self.original_file, index=False,engine='openpyxl')
-            except PermissionError:
-                self.log.emit("❌ 无法保存文件，请先关闭 Excel/WPS 表格后再运行程序！")
-                self.finished.emit("失败")
-                return
+            workbook_writer.save()
             self.log.emit("✅ 所有数据回填完成！")
 
         except Exception as e:
@@ -1461,6 +1569,8 @@ class BusinessBackfillWorker(QThread):
                 # self.log.emit(f"❌ 异常:{str(e)}")
         finally:
             self._close_browser()
+            if workbook_writer is not None:
+                workbook_writer.close()
             self._running = False
             self.finished.emit("结束")
 

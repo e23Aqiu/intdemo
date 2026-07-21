@@ -181,33 +181,87 @@ QMainWindow, QDialog {
     background: #f4f7fb;
 }
 QFrame#Sidebar {
-    background: #17233c;
+    background: qlineargradient(
+        x1: 0, y1: 0, x2: 0, y2: 1,
+        stop: 0 #123f42,
+        stop: 0.58 #0d3439,
+        stop: 1 #092a31
+    );
     border: none;
+    border-right: 1px solid #1f4e51;
+}
+QLabel#BrandBadge {
+    color: #17393b;
+    background: #f0ad69;
+    border: 1px solid #ffc98f;
+    border-radius: 13px;
+    font-size: 20px;
+    font-weight: 800;
 }
 QLabel#BrandTitle {
-    color: white;
-    font-size: 20px;
+    color: #f4fbfa;
+    font-size: 17px;
     font-weight: 700;
 }
-QLabel#BrandSubTitle, QLabel#SidebarUser {
-    color: #aebbd1;
+QLabel#BrandSubTitle {
+    color: #8eb7b5;
+    font-size: 10px;
+    font-weight: 600;
+}
+QLabel#SidebarSectionLabel {
+    color: #729b99;
+    padding: 0 10px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QLabel#SidebarStatus {
+    color: #72d2bd;
+    padding: 3px 10px;
+    font-size: 11px;
+}
+QFrame#SidebarProfile {
+    background: #123b40;
+    border: 1px solid #28565a;
+    border-radius: 12px;
+}
+QLabel#SidebarAvatar {
+    color: #17393b;
+    background: #f0ad69;
+    border: 1px solid #ffc98f;
+    border-radius: 18px;
+    font-size: 15px;
+    font-weight: 800;
+}
+QLabel#SidebarUser {
+    color: #f3faf9;
+    font-size: 13px;
+    font-weight: 700;
+}
+QLabel#SidebarRole {
+    color: #8fb2b1;
+    font-size: 10px;
 }
 QPushButton#NavButton {
-    color: #cbd5e5;
+    color: #c4d9d7;
     background: transparent;
-    border: none;
-    border-radius: 8px;
-    padding: 11px 14px;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 10px 13px;
     text-align: left;
     font-size: 14px;
+    font-weight: 500;
 }
 QPushButton#NavButton:hover {
-    background: #243453;
-    color: white;
+    color: #f5fbfa;
+    background: #174b4e;
+    border-color: #285e60;
 }
 QPushButton#NavButton:checked {
-    background: #3478f6;
-    color: white;
+    color: #ffffff;
+    background: #1d8178;
+    border: 1px solid #2e988b;
+    border-left: 4px solid #8ce3d1;
+    padding-left: 10px;
     font-weight: 700;
 }
 QFrame#TopBar, QFrame#Card, QGroupBox {
@@ -643,6 +697,26 @@ QPushButton#PrimaryButton {
 QPushButton#PrimaryButton:hover {
     background: #2868db;
 }
+QPushButton#AnomalyButton {
+    color: #9a6415;
+    background: #fff7e5;
+    border-color: #f4d79b;
+    font-weight: 600;
+}
+QPushButton#AnomalyButton:hover {
+    color: #81520f;
+    background: #ffefc7;
+    border-color: #e6bf69;
+}
+QPushButton#AnomalyButton:checked {
+    color: white;
+    background: #d18400;
+    border-color: #d18400;
+}
+QPushButton#AnomalyButton:checked:hover {
+    background: #b97200;
+    border-color: #b97200;
+}
 QPushButton#DangerButton {
     color: white;
     background: #e45454;
@@ -792,6 +866,7 @@ QLabel#ModeHint:disabled {
 }
 QPushButton:disabled,
 QPushButton#PrimaryButton:disabled,
+QPushButton#AnomalyButton:disabled,
 QPushButton#DangerButton:disabled,
 QPushButton#ViolationModeButton:checked:disabled {
     color: #aab3bf;
@@ -799,7 +874,7 @@ QPushButton#ViolationModeButton:checked:disabled {
     border-color: #e5eaf0;
 }
 QPushButton#NavButton:disabled {
-    color: #647087;
+    color: #698b89;
     background: transparent;
     border: none;
 }
@@ -842,6 +917,74 @@ QProgressBar::chunk:disabled {
     background: #c7d0dc;
 }
 """
+
+# Keep the widget rules together while applying the product palette from one
+# place.  This also covers Qt's nested controls (calendar menus, spin buttons,
+# table selections and scrollbars) so dialogs and content pages stay visually
+# consistent with the sidebar.
+_CONTENT_PALETTE = {
+    "#243047": "#173a3d",
+    "#f4f7fb": "#f3f7f6",
+    "#e4eaf2": "#d8e7e3",
+    "#f7f9fc": "#f5f8f7",
+    "#dce4ef": "#d8e7e3",
+    "#17233c": "#173a3d",
+    "#526177": "#526e6d",
+    "#f7f9fd": "#f5f8f7",
+    "#dfe6f1": "#d8e7e3",
+    "#f3f7fd": "#edf7f5",
+    "#c8d6e8": "#b8d8d1",
+    "#708096": "#647c7b",
+    "#1c5ed6": "#176f68",
+    "#edf4ff": "#e7f6f2",
+    "#d5e4ff": "#bfe1d9",
+    "#d9e1ec": "#d3e3df",
+    "#3478f6": "#1d8178",
+    "#aebdd1": "#9fbdb8",
+    "#fbfcfe": "#fbfdfc",
+    "#edf3fb": "#e9f4f1",
+    "#d5e0ee": "#cfdfdb",
+    "#99a5b7": "#91a6a3",
+    "#f2f5f9": "#f1f5f4",
+    "#e1e7ef": "#dde7e4",
+    "#e2e8f1": "#dbe7e4",
+    "#d7e0eb": "#d3e2df",
+    "#174a9c": "#145f58",
+    "#e8f1ff": "#e1f2ee",
+    "#b9c5d5": "#adc4c0",
+    "#5c8fe9": "#4a9c91",
+    "#f3f7ff": "#edf8f5",
+    "#2868db": "#166d66",
+    "#eef2f6": "#edf2f1",
+    "#d4dce7": "#d3dedb",
+    "#aeb9c8": "#a6b7b3",
+    "#eaf1fb": "#e5f1ee",
+    "#cfd9e7": "#cadeda",
+    "#5d91ed": "#69aaa1",
+    "#64748b": "#617978",
+    "#f2f6fb": "#f1f6f4",
+    "#e5ebf3": "#e1ebe8",
+    "#b8d0fb": "#9fd7cc",
+    "#eef3fa": "#e9f2f0",
+    "#e2eaf5": "#dce9e6",
+    "#eaf0f7": "#e5efed",
+    "#dce5f1": "#d7e5e2",
+    "#f1f5fa": "#eef5f3",
+    "#edf1f6": "#e8f1ef",
+    "#f8fafd": "#f7faf9",
+    "#dfe6ef": "#dae7e4",
+    "#d9e2ee": "#d4e3df",
+    "#245fc7": "#176f68",
+    "#f1f5fb": "#edf6f4",
+    "#38b779": "#1f9b77",
+    "#e3ebf7": "#dcebe8",
+    "#b9c6d7": "#aec7c2",
+    "#91a5bf": "#82aaa3",
+    "#718aa9": "#618f88",
+}
+
+for _old_color, _new_color in _CONTENT_PALETTE.items():
+    APP_STYLESHEET = APP_STYLESHEET.replace(_old_color, _new_color)
 
 APP_STYLESHEET = (
     APP_STYLESHEET.replace("__COMBO_ARROW__", _control_asset_path("chevron-down.svg"))

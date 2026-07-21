@@ -13,7 +13,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..config import APP_NAME, DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
+from ..config import APP_NAME
 from ..database import AuthenticationError, Database
 from .frameless import FramelessDialog, FramelessMessageBox as QMessageBox
 
@@ -108,7 +108,7 @@ class PasswordDialog(FramelessDialog):
 
 
 class LoginDialog(FramelessDialog):
-    def __init__(self, database: Database, bootstrap_created=False, parent=None):
+    def __init__(self, database: Database, parent=None):
         super().__init__(
             parent,
             resizable=False,
@@ -116,7 +116,6 @@ class LoginDialog(FramelessDialog):
             show_maximize=False,
         )
         self.database = database
-        self.bootstrap_created = bootstrap_created
         self.account = None
         self.setWindowTitle(f"登录 - {APP_NAME}")
         self.setFixedSize(470, 430)
@@ -124,6 +123,7 @@ class LoginDialog(FramelessDialog):
         root = QVBoxLayout(self)
         root.setContentsMargins(42, 36, 42, 36)
         root.setSpacing(14)
+        root.addStretch()
 
         title = QLabel(APP_NAME)
         title.setObjectName("PageTitle")
@@ -150,16 +150,6 @@ class LoginDialog(FramelessDialog):
         card_layout.addRow("账号", self.username_edit)
         card_layout.addRow("密码", self.password_edit)
         root.addWidget(card)
-
-        if bootstrap_created:
-            info = QLabel(
-                f"首次启动已创建管理员：{DEFAULT_ADMIN_USERNAME} / {DEFAULT_ADMIN_PASSWORD}\n"
-                "登录后将要求立即修改密码。"
-            )
-            info.setWordWrap(True)
-            info.setStyleSheet("color:#9a6415;background:#fff7e5;padding:10px;border-radius:6px;")
-            root.addWidget(info)
-            self.username_edit.setText(DEFAULT_ADMIN_USERNAME)
 
         login_btn = QPushButton("登录")
         login_btn.setObjectName("PrimaryButton")
