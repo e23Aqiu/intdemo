@@ -1,6 +1,8 @@
 import json
+import os
 import sqlite3
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
@@ -204,6 +206,70 @@ class Database:
                     deleted_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS workflow_batches (
+                    batch_id TEXT PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    source_path TEXT NOT NULL,
+                    source_signature TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'incomplete'
+                        CHECK (status IN ('incomplete', 'running', 'succeeded', 'cancelled')),
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    completed_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS workflow_runs (
+                    run_id TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL REFERENCES workflow_batches(batch_id) ON DELETE CASCADE,
+                    user_id INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    process_session_id TEXT NOT NULL,
+                    process_id INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL
+                        CHECK (status IN (
+                            'running', 'paused', 'stopping', 'stopped',
+                            'succeeded', 'failed', 'interrupted'
+                        )),
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    heartbeat_at TEXT NOT NULL,
+                    heartbeat_ts REAL NOT NULL,
+                    active_ms INTEGER NOT NULL DEFAULT 0,
+                    paused_ms INTEGER NOT NULL DEFAULT 0,
+                    current_step INTEGER NOT NULL DEFAULT 0,
+                    stop_reason TEXT NOT NULL DEFAULT '',
+                    error_summary TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS workflow_step_attempts (
+                    attempt_id TEXT PRIMARY KEY,
+                    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+                    step_no INTEGER NOT NULL,
+                    attempt_no INTEGER NOT NULL,
+                    status TEXT NOT NULL
+                        CHECK (status IN (
+                            'running', 'paused', 'stopping', 'stopped',
+                            'succeeded', 'failed', 'interrupted'
+                        )),
+                    started_at TEXT NOT NULL,
+                    ended_at TEXT,
+                    active_ms INTEGER NOT NULL DEFAULT 0,
+                    paused_ms INTEGER NOT NULL DEFAULT 0,
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    UNIQUE(run_id, step_no, attempt_no)
+                );
+
+                CREATE TABLE IF NOT EXISTS workflow_timer_events (
+                    event_uid TEXT PRIMARY KEY,
+                    batch_id TEXT NOT NULL REFERENCES workflow_batches(batch_id) ON DELETE CASCADE,
+                    run_id TEXT NOT NULL REFERENCES workflow_runs(run_id) ON DELETE CASCADE,
+                    attempt_id TEXT REFERENCES workflow_step_attempts(attempt_id) ON DELETE SET NULL,
+                    event_type TEXT NOT NULL,
+                    reason TEXT NOT NULL DEFAULT '',
+                    details_json TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_activity_user_time
                     ON activity_events(user_id, created_at);
                 CREATE INDEX IF NOT EXISTS idx_activity_metric_time
@@ -211,6 +277,14 @@ class Database:
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_task_metric
                     ON activity_events(user_id, metric_key, task_id)
                     WHERE task_id IS NOT NULL;
+                CREATE INDEX IF NOT EXISTS idx_workflow_batch_lookup
+                    ON workflow_batches(user_id, source_path, source_signature, status);
+                CREATE INDEX IF NOT EXISTS idx_workflow_run_batch
+                    ON workflow_runs(batch_id, started_at);
+                CREATE INDEX IF NOT EXISTS idx_workflow_run_heartbeat
+                    ON workflow_runs(status, heartbeat_ts);
+                CREATE INDEX IF NOT EXISTS idx_workflow_step_run
+                    ON workflow_step_attempts(run_id, step_no, attempt_no);
                 """
             )
             account_columns = {
@@ -227,6 +301,14 @@ class Database:
             }
             if "event_uid" not in activity_columns:
                 conn.execute("ALTER TABLE activity_events ADD COLUMN event_uid TEXT")
+            workflow_run_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(workflow_runs)").fetchall()
+            }
+            if "process_id" not in workflow_run_columns:
+                conn.execute(
+                    "ALTER TABLE workflow_runs ADD COLUMN process_id INTEGER NOT NULL DEFAULT 0"
+                )
             missing_event_uids = conn.execute(
                 "SELECT id FROM activity_events WHERE event_uid IS NULL OR TRIM(event_uid)=''"
             ).fetchall()
@@ -1124,3 +1206,750 @@ class Database:
         params = tuple(params) + tuple(date_params) + (int(limit),)
         with self._connect() as conn:
             return conn.execute(sql, params).fetchall()
+
+    @staticmethod
+    def _insert_workflow_timer_event(
+        conn,
+        batch_id: str,
+        run_id: str,
+        event_type: str,
+        created_at: str,
+        attempt_id: Optional[str] = None,
+        reason: str = "",
+        details: Optional[Dict] = None,
+    ) -> None:
+        conn.execute(
+            """
+            INSERT INTO workflow_timer_events(
+                event_uid, batch_id, run_id, attempt_id, event_type,
+                reason, details_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                uuid.uuid4().hex,
+                batch_id,
+                run_id,
+                attempt_id,
+                event_type,
+                reason or "",
+                json.dumps(details or {}, ensure_ascii=False, separators=(",", ":")),
+                created_at,
+            ),
+        )
+
+    @staticmethod
+    def _process_is_running(process_id: int) -> bool:
+        process_id = int(process_id or 0)
+        if process_id <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.OpenProcess.argtypes = (
+                wintypes.DWORD,
+                wintypes.BOOL,
+                wintypes.DWORD,
+            )
+            kernel32.OpenProcess.restype = wintypes.HANDLE
+            kernel32.GetExitCodeProcess.argtypes = (
+                wintypes.HANDLE,
+                ctypes.POINTER(wintypes.DWORD),
+            )
+            kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            process_query_limited_information = 0x1000
+            still_active = 259
+            handle = kernel32.OpenProcess(
+                process_query_limited_information,
+                False,
+                process_id,
+            )
+            if not handle:
+                return ctypes.get_last_error() == 5
+            try:
+                exit_code = wintypes.DWORD()
+                if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                    return False
+                return exit_code.value == still_active
+            finally:
+                kernel32.CloseHandle(handle)
+        try:
+            os.kill(process_id, 0)
+            return True
+        except PermissionError:
+            return True
+        except (ProcessLookupError, OSError):
+            return False
+
+    def recover_stale_workflow_runs(
+        self,
+        stale_after_seconds: int = 15,
+        now_ts: Optional[float] = None,
+    ) -> int:
+        """把失去心跳的运行标记为异常中断，保留最后一次累计时间。"""
+        current_ts = float(time.time() if now_ts is None else now_ts)
+        cutoff = current_ts - max(1, int(stale_after_seconds))
+        detected_at = self._now()
+        recovered = 0
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT run_id, batch_id, heartbeat_at, active_ms, paused_ms,
+                       current_step, status, heartbeat_ts, process_id
+                FROM workflow_runs
+                WHERE status IN ('running', 'paused', 'stopping')
+                """
+            ).fetchall()
+            for row in rows:
+                process_id = int(row["process_id"] or 0)
+                process_dead = process_id > 0 and not self._process_is_running(process_id)
+                heartbeat_stale = float(row["heartbeat_ts"] or 0) < cutoff
+                legacy_without_process = process_id <= 0 and heartbeat_stale
+                if not process_dead and not legacy_without_process:
+                    continue
+                ended_at = row["heartbeat_at"] or detected_at
+                interruption_reason = (
+                    "程序进程已退出"
+                    if process_dead
+                    else "程序异常退出或心跳中断"
+                )
+                conn.execute(
+                    """
+                    UPDATE workflow_runs
+                    SET status='interrupted', ended_at=?, stop_reason=?,
+                        heartbeat_at=?, heartbeat_ts=?
+                    WHERE run_id=? AND status IN ('running', 'paused', 'stopping')
+                    """,
+                    (
+                        ended_at,
+                        interruption_reason,
+                        ended_at,
+                        min(current_ts, cutoff),
+                        row["run_id"],
+                    ),
+                )
+                conn.execute(
+                    """
+                    UPDATE workflow_step_attempts
+                    SET status='interrupted', ended_at=?,
+                        last_error=CASE WHEN last_error='' THEN ? ELSE last_error END
+                    WHERE run_id=? AND status IN ('running', 'paused', 'stopping')
+                    """,
+                    (ended_at, interruption_reason, row["run_id"]),
+                )
+                conn.execute(
+                    """
+                    UPDATE workflow_batches
+                    SET status='incomplete', updated_at=?
+                    WHERE batch_id=?
+                    """,
+                    (detected_at, row["batch_id"]),
+                )
+                self._insert_workflow_timer_event(
+                    conn,
+                    row["batch_id"],
+                    row["run_id"],
+                    "run_interrupted",
+                    detected_at,
+                    reason=interruption_reason,
+                    details={
+                        "last_heartbeat_at": row["heartbeat_at"],
+                        "active_ms": int(row["active_ms"]),
+                        "paused_ms": int(row["paused_ms"]),
+                        "current_step": int(row["current_step"]),
+                        "previous_status": row["status"],
+                        "process_id": process_id,
+                    },
+                )
+                recovered += 1
+        return recovered
+
+    def start_workflow_run(
+        self,
+        user_id: int,
+        source_path: str,
+        source_signature: str,
+        run_id: str,
+        process_session_id: str,
+        process_id: int,
+        stale_after_seconds: int = 15,
+        source_signature_aliases: Optional[Iterable[str]] = None,
+    ) -> Dict:
+        """创建一次物理运行，并复用相同文件输入的未完成逻辑批次。"""
+        source_path = str(source_path or "").strip()
+        source_signature = str(source_signature or "").strip()
+        run_id = str(run_id or "").strip()
+        process_session_id = str(process_session_id or "").strip()
+        process_id = int(process_id or 0)
+        if (
+            not source_path
+            or not source_signature
+            or not run_id
+            or not process_session_id
+            or process_id <= 0
+        ):
+            raise ValueError("计时任务缺少必要标识")
+
+        self.recover_stale_workflow_runs(stale_after_seconds)
+        signature_aliases = [source_signature]
+        for alias in source_signature_aliases or ():
+            alias = str(alias or "").strip()
+            if alias and alias not in signature_aliases:
+                signature_aliases.append(alias)
+        now = self._now()
+        heartbeat_ts = time.time()
+        with self._connect() as conn:
+            account = conn.execute(
+                "SELECT id, is_active FROM accounts WHERE id=?",
+                (int(user_id),),
+            ).fetchone()
+            if not account or not account["is_active"]:
+                raise DatabaseError("当前账号不可用于创建计时任务")
+
+            signature_placeholders = ",".join("?" for _ in signature_aliases)
+            batches = conn.execute(
+                f"""
+                SELECT * FROM workflow_batches
+                WHERE user_id=? AND source_path=?
+                  AND source_signature IN ({signature_placeholders})
+                  AND status IN ('incomplete', 'running')
+                ORDER BY updated_at DESC
+                """,
+                (int(user_id), source_path, *signature_aliases),
+            ).fetchall()
+            if batches:
+                batch_ids = [row["batch_id"] for row in batches]
+                batch_placeholders = ",".join("?" for _ in batch_ids)
+                active_run = conn.execute(
+                    """
+                    SELECT run_id, heartbeat_ts FROM workflow_runs
+                    WHERE batch_id IN ({})
+                      AND status IN ('running', 'paused', 'stopping')
+                    ORDER BY started_at DESC LIMIT 1
+                    """.format(batch_placeholders),
+                    batch_ids,
+                ).fetchone()
+                if active_run:
+                    raise DatabaseError("同一批次仍在另一个客户端实例中运行")
+                batch_id = batches[0]["batch_id"]
+                for duplicate in batches[1:]:
+                    duplicate_id = duplicate["batch_id"]
+                    conn.execute(
+                        "UPDATE workflow_timer_events SET batch_id=? WHERE batch_id=?",
+                        (batch_id, duplicate_id),
+                    )
+                    conn.execute(
+                        "UPDATE workflow_runs SET batch_id=? WHERE batch_id=?",
+                        (batch_id, duplicate_id),
+                    )
+                    conn.execute(
+                        "DELETE FROM workflow_batches WHERE batch_id=?",
+                        (duplicate_id,),
+                    )
+                created_at = min(row["created_at"] for row in batches)
+                conn.execute(
+                    """
+                    UPDATE workflow_batches
+                    SET source_signature=?, created_at=?, status='incomplete',
+                        updated_at=?
+                    WHERE batch_id=?
+                    """,
+                    (source_signature, created_at, now, batch_id),
+                )
+                resumed = True
+            else:
+                batch_id = uuid.uuid4().hex
+                resumed = False
+                conn.execute(
+                    """
+                    INSERT INTO workflow_batches(
+                        batch_id, user_id, source_path, source_signature, status,
+                        created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'incomplete', ?, ?)
+                    """,
+                    (
+                        batch_id,
+                        int(user_id),
+                        source_path,
+                        source_signature,
+                        now,
+                        now,
+                    ),
+                )
+
+            totals = conn.execute(
+                """
+                SELECT COALESCE(SUM(active_ms), 0) AS active_ms,
+                       COALESCE(SUM(paused_ms), 0) AS paused_ms,
+                       COUNT(*) AS run_count
+                FROM workflow_runs WHERE batch_id=?
+                """,
+                (batch_id,),
+            ).fetchone()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO workflow_runs(
+                        run_id, batch_id, user_id, process_session_id, process_id, status,
+                        started_at, heartbeat_at, heartbeat_ts
+                    ) VALUES (?, ?, ?, ?, ?, 'running', ?, ?, ?)
+                    """,
+                    (
+                        run_id,
+                        batch_id,
+                        int(user_id),
+                        process_session_id,
+                        process_id,
+                        now,
+                        now,
+                        heartbeat_ts,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DatabaseError("计时运行标识已存在") from exc
+            conn.execute(
+                """
+                UPDATE workflow_batches
+                SET status='running', updated_at=?, completed_at=NULL
+                WHERE batch_id=?
+                """,
+                (now, batch_id),
+            )
+            self._insert_workflow_timer_event(
+                conn,
+                batch_id,
+                run_id,
+                "run_started",
+                now,
+                details={
+                    "resumed_batch": resumed,
+                    "previous_run_count": int(totals["run_count"]),
+                },
+            )
+            return {
+                "batch_id": batch_id,
+                "run_id": run_id,
+                "resumed": resumed,
+                "previous_active_ms": int(totals["active_ms"]),
+                "previous_paused_ms": int(totals["paused_ms"]),
+                "run_number": int(totals["run_count"]) + 1,
+            }
+
+    def start_workflow_step(self, run_id: str, step_no: int) -> Dict:
+        now = self._now()
+        with self._connect() as conn:
+            run = conn.execute(
+                "SELECT batch_id, status FROM workflow_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise DatabaseError("计时运行不存在")
+            if run["status"] not in {"running", "paused", "stopping"}:
+                raise DatabaseError("计时运行已经结束")
+            attempt_no = conn.execute(
+                """
+                SELECT COALESCE(MAX(attempt_no), 0) + 1
+                FROM workflow_step_attempts WHERE run_id=? AND step_no=?
+                """,
+                (run_id, int(step_no)),
+            ).fetchone()[0]
+            attempt_id = uuid.uuid4().hex
+            conn.execute(
+                """
+                INSERT INTO workflow_step_attempts(
+                    attempt_id, run_id, step_no, attempt_no, status, started_at
+                ) VALUES (?, ?, ?, ?, 'running', ?)
+                """,
+                (attempt_id, run_id, int(step_no), int(attempt_no), now),
+            )
+            conn.execute(
+                "UPDATE workflow_runs SET current_step=? WHERE run_id=?",
+                (int(step_no), run_id),
+            )
+            self._insert_workflow_timer_event(
+                conn,
+                run["batch_id"],
+                run_id,
+                "step_started",
+                now,
+                attempt_id=attempt_id,
+                details={"step_no": int(step_no), "attempt_no": int(attempt_no)},
+            )
+            return {
+                "attempt_id": attempt_id,
+                "step_no": int(step_no),
+                "attempt_no": int(attempt_no),
+            }
+
+    def checkpoint_workflow_timing(
+        self,
+        run_id: str,
+        status: str,
+        active_ms: int,
+        paused_ms: int,
+        current_step: int = 0,
+        attempt_id: Optional[str] = None,
+        step_status: Optional[str] = None,
+        step_active_ms: int = 0,
+        step_paused_ms: int = 0,
+        event_type: Optional[str] = None,
+        reason: str = "",
+        details: Optional[Dict] = None,
+    ) -> None:
+        active_statuses = {"running", "paused", "stopping"}
+        if status not in active_statuses:
+            raise ValueError("无效的运行中计时状态")
+        if step_status is not None and step_status not in active_statuses:
+            raise ValueError("无效的步骤计时状态")
+        now = self._now()
+        now_ts = time.time()
+        with self._connect() as conn:
+            run = conn.execute(
+                "SELECT batch_id, status FROM workflow_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if not run or run["status"] not in active_statuses:
+                return
+            conn.execute(
+                """
+                UPDATE workflow_runs
+                SET status=?, active_ms=?, paused_ms=?, current_step=?,
+                    heartbeat_at=?, heartbeat_ts=?,
+                    stop_reason=CASE WHEN ?<>'' THEN ? ELSE stop_reason END
+                WHERE run_id=?
+                """,
+                (
+                    status,
+                    max(0, int(active_ms)),
+                    max(0, int(paused_ms)),
+                    max(0, int(current_step)),
+                    now,
+                    now_ts,
+                    reason,
+                    reason,
+                    run_id,
+                ),
+            )
+            if attempt_id and step_status:
+                conn.execute(
+                    """
+                    UPDATE workflow_step_attempts
+                    SET status=?, active_ms=?, paused_ms=?
+                    WHERE attempt_id=? AND status IN ('running', 'paused', 'stopping')
+                    """,
+                    (
+                        step_status,
+                        max(0, int(step_active_ms)),
+                        max(0, int(step_paused_ms)),
+                        attempt_id,
+                    ),
+                )
+            conn.execute(
+                "UPDATE workflow_batches SET updated_at=? WHERE batch_id=?",
+                (now, run["batch_id"]),
+            )
+            if event_type:
+                self._insert_workflow_timer_event(
+                    conn,
+                    run["batch_id"],
+                    run_id,
+                    event_type,
+                    now,
+                    attempt_id=attempt_id,
+                    reason=reason,
+                    details=details,
+                )
+
+    def record_workflow_retry(
+        self,
+        run_id: str,
+        attempt_id: Optional[str],
+        retry_type: str,
+        reason: str = "",
+    ) -> None:
+        if not attempt_id:
+            return
+        now = self._now()
+        with self._connect() as conn:
+            run = conn.execute(
+                "SELECT batch_id, status FROM workflow_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if not run or run["status"] not in {"running", "paused", "stopping"}:
+                return
+            cursor = conn.execute(
+                """
+                UPDATE workflow_step_attempts
+                SET retry_count=retry_count+1,
+                    last_error=CASE WHEN ?<>'' THEN ? ELSE last_error END
+                WHERE attempt_id=? AND status IN ('running', 'paused', 'stopping')
+                """,
+                (reason, reason, attempt_id),
+            )
+            if cursor.rowcount <= 0:
+                return
+            self._insert_workflow_timer_event(
+                conn,
+                run["batch_id"],
+                run_id,
+                "retry",
+                now,
+                attempt_id=attempt_id,
+                reason=reason,
+                details={"retry_type": retry_type},
+            )
+
+    def finish_workflow_step(
+        self,
+        attempt_id: str,
+        status: str,
+        active_ms: int,
+        paused_ms: int,
+        error_summary: str = "",
+    ) -> None:
+        terminal_statuses = {"stopped", "succeeded", "failed", "interrupted"}
+        if status not in terminal_statuses:
+            raise ValueError("无效的步骤结束状态")
+        now = self._now()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT s.run_id, r.batch_id, s.step_no, s.status
+                FROM workflow_step_attempts s
+                JOIN workflow_runs r ON r.run_id=s.run_id
+                WHERE s.attempt_id=?
+                """,
+                (attempt_id,),
+            ).fetchone()
+            if not row or row["status"] not in {"running", "paused", "stopping"}:
+                return
+            conn.execute(
+                """
+                UPDATE workflow_step_attempts
+                SET status=?, ended_at=?, active_ms=?, paused_ms=?,
+                    last_error=CASE WHEN ?<>'' THEN ? ELSE last_error END
+                WHERE attempt_id=?
+                """,
+                (
+                    status,
+                    now,
+                    max(0, int(active_ms)),
+                    max(0, int(paused_ms)),
+                    error_summary,
+                    error_summary,
+                    attempt_id,
+                ),
+            )
+            self._insert_workflow_timer_event(
+                conn,
+                row["batch_id"],
+                row["run_id"],
+                "step_finished",
+                now,
+                attempt_id=attempt_id,
+                reason=error_summary,
+                details={"step_no": int(row["step_no"]), "status": status},
+            )
+
+    def finish_workflow_run(
+        self,
+        run_id: str,
+        status: str,
+        active_ms: int,
+        paused_ms: int,
+        reason: str = "",
+        error_summary: str = "",
+    ) -> Dict:
+        terminal_statuses = {"stopped", "succeeded", "failed", "interrupted"}
+        if status not in terminal_statuses:
+            raise ValueError("无效的计时结束状态")
+        now = self._now()
+        now_ts = time.time()
+        with self._connect() as conn:
+            run = conn.execute(
+                "SELECT batch_id, status FROM workflow_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            if not run:
+                raise DatabaseError("计时运行不存在")
+            if run["status"] in terminal_statuses:
+                batch_id = run["batch_id"]
+            else:
+                batch_id = run["batch_id"]
+                conn.execute(
+                    """
+                    UPDATE workflow_runs
+                    SET status=?, ended_at=?, heartbeat_at=?, heartbeat_ts=?,
+                        active_ms=?, paused_ms=?, stop_reason=?, error_summary=?
+                    WHERE run_id=?
+                    """,
+                    (
+                        status,
+                        now,
+                        now,
+                        now_ts,
+                        max(0, int(active_ms)),
+                        max(0, int(paused_ms)),
+                        reason or "",
+                        error_summary or "",
+                        run_id,
+                    ),
+                )
+                step_status = "succeeded" if status == "succeeded" else status
+                conn.execute(
+                    """
+                    UPDATE workflow_step_attempts
+                    SET status=?, ended_at=?,
+                        last_error=CASE WHEN last_error='' THEN ? ELSE last_error END
+                    WHERE run_id=? AND status IN ('running', 'paused', 'stopping')
+                    """,
+                    (step_status, now, error_summary or reason or "", run_id),
+                )
+                batch_status = "succeeded" if status == "succeeded" else "incomplete"
+                conn.execute(
+                    """
+                    UPDATE workflow_batches
+                    SET status=?, updated_at=?, completed_at=?
+                    WHERE batch_id=?
+                    """,
+                    (
+                        batch_status,
+                        now,
+                        now if batch_status == "succeeded" else None,
+                        batch_id,
+                    ),
+                )
+                self._insert_workflow_timer_event(
+                    conn,
+                    batch_id,
+                    run_id,
+                    "run_finished",
+                    now,
+                    reason=reason or error_summary,
+                    details={"status": status},
+                )
+
+            totals = conn.execute(
+                """
+                SELECT COALESCE(SUM(active_ms), 0) AS active_ms,
+                       COALESCE(SUM(paused_ms), 0) AS paused_ms,
+                       COUNT(*) AS run_count
+                FROM workflow_runs WHERE batch_id=?
+                """,
+                (batch_id,),
+            ).fetchone()
+            return {
+                "batch_id": batch_id,
+                "active_ms": int(totals["active_ms"]),
+                "paused_ms": int(totals["paused_ms"]),
+                "run_count": int(totals["run_count"]),
+            }
+
+    def get_workflow_batch_summary(self, batch_id: str) -> Dict:
+        with self._connect() as conn:
+            batch = conn.execute(
+                "SELECT * FROM workflow_batches WHERE batch_id=?",
+                (batch_id,),
+            ).fetchone()
+            if not batch:
+                raise DatabaseError("计时批次不存在")
+            totals = conn.execute(
+                """
+                SELECT COALESCE(SUM(active_ms), 0) AS active_ms,
+                       COALESCE(SUM(paused_ms), 0) AS paused_ms,
+                       COUNT(*) AS run_count,
+                       SUM(CASE WHEN status='stopped' THEN 1 ELSE 0 END) AS stopped_count,
+                       SUM(CASE WHEN status='interrupted' THEN 1 ELSE 0 END) AS interrupted_count
+                FROM workflow_runs WHERE batch_id=?
+                """,
+                (batch_id,),
+            ).fetchone()
+            return {
+                "batch_id": batch_id,
+                "status": batch["status"],
+                "source_path": batch["source_path"],
+                "source_signature": batch["source_signature"],
+                "active_ms": int(totals["active_ms"]),
+                "paused_ms": int(totals["paused_ms"]),
+                "run_count": int(totals["run_count"]),
+                "stopped_count": int(totals["stopped_count"] or 0),
+                "interrupted_count": int(totals["interrupted_count"] or 0),
+            }
+
+    def get_workflow_timing_totals(
+        self,
+        user_id: Optional[int] = None,
+        users_only: bool = False,
+        start_date=None,
+        end_date=None,
+    ) -> Dict:
+        """只汇总已经成功完成完整流程的批次及其全部运行时间。"""
+        completed_batches_sql = """
+            SELECT b.batch_id, COALESCE(SUM(e.amount), 0) AS completed_items
+            FROM activity_events e
+            JOIN workflow_runs final_run
+              ON final_run.run_id=e.task_id AND final_run.user_id=e.user_id
+            JOIN workflow_batches b ON b.batch_id=final_run.batch_id
+            JOIN accounts a ON a.id=e.user_id
+            WHERE e.metric_key=? AND e.source='unified_workflow'
+              AND final_run.status='succeeded' AND b.status='succeeded'
+        """
+        params = [WORKFLOW_TOTAL_METRIC]
+
+        if user_id is not None:
+            completed_batches_sql += " AND e.user_id=?"
+            params.append(int(user_id))
+        elif users_only:
+            completed_batches_sql += " AND a.role='user'"
+
+        date_sql, date_params, _, _ = self._date_range_clause(
+            "e.created_at",
+            start_date,
+            end_date,
+        )
+        completed_batches_sql += date_sql
+        completed_batches_sql += " GROUP BY b.batch_id"
+        params.extend(date_params)
+
+        summary_sql = f"""
+            WITH completed_batches AS (
+                {completed_batches_sql}
+            ), timing AS (
+                SELECT COALESCE(SUM(r.active_ms), 0) AS active_ms,
+                       COALESCE(SUM(r.paused_ms), 0) AS paused_ms,
+                       COUNT(*) AS run_count
+                FROM workflow_runs r
+                JOIN completed_batches completed
+                  ON completed.batch_id=r.batch_id
+            )
+            SELECT timing.active_ms,
+                   timing.paused_ms,
+                   timing.run_count,
+                   COALESCE((
+                       SELECT SUM(completed_items) FROM completed_batches
+                   ), 0) AS completed_items
+            FROM timing
+        """
+
+        with self._connect() as conn:
+            summary = conn.execute(summary_sql, params).fetchone()
+
+        active_ms = int(summary["active_ms"] or 0)
+        paused_ms = int(summary["paused_ms"] or 0)
+        return {
+            "active_ms": active_ms,
+            "paused_ms": paused_ms,
+            "total_ms": active_ms + paused_ms,
+            "run_count": int(summary["run_count"] or 0),
+            "completed_items": int(summary["completed_items"] or 0),
+        }
+
+    def get_workflow_run(self, run_id: str) -> Optional[sqlite3.Row]:
+        with self._connect() as conn:
+            return conn.execute(
+                "SELECT * FROM workflow_runs WHERE run_id=?",
+                (run_id,),
+            ).fetchone()

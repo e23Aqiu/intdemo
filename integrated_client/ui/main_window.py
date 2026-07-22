@@ -18,6 +18,7 @@ from PyQt5.QtWidgets import (
 from ..config import APP_NAME, APP_VERSION
 from ..database import Database
 from ..models import Account
+from ..timing import WorkflowTimingService
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
 from .account_page import AccountPage
 from .auth_dialogs import PasswordDialog
@@ -87,7 +88,11 @@ class MainWindow(FramelessMainWindow):
                 "自动验证码识别需要修复运行环境后再启用。"
             )
         self.statistics_page = StatisticsPage(database, account, warning)
-        self.workflow_page = WorkflowPage(self._record_workflow_summary)
+        self.workflow_timing = WorkflowTimingService(database, account.id)
+        self.workflow_page = WorkflowPage(
+            self._record_workflow_summary,
+            timing_service=self.workflow_timing,
+        )
         self.personal_center_page = PersonalCenterPage(account)
         self.personal_center_page.change_password_requested.connect(self._change_password)
         self.personal_center_page.logout_requested.connect(self._request_logout)

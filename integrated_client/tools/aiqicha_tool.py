@@ -339,6 +339,7 @@ class QueryWorker(QThread):
     resume_signal = pyqtSignal()                  # 验证码已处理，通知主线程恢复UI
     login_confirmed_signal = pyqtSignal()        # 用户处理完，继续执行
     finished_signal = pyqtSignal(bool)           # 完成(bool=是否有错误)
+    retry_signal = pyqtSignal(str, str)           # 重试类型, 原因
     
     def __init__(self, df, company_col):
         super().__init__()
@@ -577,6 +578,10 @@ class QueryWorker(QThread):
                     # 检测是否遇到验证码/安全验证
                     if self._check_captcha():
                         captcha_count += 1
+                        self.retry_signal.emit(
+                            "aiqicha_captcha",
+                            f"爱企查触发第 {captcha_count} 次安全验证",
+                        )
                         self.log_signal.emit(f"  ⚠️ 检测到验证码（第{captcha_count}次），请在浏览器中完成验证后点击「继续」")
 
                         # 通过暂停机制等待用户处理验证码

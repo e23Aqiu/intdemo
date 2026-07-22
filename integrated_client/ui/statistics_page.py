@@ -49,6 +49,21 @@ from .date_range import DateRangeSelector
 from .frameless import FramelessMessageBox as QMessageBox
 
 
+MILLISECONDS_PER_HOUR = 60 * 60 * 1000
+
+
+def format_hours(milliseconds):
+    return f"{max(0, float(milliseconds)) / MILLISECONDS_PER_HOUR:.1f} 小时"
+
+
+def format_precise_duration(milliseconds):
+    total_ms = max(0, int(round(float(milliseconds))))
+    hours, remainder = divmod(total_ms, MILLISECONDS_PER_HOUR)
+    minutes, remainder = divmod(remainder, 60 * 1000)
+    seconds, milliseconds = divmod(remainder, 1000)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}.{milliseconds:03d}"
+
+
 class ChartHoverCard(QFrame):
     """不受图表边界裁切、可由图表内容单独定制的悬浮信息卡。"""
 
@@ -748,7 +763,7 @@ class ViolationReasonChart(AnimatedDonutChart):
 
 
 class StationDistributionChart(AnimatedDonutChart):
-    """用双环形图对比各站总计数与有电话数在全部站点中的占比。"""
+    """用环形图对比各站业务量与耗时在全部站点中的占比。"""
 
     TOTAL_COLOR = QColor("#1d8178")
     PHONE_COLOR = QColor("#f0a45d")
@@ -786,6 +801,7 @@ class StationDistributionChart(AnimatedDonutChart):
         share_key,
         title,
         center_label,
+        is_duration=False,
     ):
         inner = outer.adjusted(
             outer.width() * 0.28,
@@ -793,7 +809,7 @@ class StationDistributionChart(AnimatedDonutChart):
             -outer.width() * 0.28,
             -outer.height() * 0.28,
         )
-        total = sum(int(row[value_key]) for row in self._rows)
+        total = sum(max(0, int(row[value_key])) for row in self._rows)
         painter.setPen(QColor("#526e6d"))
         painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
         painter.drawText(
@@ -821,6 +837,7 @@ class StationDistributionChart(AnimatedDonutChart):
                                 "value": value,
                                 "share": row[share_key],
                                 "color": color,
+                                "is_duration": is_duration,
                             },
                         }
                     )
@@ -847,7 +864,11 @@ class StationDistributionChart(AnimatedDonutChart):
         painter.drawText(
             QRectF(inner.left(), inner.top() - 5, inner.width(), inner.height()),
             Qt.AlignCenter,
-            str(total),
+            (
+                f"{total / MILLISECONDS_PER_HOUR:.1f}"
+                if is_duration
+                else str(total)
+            ),
         )
         painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 8))
@@ -869,46 +890,47 @@ class StationDistributionChart(AnimatedDonutChart):
 
         painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
-        painter.drawText(20, 29, "各站业务分布")
+        painter.drawText(20, 29, "各站业务与耗时分布")
         painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
-        painter.drawText(130, 29, "占全部站点对应数据的比例")
+        painter.drawText(165, 29, "占全部站点对应指标的比例")
 
         if not self._rows:
             painter.setPen(QColor("#8a98aa"))
             painter.drawText(self.rect(), Qt.AlignCenter, "暂无站点数据")
             return
 
-        chart_area_width = min(450, max(360, int(self.width() * 0.42)))
+        chart_area_width = min(680, max(520, int(self.width() * 0.58)))
         chart_size = min(
-            160,
-            max(120, self.height() - 115),
-            max(120, int((chart_area_width - 70) / 2)),
+            128,
+            max(92, self.height() - 115),
+            max(92, int((chart_area_width - 76) / 4)),
         )
-        first_left = 30
-        second_left = first_left + chart_size + 30
+        first_left = 20
+        chart_gap = 16
         chart_top = 82
-        self._draw_series_donut(
-            painter,
-            QRectF(first_left, chart_top, chart_size, chart_size),
-            "total",
-            "total_share",
-            "各站总计数占比",
-            "总计数",
+        series = (
+            ("total", "total_share", "各站总计数占比", "总计数", False),
+            ("has_phone", "phone_share", "各站有电话数占比", "有电话数", False),
+            ("total_time_ms", "total_time_share", "各站总耗时占比", "小时", True),
+            ("active_ms", "active_time_share", "各站有效耗时占比", "小时", True),
         )
-        self._draw_series_donut(
-            painter,
-            QRectF(second_left, chart_top, chart_size, chart_size),
-            "has_phone",
-            "phone_share",
-            "各站有电话数占比",
-            "有电话数",
-        )
+        for index, (value_key, share_key, title, center_label, is_duration) in enumerate(series):
+            left = first_left + index * (chart_size + chart_gap)
+            self._draw_series_donut(
+                painter,
+                QRectF(left, chart_top, chart_size, chart_size),
+                value_key,
+                share_key,
+                title,
+                center_label,
+                is_duration=is_duration,
+            )
 
-        legend_left = second_left + chart_size + 40
+        legend_left = first_left + 4 * chart_size + 3 * chart_gap + 30
         legend_width = max(270, self.width() - legend_left - 22)
-        total_column = legend_left + legend_width - 310
-        phone_column = legend_left + legend_width - 150
+        total_column = legend_left + legend_width - 300
+        active_column = legend_left + legend_width - 145
         painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
         painter.setPen(QColor("#718096"))
         painter.drawText(legend_left + 18, 52, "站点")
@@ -916,13 +938,13 @@ class StationDistributionChart(AnimatedDonutChart):
         painter.drawText(
             QRectF(total_column, 40, 145, 18),
             Qt.AlignRight | Qt.AlignVCenter,
-            "总计数 / 占比",
+            "总耗时 / 占比",
         )
         painter.setPen(self.PHONE_COLOR)
         painter.drawText(
-            QRectF(phone_column, 40, 145, 18),
+            QRectF(active_column, 40, 145, 18),
             Qt.AlignRight | Qt.AlignVCenter,
-            "有电话数 / 占比",
+            "有效耗时 / 占比",
         )
 
         visible_rows = self._rows[:7]
@@ -966,13 +988,15 @@ class StationDistributionChart(AnimatedDonutChart):
             painter.drawText(
                 QRectF(total_column, row_top, 145, row_height - 2),
                 Qt.AlignRight | Qt.AlignVCenter,
-                f'{row["total"]} 条 · {self._format_share(row["total_share"])}',
+                f'{format_hours(row["total_time_ms"])} · '
+                f'{self._format_share(row["total_time_share"])}',
             )
             painter.setPen(self.PHONE_COLOR)
             painter.drawText(
-                QRectF(phone_column, row_top, 145, row_height - 2),
+                QRectF(active_column, row_top, 145, row_height - 2),
                 Qt.AlignRight | Qt.AlignVCenter,
-                f'{row["has_phone"]} 条 · {self._format_share(row["phone_share"])}',
+                f'{format_hours(row["active_ms"])} · '
+                f'{self._format_share(row["active_time_share"])}',
             )
 
         if len(self._rows) > len(visible_rows):
@@ -988,14 +1012,24 @@ class StationDistributionChart(AnimatedDonutChart):
         slice_index, payload = self._slice_at(event.pos())
         if payload is not None:
             self._hovered_slice = slice_index
-            self._hover_card.show_details(
-                payload["station"],
+            details = (
                 [
+                    ("小时数", format_hours(payload["value"])),
+                    ("精确耗时", format_precise_duration(payload["value"])),
+                    ("占比", self._format_share(payload["share"])),
+                ]
+                if payload["is_duration"]
+                else [
                     ("数量", f'{payload["value"]} 条'),
                     ("占比", self._format_share(payload["share"])),
-                ],
+                ]
+            )
+            self._hover_card.show_details(
+                f'{payload["station"]} · {payload["series"]}',
+                details,
                 payload["color"],
                 event.globalPos(),
+                card_width=300 if payload["is_duration"] else 240,
             )
             self.update()
             return
@@ -1011,12 +1045,18 @@ class StationDistributionChart(AnimatedDonutChart):
                         ("总数占比", self._format_share(row["total_share"])),
                         ("有电话数", f'{row["has_phone"]} 条'),
                         ("有电话占比", self._format_share(row["phone_share"])),
+                        ("总耗时", format_hours(row["total_time_ms"])),
+                        ("精确总耗时", format_precise_duration(row["total_time_ms"])),
+                        ("总耗时占比", self._format_share(row["total_time_share"])),
+                        ("有效耗时", format_hours(row["active_ms"])),
+                        ("精确有效耗时", format_precise_duration(row["active_ms"])),
+                        ("有效耗时占比", self._format_share(row["active_time_share"])),
                     ],
                     self.COLORS[
                         self._rows.index(row) % len(self.COLORS)
                     ],
                     event.globalPos(),
-                    card_width=288,
+                    card_width=520,
                 )
                 return
         if self._hovered_slice is not None:
@@ -1027,6 +1067,9 @@ class StationDistributionChart(AnimatedDonutChart):
 
 
 class StatisticsPage(QWidget):
+    HUMAN_BASELINE_ITEMS = 260
+    HUMAN_BASELINE_MS = 6 * 60 * 60 * 1000
+
     def __init__(self, database: Database, account: Account, dependency_warning="", parent=None):
         super().__init__(parent)
         self.database = database
@@ -1114,6 +1157,22 @@ class StatisticsPage(QWidget):
             self.filter_layout.minimumSize().width()
         )
         layout.addWidget(self.filter_card)
+
+        timing_header = QHBoxLayout()
+        timing_header.setContentsMargins(2, 1, 2, 0)
+        timing_title = QLabel("效率统计")
+        timing_title.setStyleSheet("color:#173a3d;font-size:14px;font-weight:700;")
+        timing_header.addWidget(timing_title)
+        self.timing_scope_label = QLabel("人工基准：260 条 / 6 小时")
+        self.timing_scope_label.setObjectName("Muted")
+        timing_header.addWidget(self.timing_scope_label)
+        timing_header.addStretch(1)
+        layout.addLayout(timing_header)
+
+        self.timing_kpi_layout = QGridLayout()
+        self.timing_kpi_layout.setSpacing(10)
+        self.timing_kpi_cards = {}
+        layout.addLayout(self.timing_kpi_layout)
 
         self._active_category = self.category_combo.currentData()
         self._station_before_distribution = None
@@ -1531,11 +1590,112 @@ class StatisticsPage(QWidget):
         box.setContentsMargins(14, 9, 14, 9)
         caption = QLabel(label)
         caption.setObjectName("Muted")
-        number = QLabel(f"{value} {unit}")
+        number = QLabel(f"{value} {unit}".rstrip())
         number.setObjectName("MetricValue")
         box.addWidget(caption)
         box.addWidget(number)
         return card
+
+    def _refresh_timing_kpis(self, user_id):
+        while self.timing_kpi_layout.count():
+            item = self.timing_kpi_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self.timing_kpi_cards = {}
+
+        start_date, end_date = self._date_range()
+        totals = self.database.get_workflow_timing_totals(
+            user_id,
+            users_only=(user_id is None),
+            start_date=start_date,
+            end_date=end_date,
+        )
+        completed_items = totals["completed_items"]
+        average_ms = (
+            totals["active_ms"] / completed_items
+            if completed_items
+            else None
+        )
+        manual_estimated_ms = (
+            completed_items
+            * self.HUMAN_BASELINE_MS
+            / self.HUMAN_BASELINE_ITEMS
+        )
+        efficiency_gain = (
+            (manual_estimated_ms - totals["active_ms"])
+            / manual_estimated_ms
+            * 100
+            if manual_estimated_ms
+            else None
+        )
+        detail_summary = (
+            f"精确总用时：{format_precise_duration(totals['total_ms'])}\n"
+            f"精确有效用时：{format_precise_duration(totals['active_ms'])}\n"
+            f"精确暂停等待：{format_precise_duration(totals['paused_ms'])}\n"
+            f"计时运行：{totals['run_count']} 次\n"
+            f"有计时记录的完成数据：{completed_items} 条"
+        )
+        values = [
+            (
+                "总用时",
+                f"{totals['total_ms'] / MILLISECONDS_PER_HOUR:.1f}",
+                "小时",
+                detail_summary
+                + "\n\n总用时＝有效用时＋暂停、登录验证及人工等待；"
+                "不包含停止后到再次启动前的间隔。只有三个步骤全部成功后，"
+                "该批次及其此前停止、异常或重试的用时才会计入仪表盘。",
+            ),
+            (
+                "有效用时",
+                f"{totals['active_ms'] / MILLISECONDS_PER_HOUR:.1f}",
+                "小时",
+                detail_summary
+                + "\n\n有效用时包含停止、失败和重试前已经运行的时间，"
+                "不包含暂停等待。未完成批次暂不计入，最终完成后统一计入。",
+            ),
+            (
+                "每条平均用时",
+                (
+                    f"{average_ms / MILLISECONDS_PER_HOUR:.1f}"
+                    if average_ms is not None
+                    else "—"
+                ),
+                "小时/条" if average_ms is not None else "",
+                detail_summary
+                + (
+                    f"\n精确每条平均：{format_precise_duration(average_ms)}"
+                    if average_ms is not None
+                    else "\n精确每条平均：暂无可匹配完成数据"
+                )
+                + "\n\n每条平均＝有效用时÷有计时记录的完整流程条数；"
+                "升级前没有计时记录的历史条数不参与计算。",
+            ),
+            (
+                "较纯人工效率提升",
+                f"{efficiency_gain:.1f}" if efficiency_gain is not None else "—",
+                "%" if efficiency_gain is not None else "",
+                detail_summary
+                + f"\n人工预计用时：{format_precise_duration(manual_estimated_ms)}"
+                + "\n\n按人工 260 条耗时 6 小时（平均约 83.077 秒/条）计算："
+                "(人工预计用时－系统有效用时)÷人工预计用时。负值表示慢于人工。",
+            ),
+        ]
+        for column in range(4):
+            self.timing_kpi_layout.setColumnStretch(column, 1)
+        for index, (label, value, unit, tooltip) in enumerate(values):
+            card = self._metric_card(label, value, unit)
+            card.setToolTip(tooltip)
+            card.setToolTipDuration(15000)
+            for child_label in card.findChildren(QLabel):
+                child_label.setToolTip(tooltip)
+                child_label.setToolTipDuration(15000)
+            self.timing_kpi_cards[label] = card
+            self.timing_kpi_layout.addWidget(card, 0, index)
+
+        self.timing_scope_label.setText(
+            f"有计时记录的完成数据：{completed_items} 条 · "
+            "人工基准：260 条 / 6 小时"
+        )
 
     def _add_kpis(self, values, columns=4):
         for column in range(max(columns, self.kpi_layout.columnCount())):
@@ -1612,12 +1772,32 @@ class StatisticsPage(QWidget):
                 row["station"],
             ),
         )
+        for row in rows:
+            timing = self.database.get_workflow_timing_totals(
+                row["user_id"],
+                start_date=start_date,
+                end_date=end_date,
+            )
+            row["total_time_ms"] = timing["total_ms"]
+            row["active_ms"] = timing["active_ms"]
         all_total = sum(row["total"] for row in rows)
         all_has_phone = sum(row["has_phone"] for row in rows)
+        all_total_time_ms = sum(row["total_time_ms"] for row in rows)
+        all_active_ms = sum(row["active_ms"] for row in rows)
         for row in rows:
             row["total_share"] = row["total"] / all_total * 100 if all_total else 0
             row["phone_share"] = (
                 row["has_phone"] / all_has_phone * 100 if all_has_phone else 0
+            )
+            row["total_time_share"] = (
+                row["total_time_ms"] / all_total_time_ms * 100
+                if all_total_time_ms
+                else 0
+            )
+            row["active_time_share"] = (
+                row["active_ms"] / all_active_ms * 100
+                if all_active_ms
+                else 0
             )
         return rows
 
@@ -1898,12 +2078,14 @@ class StatisticsPage(QWidget):
             self.station_combo.blockSignals(False)
             self.station_combo.setEnabled(False)
             self.station_combo.setToolTip("各站分布固定统计全部站点")
+            self._refresh_timing_kpis(None)
             self._render_station_distribution()
             return
 
         self.station_combo.setEnabled(True)
         self.station_combo.setToolTip("")
         user_id = self._selected_user_id()
+        self._refresh_timing_kpis(user_id)
         scope = self._selected_scope()
         if anomaly_button is not None and category == "completion":
             anomaly_rows = self._get_anomaly_rows(user_id)

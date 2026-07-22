@@ -46,7 +46,12 @@ from integrated_client.tools.aiqicha_tool import (
     TARGET_COLUMNS,
     has_meaningful_value,
 )
-from integrated_client.tools.transport_tool import TargetedWorkbookWriter, Worker
+from integrated_client.tools.transport_tool import (
+    BusinessBackfillWorker,
+    TargetedWorkbookWriter,
+    Worker,
+)
+from integrated_client.timing import WorkflowTimingService
 from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
 from integrated_client.ui.frameless import (
@@ -188,6 +193,54 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(saved["说明"]["A1"].value, "这个工作表必须保留")
         self.assertIn("A1:B1", {str(cell_range) for cell_range in saved["说明"].merged_cells.ranges})
         saved.close()
+
+    def test_targeted_writer_reuses_formatted_blank_columns_after_anchor(self):
+        file_path = Path(self.temp_dir.name) / "formatted-empty-columns.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["H1"] = "车辆所有人/企业"
+        sheet["H2"] = "示例公司"
+        sheet["O1"] = "站场"
+        sheet["P1"] = "已协助补缴"
+        for row in range(1, 4):
+            for column in range(17, 20):
+                sheet.cell(row, column).fill = PatternFill("solid", fgColor="FFF2CC")
+        sheet["T1"] = "运输证号_纯数字"
+        sheet["T2"] = "131102061"
+        sheet["U1"] = "查询状态"
+        sheet["U2"] = "查询成功"
+        sheet["V1"] = "回填状态"
+        sheet["V2"] = "回填成功"
+        workbook.save(file_path)
+        workbook.close()
+
+        transport_writer = TargetedWorkbookWriter(
+            file_path,
+            ("运输证号_纯数字", "查询状态"),
+        )
+        transport_writer.save()
+        transport_writer.close()
+        backfill_writer = TargetedWorkbookWriter(
+            file_path,
+            ("车辆所有人/企业", "回填状态"),
+        )
+        backfill_writer.save()
+        backfill_writer.close()
+
+        saved = load_workbook(file_path)
+        sheet = saved.active
+        self.assertEqual(sheet["Q1"].value, "运输证号_纯数字")
+        self.assertEqual(sheet["Q2"].value, "131102061")
+        self.assertEqual(sheet["R1"].value, "查询状态")
+        self.assertEqual(sheet["R2"].value, "查询成功")
+        self.assertEqual(sheet["S1"].value, "回填状态")
+        self.assertEqual(sheet["S2"].value, "回填成功")
+        self.assertEqual(sheet["H1"].value, "车辆所有人/企业")
+        self.assertEqual(sheet["H2"].value, "示例公司")
+        for column in ("T", "U", "V"):
+            self.assertIsNone(sheet[f"{column}1"].value)
+            self.assertIsNone(sheet[f"{column}2"].value)
+        saved.close()
         self.assertEqual(
             list(file_path.parent.glob(f".{file_path.stem}.*.tmp{file_path.suffix}")),
             [],
@@ -283,11 +336,320 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(sheet.cell(2, headers["查询状态"]).value, "已有企业信息（跳过）")
         saved.close()
 
+    def test_transport_worker_restarts_closed_browser_and_retries_same_row(self):
+        file_path = Path(self.temp_dir.name) / "transport-browser-restart.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["车辆标识", "已协助补缴", "车辆所有人/企业", "查询状态"])
+        sheet.append(
+            [
+                "冀TJ2892_黄色",
+                "",
+                "无运输证号",
+                "Page.goto: Target page, context or browser has bee",
+            ]
+        )
+        workbook.save(file_path)
+        workbook.close()
+
+        class Response:
+            status = 200
+
+        class Locator:
+            def __init__(self, selector):
+                self.selector = selector
+
+            def click(self, *_args, **_kwargs):
+                return None
+
+            def select_option(self, *_args, **_kwargs):
+                return None
+
+            def fill(self, *_args, **_kwargs):
+                return None
+
+            def count(self):
+                return 0
+
+        class Page:
+            def __init__(self, closed=False):
+                self.closed = closed
+                self.goto_calls = 0
+
+            def goto(self, *_args, **_kwargs):
+                self.goto_calls += 1
+                if self.closed:
+                    raise RuntimeError(
+                        "Page.goto: Target page, context or browser has been closed"
+                    )
+                return Response()
+
+            def locator(self, selector):
+                return Locator(selector)
+
+            def wait_for_timeout(self, *_args, **_kwargs):
+                return None
+
+            def evaluate(self, *_args, **_kwargs):
+                return None
+
+            def content(self):
+                return "查询不到信息"
+
+            def reload(self):
+                return None
+
+        class Context:
+            def __init__(self, page):
+                self.page = page
+
+            def new_page(self):
+                return self.page
+
+            def close(self):
+                return None
+
+        class Browser:
+            def __init__(self, page):
+                self.page = page
+
+            def new_context(self, **_kwargs):
+                return Context(self.page)
+
+            def close(self):
+                return None
+
+        class Chromium:
+            def __init__(self, page):
+                self.page = page
+
+            def launch(self, **_kwargs):
+                return Browser(self.page)
+
+        class Runtime:
+            def __init__(self, page):
+                self.chromium = Chromium(page)
+
+            def stop(self):
+                return None
+
+        class Manager:
+            def __init__(self, runtime):
+                self.runtime = runtime
+
+            def start(self):
+                return self.runtime
+
+        closed_page = Page(closed=True)
+        recovered_page = Page()
+        managers = iter(
+            (Manager(Runtime(closed_page)), Manager(Runtime(recovered_page)))
+        )
+        worker = Worker(str(file_path), True, False, 2, True, 2, False)
+        logs = []
+        retries = []
+        results = []
+        worker.log.connect(logs.append)
+        worker.retry_signal.connect(lambda retry_type, reason: retries.append((retry_type, reason)))
+        worker.finished.connect(results.append)
+        with patch(
+            "integrated_client.tools.transport_tool.sync_playwright",
+            side_effect=lambda: next(managers),
+        ), patch(
+            "integrated_client.tools.transport_tool.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ), patch(
+            "integrated_client.tools.transport_tool.ocr_code",
+            return_value="1234",
+        ):
+            worker.run()
+
+        self.assertEqual(closed_page.goto_calls, 1)
+        self.assertGreaterEqual(recovered_page.goto_calls, 1)
+        self.assertEqual(results, ["完成"])
+        self.assertTrue(any(item[0] == "transport_browser" for item in retries))
+        self.assertTrue(any("重试当前记录" in line for line in logs))
+        saved = load_workbook(file_path, data_only=True)
+        headers = {
+            cell.value: cell.column
+            for cell in saved.active[1]
+            if cell.value is not None
+        }
+        self.assertEqual(
+            saved.active.cell(2, headers["查询状态"]).value,
+            "查询无结果",
+        )
+        saved.close()
+
+    def test_business_worker_restarts_after_http_404_and_emits_once(self):
+        file_path = Path(self.temp_dir.name) / "business-browser-restart.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(
+            [
+                "车辆标识",
+                "已协助补缴",
+                "运输证号_纯数字",
+                "车辆所有人/企业",
+            ]
+        )
+        sheet.append(["冀TJ2892_黄色", "", "130000001", "无运输证号"])
+        workbook.save(file_path)
+        workbook.close()
+
+        class Response:
+            def __init__(self, status):
+                self.status = status
+
+        class Page:
+            def __init__(self, status):
+                self.status = status
+                self.goto_calls = 0
+
+            def goto(self, *_args, **_kwargs):
+                self.goto_calls += 1
+                return Response(self.status)
+
+            def wait_for_selector(self, *_args, **_kwargs):
+                return None
+
+            def click(self, *_args, **_kwargs):
+                return None
+
+            def fill(self, *_args, **_kwargs):
+                return None
+
+        class Context:
+            def __init__(self, page):
+                self.page = page
+
+            def new_page(self):
+                return self.page
+
+        class Browser:
+            def __init__(self, page):
+                self.page = page
+
+            def new_context(self, **_kwargs):
+                return Context(self.page)
+
+            def close(self):
+                return None
+
+        class Chromium:
+            def __init__(self, page):
+                self.page = page
+
+            def launch(self, **_kwargs):
+                return Browser(self.page)
+
+        class Runtime:
+            def __init__(self, page):
+                self.chromium = Chromium(page)
+
+            def stop(self):
+                return None
+
+        class Manager:
+            def __init__(self, runtime):
+                self.runtime = runtime
+
+            def start(self):
+                return self.runtime
+
+        not_found_page = Page(404)
+        recovered_page = Page(200)
+        managers = iter(
+            (Manager(Runtime(not_found_page)), Manager(Runtime(recovered_page)))
+        )
+        worker = BusinessBackfillWorker(str(file_path), True, True, 2, False)
+        logs = []
+        retries = []
+        results = []
+        worker.log.connect(logs.append)
+        worker.retry_signal.connect(lambda retry_type, reason: retries.append((retry_type, reason)))
+        worker.finished.connect(results.append)
+        with patch(
+            "integrated_client.tools.transport_tool.sync_playwright",
+            side_effect=lambda: next(managers),
+        ), patch(
+            "integrated_client.tools.transport_tool.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ), patch.object(
+            BusinessBackfillWorker,
+            "_wait_for_business_response",
+            return_value="captcha",
+        ), patch.object(BusinessBackfillWorker, "solve_captcha", return_value=False):
+            worker.run()
+
+        self.assertEqual(not_found_page.goto_calls, 1)
+        self.assertEqual(recovered_page.goto_calls, 1)
+        self.assertEqual(results, ["结束"])
+        self.assertTrue(any(item[0] == "business_browser" for item in retries))
+        self.assertTrue(any("重新启动并重试当前记录" in line for line in logs))
+        saved = load_workbook(file_path, data_only=True)
+        headers = {
+            cell.value: cell.column
+            for cell in saved.active[1]
+            if cell.value is not None
+        }
+        self.assertEqual(
+            saved.active.cell(2, headers["回填状态"]).value,
+            "验证码识别失败",
+        )
+        saved.close()
+
+    def test_business_waits_for_stable_captcha_image_and_result(self):
+        worker = BusinessBackfillWorker("unused.xlsx", True, True, 2, False)
+
+        class Page:
+            def __init__(self):
+                self.waits = []
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
+
+        page = Page()
+        worker.page = page
+        logs = []
+        worker.log.connect(logs.append)
+
+        with patch.object(
+            worker,
+            "_business_result_is_ready",
+            return_value=False,
+        ), patch.object(
+            worker,
+            "_captcha_image_is_ready",
+            side_effect=(False, True, False, True, True),
+        ):
+            response_state = worker._wait_for_business_response()
+
+        self.assertEqual(worker.web_timeout, 60_000)
+        self.assertEqual(response_state, "captcha")
+        self.assertEqual(page.waits, [250, 800, 250, 800])
+        self.assertTrue(any("等待营运查询响应" in line for line in logs))
+        self.assertTrue(any("验证码图片加载完成" in line for line in logs))
+
+        page.waits.clear()
+        with patch.object(
+            worker,
+            "_business_result_is_ready",
+            side_effect=(False, False, True),
+        ):
+            self.assertTrue(worker._wait_for_business_result())
+        self.assertEqual(page.waits, [250, 250])
+
     def test_main_window_contains_integrated_pages(self):
         window = MainWindow(self.db, self.admin)
         self.assertIs(window._pages["home"], window.statistics_page)
         self.assertIn("workflow", window._pages)
         self.assertIs(window._pages["workflow"], window.workflow_page)
+        self.assertIs(
+            window.workflow_page._timing_service,
+            window.workflow_timing,
+        )
+        self.assertIn("本批次累计", window.workflow_page.timing_label.text())
         self.assertIs(window._pages["personal"], window.personal_center_page)
         self.assertNotIn("transport", window._pages)
         self.assertNotIn("aiqicha", window._pages)
@@ -1143,6 +1505,70 @@ class ToolAndUiTests(unittest.TestCase):
         window._prepared_to_close = True
         window.close()
 
+    def test_dashboard_shows_timing_efficiency_kpis(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        station = next(
+            account
+            for account in self.db.list_accounts()
+            if account.username == "luogang"
+        )
+        now = 1000.0
+        dataframe = pd.DataFrame(
+            {
+                "车辆标识": ["粤A12345_黄色"] * 4,
+                "已协助补缴": [""] * 4,
+                "原因": [""] * 4,
+            }
+        )
+        service = WorkflowTimingService(
+            self.db,
+            station.id,
+            clock=lambda: now,
+        )
+        source_path = Path(self.temp_dir.name) / "dashboard-timing.xlsx"
+        service.start_run(source_path, dataframe, run_id="dashboard-timing-run")
+        service.start_step(1)
+        now += 120.125
+        service.pause("等待登录")
+        now += 60.250
+        service.resume("登录完成")
+        now += 60.375
+        service.finish_run("succeeded")
+        self.db.record_activity_batch(
+            station.id,
+            {WORKFLOW_TOTAL_METRIC: 4},
+            source="unified_workflow",
+            task_id="dashboard-timing-run",
+        )
+
+        page = StatisticsPage(self.db, self.admin)
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("completion")
+        )
+        page.station_combo.setCurrentIndex(page.station_combo.findData(station.id))
+        self.app.processEvents()
+
+        def card_value(label):
+            labels = page.timing_kpi_cards[label].findChildren(QLabel)
+            return labels[-1].text()
+
+        self.assertEqual(card_value("总用时"), "0.1 小时")
+        self.assertEqual(card_value("有效用时"), "0.1 小时")
+        self.assertEqual(card_value("每条平均用时"), "0.0 小时/条")
+        self.assertEqual(card_value("较纯人工效率提升"), "45.7 %")
+        self.assertIn("4 条", page.timing_scope_label.text())
+        self.assertIn("260 条 / 6 小时", page.timing_scope_label.text())
+        total_tooltip = page.timing_kpi_cards["总用时"].toolTip()
+        self.assertIn("精确总用时：00:04:00.750", total_tooltip)
+        self.assertIn("精确有效用时：00:03:00.500", total_tooltip)
+        self.assertIn("精确暂停等待：00:01:00.250", total_tooltip)
+        average_tooltip = page.timing_kpi_cards["每条平均用时"].toolTip()
+        self.assertIn("精确每条平均：00:00:45.125", average_tooltip)
+
+        page.close()
+        page.deleteLater()
+        self.app.processEvents()
+
     def test_workflow_settings_browser_check_and_collapsible_panels(self):
         page = WorkflowPage()
         page.resize(1400, 900)
@@ -1241,6 +1667,44 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.collapsed_content_spacer.isHidden())
         self.assertTrue(page.shutdown())
         page.close()
+
+    def test_workflow_start_keeps_previous_log_and_adds_run_separator(self):
+        file_path = Path(self.temp_dir.name) / "log-history.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["车辆标识", "已协助补缴"])
+        sheet.append(["粤A12345_黄色", ""])
+        workbook.save(file_path)
+        workbook.close()
+
+        page = WorkflowPage()
+        page.file_path = str(file_path)
+        page.df = pd.DataFrame(
+            {"车辆标识": ["粤A12345_黄色"], "已协助补缴": [""]}
+        )
+        page.browser_check_state = "ready"
+        page.log_text.setPlainText("[19:00:00] 上一次执行发生浏览器异常")
+        with patch.object(page, "_reload_preview", return_value=True), patch.object(
+            page,
+            "_start_transport_worker",
+        ), patch(
+            "integrated_client.ui.workflow_page.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ):
+            page.start_pipeline()
+
+        log_text = page.log_text.toPlainText()
+        self.assertIn("上一次执行发生浏览器异常", log_text)
+        self.assertIn("第 1 次流水线执行", log_text)
+        self.assertIn("一键三步流水线已启动", log_text)
+        self.assertLess(
+            log_text.index("上一次执行发生浏览器异常"),
+            log_text.index("第 1 次流水线执行"),
+        )
+        page._finish_pipeline(False, "测试结束", outcome="failed")
+        page.close()
+        page.deleteLater()
+        self.app.processEvents()
 
     def test_workflow_start_browser_check_dialog_actions(self):
         self.assertFalse(
@@ -1373,6 +1837,49 @@ class ToolAndUiTests(unittest.TestCase):
         accounts = {account.username: account for account in self.db.list_accounts()}
         luogang = accounts["luogang"]
         taiping = accounts["taiping"]
+
+        def record_timing(account, run_id, active_before_pause, paused, active_after_pause):
+            clock = [1000.0]
+            service = WorkflowTimingService(
+                self.db,
+                account.id,
+                clock=lambda: clock[0],
+            )
+            dataframe = pd.DataFrame(
+                {
+                    "车辆标识": [f"粤A{account.id:05d}_黄色"],
+                    "已协助补缴": [""],
+                    "原因": [""],
+                }
+            )
+            service.start_run(
+                Path(self.temp_dir.name) / f"{run_id}.xlsx",
+                dataframe,
+                run_id=run_id,
+            )
+            service.start_step(1)
+            clock[0] += active_before_pause
+            if paused:
+                service.pause("等待人工")
+                clock[0] += paused
+                service.resume("继续执行")
+            clock[0] += active_after_pause
+            service.finish_run("succeeded")
+
+        record_timing(
+            luogang,
+            "station-share-luogang",
+            3600,
+            600,
+            1800,
+        )
+        record_timing(
+            taiping,
+            "station-share-taiping",
+            1800,
+            0,
+            0,
+        )
         self.db.record_activity_batch(
             luogang.id,
             {WORKFLOW_TOTAL_METRIC: 30, WORKFLOW_HAS_PHONE_METRIC: 12},
@@ -1417,16 +1924,27 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertAlmostEqual(rows["luogang"]["phone_share"], 60.0)
         self.assertAlmostEqual(rows["taiping"]["total_share"], 25.0)
         self.assertAlmostEqual(rows["taiping"]["phone_share"], 40.0)
+        self.assertEqual(rows["luogang"]["total_time_ms"], 6_000_000)
+        self.assertEqual(rows["luogang"]["active_ms"], 5_400_000)
+        self.assertAlmostEqual(rows["luogang"]["total_time_share"], 6000 / 78)
+        self.assertAlmostEqual(rows["luogang"]["active_time_share"], 75.0)
+        self.assertAlmostEqual(rows["taiping"]["total_time_share"], 1800 / 78)
+        self.assertAlmostEqual(rows["taiping"]["active_time_share"], 25.0)
         page.station_distribution_chart.resize(1000, 280)
         page.station_distribution_chart.grab()
         self.app.processEvents()
-        self.assertEqual(len(page.station_distribution_chart._slice_hitboxes), 4)
+        self.assertEqual(len(page.station_distribution_chart._slice_hitboxes), 8)
         self.assertEqual(
             {
                 item["payload"]["series"]
                 for item in page.station_distribution_chart._slice_hitboxes
             },
-            {"各站总计数占比", "各站有电话数占比"},
+            {
+                "各站总计数占比",
+                "各站有电话数占比",
+                "各站总耗时占比",
+                "各站有效耗时占比",
+            },
         )
         chart = page.station_distribution_chart
         slice_item = chart._slice_hitboxes[0]
@@ -1455,6 +1973,40 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertEqual(chart._hover_card.width(), 240)
 
+        duration_item = next(
+            item
+            for item in chart._slice_hitboxes
+            if item["payload"]["series"] == "各站总耗时占比"
+        )
+        duration_outer = duration_item["outer"]
+        duration_inner = duration_item["inner"]
+        duration_local = QPoint(
+            int(
+                duration_outer.center().x()
+                + (duration_outer.width() + duration_inner.width()) / 4
+            ),
+            int(duration_outer.center().y()),
+        )
+        duration_event = QMouseEvent(
+            QEvent.MouseMove,
+            duration_local,
+            chart.mapToGlobal(duration_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        chart.mouseMoveEvent(duration_event)
+        duration_payload = duration_item["payload"]
+        self.assertEqual(
+            chart._hover_card.details,
+            [
+                ("小时数", "1.7 小时"),
+                ("精确耗时", "01:40:00.000"),
+                ("占比", chart._format_share(duration_payload["share"])),
+            ],
+        )
+        self.assertEqual(chart._hover_card.width(), 300)
+
         legend_rect, legend_row = chart._legend_hitboxes[0]
         legend_local = legend_rect.center().toPoint()
         legend_event = QMouseEvent(
@@ -1474,9 +2026,21 @@ class ToolAndUiTests(unittest.TestCase):
                 ("总数占比", chart._format_share(legend_row["total_share"])),
                 ("有电话数", f'{legend_row["has_phone"]} 条'),
                 ("有电话占比", chart._format_share(legend_row["phone_share"])),
+                ("总耗时", "1.7 小时"),
+                ("精确总耗时", "01:40:00.000"),
+                (
+                    "总耗时占比",
+                    chart._format_share(legend_row["total_time_share"]),
+                ),
+                ("有效耗时", "1.5 小时"),
+                ("精确有效耗时", "01:30:00.000"),
+                (
+                    "有效耗时占比",
+                    chart._format_share(legend_row["active_time_share"]),
+                ),
             ],
         )
-        self.assertEqual(chart._hover_card.width(), 288)
+        self.assertEqual(chart._hover_card.width(), 520)
         for index in range(chart._hover_card._details_layout.count()):
             detail_label = chart._hover_card._details_layout.itemAt(index).widget()
             self.assertGreaterEqual(detail_label.width(), detail_label.sizeHint().width())

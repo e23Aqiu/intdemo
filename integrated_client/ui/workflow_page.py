@@ -200,9 +200,10 @@ class WorkflowPage(QWidget):
         "正在检测内置浏览器 ···",
     )
 
-    def __init__(self, stats_recorder=None, parent=None):
+    def __init__(self, stats_recorder=None, timing_service=None, parent=None):
         super().__init__(parent)
         self._stats_recorder = stats_recorder
+        self._timing_service = timing_service
         self.file_path = ""
         self.df = pd.DataFrame()
         self.model = DataFrameTableModel(self.df, self)
@@ -219,6 +220,8 @@ class WorkflowPage(QWidget):
         self.browser_check_state = "unchecked"
         self._settings_browser_check_requested = False
         self._browser_start_dialog = None
+        self._timing_finished_steps = set()
+        self._timing_heartbeat_ticks = 0
 
         self._build_ui()
         self._sync_mode_controls()
@@ -226,6 +229,10 @@ class WorkflowPage(QWidget):
         self.preview_timer = QTimer(self)
         self.preview_timer.timeout.connect(self._poll_file_preview)
         self.preview_timer.start(800)
+
+        self.timing_timer = QTimer(self)
+        self.timing_timer.timeout.connect(self._timing_tick)
+        self.timing_timer.start(1000)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -444,6 +451,19 @@ class WorkflowPage(QWidget):
         self.progress_bar.setFormat("整体进度 %p%")
         workflow_root.addWidget(self.progress_bar)
 
+        self.timing_label = QLabel(
+            "本次有效用时 00:00:00.000 · 本批次累计 00:00:00.000"
+        )
+        self.timing_label.setObjectName("WorkflowTimingLabel")
+        self.timing_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.timing_label.setStyleSheet(
+            "color:#526e6d;font-size:12px;font-weight:600;padding:0 2px;"
+        )
+        self.timing_label.setToolTip(
+            "有效用时不包含暂停等待；停止后再次处理同一份输入数据时会累计前次用时。"
+        )
+        workflow_root.addWidget(self.timing_label)
+
         splitter = QSplitter(Qt.Vertical)
         splitter.setChildrenCollapsible(False)
         self.content_splitter = splitter
@@ -464,6 +484,7 @@ class WorkflowPage(QWidget):
 
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
+        self.log_text.document().setMaximumBlockCount(5000)
         self.log_panel = CollapsiblePanel("流水线日志", self.log_text)
         self.log_toggle_btn = self.log_panel.toggle_button
         self.log_panel.expanded_changed.connect(self._rebalance_content_panels)
@@ -562,6 +583,109 @@ class WorkflowPage(QWidget):
             self.content_splitter.setSizes([1, 1_000])
         else:
             self.content_splitter.setSizes([1, 1])
+
+    def _refresh_timing_label(self, snapshot=None):
+        service = self._timing_service
+        if service is None:
+            self.timing_label.setText(
+                "本次有效用时 00:00:00.000 · 本批次累计 00:00:00.000"
+            )
+            return
+        snapshot = snapshot or service.snapshot()
+        run_text = service.format_duration(snapshot.get("run_active_ms", 0))
+        batch_text = service.format_duration(snapshot.get("batch_active_ms", 0))
+        paused_text = service.format_duration(snapshot.get("run_paused_ms", 0))
+        prefix = "暂停中 · " if snapshot.get("state") == "paused" else ""
+        self.timing_label.setText(
+            f"{prefix}本次有效用时 {run_text} · 本批次累计 {batch_text}"
+        )
+        self.timing_label.setToolTip(
+            f"本次暂停等待 {paused_text}。有效用时不包含暂停；"
+            "停止后再次处理相同输入数据时会累计前次有效用时。"
+        )
+
+    def _timing_tick(self):
+        service = self._timing_service
+        if service is None:
+            return
+        self._refresh_timing_label()
+        if not service.is_active:
+            self._timing_heartbeat_ticks = 0
+            return
+        self._timing_heartbeat_ticks += 1
+        if self._timing_heartbeat_ticks < 5:
+            return
+        self._timing_heartbeat_ticks = 0
+        try:
+            service.heartbeat()
+        except Exception as exc:
+            self._log(f"⚠️ 计时心跳保存失败：{exc}")
+
+    def _timing_start_step(self, step):
+        service = self._timing_service
+        if service is None:
+            return
+        try:
+            service.start_step(step)
+        except Exception as exc:
+            self._log(f"⚠️ 步骤 {step} 计时启动失败：{exc}")
+
+    def _timing_finish_step(self, step, status, error_summary=""):
+        service = self._timing_service
+        if service is None or step in self._timing_finished_steps:
+            return
+        try:
+            service.finish_step(status, error_summary)
+            self._timing_finished_steps.add(step)
+            self._refresh_timing_label()
+        except Exception as exc:
+            self._log(f"⚠️ 步骤 {step} 计时结束失败：{exc}")
+
+    def _timing_retry(self, retry_type, reason=""):
+        service = self._timing_service
+        if service is None:
+            return
+        try:
+            service.record_retry(str(retry_type), str(reason))
+        except Exception as exc:
+            self._log(f"⚠️ 重试计时记录失败：{exc}")
+
+    def _timing_pause(self, reason):
+        if self._timing_service is None:
+            return
+        try:
+            self._timing_service.pause(reason)
+            self._refresh_timing_label()
+        except Exception as exc:
+            self._log(f"⚠️ 暂停计时记录失败：{exc}")
+
+    def _timing_resume(self, reason):
+        if self._timing_service is None:
+            return
+        try:
+            self._timing_service.resume(reason)
+            self._refresh_timing_label()
+        except Exception as exc:
+            self._log(f"⚠️ 恢复计时记录失败：{exc}")
+
+    def _timing_request_stop(self, reason):
+        if self._timing_service is None:
+            return
+        try:
+            self._timing_service.request_stop(reason)
+            self._refresh_timing_label()
+        except Exception as exc:
+            self._log(f"⚠️ 停止计时记录失败：{exc}")
+
+    def _timing_finish_run(self, status, reason=""):
+        service = self._timing_service
+        if service is None or not service.is_active:
+            return
+        try:
+            snapshot = service.finish_run(status, reason, reason if status == "failed" else "")
+            self._refresh_timing_label(snapshot)
+        except Exception as exc:
+            self._log(f"⚠️ 流水线计时结束失败：{exc}")
 
     def _log(self, message):
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -756,11 +880,31 @@ class WorkflowPage(QWidget):
             QMessageBox.warning(self, "内置浏览器不可用", str(exc))
             return
 
-        self.log_text.clear()
         self.stopping = False
         self.awaiting_login = False
         self._task_id = uuid.uuid4().hex
         self._stats_recorded = False
+        self._timing_finished_steps = set()
+        self._timing_heartbeat_ticks = 0
+        timing_result = None
+        if self._timing_service is not None:
+            try:
+                timing_result = self._timing_service.start_run(
+                    self.file_path,
+                    self.df,
+                    run_id=self._task_id,
+                )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "计时任务创建失败",
+                    f"无法创建本次业务计时记录：\n{exc}",
+                )
+                return
+        if self.log_text.toPlainText().strip():
+            self.log_text.append("")
+        run_number = timing_result["run_number"] if timing_result else 1
+        self._log(f"━━━━━━━━━━ 第 {run_number} 次流水线执行 ━━━━━━━━━━")
         self.current_step = 1
         self.progress_bar.setValue(0)
         self._set_step_status(1, "正在执行", "running")
@@ -768,9 +912,19 @@ class WorkflowPage(QWidget):
         self._set_step_status(3, "等待步骤 2", "waiting")
         self._set_controls_running(True)
         self._log("一键三步流水线已启动。")
+        if timing_result and timing_result["resumed"]:
+            previous = self._timing_service.format_duration(
+                timing_result["previous_active_ms"]
+            )
+            self._log(
+                f"已接续同一业务批次，前 {timing_result['run_number'] - 1} 次"
+                f"累计有效用时 {previous}。"
+            )
+        self._refresh_timing_label()
         self._start_transport_worker()
 
     def _start_transport_worker(self):
+        self._timing_start_step(1)
         auto_mode = bool(self.mode_combo.currentData())
         worker = Worker(
             self.file_path,
@@ -786,6 +940,8 @@ class WorkflowPage(QWidget):
         worker.progress.connect(lambda value: self._on_step_progress(1, value))
         worker.pause_signal.connect(lambda: self._on_pause_requested(1, "等待验证码或人工处理"))
         worker.input_signal.connect(self._transport_manual_input)
+        if hasattr(worker, "retry_signal"):
+            worker.retry_signal.connect(self._timing_retry)
         worker.finished.connect(lambda result, obj=worker: self._transport_finished(obj, result))
         worker.start()
 
@@ -795,11 +951,18 @@ class WorkflowPage(QWidget):
         self._retire_worker(worker)
         self._reload_preview(force=True)
         if self.stopping:
+            self._timing_finish_step(1, "stopped", "用户手动停止")
             self._finish_stopped(1)
         elif result == "失败":
+            self._timing_finish_step(1, "failed", "步骤 1 执行失败")
             self._set_step_status(1, "执行失败", "failed")
-            self._finish_pipeline(False, "步骤 1 失败，流水线已停止。")
+            self._finish_pipeline(
+                False,
+                "步骤 1 失败，流水线已停止。",
+                outcome="failed",
+            )
         else:
+            self._timing_finish_step(1, "succeeded")
             self._set_step_status(1, "已完成", "success")
             self.current_step = 2
             self._set_step_status(2, "正在执行", "running")
@@ -807,6 +970,7 @@ class WorkflowPage(QWidget):
             QTimer.singleShot(0, self._start_backfill_worker)
 
     def _start_backfill_worker(self):
+        self._timing_start_step(2)
         auto_mode = bool(self.mode_combo.currentData())
         worker = BusinessBackfillWorker(
             self.file_path,
@@ -820,6 +984,8 @@ class WorkflowPage(QWidget):
         worker.progress.connect(lambda value: self._on_step_progress(2, value))
         worker.pause_signal.connect(lambda: self._on_pause_requested(2, "等待验证码或人工处理"))
         worker.input_signal.connect(self._business_manual_input)
+        if hasattr(worker, "retry_signal"):
+            worker.retry_signal.connect(self._timing_retry)
         worker.finished.connect(lambda result, obj=worker: self._backfill_finished(obj, result))
         worker.start()
 
@@ -829,11 +995,18 @@ class WorkflowPage(QWidget):
         self._retire_worker(worker)
         self._reload_preview(force=True)
         if self.stopping:
+            self._timing_finish_step(2, "stopped", "用户手动停止")
             self._finish_stopped(2)
         elif result == "失败":
+            self._timing_finish_step(2, "failed", "步骤 2 执行失败")
             self._set_step_status(2, "执行失败", "failed")
-            self._finish_pipeline(False, "步骤 2 失败，流水线已停止。")
+            self._finish_pipeline(
+                False,
+                "步骤 2 失败，流水线已停止。",
+                outcome="failed",
+            )
         else:
+            self._timing_finish_step(2, "succeeded")
             self._set_step_status(2, "已完成", "success")
             self.current_step = 3
             self._set_step_status(3, "正在启动浏览器", "running")
@@ -841,6 +1014,7 @@ class WorkflowPage(QWidget):
             QTimer.singleShot(0, self._start_aiqicha_worker)
 
     def _start_aiqicha_worker(self):
+        self._timing_start_step(3)
         if not self._reload_preview(force=True):
             self._set_step_status(3, "读取表格失败", "failed")
             self._finish_pipeline(False, "步骤 3 无法重新读取业务表格。")
@@ -865,11 +1039,14 @@ class WorkflowPage(QWidget):
         worker.login_required_signal.connect(self._on_login_required)
         worker.pause_signal.connect(lambda: self._on_pause_requested(3, "等待完成爱企查验证"))
         worker.resume_signal.connect(self._on_aiqicha_resumed)
+        if hasattr(worker, "retry_signal"):
+            worker.retry_signal.connect(self._timing_retry)
         worker.finished_signal.connect(lambda success, obj=worker: self._aiqicha_finished(obj, success))
         worker.start()
 
     def _on_login_required(self):
         self.awaiting_login = True
+        self._timing_pause("等待用户登录爱企查")
         self.continue_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self._set_step_status(3, "请登录爱企查后点击继续", "paused")
@@ -877,6 +1054,7 @@ class WorkflowPage(QWidget):
 
     def _on_aiqicha_resumed(self):
         self.awaiting_login = False
+        self._timing_resume("爱企查登录或验证已完成")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self._set_step_status(3, "正在查询", "running")
@@ -891,15 +1069,26 @@ class WorkflowPage(QWidget):
         self._retire_worker(worker)
         saved = self._save_aiqicha_results()
         if self.stopping:
+            self._timing_finish_step(3, "stopped", "用户手动停止")
             self._finish_stopped(3)
         elif not success or not saved:
+            self._timing_finish_step(3, "failed", "步骤 3 执行或保存失败")
             self._set_step_status(3, "执行失败" if not success else "保存失败", "failed")
-            self._finish_pipeline(False, "步骤 3 未正常完成，请查看日志。")
+            self._finish_pipeline(
+                False,
+                "步骤 3 未正常完成，请查看日志。",
+                outcome="failed",
+            )
         else:
+            self._timing_finish_step(3, "succeeded")
             self._set_step_status(3, "已完成", "success")
             self.progress_bar.setValue(100)
             self._record_workflow_stats()
-            self._finish_pipeline(True, "三个步骤已全部完成，结果已保存到原业务表格。")
+            self._finish_pipeline(
+                True,
+                "三个步骤已全部完成，结果已保存到原业务表格。",
+                outcome="succeeded",
+            )
 
     def _save_aiqicha_results(self):
         if self.df is None or self.df.empty:
@@ -1045,6 +1234,7 @@ class WorkflowPage(QWidget):
     def _on_pause_requested(self, step, text):
         if not self.pipeline_running or self.stopping:
             return
+        self._timing_pause(text)
         self.continue_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self._set_step_status(step, text, "paused")
@@ -1057,6 +1247,7 @@ class WorkflowPage(QWidget):
             worker.global_pause()
         elif isinstance(worker, QueryWorker):
             worker.pause()
+        self._timing_pause("用户手动暂停")
         self.pause_btn.setEnabled(False)
         self.continue_btn.setEnabled(True)
         self._set_step_status(self.current_step, "已暂停", "paused")
@@ -1071,6 +1262,7 @@ class WorkflowPage(QWidget):
             self.awaiting_login = False
         else:
             worker.resume()
+        self._timing_resume("用户继续执行")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
         self._set_step_status(self.current_step, "正在执行", "running")
@@ -1080,6 +1272,7 @@ class WorkflowPage(QWidget):
         if not self.pipeline_running:
             return
         self.stopping = True
+        self._timing_request_stop("用户手动停止")
         self.pause_btn.setEnabled(False)
         self.continue_btn.setEnabled(False)
         self.stop_btn.setEnabled(False)
@@ -1093,12 +1286,19 @@ class WorkflowPage(QWidget):
     def _finish_stopped(self, step):
         if step == 3:
             self._save_aiqicha_results()
+        self._timing_finish_step(step, "stopped", "用户手动停止")
         self._set_step_status(step, "已停止", "stopped")
         for later_step in range(step + 1, 4):
             self._set_step_status(later_step, "未执行", "waiting")
-        self._finish_pipeline(False, "流水线已停止，已完成的数据已保留。")
+        self._finish_pipeline(
+            False,
+            "流水线已停止，已完成的数据已保留。",
+            outcome="stopped",
+        )
 
-    def _finish_pipeline(self, success, message):
+    def _finish_pipeline(self, success, message, outcome=None):
+        outcome = outcome or ("succeeded" if success else "failed")
+        self._timing_finish_run(outcome, message)
         self.current_worker = None
         self.awaiting_login = False
         self._set_controls_running(False)
@@ -1125,11 +1325,13 @@ class WorkflowPage(QWidget):
         worker = self.current_worker
         if not isinstance(worker, Worker):
             return
+        self._timing_pause("等待人工录入运输证号")
         text, accepted = QInputDialog.getText(
             self, "人工录入运输证号", f"车辆：{plate}\n请输入运输证号："
         )
         worker.input_result = text if accepted else ""
         worker.resume()
+        self._timing_resume("人工录入运输证号已完成")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
 
@@ -1137,11 +1339,13 @@ class WorkflowPage(QWidget):
         worker = self.current_worker
         if not isinstance(worker, BusinessBackfillWorker):
             return
+        self._timing_pause("等待人工录入企业信息")
         text, accepted = QInputDialog.getText(
             self, "人工录入企业", f"车辆：{plate}\n请输入公司/所有人名称："
         )
         worker.input_result = text if accepted else ""
         worker.resume()
+        self._timing_resume("人工录入企业信息已完成")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
 
@@ -1162,6 +1366,16 @@ class WorkflowPage(QWidget):
                 return False
         if self.current_step == 3:
             self._save_aiqicha_results()
+        if self._timing_service is not None and self._timing_service.is_active:
+            self._timing_request_stop("客户端退出或注销")
+            if self.current_step:
+                self._timing_finish_step(
+                    self.current_step,
+                    "stopped",
+                    "客户端退出或注销",
+                )
+            self._timing_finish_run("stopped", "客户端退出或注销")
+        self.timing_timer.stop()
         self.current_worker = None
         self.pipeline_running = False
         self._cleanup_retired_workers()

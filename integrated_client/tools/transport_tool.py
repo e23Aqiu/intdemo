@@ -45,6 +45,8 @@ os.environ["PLAYWRIGHT_LOCAL_LOG_DIR"] = os.devnull
 class TargetedWorkbookWriter:
     """只更新指定结果单元格，并通过同目录原子替换保存工作簿。"""
 
+    RESULT_COLUMN_ANCHOR = "已协助补缴"
+
     def __init__(self, file_path, target_columns):
         self.file_path = Path(file_path)
         self.workbook = openpyxl.load_workbook(self.file_path)
@@ -55,17 +57,64 @@ class TargetedWorkbookWriter:
             if cell.value is not None and str(cell.value).strip()
         }
         self.dirty = False
-        next_column = max(
-            self.sheet.max_column,
-            max(self.column_indexes.values(), default=0),
-        ) + 1
         for column_name in target_columns:
             if column_name in self.column_indexes:
+                self._move_existing_result_column_left(column_name)
                 continue
-            self.sheet.cell(1, next_column, column_name)
-            self.column_indexes[column_name] = next_column
-            next_column += 1
+            column_index = self._next_result_column()
+            self.sheet.cell(1, column_index, column_name)
+            self.column_indexes[column_name] = column_index
             self.dirty = True
+
+    @staticmethod
+    def _is_empty_value(value):
+        return value is None or (isinstance(value, str) and not value.strip())
+
+    def _column_is_empty(self, column_index):
+        return all(
+            self._is_empty_value(self.sheet.cell(row, column_index).value)
+            for row in range(1, self.sheet.max_row + 1)
+        )
+
+    def _first_empty_column(self, start_column, stop_column):
+        for column_index in range(start_column, stop_column):
+            if self._column_is_empty(column_index):
+                return column_index
+        return None
+
+    def _next_result_column(self):
+        anchor_index = self.column_indexes.get(self.RESULT_COLUMN_ANCHOR)
+        last_used_column = max(
+            self.sheet.max_column,
+            max(self.column_indexes.values(), default=0),
+        )
+        if anchor_index is not None:
+            empty_column = self._first_empty_column(
+                anchor_index + 1,
+                last_used_column + 1,
+            )
+            if empty_column is not None:
+                return empty_column
+        return last_used_column + 1
+
+    def _move_existing_result_column_left(self, column_name):
+        anchor_index = self.column_indexes.get(self.RESULT_COLUMN_ANCHOR)
+        source_column = self.column_indexes[column_name]
+        if anchor_index is None or source_column <= anchor_index + 1:
+            return
+        destination_column = self._first_empty_column(
+            anchor_index + 1,
+            source_column,
+        )
+        if destination_column is None:
+            return
+        for row in range(1, self.sheet.max_row + 1):
+            source_cell = self.sheet.cell(row, source_column)
+            destination_cell = self.sheet.cell(row, destination_column)
+            destination_cell.value = source_cell.value
+            source_cell.value = None
+        self.column_indexes[column_name] = destination_column
+        self.dirty = True
 
     @staticmethod
     def _cell_value(value):
@@ -136,7 +185,44 @@ CONFIG = {
     },
     "BUSINESS_QUERY_URL": "https://ysfw.mot.gov.cn/NetRoadCGSS-web/information/query?searchType=car",
     "CAPTCHA_WAIT_SEC": 5,
+    "BUSINESS_WEB_TIMEOUT_MS": 60000,
+    "BUSINESS_CAPTCHA_POLL_MS": 250,
+    "BUSINESS_CAPTCHA_STABLE_MS": 800,
+    "BROWSER_RETRY_LIMIT": 3,
 }
+
+
+class BrowserRecoveryError(RuntimeError):
+    """浏览器或目标网页失效，且需要重新创建浏览器后重试当前记录。"""
+
+
+def is_recoverable_browser_error(error):
+    if isinstance(error, BrowserRecoveryError):
+        return True
+    message = str(error or "").casefold()
+    markers = (
+        "target page",
+        "browser has been closed",
+        "context or browser",
+        "page.goto",
+        "connection closed",
+        "connection reset",
+        "timeout",
+        "net::err",
+        "http 404",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    )
+    return any(marker in message for marker in markers)
+
+
+def ensure_successful_navigation(response, page_name):
+    status = getattr(response, "status", None)
+    if status is not None and int(status) >= 400:
+        raise BrowserRecoveryError(f"{page_name}返回 HTTP {int(status)}")
+    return response
 
 # ====================== 工具函数（通用功能） ======================
 def clean_company_name(name):
@@ -326,6 +412,7 @@ class Worker(QThread):
     pause_signal = pyqtSignal()
     input_signal = pyqtSignal(str)
     stat_event = pyqtSignal(str, int)
+    retry_signal = pyqtSignal(str, str)
 
     input_result = ""
 
@@ -340,6 +427,8 @@ class Worker(QThread):
         self._global_paused = False
         self.browser: Union[Browser, None] = None
         self.page: Union[Page, None] = None
+        self.context = None
+        self.playwright = None
 
         self.PAGE_RETRY = page_retry
         self.DETAIL_RETRY = 9999
@@ -367,8 +456,54 @@ class Worker(QThread):
         if not self._running:
             raise Exception("手动停止")
 
+    def _close_browser(self):
+        try:
+            if self.context:
+                self.context.close()
+        except Exception:
+            pass
+        self.context = None
+        try:
+            if self.browser:
+                self.browser.close()
+        except Exception:
+            pass
+        self.browser = None
+        self.page = None
+        try:
+            if self.playwright:
+                self.playwright.stop()
+        except Exception:
+            pass
+        self.playwright = None
+
+    def _create_new_browser(self):
+        self._close_browser()
+        try:
+            self.playwright = sync_playwright().start()
+            browser_path = get_builtin_chromium_path(self.playwright)
+            self.browser = self.playwright.chromium.launch(
+                headless=False,
+                slow_mo=600,
+                executable_path=browser_path,
+            )
+            self.context = self.browser.new_context(
+                viewport={"width": 390, "height": 844},
+                user_agent=(
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 "
+                    "Mobile/15E148 Safari/604.1"
+                ),
+            )
+            self.page = self.context.new_page()
+            self.log.emit("🔧 使用内置 Chromium 浏览器")
+            return True
+        except Exception as exc:
+            self.log.emit(f"❌ 浏览器启动失败：{str(exc)[:160]}")
+            self._close_browser()
+            return False
+
     def run(self):
-        playwright = None
         workbook_writer = None
         current_row_index = None
         try:
@@ -416,24 +551,14 @@ class Worker(QThread):
                     self.log.emit("❌ 无法保存原始表，请先关闭 Excel/WPS 表格后再运行程序！")
                     raise
 
-            playwright = sync_playwright().start()
-            browser_path = get_builtin_chromium_path(playwright)
-            self.browser = playwright.chromium.launch(
-                headless=False,
-                slow_mo=600,
-                executable_path=browser_path,
-            )
-            self.log.emit("🔧 使用内置 Chromium 浏览器")
-            # ============= 仅运输证查询：手机布局 =============
-            # 模拟iPhone移动端，解决验证码扁平问题
-            self.context = self.browser.new_context(
-                viewport={"width": 390, "height": 844},  # 手机尺寸
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
-            )
-            self.page = self.context.new_page()
-            # ================================================
+            if not self._create_new_browser():
+                self.finished.emit("失败")
+                return
 
-            for idx, (_, row) in enumerate(df.iterrows()):
+            idx = 0
+            browser_restarts = 0
+            while idx < total and self._running:
+                row = df.iloc[idx]
                 current_row_index = idx
                 self._check_stopped()
 
@@ -450,15 +575,25 @@ class Worker(QThread):
                     self.log.emit("✅ 已有运输证号，跳过查询")
                     df.at[idx, "查询状态"] = "已存在（跳过）"
                     save_results(idx)
+                    idx += 1
+                    browser_restarts = 0
                     continue
 
                 # 已有企业信息说明该行已完成后续回填，不再重复查询运输证号。
                 existing_company = row.get("车辆所有人/企业", "")
-                if has_nonempty_cell_value(existing_company):
+                existing_query_status = str(row.get("查询状态", "")).strip()
+                previous_browser_failure = is_recoverable_browser_error(
+                    existing_query_status
+                )
+                if has_nonempty_cell_value(existing_company) and not previous_browser_failure:
                     self.log.emit("✅ 已有企业信息，跳过运输证查询")
                     df.at[idx, "查询状态"] = "已有企业信息（跳过）"
                     save_results(idx)
+                    idx += 1
+                    browser_restarts = 0
                     continue
+                if previous_browser_failure:
+                    self.log.emit("↻ 检测到上次浏览器异常，本行重新查询运输证号")
 
                 # 检查是否已补缴
                 if pd.notna(has_paid) and str(has_paid).strip() != "":
@@ -470,6 +605,8 @@ class Worker(QThread):
                         self.page.wait_for_timeout(1000)
                     except:
                         pass
+                    idx += 1
+                    browser_restarts = 0
                     continue
 
                 # 解析车牌
@@ -478,6 +615,8 @@ class Worker(QThread):
                     df.at[idx, "查询状态"] = "车牌格式错误（解析失败）"
                     self.log.emit(f"⚠️ 车牌解析失败")
                     save_results(idx)
+                    idx += 1
+                    browser_restarts = 0
                     continue
 
                 # 黄牌过滤
@@ -486,6 +625,8 @@ class Worker(QThread):
                         df.at[idx, "查询状态"] = "已跳过（非黄牌）"
                         save_results(idx)
                         self.log.emit(f"⏭️ 非黄牌，已跳过")
+                        idx += 1
+                        browser_restarts = 0
                         continue
 
                 full_plate = province + plate_num
@@ -499,7 +640,8 @@ class Worker(QThread):
 
                 try:
                     self._check_stopped()
-                    self.page.goto(CONFIG["TARGET_URL"], timeout=60000)
+                    response = self.page.goto(CONFIG["TARGET_URL"], timeout=60000)
+                    ensure_successful_navigation(response, "运输证查询页")
                     self.log.emit("✓ 切换到外省查询")
                     self.page.locator("text='外省查询'").click()
                     self.page.wait_for_timeout(800)
@@ -607,6 +749,10 @@ class Worker(QThread):
                                     captcha_code = ocr_code(self.page, CONFIG["CAPT_IMG_SELECTOR"])
                                     if not captcha_code:
                                         captcha_err += 1
+                                        self.retry_signal.emit(
+                                            "transport_captcha_ocr",
+                                            f"运输证验证码 OCR 第 {captcha_err} 次失败",
+                                        )
                                         self.log.emit(
                                             f"⚠️ OCR失败，刷新验证码 | 重试次数：{captcha_err}")
                                         self.page.locator(CONFIG["CAPT_IMG_SELECTOR"]).click()
@@ -628,6 +774,10 @@ class Worker(QThread):
 
                                 if captcha_input_still_exists:
                                     captcha_err += 1
+                                    self.retry_signal.emit(
+                                        "transport_captcha",
+                                        f"运输证验证码第 {captcha_err} 次错误",
+                                    )
                                     self.log.emit(f"❌ 验证码错误 | 重试次数：{captcha_err}")
 
                                     # 仅真正验证码错误，才执行清空+刷新
@@ -721,6 +871,10 @@ class Worker(QThread):
                             list_loaded = True
                             break
                         elif "查询不到信息" in self.page.content():
+                            self.retry_signal.emit(
+                                "transport_result_page",
+                                f"运输证结果页第 {page_try + 1} 次无数据",
+                            )
                             self.log.emit(f"ℹ️ 第 {page_try + 1} 次无数据，刷新结果页重试")
                             self.page.reload()  # 仅刷新结果页，仍在结果页
                             self.page.wait_for_timeout(1500)
@@ -733,6 +887,8 @@ class Worker(QThread):
 
                     # ===================== 如果验证码失败已标记，直接跳过后续所有查询代码 =====================
                     if not list_loaded and str(df.at[idx, "查询状态"]).strip() == "验证码识别失败":
+                        idx += 1
+                        browser_restarts = 0
                         continue
                     # ==============================================================================================
 
@@ -762,6 +918,10 @@ class Worker(QThread):
                                 else:
                                     # 内容为空才重试
                                     if detail_try < self.DETAIL_RETRY - 1:
+                                        self.retry_signal.emit(
+                                            "transport_detail",
+                                            f"运输证详情第 {detail_try + 1} 次内容为空",
+                                        )
                                         self.log.emit(
                                             f"⚠️ 详情页内容为空，刷新重试")
                                         self.page.reload()
@@ -769,6 +929,10 @@ class Worker(QThread):
                             except:
                                 # 加载异常
                                 if detail_try < self.DETAIL_RETRY - 1:
+                                    self.retry_signal.emit(
+                                        "transport_detail",
+                                        f"运输证详情第 {detail_try + 1} 次加载异常",
+                                    )
                                     self.log.emit(f"⚠️ 详情页加载异常，刷新重试")
                                     self.page.reload()
                                     self.page.wait_for_timeout(800)
@@ -800,6 +964,24 @@ class Worker(QThread):
                             self.log.emit(f"⚠️ {error_msg}")
 
                 except Exception as e:
+                    if is_recoverable_browser_error(e):
+                        browser_restarts += 1
+                        retry_limit = CONFIG["BROWSER_RETRY_LIMIT"]
+                        reason = str(e).strip() or e.__class__.__name__
+                        self.retry_signal.emit(
+                            "transport_browser",
+                            f"运输证浏览器异常重启：{reason[:120]}",
+                        )
+                        if browser_restarts <= retry_limit:
+                            self.log.emit(
+                                "⚠️ 浏览器或查询页失效，正在重新启动浏览器并重试"
+                                f"当前记录（{browser_restarts}/{retry_limit}）"
+                            )
+                            if self._create_new_browser():
+                                continue
+                        raise BrowserRecoveryError(
+                            "运输证浏览器恢复失败，当前记录未跳过，步骤 1 已停止"
+                        ) from e
                     error_msg = str(e)[:50]
                     self.log.emit(f"💥 异常：{error_msg}")
 
@@ -835,7 +1017,10 @@ class Worker(QThread):
                 save_results(idx)
                 if tr_clean:
                     self.stat_event.emit("transport_query_completed", 1)
+                idx += 1
+                browser_restarts = 0
 
+            workbook_writer.save()
             self.log.emit(f"\n📊 所有任务完成，原始表已保存：{self.src}")
 
         except Exception as e:
@@ -853,16 +1038,7 @@ class Worker(QThread):
                 self.finished.emit("失败")
                 return
         finally:
-            try:
-                if self.browser:
-                    self.browser.close()
-            except:
-                pass
-            try:
-                if playwright:
-                    playwright.stop()
-            except:
-                pass
+            self._close_browser()
             if workbook_writer is not None:
                 workbook_writer.close()
             self._running = False
@@ -878,6 +1054,7 @@ class BusinessBackfillWorker(QThread):
     pause_signal = pyqtSignal()
     input_signal = pyqtSignal(str)
     stat_event = pyqtSignal(str, int)
+    retry_signal = pyqtSignal(str, str)
 
     input_result = ""
 
@@ -886,7 +1063,7 @@ class BusinessBackfillWorker(QThread):
         self.original_file = original_file
         self.auto_continue = auto_continue
         self.auto_mode = auto_mode
-        self.web_timeout = 30000
+        self.web_timeout = CONFIG["BUSINESS_WEB_TIMEOUT_MS"]
         self.captcha_retry = captcha_retry
         self.manual_at_captcha = manual_at_captcha
         self._running = True
@@ -950,6 +1127,151 @@ class BusinessBackfillWorker(QThread):
             self.log.emit(f"❌ 浏览器启动失败: {e}")
             return False
 
+    def _create_browser_with_retries(self, retry_type, reason):
+        retry_limit = CONFIG["BROWSER_RETRY_LIMIT"]
+        for attempt in range(1, retry_limit + 1):
+            self._check_stopped()
+            if self._create_new_browser():
+                return True
+            self.retry_signal.emit(
+                retry_type,
+                f"{reason}，浏览器启动第 {attempt} 次失败",
+            )
+            if attempt < retry_limit:
+                self.log.emit(
+                    f"⚠️ 浏览器启动失败，正在重试（{attempt}/{retry_limit}）"
+                )
+        return False
+
+    def _captcha_prompt_is_visible(self):
+        try:
+            prompt = self.page.locator(".verify-msg")
+            return bool(prompt.count() and prompt.first.is_visible())
+        except Exception:
+            return False
+
+    def _captcha_image_is_ready(self):
+        """验证码题目和图片均完整加载后才允许开始识别。"""
+        try:
+            prompt = self.page.locator(".verify-msg")
+            if not prompt.count() or not prompt.first.is_visible():
+                return False
+            prompt_text = prompt.first.inner_text().strip()
+            if not re.search(r"【([^】]+)】", prompt_text):
+                return False
+
+            image = self.page.locator(".back-img")
+            if not image.count() or not image.first.is_visible():
+                return False
+            return bool(
+                image.first.evaluate(
+                    """
+                    async element => {
+                        const rect = element.getBoundingClientRect();
+                        if (rect.width < 20 || rect.height < 20) return false;
+
+                        const image = element.matches('img')
+                            ? element
+                            : element.querySelector('img');
+                        if (image) {
+                            return image.complete
+                                && image.naturalWidth >= 20
+                                && image.naturalHeight >= 20;
+                        }
+
+                        const canvas = element.matches('canvas')
+                            ? element
+                            : element.querySelector('canvas');
+                        if (canvas) {
+                            return canvas.width >= 20 && canvas.height >= 20;
+                        }
+
+                        const background = getComputedStyle(element).backgroundImage;
+                        const match = background && background.match(/url\\(["']?(.*?)["']?\\)/);
+                        if (!match || !match[1]) return false;
+                        return await new Promise(resolve => {
+                            const probe = new Image();
+                            const timer = setTimeout(() => resolve(false), 5000);
+                            probe.onload = () => {
+                                clearTimeout(timer);
+                                resolve(probe.naturalWidth >= 20 && probe.naturalHeight >= 20);
+                            };
+                            probe.onerror = () => {
+                                clearTimeout(timer);
+                                resolve(false);
+                            };
+                            probe.src = match[1];
+                        });
+                    }
+                    """
+                )
+            )
+        except Exception:
+            return False
+
+    def _business_result_is_ready(self):
+        if self._captcha_prompt_is_visible():
+            return False
+        try:
+            owner = self.page.locator("#ownerName2")
+            if owner.count() and owner.first.is_visible():
+                owner_text = (owner.first.text_content() or "").strip()
+                if owner_text:
+                    return True
+        except Exception:
+            pass
+        try:
+            tips = self.page.locator(".layui-layer-content")
+            for index in range(tips.count()):
+                tip = tips.nth(index)
+                if not tip.is_visible():
+                    continue
+                tip_text = (tip.inner_text() or "").strip()
+                if any(
+                    keyword in tip_text
+                    for keyword in ("系统无该营运车辆信息", "未查询到")
+                ):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _wait_for_business_response(self):
+        """等待验证码图片稳定就绪，或等待无需验证码的业务结果。"""
+        deadline = time.monotonic() + self.web_timeout / 1000
+        wait_logged = False
+        while time.monotonic() < deadline:
+            self._check_stopped()
+            if self._business_result_is_ready():
+                return "result"
+            if self._captcha_image_is_ready():
+                if not wait_logged:
+                    self.log.emit("⏳ 验证码已出现，等待图片完整加载...")
+                    wait_logged = True
+                self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_STABLE_MS"])
+                self._check_stopped()
+                if self._captcha_image_is_ready():
+                    self.log.emit("✅ 验证码图片加载完成，开始处理")
+                    return "captcha"
+            elif not wait_logged:
+                self.log.emit("⏳ 等待营运查询响应或验证码图片加载...")
+                wait_logged = True
+            self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
+        raise BrowserRecoveryError(
+            f"等待营运查询响应或验证码图片加载超时（{self.web_timeout // 1000}秒）"
+        )
+
+    def _wait_for_business_result(self):
+        """验证码通过后继续等待公司信息或无数据提示真正出现。"""
+        deadline = time.monotonic() + self.web_timeout / 1000
+        self.log.emit("⏳ 等待营运企业信息加载完成...")
+        while time.monotonic() < deadline:
+            self._check_stopped()
+            if self._business_result_is_ready():
+                return True
+            self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
+        return False
+
     # ======================
     # 封装：你的专属验证码识别逻辑（完全未修改，原样封装）
     # ======================
@@ -969,6 +1291,11 @@ class BusinessBackfillWorker(QThread):
             for i in range(captcha_max_retry):
                 self._check_stopped()
                 try:
+                    if i > 0:
+                        response_state = self._wait_for_business_response()
+                        if response_state == "result":
+                            self.log.emit("✅ 验证码已通过，营运信息已返回")
+                            return True
                     prompt_el = self.page.locator(".verify-msg")
                     if not prompt_el.count():
                         self.log.emit("✅ 未检测到验证码，直接跳过")
@@ -982,7 +1309,7 @@ class BusinessBackfillWorker(QThread):
                     target_chars = [c.strip() for c in match.group(1).split(',')]
                     self.log.emit(f"🎯 系统需要依次点击的文字：{target_chars}")
 
-                    img_el = self.page.locator(".back-img")
+                    img_el = self.page.locator(".back-img").first
                     img_bytes = img_el.screenshot()
 
                     # 整图锐化
@@ -1162,6 +1489,10 @@ class BusinessBackfillWorker(QThread):
                         time.sleep(2)
 
                 except Exception as e:
+                    self.retry_signal.emit(
+                        "business_captcha",
+                        f"营运查询验证码第 {i + 1} 次失败：{str(e)[:80]}",
+                    )
                     self.log.emit(f"❌ 第{i + 1}次验证失败：{str(e)[:80]}")
                     try:
                         self.page.locator(".verify-refresh").click()
@@ -1176,6 +1507,7 @@ class BusinessBackfillWorker(QThread):
 
     def run(self):
         workbook_writer = None
+        final_result = "结束"
         try:
             try:
                 df_original = pd.read_excel(
@@ -1185,13 +1517,13 @@ class BusinessBackfillWorker(QThread):
                 )
             except PermissionError:
                 self.log.emit("❌ 无法读取原始表，请先关闭 Excel/WPS 表格后再运行程序！")
-                self.finished.emit("失败")
+                final_result = "失败"
                 return
 
             # 校验原始表是否有"运输证号_纯数字"列
             if "运输证号_纯数字" not in df_original.columns:
                 self.log.emit("❌ 原始表缺少[运输证号_纯数字]列，请先运行查询运输证号功能！")
-                self.finished.emit("失败")
+                final_result = "失败"
                 return
 
             if "车辆所有人/企业" not in df_original.columns:
@@ -1227,12 +1559,16 @@ class BusinessBackfillWorker(QThread):
             self.progress.emit(0)
             self.log.emit(f"📌 原始表共 {total} 条，开始回填营运信息")
 
-            if not self._create_new_browser():
+            if not self._create_browser_with_retries(
+                "business_browser_start",
+                "营运查询浏览器启动失败",
+            ):
                 self.log.emit("❌ 浏览器启动失败，程序退出")
-                self.finished.emit("失败")
+                final_result = "失败"
                 return
 
             idx = 0
+            browser_restart_counts = {}
             while idx < total and self._running:
                 row = df_original.iloc[idx]
                 company = ""
@@ -1265,12 +1601,21 @@ class BusinessBackfillWorker(QThread):
                 # 然后再判断 车辆所有人/企业
                 if "车辆所有人/企业" in df_original.columns:
                     val = str(df_original.at[idx, "车辆所有人/企业"]).strip()
-                    if val not in ["", "nan", "NaN", "None"]:
+                    stale_no_transport = (
+                        val == "无运输证号"
+                        and bool(cert_no)
+                        and cert_no.lower() != "nan"
+                    )
+                    if val not in ["", "nan", "NaN", "None"] and not stale_no_transport:
                         self.log.emit(f"✅ 已有公司信息，跳过：{car_full}")
                         idx += 1
                         progress = int((idx / total) * 100)
                         self.progress.emit(progress)
                         continue
+                    if stale_no_transport:
+                        self.log.emit(
+                            f"↻ 已取得运输证号，重新回填原“无运输证号”记录：{car_full}"
+                        )
 
                 if not cert_no or cert_no.lower() == "nan":
                     self.log.emit(f"ℹ️ 无运输证号：{car_full} → 无运输证号")
@@ -1292,9 +1637,17 @@ class BusinessBackfillWorker(QThread):
 
                 try:
                     if not self.browser or not self.page:
-                        self._create_new_browser()
+                        if not self._create_browser_with_retries(
+                            "business_browser",
+                            "营运查询浏览器恢复失败",
+                        ):
+                            raise BrowserRecoveryError("营运查询浏览器无法重新启动")
 
-                    self.page.goto(CONFIG["BUSINESS_QUERY_URL"], timeout=self.web_timeout)
+                    response = self.page.goto(
+                        CONFIG["BUSINESS_QUERY_URL"],
+                        timeout=self.web_timeout,
+                    )
+                    ensure_successful_navigation(response, "营运查询页")
                     self.page.wait_for_selector("a:has-text('营运车辆')", timeout=self.web_timeout)
                     self.page.click("a:has-text('营运车辆')")
                     time.sleep(0.5)
@@ -1302,14 +1655,15 @@ class BusinessBackfillWorker(QThread):
                     self.page.fill('input[placeholder="请输入车辆号牌"]', plate)
                     self.page.fill('input[placeholder="请输入道路运输证号"]', cert_no)
                     self.page.click("button[lay-filter='formVehicle']")
-                    time.sleep(0.5)
+                    response_state = self._wait_for_business_response()
+                    has_captcha = response_state == "captcha"
 
                     is_captcha_fail = False
-                    captcha_passed = False  # 标记验证码是否已通过（避免重复等待加载圈）
+                    captcha_passed = response_state == "result"
 
                     if self.auto_mode:
                         # 调用封装的验证码方法
-                        success = self.solve_captcha()
+                        success = not has_captcha or self.solve_captcha()
                         if not success:
                             self.log.emit("❌ 验证码识别全部失败！")
                             df_original.at[idx, "车辆所有人/企业"] = ""
@@ -1323,7 +1677,7 @@ class BusinessBackfillWorker(QThread):
                             is_captcha_fail = False
                     else:
                         if not self.manual_at_captcha:
-                            success = self.solve_captcha()
+                            success = not has_captcha or self.solve_captcha()
                             if not success:
                                 self.log.emit(f"❌ 自动识别{self.captcha_retry}次失败，转为人工接管")
                                 if self.auto_continue:
@@ -1363,7 +1717,11 @@ class BusinessBackfillWorker(QThread):
                                         # 3. 等加载圈消失
                                         if self.page.locator(".layui-layer-loading2").count() > 0:
                                             try:
-                                                self.page.wait_for_selector(".layui-layer-loading2", state="detached", timeout=15000)
+                                                self.page.wait_for_selector(
+                                                    ".layui-layer-loading2",
+                                                    state="detached",
+                                                    timeout=self.web_timeout,
+                                                )
                                             except:
                                                 pass
 
@@ -1386,7 +1744,9 @@ class BusinessBackfillWorker(QThread):
                                     while self._paused and self._running:
                                         time.sleep(0.2)
                         else:
-                            if self.auto_continue:
+                            if not has_captcha:
+                                captcha_passed = True
+                            elif self.auto_continue:
                                 # 人工点完验证码后：先等用户点完验证码，再等加载圈消失，最后检查验证码是否通过
                                 while self._running:
                                     self._check_stopped()
@@ -1424,7 +1784,11 @@ class BusinessBackfillWorker(QThread):
                                     # 3. 等加载圈消失
                                     if self.page.locator(".layui-layer-loading2").count() > 0:
                                         try:
-                                            self.page.wait_for_selector(".layui-layer-loading2", state="detached", timeout=15000)
+                                            self.page.wait_for_selector(
+                                                ".layui-layer-loading2",
+                                                state="detached",
+                                                timeout=self.web_timeout,
+                                            )
                                         except:
                                             pass
 
@@ -1452,33 +1816,29 @@ class BusinessBackfillWorker(QThread):
                         self.log.emit("ℹ️ 因验证码识别失败，跳过营运信息解析")
                     else:
                         # 等待结果
-                        try:
-                            # 如果验证码已通过（captcha_passed=True），则已等过加载圈，跳过重复等待
-                            if not captcha_passed:
-                                # 先等加载圈出现并消失（网速慢时必须有这一步）
-                                if self.page.locator(".layui-layer-loading2").count() > 0:
-                                    self.log.emit("⏳ 正在加载数据，等待加载圈消失...")
-                                    try:
-                                        self.page.wait_for_selector(".layui-layer-loading2", state="detached", timeout=15000)
-                                    except:
-                                        pass
-                                # 再等真正的结果（公司名或错误提示）
-                                self.page.wait_for_selector("#ownerName2,.layui-layer-content",
-                                                            state="attached", timeout=10000)
-                            else:
-                                self.log.emit("⏳ 验证码已通过，直接获取信息")
-                            self._check_stopped()
-                        except:
-                            self.log.emit("⚠️ 网页加载超时，未获取到任何信息")
-                            pass
+                        if captcha_passed:
+                            self.log.emit("⏳ 验证码已通过，继续等待营运信息")
+                        result_ready = self._wait_for_business_result()
+                        if not result_ready:
+                            self.log.emit(
+                                f"⚠️ 网页加载超过 {self.web_timeout // 1000} 秒，"
+                                "仍未获取到营运信息"
+                            )
 
                         html = self.page.content().lower()
                         tip_loc = self.page.locator(".layui-layer-content")
                         has_no_data_tip = False
-                        if tip_loc.count() > 0:
-                            tip_text = tip_loc.first.inner_text().strip()
-                            if any(key in tip_text for key in ["系统无该营运车辆信息", "未查询到"]):
+                        for tip_index in range(tip_loc.count()):
+                            tip = tip_loc.nth(tip_index)
+                            if not tip.is_visible():
+                                continue
+                            tip_text = tip.inner_text().strip()
+                            if any(
+                                key in tip_text
+                                for key in ["系统无该营运车辆信息", "未查询到"]
+                            ):
                                 has_no_data_tip = True
+                                break
 
                         if has_no_data_tip:
                             company = "无营运信息"
@@ -1499,17 +1859,43 @@ class BusinessBackfillWorker(QThread):
 
                         # ====================== 优化2：只有【人工接管模式】才弹输入框 ======================
                         need_manual_input = False
-                        # 人工模式 + 公司为空 → 才弹框
-                        if not self.auto_mode and company.strip() == "":
+                        # 人工模式 + 页面已明确返回但公司为空 → 才弹框；技术超时不弹框。
+                        if (
+                            not self.auto_mode
+                            and result_ready
+                            and company.strip() == ""
+                        ):
                             need_manual_input = True
 
                 except Exception as e:
                     err_msg = str(e)
-                    self.log.emit(f"⚠️ 网页/浏览器已关闭")
-                    if any(key in err_msg for key in ["browser", "page", "Timeout", "context", "closed", "connection"]):
-                        self._create_new_browser()
-                        need_retry = True
-                        company = ""
+                    if is_recoverable_browser_error(e):
+                        attempt = browser_restart_counts.get(idx, 0) + 1
+                        browser_restart_counts[idx] = attempt
+                        retry_limit = CONFIG["BROWSER_RETRY_LIMIT"]
+                        self.retry_signal.emit(
+                            "business_browser",
+                            f"营运查询浏览器异常重启：{err_msg[:80]}",
+                        )
+                        if attempt <= retry_limit:
+                            self.log.emit(
+                                "⚠️ 营运查询页或浏览器失效，正在重新启动并重试"
+                                f"当前记录（{attempt}/{retry_limit}）"
+                            )
+                            if self._create_browser_with_retries(
+                                "business_browser",
+                                "营运查询浏览器恢复失败",
+                            ):
+                                need_retry = True
+                                company = ""
+                            else:
+                                raise BrowserRecoveryError(
+                                    "营运查询浏览器重新启动失败"
+                                ) from e
+                        else:
+                            raise BrowserRecoveryError(
+                                "营运查询页连续失效，当前记录未跳过，步骤 2 已停止"
+                            ) from e
                     else:
                         company = ""
 
@@ -1561,18 +1947,17 @@ class BusinessBackfillWorker(QThread):
                 self.log.emit("🛑 已手动停止回填")
             elif isinstance(e, PermissionError):
                 self.log.emit("❌ 无法读写文件，请先关闭 Excel/WPS 表格后再运行程序！")
-                self.finished.emit("失败")
+                final_result = "失败"
                 return
             else:
-                self.log.emit(f"❌ 回填异常，请检查网址是否正常访问")
-                self.finished.emit("失败")
-                # self.log.emit(f"❌ 异常:{str(e)}")
+                self.log.emit(f"❌ 回填异常：{str(e)[:200]}")
+                final_result = "失败"
         finally:
             self._close_browser()
             if workbook_writer is not None:
                 workbook_writer.close()
             self._running = False
-            self.finished.emit("结束")
+            self.finished.emit(final_result)
 
 # ====================== 主界面 ======================
 
