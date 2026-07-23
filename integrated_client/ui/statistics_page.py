@@ -143,7 +143,16 @@ class ChartHoverCard(QFrame):
             if item.widget():
                 item.widget().deleteLater()
 
-    def show_details(self, title, details, accent_color, anchor, card_width=240):
+    def show_details(
+        self,
+        title,
+        details,
+        accent_color,
+        anchor,
+        card_width=240,
+        compact=None,
+        punctuated=False,
+    ):
         """在全局坐标 anchor 附近显示，并保持在当前屏幕可用区域内。"""
         self.title_text = str(title)
         self.details = [(str(key), str(value)) for key, value in details]
@@ -164,7 +173,7 @@ class ChartHoverCard(QFrame):
             f"background:{QColor(accent_color).name()};border-radius:2px;"
         )
         self._clear_details()
-        compact_grid = len(self.details) > 2
+        compact_grid = len(self.details) > 2 if compact is None else bool(compact)
         self._details_layout.setHorizontalSpacing(12 if compact_grid else 18)
         self._detail_row_count = (
             math.ceil(len(self.details) / 2) if compact_grid else len(self.details)
@@ -174,8 +183,9 @@ class ChartHoverCard(QFrame):
             group = index % 2 if compact_grid else 0
             key_column = group * 2
             value_column = key_column + 1
-            key_label = QLabel(key)
+            key_label = QLabel(f"{key}：" if punctuated else key)
             key_label.setObjectName("HoverCardKey")
+            key_label.setContentsMargins(0, 0, 4 if punctuated else 0, 0)
             value_label = QLabel(value)
             value_label.setObjectName("HoverCardValue")
             value_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -208,6 +218,45 @@ class ChartHoverCard(QFrame):
         self.move(x, y)
         self.show()
         self.raise_()
+
+
+class TimingMetricCard(QFrame):
+    """使用主题悬浮卡展示计时指标的精简明细。"""
+
+    def __init__(self, hover_title, hover_details, accent_color, parent=None):
+        super().__init__(parent)
+        self._hover_title = str(hover_title)
+        self._hover_details = list(hover_details)
+        self._hover_accent = QColor(accent_color)
+        self._hover_card = ChartHoverCard(self)
+        self.setMouseTracking(True)
+
+    def _show_hover_card(self, anchor):
+        self._hover_card.show_details(
+            self._hover_title,
+            self._hover_details,
+            self._hover_accent,
+            anchor,
+            card_width=280,
+            compact=False,
+            punctuated=True,
+        )
+
+    def enterEvent(self, event):
+        self._show_hover_card(self.mapToGlobal(self.rect().center()))
+        super().enterEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self._show_hover_card(event.globalPos())
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_card.hide()
+        super().leaveEvent(event)
+
+    def hideEvent(self, event):
+        self._hover_card.hide()
+        super().hideEvent(event)
 
 
 class AnimatedDonutChart(QWidget):
@@ -1113,7 +1162,7 @@ class StatisticsPage(QWidget):
         ),
         "timing": (
             "用时效率",
-            "查看有效用时、暂停等待、平均用时和效率提升。",
+            "查看总用时、有效用时、平均处理效率和效率提升。",
         ),
         "completion": (
             "完成类型",
@@ -1228,7 +1277,7 @@ class StatisticsPage(QWidget):
         timing_title = QLabel("效率统计")
         timing_title.setStyleSheet("color:#173a3d;font-size:14px;font-weight:700;")
         timing_header.addWidget(timing_title)
-        self.timing_scope_label = QLabel("人工基准：260 条 / 6 小时")
+        self.timing_scope_label = QLabel("仅统计三步全部完成的数据")
         self.timing_scope_label.setObjectName("Muted")
         timing_header.addWidget(self.timing_scope_label)
         timing_header.addStretch(1)
@@ -1516,9 +1565,14 @@ class StatisticsPage(QWidget):
             end_date=end_date,
         )
         completed_items = int(totals["completed_items"])
-        average_ms = (
-            totals["active_ms"] / completed_items
-            if completed_items
+        average_total_ms = (
+            totals["total_ms"] / completed_items
+            if completed_items and totals["total_ms"] > 0
+            else None
+        )
+        throughput_per_hour = (
+            completed_items * MILLISECONDS_PER_HOUR / totals["total_ms"]
+            if completed_items and totals["total_ms"] > 0
             else None
         )
         manual_estimated_ms = (
@@ -1527,7 +1581,7 @@ class StatisticsPage(QWidget):
             / self.HUMAN_BASELINE_ITEMS
         )
         efficiency_gain = (
-            (manual_estimated_ms - totals["active_ms"])
+            (manual_estimated_ms - totals["total_ms"])
             / manual_estimated_ms
             * 100
             if manual_estimated_ms
@@ -1539,16 +1593,19 @@ class StatisticsPage(QWidget):
             ("暂停等待", format_precise_duration(totals["paused_ms"]), "登录、验证及人工等待"),
             ("完成数据", f"{completed_items} 条", "仅统计三步全部成功的批次"),
             (
-                "每条平均用时",
-                format_precise_duration(average_ms) if average_ms is not None else "—",
-                "有效用时÷有计时记录的完成数据",
+                "平均处理效率",
+                (
+                    f"{throughput_per_hour:.0f} 条/小时"
+                    if throughput_per_hour is not None
+                    else "—"
+                ),
+                "完成数据÷总用时",
             ),
             (
                 "较纯人工效率提升",
                 f"{efficiency_gain:.1f}%" if efficiency_gain is not None else "—",
-                "人工基准：260 条 / 6 小时",
+                "正值表示效率提升，负值表示低于参考效率",
             ),
-            ("计时运行", f"{totals['run_count']} 次", "包含同批次停止、失败和重试运行"),
         ]
         return totals, rows
 
@@ -1990,8 +2047,22 @@ class StatisticsPage(QWidget):
                 item.widget().deleteLater()
 
     @staticmethod
-    def _metric_card(label, value, unit):
-        card = QFrame()
+    def _metric_card(
+        label,
+        value,
+        unit,
+        hover_details=None,
+        hover_accent="#1d8178",
+    ):
+        card = (
+            TimingMetricCard(
+                f"{label}明细",
+                hover_details,
+                hover_accent,
+            )
+            if hover_details is not None
+            else QFrame()
+        )
         card.setObjectName("Card")
         box = QVBoxLayout(card)
         box.setContentsMargins(14, 9, 14, 9)
@@ -1999,6 +2070,9 @@ class StatisticsPage(QWidget):
         caption.setObjectName("Muted")
         number = QLabel(f"{value} {unit}".rstrip())
         number.setObjectName("MetricValue")
+        if hover_details is not None:
+            caption.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+            number.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         box.addWidget(caption)
         box.addWidget(number)
         return card
@@ -2019,9 +2093,14 @@ class StatisticsPage(QWidget):
             end_date=end_date,
         )
         completed_items = totals["completed_items"]
-        average_ms = (
-            totals["active_ms"] / completed_items
-            if completed_items
+        average_total_ms = (
+            totals["total_ms"] / completed_items
+            if completed_items and totals["total_ms"] > 0
+            else None
+        )
+        throughput_per_hour = (
+            completed_items * MILLISECONDS_PER_HOUR / totals["total_ms"]
+            if completed_items and totals["total_ms"] > 0
             else None
         )
         manual_estimated_ms = (
@@ -2030,80 +2109,103 @@ class StatisticsPage(QWidget):
             / self.HUMAN_BASELINE_ITEMS
         )
         efficiency_gain = (
-            (manual_estimated_ms - totals["active_ms"])
+            (manual_estimated_ms - totals["total_ms"])
             / manual_estimated_ms
             * 100
             if manual_estimated_ms
             else None
         )
-        detail_summary = (
-            f"精确总用时：{format_precise_duration(totals['total_ms'])}\n"
-            f"精确有效用时：{format_precise_duration(totals['active_ms'])}\n"
-            f"精确暂停等待：{format_precise_duration(totals['paused_ms'])}\n"
-            f"计时运行：{totals['run_count']} 次\n"
-            f"有计时记录的完成数据：{completed_items} 条"
+        completed_text = f"{completed_items} 条"
+        precise_total = format_precise_duration(totals["total_ms"])
+        precise_active = format_precise_duration(totals["active_ms"])
+        precise_paused = format_precise_duration(totals["paused_ms"])
+        seconds_per_item = (
+            average_total_ms / 1000
+            if average_total_ms is not None
+            else None
+        )
+        precise_average = (
+            format_precise_duration(average_total_ms)
+            if average_total_ms is not None
+            else "暂无数据"
         )
         values = [
             (
                 "总用时",
                 f"{totals['total_ms'] / MILLISECONDS_PER_HOUR:.1f}",
                 "小时",
-                detail_summary
-                + "\n\n总用时＝有效用时＋暂停、登录验证及人工等待；"
-                "不包含停止后到再次启动前的间隔。只有三个步骤全部成功后，"
-                "该批次及其此前停止、异常或重试的用时才会计入仪表盘。",
+                [
+                    ("精确用时", precise_total),
+                    ("有效用时", precise_active),
+                    ("暂停等待", precise_paused),
+                ],
+                "#1d8178",
             ),
             (
                 "有效用时",
                 f"{totals['active_ms'] / MILLISECONDS_PER_HOUR:.1f}",
                 "小时",
-                detail_summary
-                + "\n\n有效用时包含停止、失败和重试前已经运行的时间，"
-                "不包含暂停等待。未完成批次暂不计入，最终完成后统一计入。",
+                [
+                    ("精确用时", precise_active),
+                    ("完成数据", completed_text),
+                ],
+                "#2f8f82",
             ),
             (
-                "每条平均用时",
+                "平均处理效率",
                 (
-                    f"{average_ms / MILLISECONDS_PER_HOUR:.1f}"
-                    if average_ms is not None
+                    f"{throughput_per_hour:.0f}"
+                    if throughput_per_hour is not None
                     else "—"
                 ),
-                "小时/条" if average_ms is not None else "",
-                detail_summary
-                + (
-                    f"\n精确每条平均：{format_precise_duration(average_ms)}"
-                    if average_ms is not None
-                    else "\n精确每条平均：暂无可匹配完成数据"
-                )
-                + "\n\n每条平均＝有效用时÷有计时记录的完整流程条数；"
-                "升级前没有计时记录的历史条数不参与计算。",
+                "条/小时" if throughput_per_hour is not None else "",
+                [
+                    (
+                        "平均耗时",
+                        f"{seconds_per_item:.1f} 秒/条"
+                        if seconds_per_item is not None
+                        else "暂无数据",
+                    ),
+                    ("精确平均", precise_average),
+                    ("完成数据", completed_text),
+                ],
+                "#d39a2c",
             ),
             (
                 "较纯人工效率提升",
                 f"{efficiency_gain:.1f}" if efficiency_gain is not None else "—",
                 "%" if efficiency_gain is not None else "",
-                detail_summary
-                + f"\n人工预计用时：{format_precise_duration(manual_estimated_ms)}"
-                + "\n\n按人工 260 条耗时 6 小时（平均约 83.077 秒/条）计算："
-                "(人工预计用时－系统有效用时)÷人工预计用时。负值表示慢于人工。",
+                [
+                    ("总用时", precise_total),
+                    (
+                        "人工预计用时",
+                        format_precise_duration(manual_estimated_ms),
+                    ),
+                    ("完成数据", completed_text),
+                ],
+                "#4a8bc4",
             ),
         ]
         for column in range(4):
             self.timing_kpi_layout.setColumnStretch(column, 1)
-        for index, (label, value, unit, tooltip) in enumerate(values):
-            card = self._metric_card(label, value, unit)
-            card.setToolTip(tooltip)
-            card.setToolTipDuration(15000)
-            for child_label in card.findChildren(QLabel):
-                child_label.setToolTip(tooltip)
-                child_label.setToolTipDuration(15000)
+        for index, (
+            label,
+            value,
+            unit,
+            hover_details,
+            hover_accent,
+        ) in enumerate(values):
+            card = self._metric_card(
+                label,
+                value,
+                unit,
+                hover_details=hover_details,
+                hover_accent=hover_accent,
+            )
             self.timing_kpi_cards[label] = card
             self.timing_kpi_layout.addWidget(card, 0, index)
 
-        self.timing_scope_label.setText(
-            f"有计时记录的完成数据：{completed_items} 条 · "
-            "人工基准：260 条 / 6 小时"
-        )
+        self.timing_scope_label.setText(f"完成数据：{completed_items} 条")
 
     def _add_kpis(self, values, columns=4):
         for column in range(max(columns, self.kpi_layout.columnCount())):

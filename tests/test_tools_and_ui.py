@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QApplication,
     QComboBox,
     QFrame,
+    QHeaderView,
     QLabel,
     QMessageBox,
     QPushButton,
@@ -55,7 +56,11 @@ from integrated_client.tools.transport_tool import (
 from integrated_client.timing import WorkflowTimingService
 from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
-from integrated_client.ui.dashboard_page import DashboardPage
+from integrated_client.ui.dashboard_page import (
+    DashboardMetricIcon,
+    DashboardPage,
+    StationShareChart,
+)
 from integrated_client.ui.frameless import (
     FramelessMessageBox,
     HTBOTTOMRIGHT,
@@ -1735,16 +1740,107 @@ class ToolAndUiTests(unittest.TestCase):
 
         self.assertEqual(card_value("总用时"), "0.1 小时")
         self.assertEqual(card_value("有效用时"), "0.1 小时")
-        self.assertEqual(card_value("每条平均用时"), "0.0 小时/条")
-        self.assertEqual(card_value("较纯人工效率提升"), "45.7 %")
-        self.assertIn("4 条", page.timing_scope_label.text())
-        self.assertIn("260 条 / 6 小时", page.timing_scope_label.text())
-        total_tooltip = page.timing_kpi_cards["总用时"].toolTip()
-        self.assertIn("精确总用时：00:04:00.750", total_tooltip)
-        self.assertIn("精确有效用时：00:03:00.500", total_tooltip)
-        self.assertIn("精确暂停等待：00:01:00.250", total_tooltip)
-        average_tooltip = page.timing_kpi_cards["每条平均用时"].toolTip()
-        self.assertIn("精确每条平均：00:00:45.125", average_tooltip)
+        self.assertEqual(card_value("平均处理效率"), "60 条/小时")
+        self.assertEqual(card_value("较纯人工效率提升"), "27.6 %")
+        self.assertEqual(page.timing_scope_label.text(), "完成数据：4 条")
+
+        page.resize(1220, 760)
+        page.show()
+        self.app.processEvents()
+        total_card = page.timing_kpi_cards["总用时"]
+        total_point = total_card.rect().center()
+        total_event = QMouseEvent(
+            QEvent.MouseMove,
+            total_point,
+            total_card.mapToGlobal(total_point),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        total_card.mouseMoveEvent(total_event)
+        self.assertTrue(total_card._hover_card.isVisible())
+        self.assertEqual(
+            total_card._hover_card.details,
+            [
+                ("精确用时", "00:04:00.750"),
+                ("有效用时", "00:03:00.500"),
+                ("暂停等待", "00:01:00.250"),
+            ],
+        )
+        self.assertEqual(total_card._hover_card._detail_row_count, 3)
+        hover_keys = total_card._hover_card.findChildren(QLabel, "HoverCardKey")
+        self.assertTrue(hover_keys)
+        self.assertTrue(all(label.text().endswith("：") for label in hover_keys))
+        self.assertTrue(
+            all(label.contentsMargins().right() >= 4 for label in hover_keys)
+        )
+        self.assertEqual(total_card.toolTip(), "")
+
+        average_card = page.timing_kpi_cards["平均处理效率"]
+        average_point = average_card.rect().center()
+        average_event = QMouseEvent(
+            QEvent.MouseMove,
+            average_point,
+            average_card.mapToGlobal(average_point),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        average_card.mouseMoveEvent(average_event)
+        self.assertEqual(
+            average_card._hover_card.details,
+            [
+                ("平均耗时", "60.2 秒/条"),
+                ("精确平均", "00:01:00.188"),
+                ("完成数据", "4 条"),
+            ],
+        )
+
+        efficiency_card = page.timing_kpi_cards["较纯人工效率提升"]
+        efficiency_point = efficiency_card.rect().center()
+        efficiency_event = QMouseEvent(
+            QEvent.MouseMove,
+            efficiency_point,
+            efficiency_card.mapToGlobal(efficiency_point),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        efficiency_card.mouseMoveEvent(efficiency_event)
+        self.assertEqual(
+            efficiency_card._hover_card.details,
+            [
+                ("总用时", "00:04:00.750"),
+                ("人工预计用时", "00:05:32.308"),
+                ("完成数据", "4 条"),
+            ],
+        )
+
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("timing")
+        )
+        self.app.processEvents()
+        timing_metrics = [
+            page.summary_table.item(row, 0).text()
+            for row in range(page.summary_table.rowCount())
+        ]
+        self.assertNotIn("计时运行", timing_metrics)
+        efficiency_row = timing_metrics.index("平均处理效率")
+        self.assertEqual(
+            page.summary_table.item(efficiency_row, 1).text(),
+            "60 条/小时",
+        )
+        self.assertEqual(
+            page.summary_table.item(efficiency_row, 2).text(),
+            "完成数据÷总用时",
+        )
+        timing_text = " ".join(
+            page.summary_table.item(row, column).text()
+            for row in range(page.summary_table.rowCount())
+            for column in range(page.summary_table.columnCount())
+        )
+        self.assertNotIn("260 条", timing_text)
+        self.assertNotIn("6 小时", timing_text)
 
         page.close()
         page.deleteLater()
@@ -2328,6 +2424,17 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(page.table.rowCount(), 6)
         self.assertFalse(page.table.showGrid())
         self.assertFalse(page.table.verticalHeader().isVisible())
+        table_header = page.table.horizontalHeader()
+        for column in (0, 1, 4, 5):
+            self.assertEqual(
+                table_header.sectionResizeMode(column),
+                QHeaderView.Stretch,
+            )
+        for column in (2, 3, 6):
+            self.assertEqual(
+                table_header.sectionResizeMode(column),
+                QHeaderView.ResizeToContents,
+            )
 
         luogang_row = next(
             index
@@ -3008,6 +3115,39 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertNotIn("J形行驶", violations)
         page.shutdown()
 
+    def test_dashboard_station_legend_lines_do_not_overlap(self):
+        chart = StationShareChart()
+        chart.resize(597, 246)
+        chart.set_rows(
+            [
+                {
+                    "station": name,
+                    "total": total,
+                    "total_ms": total_ms,
+                }
+                for name, total, total_ms in (
+                    ("萝岗中心站", 12, 720_000),
+                    ("太平中心站", 4, 0),
+                    ("道滘中心站", 4, 0),
+                    ("宝安中心站", 4, 0),
+                    ("南头中心站", 4, 0),
+                )
+            ]
+        )
+        chart.show()
+        self.app.processEvents()
+        chart.grab()
+
+        legend_rects = chart._legend_text_rects
+        self.assertEqual(len(legend_rects), 5)
+        for station_rect, detail_rect in legend_rects:
+            self.assertLessEqual(station_rect.bottom(), detail_rect.top())
+        for current, following in zip(legend_rects, legend_rects[1:]):
+            self.assertLessEqual(current[1].bottom(), following[0].top())
+
+        chart.close()
+        chart.deleteLater()
+
     def test_dashboard_summarizes_daily_phone_violation_and_station_data(self):
         self.db.ensure_default_station_users()
         accounts = {account.username: account for account in self.db.list_accounts()}
@@ -3079,8 +3219,27 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIn("+100.0%", page.metric_cards["today"].detail_label.text())
         self.assertEqual(page.metric_cards["phone"].value_label.text(), "11")
         self.assertEqual(page.metric_cards["no_phone"].value_label.text(), "4")
+        expected_icon_kinds = {
+            "total": "search",
+            "today": "calendar",
+            "phone": "phone",
+            "no_phone": "phone-off",
+            "time": "clock",
+        }
+        for key, icon_kind in expected_icon_kinds.items():
+            badge = page.metric_cards[key].icon_badge
+            self.assertIsInstance(badge, DashboardMetricIcon)
+            self.assertNotIsInstance(badge, QLabel)
+            self.assertEqual(badge.icon_kind, icon_kind)
+            self.assertFalse(badge.grab().isNull())
         self.assertEqual(page.phone_chart.phone_count, 11)
         self.assertEqual(page.phone_chart.no_phone_count, 4)
+        self.assertFalse(page.phone_chart.grab().isNull())
+        center_gap = (
+            page.phone_chart._center_value_rect.top()
+            - page.phone_chart._center_label_rect.bottom()
+        )
+        self.assertGreaterEqual(center_gap, 5.5)
         self.assertEqual(page.trend_chart._rows[-2]["total"], 5)
         self.assertEqual(page.trend_chart._rows[-1]["total"], 10)
         self.assertEqual(page.violation_table.item(0, 1).text(), "证件异常")

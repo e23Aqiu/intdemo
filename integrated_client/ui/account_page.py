@@ -156,9 +156,9 @@ class AccountPage(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(42)
         header_view = self.table.horizontalHeader()
-        header_view.setSectionResizeMode(0, QHeaderView.Stretch)
-        header_view.setSectionResizeMode(1, QHeaderView.Stretch)
-        for column in (2, 3, 4, 5, 6):
+        for column in (0, 1, 4, 5):
+            header_view.setSectionResizeMode(column, QHeaderView.Stretch)
+        for column in (2, 3, 6):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self.table.itemSelectionChanged.connect(self._selection_changed)
         card_layout.addWidget(self.table, 1)
