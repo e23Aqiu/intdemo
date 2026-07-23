@@ -781,10 +781,19 @@ class StationDistributionChart(AnimatedDonutChart):
         super().__init__(parent)
         self._rows = []
         self._legend_hitboxes = []
+        self._series_mode = "counts"
         self.setMinimumHeight(280)
 
     def set_rows(self, rows):
         self._rows = list(rows)
+        self._hovered_slice = None
+        self._hover_card.hide()
+        self.update()
+
+    def set_series_mode(self, mode):
+        if mode not in {"counts", "timing"}:
+            raise ValueError(f"Unsupported station distribution mode: {mode}")
+        self._series_mode = mode
         self._hovered_slice = None
         self._hover_card.hide()
         self.update()
@@ -888,32 +897,44 @@ class StationDistributionChart(AnimatedDonutChart):
         painter.setBrush(QColor("#ffffff"))
         painter.drawRoundedRect(bounds, 10, 10)
 
+        is_timing_mode = self._series_mode == "timing"
+        panel_title = "各站用时效率分布" if is_timing_mode else "各站业务分布"
+        panel_subtitle = (
+            "总用时与有效用时占全部站点对应指标的比例"
+            if is_timing_mode
+            else "总计数与有电话数占全部站点对应指标的比例"
+        )
         painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
-        painter.drawText(20, 29, "各站业务与耗时分布")
+        painter.drawText(20, 29, panel_title)
         painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
-        painter.drawText(165, 29, "占全部站点对应指标的比例")
+        painter.drawText(155, 29, panel_subtitle)
 
         if not self._rows:
             painter.setPen(QColor("#8a98aa"))
             painter.drawText(self.rect(), Qt.AlignCenter, "暂无站点数据")
             return
 
-        chart_area_width = min(680, max(520, int(self.width() * 0.58)))
+        chart_area_width = min(470, max(350, int(self.width() * 0.43)))
         chart_size = min(
-            128,
-            max(92, self.height() - 115),
-            max(92, int((chart_area_width - 76) / 4)),
+            168,
+            max(112, self.height() - 112),
+            max(112, int((chart_area_width - 44) / 2)),
         )
         first_left = 20
-        chart_gap = 16
+        chart_gap = 24
         chart_top = 82
         series = (
-            ("total", "total_share", "各站总计数占比", "总计数", False),
-            ("has_phone", "phone_share", "各站有电话数占比", "有电话数", False),
-            ("total_time_ms", "total_time_share", "各站总耗时占比", "小时", True),
-            ("active_ms", "active_time_share", "各站有效耗时占比", "小时", True),
+            (
+                ("total_time_ms", "total_time_share", "各站总耗时占比", "小时", True),
+                ("active_ms", "active_time_share", "各站有效耗时占比", "小时", True),
+            )
+            if is_timing_mode
+            else (
+                ("total", "total_share", "各站总计数占比", "总计数", False),
+                ("has_phone", "phone_share", "各站有电话数占比", "有电话数", False),
+            )
         )
         for index, (value_key, share_key, title, center_label, is_duration) in enumerate(series):
             left = first_left + index * (chart_size + chart_gap)
@@ -927,24 +948,24 @@ class StationDistributionChart(AnimatedDonutChart):
                 is_duration=is_duration,
             )
 
-        legend_left = first_left + 4 * chart_size + 3 * chart_gap + 30
+        legend_left = first_left + 2 * chart_size + chart_gap + 34
         legend_width = max(270, self.width() - legend_left - 22)
-        total_column = legend_left + legend_width - 300
-        active_column = legend_left + legend_width - 145
+        first_column = legend_left + legend_width - 300
+        second_column = legend_left + legend_width - 145
         painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
         painter.setPen(QColor("#718096"))
         painter.drawText(legend_left + 18, 52, "站点")
         painter.setPen(self.TOTAL_COLOR)
         painter.drawText(
-            QRectF(total_column, 40, 145, 18),
+            QRectF(first_column, 40, 145, 18),
             Qt.AlignRight | Qt.AlignVCenter,
-            "总耗时 / 占比",
+            "总耗时 / 占比" if is_timing_mode else "总计数 / 占比",
         )
         painter.setPen(self.PHONE_COLOR)
         painter.drawText(
-            QRectF(active_column, 40, 145, 18),
+            QRectF(second_column, 40, 145, 18),
             Qt.AlignRight | Qt.AlignVCenter,
-            "有效耗时 / 占比",
+            "有效耗时 / 占比" if is_timing_mode else "有电话数 / 占比",
         )
 
         visible_rows = self._rows[:7]
@@ -953,7 +974,7 @@ class StationDistributionChart(AnimatedDonutChart):
             min(38, int((self.height() - 58) / max(len(visible_rows), 1))),
         )
         top = 59
-        label_width = max(90, total_column - legend_left - 24)
+        label_width = max(90, first_column - legend_left - 24)
         painter.setFont(QFont("Microsoft YaHei UI", 9))
 
         for index, row in enumerate(visible_rows):
@@ -986,17 +1007,27 @@ class StationDistributionChart(AnimatedDonutChart):
             )
             painter.setPen(self.TOTAL_COLOR)
             painter.drawText(
-                QRectF(total_column, row_top, 145, row_height - 2),
+                QRectF(first_column, row_top, 145, row_height - 2),
                 Qt.AlignRight | Qt.AlignVCenter,
-                f'{format_hours(row["total_time_ms"])} · '
-                f'{self._format_share(row["total_time_share"])}',
+                (
+                    f'{format_hours(row["total_time_ms"])} · '
+                    f'{self._format_share(row["total_time_share"])}'
+                    if is_timing_mode
+                    else f'{row["total"]} 条 · '
+                    f'{self._format_share(row["total_share"])}'
+                ),
             )
             painter.setPen(self.PHONE_COLOR)
             painter.drawText(
-                QRectF(active_column, row_top, 145, row_height - 2),
+                QRectF(second_column, row_top, 145, row_height - 2),
                 Qt.AlignRight | Qt.AlignVCenter,
-                f'{format_hours(row["active_ms"])} · '
-                f'{self._format_share(row["active_time_share"])}',
+                (
+                    f'{format_hours(row["active_ms"])} · '
+                    f'{self._format_share(row["active_time_share"])}'
+                    if is_timing_mode
+                    else f'{row["has_phone"]} 条 · '
+                    f'{self._format_share(row["phone_share"])}'
+                ),
             )
 
         if len(self._rows) > len(visible_rows):
@@ -1038,25 +1069,31 @@ class StationDistributionChart(AnimatedDonutChart):
                 if self._hovered_slice is not None:
                     self._hovered_slice = None
                     self.update()
-                self._hover_card.show_details(
-                    row["station"],
+                details = (
                     [
-                        ("总计数", f'{row["total"]} 条'),
-                        ("总数占比", self._format_share(row["total_share"])),
-                        ("有电话数", f'{row["has_phone"]} 条'),
-                        ("有电话占比", self._format_share(row["phone_share"])),
                         ("总耗时", format_hours(row["total_time_ms"])),
                         ("精确总耗时", format_precise_duration(row["total_time_ms"])),
                         ("总耗时占比", self._format_share(row["total_time_share"])),
                         ("有效耗时", format_hours(row["active_ms"])),
                         ("精确有效耗时", format_precise_duration(row["active_ms"])),
                         ("有效耗时占比", self._format_share(row["active_time_share"])),
-                    ],
+                    ]
+                    if self._series_mode == "timing"
+                    else [
+                        ("总计数", f'{row["total"]} 条'),
+                        ("总数占比", self._format_share(row["total_share"])),
+                        ("有电话数", f'{row["has_phone"]} 条'),
+                        ("有电话占比", self._format_share(row["phone_share"])),
+                    ]
+                )
+                self._hover_card.show_details(
+                    row["station"],
+                    details,
                     self.COLORS[
                         self._rows.index(row) % len(self.COLORS)
                     ],
                     event.globalPos(),
-                    card_width=520,
+                    card_width=520 if self._series_mode == "timing" else 340,
                 )
                 return
         if self._hovered_slice is not None:
@@ -1069,11 +1106,34 @@ class StationDistributionChart(AnimatedDonutChart):
 class StatisticsPage(QWidget):
     HUMAN_BASELINE_ITEMS = 260
     HUMAN_BASELINE_MS = 6 * 60 * 60 * 1000
+    NAVIGATION_VIEWS = {
+        "station_distribution": (
+            "全站分布",
+            "查看各站查询量与电话覆盖分布。",
+        ),
+        "timing": (
+            "用时效率",
+            "查看有效用时、暂停等待、平均用时和效率提升。",
+        ),
+        "completion": (
+            "完成类型",
+            "按站点和日期查看完整流程结果分类。",
+        ),
+        "violation": (
+            "违规原因",
+            "查看违规原因构成以及有电话数据占比。",
+        ),
+        "anomaly": (
+            "异常数据",
+            "追溯空单元格异常数量、来源站点和占比。",
+        ),
+    }
 
     def __init__(self, database: Database, account: Account, dependency_warning="", parent=None):
         super().__init__(parent)
         self.database = database
         self.account = account
+        self._sidebar_navigation = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 22)
@@ -1081,15 +1141,15 @@ class StatisticsPage(QWidget):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("数据仪表盘")
-        title.setObjectName("PageTitle")
-        title_box.addWidget(title)
-        subtitle = QLabel(
+        self.title_label = QLabel("全站分布")
+        self.title_label.setObjectName("PageTitle")
+        title_box.addWidget(self.title_label)
+        self.subtitle_label = QLabel(
             "按站点查看完成类型或违规原因统计。" if account.is_admin
             else "默认显示当前站点，可切换查看全部或其他站点的数据。"
         )
-        subtitle.setObjectName("Muted")
-        title_box.addWidget(subtitle)
+        self.subtitle_label.setObjectName("Muted")
+        title_box.addWidget(self.subtitle_label)
         header.addLayout(title_box)
         header.addStretch()
         self._showing_anomalies = False
@@ -1130,6 +1190,7 @@ class StatisticsPage(QWidget):
         self.category_combo = QComboBox()
         self.category_combo.setMinimumWidth(180)
         self.category_combo.addItem("各站分布", "station_distribution")
+        self.category_combo.addItem("用时效率", "timing")
         self.category_combo.addItem("按完成类型", "completion")
         self.category_combo.addItem("按违规类型", "violation")
         self.date_range_selector = DateRangeSelector()
@@ -1158,6 +1219,10 @@ class StatisticsPage(QWidget):
         )
         layout.addWidget(self.filter_card)
 
+        self.timing_section = QWidget()
+        timing_section_layout = QVBoxLayout(self.timing_section)
+        timing_section_layout.setContentsMargins(0, 0, 0, 0)
+        timing_section_layout.setSpacing(8)
         timing_header = QHBoxLayout()
         timing_header.setContentsMargins(2, 1, 2, 0)
         timing_title = QLabel("效率统计")
@@ -1167,12 +1232,13 @@ class StatisticsPage(QWidget):
         self.timing_scope_label.setObjectName("Muted")
         timing_header.addWidget(self.timing_scope_label)
         timing_header.addStretch(1)
-        layout.addLayout(timing_header)
+        timing_section_layout.addLayout(timing_header)
 
         self.timing_kpi_layout = QGridLayout()
         self.timing_kpi_layout.setSpacing(10)
         self.timing_kpi_cards = {}
-        layout.addLayout(self.timing_kpi_layout)
+        timing_section_layout.addLayout(self.timing_kpi_layout)
+        layout.addWidget(self.timing_section)
 
         self._active_category = self.category_combo.currentData()
         self._station_before_distribution = None
@@ -1314,6 +1380,52 @@ class StatisticsPage(QWidget):
         layout.addWidget(self.detail_tabs, 1)
         self.refresh()
 
+    @property
+    def navigation_view(self):
+        if self._showing_anomalies:
+            return "anomaly"
+        return self.category_combo.currentData() or "station_distribution"
+
+    def set_sidebar_navigation(self, enabled=True):
+        """由主窗口的数据中心侧边栏接管详细统计分类。"""
+        self._sidebar_navigation = bool(enabled)
+        self.category_filter_group.setVisible(not self._sidebar_navigation)
+        anomaly_button = getattr(self, "anomaly_button", None)
+        if anomaly_button is not None:
+            anomaly_button.setVisible(
+                self.category_combo.currentData() == "completion"
+            )
+        self._sync_view_header()
+        self.refresh()
+
+    def set_navigation_view(self, view):
+        if view not in self.NAVIGATION_VIEWS:
+            raise ValueError(f"未知的数据视图：{view}")
+        if view == "anomaly" and not self.account.is_admin:
+            raise PermissionError("普通用户无权查看异常数据")
+
+        category = "completion" if view == "anomaly" else view
+        category_index = self.category_combo.findData(category)
+        if category_index < 0:
+            raise ValueError(f"数据分类不可用：{category}")
+        if self.category_combo.currentIndex() != category_index:
+            self.category_combo.setCurrentIndex(category_index)
+
+        self._showing_anomalies = view == "anomaly"
+        anomaly_button = getattr(self, "anomaly_button", None)
+        if anomaly_button is not None:
+            anomaly_button.setChecked(self._showing_anomalies)
+        self.detail_tabs.setCurrentWidget(
+            self.data_tab if self._showing_anomalies else self.chart_tab
+        )
+        self._sync_view_header()
+        self.refresh()
+
+    def _sync_view_header(self):
+        title, subtitle = self.NAVIGATION_VIEWS[self.navigation_view]
+        self.title_label.setText(title)
+        self.subtitle_label.setText(subtitle)
+
     @staticmethod
     def _create_filter_group(label, control):
         group = QFrame()
@@ -1363,6 +1475,24 @@ class StatisticsPage(QWidget):
     def _date_range(self):
         return self.date_range_selector.date_range()
 
+    def _export_station_accounts(self):
+        default_order = {
+            username: index
+            for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
+        }
+        accounts = [
+            account
+            for account in self.database.list_accounts()
+            if not account.is_admin
+        ]
+        accounts.sort(
+            key=lambda account: (
+                default_order.get(account.username, 999),
+                account.name_label,
+            )
+        )
+        return accounts
+
     @staticmethod
     def _excel_value(text):
         value = str(text).strip()
@@ -1377,8 +1507,264 @@ class StatisticsPage(QWidget):
             return float(value), "0.00"
         return value, None
 
+    def _timing_detail_rows(self, user_id):
+        start_date, end_date = self._date_range()
+        totals = self.database.get_workflow_timing_totals(
+            user_id,
+            users_only=(user_id is None),
+            start_date=start_date,
+            end_date=end_date,
+        )
+        completed_items = int(totals["completed_items"])
+        average_ms = (
+            totals["active_ms"] / completed_items
+            if completed_items
+            else None
+        )
+        manual_estimated_ms = (
+            completed_items
+            * self.HUMAN_BASELINE_MS
+            / self.HUMAN_BASELINE_ITEMS
+        )
+        efficiency_gain = (
+            (manual_estimated_ms - totals["active_ms"])
+            / manual_estimated_ms
+            * 100
+            if manual_estimated_ms
+            else None
+        )
+        rows = [
+            ("总用时", format_precise_duration(totals["total_ms"]), "有效用时＋暂停等待"),
+            ("有效用时", format_precise_duration(totals["active_ms"]), "实际运行和重试耗时"),
+            ("暂停等待", format_precise_duration(totals["paused_ms"]), "登录、验证及人工等待"),
+            ("完成数据", f"{completed_items} 条", "仅统计三步全部成功的批次"),
+            (
+                "每条平均用时",
+                format_precise_duration(average_ms) if average_ms is not None else "—",
+                "有效用时÷有计时记录的完成数据",
+            ),
+            (
+                "较纯人工效率提升",
+                f"{efficiency_gain:.1f}%" if efficiency_gain is not None else "—",
+                "人工基准：260 条 / 6 小时",
+            ),
+            ("计时运行", f"{totals['run_count']} 次", "包含同批次停止、失败和重试运行"),
+        ]
+        return totals, rows
+
+    def _station_export_dataset(self, account):
+        start_date, end_date = self._date_range()
+        category = self.category_combo.currentData()
+
+        if self._showing_anomalies:
+            rows = self._get_anomaly_rows(account.id)
+            return (
+                ["用户（站）", "登录账号", "异常条数", "本站总计数", "异常占比"],
+                [
+                    [
+                        row["station"],
+                        row["username"],
+                        row["empty"],
+                        row["total"],
+                        f'{row["empty_rate"]:.1f}%',
+                    ]
+                    for row in rows
+                ],
+            )
+
+        if category == "timing":
+            _, rows = self._timing_detail_rows(account.id)
+            return ["指标", "数值", "统计说明"], rows
+
+        if category == "violation":
+            rows = self.database.get_violation_totals(
+                account.id,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            values = []
+            for row in rows:
+                percent = (
+                    row["has_phone"] / row["total"] * 100
+                    if row["total"]
+                    else 0
+                )
+                values.append(
+                    [
+                        row["reason"],
+                        row["total"],
+                        row["has_phone"],
+                        row["other"],
+                        f"{percent:.1f}%",
+                    ]
+                )
+            return (
+                ["违规原因", "总计", "有电话", "其他数据", "有电话占比"],
+                values,
+            )
+
+        totals_by_metric = {
+            row["metric_key"]: int(row["total"])
+            for row in self.database.get_user_totals(
+                account.id,
+                start_date,
+                end_date,
+            )
+        }
+        if category == "station_distribution":
+            total = totals_by_metric.get(WORKFLOW_TOTAL_METRIC, 0)
+            has_phone = totals_by_metric.get(WORKFLOW_HAS_PHONE_METRIC, 0)
+            no_phone = totals_by_metric.get(
+                WORKFLOW_NO_PHONE_METRIC,
+                max(0, total - has_phone),
+            )
+            timing, _ = self._timing_detail_rows(account.id)
+            phone_rate = has_phone / total * 100 if total else 0
+            return (
+                ["指标", "数值", "单位 / 统计说明"],
+                [
+                    ("总计数", total, "条"),
+                    ("有电话数", has_phone, "条"),
+                    ("无电话数", no_phone, "条"),
+                    ("有电话占比", f"{phone_rate:.1f}%", "有电话数÷总计数"),
+                    (
+                        "总用时",
+                        format_precise_duration(timing["total_ms"]),
+                        "有效用时＋暂停等待",
+                    ),
+                    (
+                        "有效用时",
+                        format_precise_duration(timing["active_ms"]),
+                        "实际运行和重试耗时",
+                    ),
+                    (
+                        "暂停等待",
+                        format_precise_duration(timing["paused_ms"]),
+                        "登录、验证及人工等待",
+                    ),
+                    ("完成数据", timing["completed_items"], "条"),
+                ],
+            )
+
+        metrics = self._ordered_completion_metrics(
+            self.database.get_metric_definitions()
+        )
+        return (
+            ["完成类型", "累计数量", "单位"],
+            [
+                [
+                    metric["label"],
+                    totals_by_metric.get(metric["metric_key"], 0),
+                    metric["unit"],
+                ]
+                for metric in metrics
+            ],
+        )
+
+    @staticmethod
+    def _unique_excel_sheet_title(workbook, preferred):
+        base = re.sub(r'[\\/*?:\[\]]+', "_", str(preferred)).strip().strip("'")
+        base = (base or "站点")[:31]
+        title = base
+        suffix_index = 2
+        while title in workbook.sheetnames:
+            suffix = f"_{suffix_index}"
+            title = f"{base[:31 - len(suffix)]}{suffix}"
+            suffix_index += 1
+        return title
+
+    def _append_station_export_sheet(
+        self,
+        workbook,
+        account,
+        category_name,
+        range_label,
+    ):
+        headers, rows = self._station_export_dataset(account)
+        sheet = workbook.create_sheet(
+            self._unique_excel_sheet_title(workbook, account.name_label)
+        )
+        sheet.sheet_view.showGridLines = False
+        final_column = max(6, len(headers))
+        sheet.merge_cells(
+            start_row=1,
+            start_column=1,
+            end_row=1,
+            end_column=final_column,
+        )
+        title_cell = sheet.cell(
+            1,
+            1,
+            f"{account.name_label} · {category_name}",
+        )
+        title_cell.font = Font(color="FFFFFF", bold=True, size=14)
+        title_cell.fill = PatternFill("solid", fgColor="1C5ED6")
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        sheet.row_dimensions[1].height = 28
+
+        metadata = (
+            ("站名", account.name_label),
+            ("登录账号", account.username),
+            ("时间范围", range_label),
+        )
+        for index, (label, value) in enumerate(metadata):
+            label_cell = sheet.cell(2, index * 2 + 1, label)
+            value_cell = sheet.cell(2, index * 2 + 2, value)
+            label_cell.font = Font(bold=True, color="526177")
+            label_cell.fill = PatternFill("solid", fgColor="EDF4FF")
+            value_cell.fill = PatternFill("solid", fgColor="F8FAFD")
+
+        header_row = 4
+        header_fill = PatternFill("solid", fgColor="3478F6")
+        header_font = Font(color="FFFFFF", bold=True)
+        thin_border = Border(
+            left=Side(style="thin", color="DCE4EF"),
+            right=Side(style="thin", color="DCE4EF"),
+            top=Side(style="thin", color="DCE4EF"),
+            bottom=Side(style="thin", color="DCE4EF"),
+        )
+        for column, header_text in enumerate(headers, 1):
+            cell = sheet.cell(header_row, column, header_text)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = thin_border
+
+        for source_row, row_values in enumerate(rows):
+            target_row = header_row + source_row + 1
+            for column, raw_value in enumerate(row_values, 1):
+                value, number_format = self._excel_value(raw_value)
+                cell = sheet.cell(target_row, column, value)
+                if number_format:
+                    cell.number_format = number_format
+                cell.border = thin_border
+                cell.alignment = Alignment(
+                    horizontal="center" if column > 1 else "left",
+                    vertical="center",
+                )
+                if source_row % 2:
+                    cell.fill = PatternFill("solid", fgColor="F7F9FD")
+
+        last_row = max(header_row, sheet.max_row)
+        last_column_letter = get_column_letter(len(headers))
+        sheet.auto_filter.ref = (
+            f"A{header_row}:{last_column_letter}{last_row}"
+        )
+        sheet.freeze_panes = f"A{header_row + 1}"
+        for column in range(1, final_column + 1):
+            letter = get_column_letter(column)
+            content_width = max(
+                len(str(sheet.cell(row, column).value or ""))
+                for row in range(1, sheet.max_row + 1)
+            )
+            sheet.column_dimensions[letter].width = min(
+                40,
+                max(12, content_width + 3),
+            )
+        return sheet
+
     def _save_dashboard_excel(self, file_path):
-        """Export the currently displayed dashboard table to one workbook."""
+        """Export the current summary and all-station detail sheets."""
         station_name = self.station_combo.currentText() or "全部站点"
         category_name = (
             "异常数据"
@@ -1490,6 +1876,17 @@ class StatisticsPage(QWidget):
             25,
         )
 
+        station_sheet_count = 0
+        if self.station_combo.currentData() is None:
+            for station in self._export_station_accounts():
+                self._append_station_export_sheet(
+                    workbook,
+                    station,
+                    category_name,
+                    range_label,
+                )
+                station_sheet_count += 1
+
         target = Path(file_path)
         workbook.save(target)
         return {
@@ -1498,6 +1895,7 @@ class StatisticsPage(QWidget):
             "station_name": station_name,
             "category_name": category_name,
             "range_label": range_label,
+            "station_sheet_count": station_sheet_count,
         }
 
     def _export_dashboard_excel(self):
@@ -1532,12 +1930,18 @@ class StatisticsPage(QWidget):
         except (OSError, ValueError) as exc:
             QMessageBox.warning(self, "导出失败", str(exc))
             return
+        station_sheet_message = (
+            f"另附 {result['station_sheet_count']} 个站点子表。\n"
+            if result["station_sheet_count"]
+            else ""
+        )
         QMessageBox.information(
             self,
             "导出成功",
             f"站点：{result['station_name']}\n"
             f"时间范围：{result['range_label']}\n"
             f"已导出 {result['row_count']} 行数据。\n"
+            f"{station_sheet_message}"
             f"{result['file_path']}",
         )
 
@@ -1564,12 +1968,14 @@ class StatisticsPage(QWidget):
             self.station_combo.blockSignals(False)
             self._has_saved_station_before_distribution = False
         self._active_category = category
+        self._sync_view_header()
         self.refresh()
 
     def _toggle_anomaly_view(self, checked):
         if not self.account.is_admin:
             return
         self._showing_anomalies = bool(checked)
+        self._sync_view_header()
         if self._showing_anomalies:
             self.detail_tabs.setCurrentWidget(self.data_tab)
         self.refresh()
@@ -1580,6 +1986,7 @@ class StatisticsPage(QWidget):
         while self.kpi_layout.count():
             item = self.kpi_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
 
     @staticmethod
@@ -1600,6 +2007,7 @@ class StatisticsPage(QWidget):
         while self.timing_kpi_layout.count():
             item = self.timing_kpi_layout.takeAt(0)
             if item.widget():
+                item.widget().hide()
                 item.widget().deleteLater()
         self.timing_kpi_cards = {}
 
@@ -1888,6 +2296,45 @@ class StatisticsPage(QWidget):
                 self.summary_table.setItem(row_index, column, item)
         self._finish_summary_table(scope, "空单元格异常来源", (0,))
 
+    def _render_timing(self, user_id, scope):
+        _, rows = self._timing_detail_rows(user_id)
+
+        self.distribution_chart.hide()
+        self.violation_chart.hide()
+        chart_was_enabled = self.detail_tabs.isTabEnabled(0)
+        if user_id is None:
+            self.station_distribution_chart.set_series_mode("timing")
+            self.station_distribution_chart.set_rows(
+                self._get_station_distribution_rows()
+            )
+            self.station_distribution_chart.show()
+            self.detail_tabs.setTabEnabled(0, True)
+            if not chart_was_enabled:
+                self.detail_tabs.setCurrentWidget(self.chart_tab)
+        else:
+            self.station_distribution_chart.hide()
+            self.detail_tabs.setTabEnabled(0, False)
+            self.detail_tabs.setCurrentWidget(self.data_tab)
+        self.data_title.setText("用时效率明细")
+
+        headers = ["指标", "数值", "统计说明"]
+        self.summary_table.setColumnCount(len(headers))
+        self.summary_table.setHorizontalHeaderLabels(headers)
+        self.summary_table.setRowCount(len(rows))
+        for row_index, values in enumerate(rows):
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 1:
+                    item.setTextAlignment(Qt.AlignCenter)
+                    item.setForeground(QColor("#176f68"))
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                elif column == 2:
+                    item.setForeground(QColor("#718096"))
+                self.summary_table.setItem(row_index, column, item)
+        self._finish_summary_table(scope, "批次计时与效率口径", (0, 2))
+
     def _render_completion(self, user_id, scope):
         metrics = self._ordered_completion_metrics(
             self.database.get_metric_definitions()
@@ -2010,6 +2457,7 @@ class StatisticsPage(QWidget):
         rows = self._get_station_distribution_rows()
         self.distribution_chart.hide()
         self.violation_chart.hide()
+        self.station_distribution_chart.set_series_mode("counts")
         self.station_distribution_chart.show()
         self.detail_tabs.setTabEnabled(0, True)
         self.data_title.setText("完整数据")
@@ -2065,9 +2513,13 @@ class StatisticsPage(QWidget):
         )
 
     def refresh(self):
+        self._sync_view_header()
         self._populate_station_options()
         self._clear_kpis()
         category = self.category_combo.currentData()
+        self.timing_section.setVisible(
+            not self._sidebar_navigation or category == "timing"
+        )
         anomaly_button = getattr(self, "anomaly_button", None)
         if anomaly_button is not None:
             anomaly_button.setVisible(category == "completion")
@@ -2078,14 +2530,20 @@ class StatisticsPage(QWidget):
             self.station_combo.blockSignals(False)
             self.station_combo.setEnabled(False)
             self.station_combo.setToolTip("各站分布固定统计全部站点")
-            self._refresh_timing_kpis(None)
+            if not self._sidebar_navigation:
+                self._refresh_timing_kpis(None)
             self._render_station_distribution()
             return
 
         self.station_combo.setEnabled(True)
         self.station_combo.setToolTip("")
         user_id = self._selected_user_id()
-        self._refresh_timing_kpis(user_id)
+        if category == "timing":
+            self._refresh_timing_kpis(user_id)
+            self._render_timing(user_id, self._selected_scope())
+            return
+        if not self._sidebar_navigation:
+            self._refresh_timing_kpis(user_id)
         scope = self._selected_scope()
         if anomaly_button is not None and category == "completion":
             anomaly_rows = self._get_anomaly_rows(user_id)

@@ -1106,6 +1106,47 @@ class Database:
                 date_params,
             ).fetchall()
 
+    def get_daily_metric_totals(
+        self,
+        metric_key: str,
+        user_id: Optional[int] = None,
+        users_only: bool = False,
+        start_date=None,
+        end_date=None,
+    ) -> List[Dict]:
+        """按本地自然日汇总一个指标，缺少数据的日期由调用方补零。"""
+        sql = """
+            SELECT SUBSTR(e.created_at, 1, 10) AS activity_date,
+                   COALESCE(SUM(e.amount), 0) AS total
+            FROM activity_events e
+            JOIN accounts a ON a.id=e.user_id
+            WHERE e.metric_key=?
+        """
+        params = [str(metric_key)]
+        if user_id is not None:
+            sql += " AND e.user_id=?"
+            params.append(int(user_id))
+        elif users_only:
+            sql += " AND a.role='user'"
+        date_sql, date_params, _, _ = self._date_range_clause(
+            "e.created_at",
+            start_date,
+            end_date,
+        )
+        sql += date_sql
+        params.extend(date_params)
+        sql += " GROUP BY activity_date ORDER BY activity_date"
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        return [
+            {
+                "date": row["activity_date"],
+                "total": int(row["total"] or 0),
+            }
+            for row in rows
+        ]
+
     def get_violation_totals(
         self,
         user_id: Optional[int] = None,

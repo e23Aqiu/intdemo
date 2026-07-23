@@ -3,13 +3,14 @@ import math
 import os
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pandas as pd
-from PyQt5.QtCore import QCoreApplication, QDate, QEvent, QPoint, QRect, QSize, Qt
+from PyQt5.QtCore import QCoreApplication, QDate, QEvent, QPoint, QSize, Qt
 from PyQt5.QtGui import QMouseEvent, QPalette
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -54,6 +55,7 @@ from integrated_client.tools.transport_tool import (
 from integrated_client.timing import WorkflowTimingService
 from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
+from integrated_client.ui.dashboard_page import DashboardPage
 from integrated_client.ui.frameless import (
     FramelessMessageBox,
     HTBOTTOMRIGHT,
@@ -64,6 +66,7 @@ from integrated_client.ui.frameless import (
     WVR_REDRAW,
 )
 from integrated_client.ui.statistics_page import (
+    AnimatedDonutChart,
     StatisticsPage,
     StationDistributionChart,
     ViolationReasonChart,
@@ -642,7 +645,8 @@ class ToolAndUiTests(unittest.TestCase):
 
     def test_main_window_contains_integrated_pages(self):
         window = MainWindow(self.db, self.admin)
-        self.assertIs(window._pages["home"], window.statistics_page)
+        self.assertIs(window._pages["home"], window.dashboard_page)
+        self.assertIs(window._pages["statistics"], window.statistics_page)
         self.assertIn("workflow", window._pages)
         self.assertIs(window._pages["workflow"], window.workflow_page)
         self.assertIs(
@@ -653,9 +657,17 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIs(window._pages["personal"], window.personal_center_page)
         self.assertNotIn("transport", window._pages)
         self.assertNotIn("aiqicha", window._pages)
-        self.assertNotIn("statistics", window._pages)
+        self.assertIn("statistics", window._pages)
         self.assertIn("accounts", window._pages)
         self.assertNotIn("statistics", window._nav_buttons)
+        for key in (
+            "data_station",
+            "data_timing",
+            "data_completion",
+            "data_violation",
+        ):
+            self.assertIn(key, window._nav_buttons)
+        self.assertNotIn("data_anomaly", window._nav_buttons)
         self.assertIn("workflow", window._nav_buttons)
         self.assertIn("personal", window._nav_buttons)
         self.assertEqual(window.sidebar.width(), 230)
@@ -680,11 +692,29 @@ class ToolAndUiTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         for _, icon_name in expected_nav.values():
             self.assertIn(icon_name, spec_text)
+        self.assertIn("nav-data.svg", spec_text)
+        self.assertEqual(window.data_nav_toggle.objectName(), "NavGroupButton")
+        self.assertFalse(window.data_nav_toggle.isChecked())
+        self.assertTrue(window.data_nav_container.isHidden())
+        self.assertFalse(window.data_nav_toggle.icon().isNull())
+        expected_data_nav = {
+            "data_station": "全站分布",
+            "data_timing": "用时效率",
+            "data_completion": "完成类型",
+            "data_violation": "违规原因",
+        }
+        for key, label in expected_data_nav.items():
+            button = window._nav_buttons[key]
+            self.assertEqual(button.text(), label)
+            self.assertEqual(button.objectName(), "NavSubButton")
         for selector in (
             "QLabel#BrandBadge",
             "QFrame#SidebarProfile",
             "QLabel#SidebarAvatar",
             "QLabel#SidebarRole",
+            "QPushButton#NavGroupButton",
+            "QPushButton#NavSubButton",
+            "QFrame#DashboardMetricCard",
             "border-left: 4px solid #8ce3d1",
         ):
             self.assertIn(selector, APP_STYLESHEET)
@@ -699,15 +729,19 @@ class ToolAndUiTests(unittest.TestCase):
             Qt.ScrollBarAsNeeded,
         )
         self.assertEqual(window.stack.minimumSize(), window.PAGE_CANVAS_SIZE)
-        self.assertIs(window.stack.currentWidget(), window.statistics_page)
+        self.assertIs(window.stack.currentWidget(), window.dashboard_page)
         self.assertTrue(window._nav_buttons["home"].isChecked())
-        self.assertEqual(window.page_title.text(), "数据仪表盘")
+        self.assertEqual(window.page_title.text(), "仪表盘")
+        self.assertEqual(
+            set(window.dashboard_page.metric_cards),
+            {"total", "today", "phone", "no_phone", "time"},
+        )
         self.assertEqual(
             [
                 window.statistics_page.category_combo.itemData(index)
                 for index in range(window.statistics_page.category_combo.count())
             ],
-            ["station_distribution", "completion", "violation"],
+            ["station_distribution", "timing", "completion", "violation"],
         )
         self.assertEqual(
             window.statistics_page.category_combo.currentData(),
@@ -715,6 +749,40 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertFalse(window.statistics_page.station_combo.isEnabled())
         self.assertFalse(window.statistics_page.station_distribution_chart.isHidden())
+        self.assertTrue(window.statistics_page.category_filter_group.isHidden())
+        window.show_page("data_station")
+        self.assertIs(window.stack.currentWidget(), window.statistics_page)
+        self.assertTrue(window.data_nav_toggle.isChecked())
+        self.assertFalse(window.data_nav_container.isHidden())
+        self.assertTrue(window._nav_buttons["data_station"].isChecked())
+        self.assertEqual(window.page_title.text(), "全站分布")
+        window.show_page("data_timing")
+        self.assertEqual(window.statistics_page.navigation_view, "timing")
+        self.assertFalse(window.statistics_page.timing_section.isHidden())
+        self.assertIs(
+            window.statistics_page.detail_tabs.currentWidget(),
+            window.statistics_page.chart_tab,
+        )
+        self.assertFalse(
+            window.statistics_page.station_distribution_chart.isHidden()
+        )
+        self.assertEqual(
+            window.statistics_page.station_distribution_chart._series_mode,
+            "timing",
+        )
+        window.show_page("data_completion")
+        self.assertEqual(window.statistics_page.navigation_view, "completion")
+        self.assertTrue(window.statistics_page.timing_section.isHidden())
+        self.assertFalse(window.statistics_page.anomaly_button.isHidden())
+        window.statistics_page.anomaly_button.click()
+        self.assertEqual(window.statistics_page.navigation_view, "anomaly")
+        self.assertEqual(window.page_title.text(), "完成类型")
+        window.statistics_page.anomaly_button.click()
+        self.assertEqual(window.statistics_page.navigation_view, "completion")
+        window.show_page("data_violation")
+        self.assertEqual(window.statistics_page.navigation_view, "violation")
+        window.show_page("home")
+        self.assertIs(window.stack.currentWidget(), window.dashboard_page)
         self.assertFalse(hasattr(window, "top_identity"))
         self.assertEqual(window.sidebar_user.text(), "系统管理员")
         self.assertEqual(window.personal_center_page.identity_value.text(), "管理员")
@@ -778,37 +846,8 @@ class ToolAndUiTests(unittest.TestCase):
             ),
             (0, 0, 0, 0),
         )
-        self.assertEqual(
-            window.statistics_page.category_combo.view().window().frameShape(),
-            QFrame.NoFrame,
-        )
         window.show()
         self.app.processEvents()
-        category_combo = window.statistics_page.category_combo
-        category_combo.showPopup()
-        self.app.processEvents()
-        self.app.processEvents()
-        category_popup = category_combo.view().window()
-        combo_rect = QRect(
-            category_combo.mapToGlobal(QPoint(0, 0)),
-            category_combo.size(),
-        )
-        popup_rect = category_popup.frameGeometry()
-        self.assertTrue(combo_rect.intersects(popup_rect))
-        view_margins = category_combo.view().contentsMargins()
-        if popup_rect.top() >= combo_rect.top():
-            popup_overlap = combo_rect.bottom() - popup_rect.top() + 1
-            expected_overlap = view_margins.top() + 1
-        else:
-            popup_overlap = popup_rect.bottom() - combo_rect.top() + 1
-            expected_overlap = view_margins.bottom() + 1
-        self.assertEqual(popup_overlap, expected_overlap)
-        self.assertFalse(category_popup.mask().isEmpty())
-        self.assertFalse(category_popup.mask().contains(QPoint(0, 0)))
-        self.assertTrue(
-            category_popup.mask().contains(category_popup.rect().center())
-        )
-        category_combo.hidePopup()
         self.assertEqual(
             [
                 window.workflow_page.page_tabs.tabText(index)
@@ -822,6 +861,7 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertFalse(window.workflow_page.page_tabs.documentMode())
         self.assertIn("QTabWidget#WorkflowTabs::pane", APP_STYLESHEET)
+        window.show_page("data_station")
         self.assertIs(
             window.statistics_page.detail_tabs.widget(1),
             window.statistics_page.data_tab,
@@ -967,11 +1007,24 @@ class ToolAndUiTests(unittest.TestCase):
         window = MainWindow(self.db, user)
         self.assertNotIn("accounts", window._pages)
         self.assertNotIn("statistics", window._nav_buttons)
+        self.assertIn("statistics", window._pages)
+        for key in (
+            "data_station",
+            "data_timing",
+            "data_completion",
+            "data_violation",
+        ):
+            self.assertIn(key, window._nav_buttons)
+        self.assertNotIn("data_anomaly", window._nav_buttons)
         self.assertIsNone(window.account_page)
         self.assertIs(window.stack.currentWidget(), window.workflow_page)
         self.assertTrue(window._nav_buttons["workflow"].isChecked())
         self.assertFalse(window._nav_buttons["home"].isChecked())
         self.assertEqual(window.page_title.text(), "一键业务处理")
+        window.show_page("data_anomaly")
+        self.assertIs(window.stack.currentWidget(), window.workflow_page)
+        self.assertTrue(window._nav_buttons["workflow"].isChecked())
+        self.assertTrue(window.statistics_page.category_filter_group.isHidden())
         self.assertFalse(hasattr(window, "top_identity"))
         self.assertEqual(window.sidebar_user.text(), "测试站点")
         self.assertEqual(window.sidebar_role.text(), "用户  ·  normal01")
@@ -1320,6 +1373,7 @@ class ToolAndUiTests(unittest.TestCase):
         window = MainWindow(self.db, self.admin)
         window.show()
         window.resize(800, 600)
+        window.show_page("data_station")
         self.app.processEvents()
         page = window.statistics_page
         selector = page.date_range_selector
@@ -1333,13 +1387,13 @@ class ToolAndUiTests(unittest.TestCase):
             [group.objectName() for group in filter_groups],
             ["DashboardFilterGroup"] * 3,
         )
-        self.assertEqual(len({group.y() for group in filter_groups}), 1)
-        self.assertLess(
-            page.station_filter_group.x(),
-            page.category_filter_group.x(),
+        self.assertTrue(page.category_filter_group.isHidden())
+        self.assertEqual(
+            page.station_filter_group.y(),
+            page.date_filter_group.y(),
         )
         self.assertLess(
-            page.category_filter_group.x(),
+            page.station_filter_group.x(),
             page.date_filter_group.x(),
         )
         self.assertEqual(page.date_filter_label.text(), "日期范围")
@@ -1482,6 +1536,7 @@ class ToolAndUiTests(unittest.TestCase):
         export_path = export_base.with_suffix(".xlsx")
         self.assertTrue(export_path.exists())
         workbook = load_workbook(export_path, data_only=True)
+        self.assertEqual(workbook.sheetnames, ["仪表盘数据"])
         sheet = workbook["仪表盘数据"]
         self.assertEqual(sheet["A1"].value, "数据仪表盘导出")
         self.assertEqual(sheet["B2"].value, station.name_label)
@@ -1500,6 +1555,132 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertGreaterEqual(sheet.column_dimensions["F"].width, 25)
         workbook.close()
         information.assert_called_once()
+
+        self.assertTrue(window.workflow_page.shutdown())
+        window._prepared_to_close = True
+        window.close()
+
+    def test_dashboard_exports_all_stations_with_station_sheets(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        accounts = {
+            account.username: account
+            for account in self.db.list_accounts()
+        }
+        luogang = accounts["luogang"]
+        taiping = accounts["taiping"]
+        self.db.record_activity_batch(
+            luogang.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 7,
+                WORKFLOW_HAS_PHONE_METRIC: 4,
+            },
+            "unified_workflow",
+            task_id="all-stations-export-luogang",
+        )
+        self.db.record_activity_batch(
+            taiping.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 3,
+                WORKFLOW_HAS_PHONE_METRIC: 2,
+            },
+            "unified_workflow",
+            task_id="all-stations-export-taiping",
+        )
+
+        window = MainWindow(self.db, self.admin)
+        page = window.statistics_page
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("completion")
+        )
+        page.station_combo.setCurrentIndex(0)
+        self.app.processEvents()
+
+        export_path = Path(self.temp_dir.name) / "all-stations-export.xlsx"
+        result = page._save_dashboard_excel(export_path)
+        self.assertEqual(result["station_name"], "全部站点")
+        self.assertEqual(result["station_sheet_count"], 5)
+
+        workbook = load_workbook(export_path, data_only=True)
+        station_names = [
+            account.name_label
+            for account in page._export_station_accounts()
+        ]
+        self.assertEqual(
+            workbook.sheetnames,
+            ["仪表盘数据", *station_names],
+        )
+        summary = workbook["仪表盘数据"]
+        self.assertEqual(summary["C6"].value, "总计数")
+        self.assertEqual(summary["D6"].value, 10)
+
+        luogang_sheet = workbook[luogang.name_label]
+        self.assertIn(luogang.name_label, luogang_sheet["A1"].value)
+        self.assertEqual(
+            [
+                luogang_sheet.cell(4, column).value
+                for column in range(1, 4)
+            ],
+            ["完成类型", "累计数量", "单位"],
+        )
+        self.assertEqual(luogang_sheet["A5"].value, "总计数")
+        self.assertEqual(luogang_sheet["B5"].value, 7)
+        self.assertEqual(luogang_sheet.freeze_panes, "A5")
+
+        taiping_sheet = workbook[taiping.name_label]
+        self.assertEqual(taiping_sheet["A5"].value, "总计数")
+        self.assertEqual(taiping_sheet["B5"].value, 3)
+        workbook.close()
+
+        category_headers = {
+            "timing": ["指标", "数值", "统计说明"],
+            "violation": ["违规原因", "总计", "有电话", "其他数据", "有电话占比"],
+            "station_distribution": ["指标", "数值", "单位 / 统计说明"],
+        }
+        for category, expected_headers in category_headers.items():
+            page.category_combo.setCurrentIndex(
+                page.category_combo.findData(category)
+            )
+            if page.station_combo.isEnabled():
+                page.station_combo.setCurrentIndex(0)
+            self.app.processEvents()
+            category_export = (
+                Path(self.temp_dir.name)
+                / f"all-stations-{category}.xlsx"
+            )
+            category_result = page._save_dashboard_excel(category_export)
+            self.assertEqual(category_result["station_sheet_count"], 5)
+            category_workbook = load_workbook(category_export, data_only=True)
+            first_station_sheet = category_workbook[station_names[0]]
+            self.assertEqual(
+                [
+                    first_station_sheet.cell(4, column).value
+                    for column in range(1, len(expected_headers) + 1)
+                ],
+                expected_headers,
+            )
+            category_workbook.close()
+
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("completion")
+        )
+        page.station_combo.setCurrentIndex(0)
+        page._toggle_anomaly_view(True)
+        self.app.processEvents()
+        anomaly_export = (
+            Path(self.temp_dir.name)
+            / "all-stations-anomaly.xlsx"
+        )
+        anomaly_result = page._save_dashboard_excel(anomaly_export)
+        self.assertEqual(anomaly_result["station_sheet_count"], 5)
+        anomaly_workbook = load_workbook(anomaly_export, data_only=True)
+        self.assertEqual(
+            [
+                anomaly_workbook[station_names[0]].cell(4, column).value
+                for column in range(1, 6)
+            ],
+            ["用户（站）", "登录账号", "异常条数", "本站总计数", "异常占比"],
+        )
+        anomaly_workbook.close()
 
         self.assertTrue(window.workflow_page.shutdown())
         window._prepared_to_close = True
@@ -1933,7 +2114,7 @@ class ToolAndUiTests(unittest.TestCase):
         page.station_distribution_chart.resize(1000, 280)
         page.station_distribution_chart.grab()
         self.app.processEvents()
-        self.assertEqual(len(page.station_distribution_chart._slice_hitboxes), 8)
+        self.assertEqual(len(page.station_distribution_chart._slice_hitboxes), 4)
         self.assertEqual(
             {
                 item["payload"]["series"]
@@ -1942,8 +2123,6 @@ class ToolAndUiTests(unittest.TestCase):
             {
                 "各站总计数占比",
                 "各站有电话数占比",
-                "各站总耗时占比",
-                "各站有效耗时占比",
             },
         )
         chart = page.station_distribution_chart
@@ -1972,6 +2151,58 @@ class ToolAndUiTests(unittest.TestCase):
             ],
         )
         self.assertEqual(chart._hover_card.width(), 240)
+
+        legend_rect, legend_row = chart._legend_hitboxes[0]
+        legend_local = legend_rect.center().toPoint()
+        legend_event = QMouseEvent(
+            QEvent.MouseMove,
+            legend_local,
+            chart.mapToGlobal(legend_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        chart.mouseMoveEvent(legend_event)
+        self.app.processEvents()
+        self.assertEqual(
+            chart._hover_card.details,
+            [
+                ("总计数", f'{legend_row["total"]} 条'),
+                ("总数占比", chart._format_share(legend_row["total_share"])),
+                ("有电话数", f'{legend_row["has_phone"]} 条'),
+                ("有电话占比", chart._format_share(legend_row["phone_share"])),
+            ],
+        )
+        self.assertEqual(chart._hover_card.width(), 340)
+
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("timing")
+        )
+        self.app.processEvents()
+        self.assertTrue(page.station_combo.isEnabled())
+        self.assertEqual(page.station_combo.currentData(), luogang.id)
+        self.assertTrue(chart.isHidden())
+        self.assertFalse(page.detail_tabs.isTabEnabled(0))
+        self.assertIs(page.detail_tabs.currentWidget(), page.data_tab)
+
+        page.station_combo.setCurrentIndex(0)
+        self.app.processEvents()
+        self.assertIsNone(page.station_combo.currentData())
+        self.assertTrue(page.detail_tabs.isTabEnabled(0))
+        self.assertIs(page.detail_tabs.currentWidget(), page.chart_tab)
+        self.assertFalse(chart.isHidden())
+        self.assertEqual(chart._series_mode, "timing")
+        chart.resize(1000, 280)
+        chart.grab()
+        self.app.processEvents()
+        self.assertEqual(len(chart._slice_hitboxes), 4)
+        self.assertEqual(
+            {
+                item["payload"]["series"]
+                for item in chart._slice_hitboxes
+            },
+            {"各站总耗时占比", "各站有效耗时占比"},
+        )
 
         duration_item = next(
             item
@@ -2022,10 +2253,6 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             chart._hover_card.details,
             [
-                ("总计数", f'{legend_row["total"]} 条'),
-                ("总数占比", chart._format_share(legend_row["total_share"])),
-                ("有电话数", f'{legend_row["has_phone"]} 条'),
-                ("有电话占比", chart._format_share(legend_row["phone_share"])),
                 ("总耗时", "1.7 小时"),
                 ("精确总耗时", "01:40:00.000"),
                 (
@@ -2044,6 +2271,19 @@ class ToolAndUiTests(unittest.TestCase):
         for index in range(chart._hover_card._details_layout.count()):
             detail_label = chart._hover_card._details_layout.itemAt(index).widget()
             self.assertGreaterEqual(detail_label.width(), detail_label.sizeHint().width())
+
+        page.station_combo.setCurrentIndex(
+            page.station_combo.findData(luogang.id)
+        )
+        self.app.processEvents()
+        self.assertTrue(chart.isHidden())
+        self.assertFalse(page.detail_tabs.isTabEnabled(0))
+        self.assertIs(page.detail_tabs.currentWidget(), page.data_tab)
+
+        page.category_combo.setCurrentIndex(
+            page.category_combo.findData("station_distribution")
+        )
+        self.app.processEvents()
         self.assertEqual(page.summary_table.rowCount(), 5)
         self.assertEqual(
             [
@@ -2767,6 +3007,297 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertNotIn("恶意U", violations)
         self.assertNotIn("J形行驶", violations)
         page.shutdown()
+
+    def test_dashboard_summarizes_daily_phone_violation_and_station_data(self):
+        self.db.ensure_default_station_users()
+        accounts = {account.username: account for account in self.db.list_accounts()}
+        station = accounts["luogang"]
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+
+        self.db.record_activity_batch(
+            station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 10,
+                WORKFLOW_HAS_PHONE_METRIC: 7,
+            },
+            source="unified_workflow",
+            details={
+                "violation_counts": {
+                    "证件异常": {"total": 6, "has_phone": 4, "other": 2},
+                    "超限": {"total": 4, "has_phone": 3, "other": 1},
+                }
+            },
+            task_id="dashboard-today",
+        )
+        self.db.record_activity_batch(
+            station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 5,
+                WORKFLOW_HAS_PHONE_METRIC: 4,
+            },
+            source="unified_workflow",
+            details={
+                "violation_counts": {
+                    "证件异常": {"total": 3, "has_phone": 2, "other": 1},
+                    "车型异常": {"total": 2, "has_phone": 2, "other": 0},
+                }
+            },
+            task_id="dashboard-yesterday",
+        )
+        with self.db._connect() as conn:
+            conn.execute(
+                "UPDATE activity_events SET created_at=? WHERE task_id=?",
+                (f"{today.isoformat()}T09:00:00+08:00", "dashboard-today"),
+            )
+            conn.execute(
+                "UPDATE activity_events SET created_at=? WHERE task_id=?",
+                (f"{yesterday.isoformat()}T09:00:00+08:00", "dashboard-yesterday"),
+            )
+
+        daily_rows = self.db.get_daily_metric_totals(
+            WORKFLOW_TOTAL_METRIC,
+            users_only=True,
+            start_date=yesterday,
+            end_date=today,
+        )
+        self.assertEqual(
+            daily_rows,
+            [
+                {"date": yesterday.isoformat(), "total": 5},
+                {"date": today.isoformat(), "total": 10},
+            ],
+        )
+
+        page = DashboardPage(self.db, self.admin)
+        page.resize(1220, 780)
+        page.show()
+        self.app.processEvents()
+
+        self.assertEqual(page.metric_cards["total"].value_label.text(), "15")
+        self.assertEqual(page.metric_cards["today"].value_label.text(), "10")
+        self.assertIn("+100.0%", page.metric_cards["today"].detail_label.text())
+        self.assertEqual(page.metric_cards["phone"].value_label.text(), "11")
+        self.assertEqual(page.metric_cards["no_phone"].value_label.text(), "4")
+        self.assertEqual(page.phone_chart.phone_count, 11)
+        self.assertEqual(page.phone_chart.no_phone_count, 4)
+        self.assertEqual(page.trend_chart._rows[-2]["total"], 5)
+        self.assertEqual(page.trend_chart._rows[-1]["total"], 10)
+        self.assertEqual(page.violation_table.item(0, 1).text(), "证件异常")
+        self.assertEqual(page.violation_table.item(0, 2).text(), "9")
+        self.assertEqual(page.violation_table.item(0, 3).text(), "60.0%")
+
+        station_row = next(
+            row
+            for row in range(page.station_table.rowCount())
+            if page.station_table.item(row, 0).text() == station.name_label
+        )
+        self.assertEqual(page.station_table.item(station_row, 1).text(), "15")
+        self.assertEqual(page.station_table.item(station_row, 2).text(), "11")
+        self.assertEqual(page.station_table.item(station_row, 3).text(), "4")
+        self.assertFalse(page.grab().isNull())
+        page.close()
+        page.deleteLater()
+
+    def test_dashboard_station_filter_and_hover_details(self):
+        self.db.ensure_default_station_users()
+        accounts = {account.username: account for account in self.db.list_accounts()}
+        luogang = accounts["luogang"]
+        taiping = accounts["taiping"]
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+
+        batches = (
+            (
+                luogang,
+                "dashboard-hover-luogang-today",
+                10,
+                7,
+                today,
+            ),
+            (
+                luogang,
+                "dashboard-hover-luogang-yesterday",
+                5,
+                4,
+                yesterday,
+            ),
+            (
+                taiping,
+                "dashboard-hover-taiping-today",
+                8,
+                5,
+                today,
+            ),
+        )
+        for station, task_id, total, phone, activity_date in batches:
+            self.db.record_activity_batch(
+                station.id,
+                {
+                    WORKFLOW_TOTAL_METRIC: total,
+                    WORKFLOW_HAS_PHONE_METRIC: phone,
+                },
+                source="unified_workflow",
+                task_id=task_id,
+            )
+            with self.db._connect() as conn:
+                conn.execute(
+                    "UPDATE activity_events SET created_at=? WHERE task_id=?",
+                    (
+                        f"{activity_date.isoformat()}T09:00:00+08:00",
+                        task_id,
+                    ),
+                )
+
+        def record_timing(station, run_id, seconds):
+            clock = [1000.0]
+            service = WorkflowTimingService(
+                self.db,
+                station.id,
+                clock=lambda: clock[0],
+            )
+            service.start_run(
+                Path(self.temp_dir.name) / f"{run_id}.xlsx",
+                pd.DataFrame({"站点": [station.username]}),
+                run_id=run_id,
+            )
+            service.start_step(1)
+            clock[0] += seconds
+            service.finish_run("succeeded")
+
+        record_timing(luogang, "dashboard-hover-luogang-today", 3600)
+        record_timing(taiping, "dashboard-hover-taiping-today", 1800)
+
+        page = DashboardPage(self.db, self.admin)
+        page.resize(1220, 780)
+        page.show()
+        self.app.processEvents()
+
+        self.assertIsNone(page.station_combo.currentData())
+        self.assertEqual(page.metric_cards["total"].value_label.text(), "23")
+        self.assertEqual(page.metric_cards["today"].value_label.text(), "18")
+        self.assertEqual(page.metric_cards["phone"].value_label.text(), "16")
+        self.assertEqual(page.metric_cards["no_phone"].value_label.text(), "7")
+        self.assertEqual(page.trend_chart._rows[-1]["has_phone"], 12)
+        self.assertEqual(page.trend_chart._rows[-1]["no_phone"], 6)
+
+        page.station_combo.setCurrentIndex(
+            page.station_combo.findData(luogang.id)
+        )
+        self.app.processEvents()
+        self.assertEqual(page.metric_cards["total"].value_label.text(), "15")
+        self.assertEqual(page.metric_cards["today"].value_label.text(), "10")
+        self.assertEqual(page.metric_cards["phone"].value_label.text(), "11")
+        self.assertEqual(page.metric_cards["no_phone"].value_label.text(), "4")
+        self.assertEqual(page.trend_chart._rows[-1]["has_phone"], 7)
+        self.assertEqual(page.trend_chart._rows[-1]["no_phone"], 3)
+
+        page.phone_chart.grab()
+        phone_rect = page.phone_chart._donut_rect
+        phone_local = QPoint(
+            int(phone_rect.center().x() + phone_rect.width() * 0.38),
+            int(phone_rect.center().y()),
+        )
+        phone_event = QMouseEvent(
+            QEvent.MouseMove,
+            phone_local,
+            page.phone_chart.mapToGlobal(phone_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        page.phone_chart.mouseMoveEvent(phone_event)
+        self.assertIsInstance(page.phone_chart, AnimatedDonutChart)
+        self.assertTrue(page.phone_chart._animation_timer.isActive())
+        self.assertEqual(page.phone_chart._hover_card.title_text, "有电话")
+        self.assertEqual(
+            page.phone_chart._hover_card.details,
+            [
+                ("数量", "11 条"),
+                ("占比", "73.3%"),
+                ("总查询量", "15 条"),
+            ],
+        )
+
+        page.trend_chart.grab()
+        trend_point = page.trend_chart._points[-1].toPoint()
+        trend_event = QMouseEvent(
+            QEvent.MouseMove,
+            trend_point,
+            page.trend_chart.mapToGlobal(trend_point),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        page.trend_chart.mouseMoveEvent(trend_event)
+        self.assertEqual(
+            page.trend_chart._hover_card.details,
+            [
+                ("查询总量", "10 条"),
+                ("有电话", "7 条"),
+                ("无电话", "3 条"),
+            ],
+        )
+
+        page.station_view_toggle.click()
+        self.app.processEvents()
+        self.assertIs(
+            page.station_view_stack.currentWidget(),
+            page.station_share_chart,
+        )
+        self.assertEqual(page.station_view_toggle.text(), "查看数据表")
+        page.station_share_chart.grab()
+        self.assertIsInstance(page.station_share_chart, AnimatedDonutChart)
+        self.assertTrue(page.station_share_chart._animation_timer.isActive())
+        self.assertEqual(len(page.station_share_chart._donuts), 2)
+
+        total_donut = page.station_share_chart._donuts[0]["rect"]
+        total_local = QPoint(
+            int(total_donut.center().x() + total_donut.width() * 0.38),
+            int(total_donut.center().y()),
+        )
+        total_event = QMouseEvent(
+            QEvent.MouseMove,
+            total_local,
+            page.station_share_chart.mapToGlobal(total_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        page.station_share_chart.mouseMoveEvent(total_event)
+        self.assertEqual(
+            page.station_share_chart._hover_card.title_text,
+            f"{luogang.name_label} · 总数量占比",
+        )
+        self.assertIn(
+            ("占比", "65.2%"),
+            page.station_share_chart._hover_card.details,
+        )
+
+        time_donut = page.station_share_chart._donuts[1]["rect"]
+        time_local = QPoint(
+            int(time_donut.center().x() + time_donut.width() * 0.38),
+            int(time_donut.center().y()),
+        )
+        time_event = QMouseEvent(
+            QEvent.MouseMove,
+            time_local,
+            page.station_share_chart.mapToGlobal(time_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        page.station_share_chart.mouseMoveEvent(time_event)
+        self.assertEqual(
+            page.station_share_chart._hover_card.title_text,
+            f"{luogang.name_label} · 总用时占比",
+        )
+        self.assertIn(
+            ("小时数", "1.0 小时"),
+            page.station_share_chart._hover_card.details,
+        )
+        page.close()
+        page.deleteLater()
 
     def test_failed_workflow_does_not_record_counts(self):
         file_path = Path(self.temp_dir.name) / "failed.xlsx"

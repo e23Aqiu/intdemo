@@ -264,10 +264,130 @@ QPushButton#NavButton:checked {
     padding-left: 10px;
     font-weight: 700;
 }
+QPushButton#NavGroupButton {
+    color: #c4d9d7;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 10px 13px;
+    text-align: left;
+    font-size: 14px;
+    font-weight: 600;
+}
+QPushButton#NavGroupButton:hover,
+QPushButton#NavGroupButton[active="true"] {
+    color: #ffffff;
+    background: #174b4e;
+    border-color: #285e60;
+}
+QWidget#DataNavContainer {
+    background: transparent;
+}
+QPushButton#NavSubButton {
+    color: #a9c4c2;
+    background: transparent;
+    border: none;
+    border-left: 2px solid #28565a;
+    border-radius: 0 8px 8px 0;
+    margin-left: 19px;
+    padding: 8px 12px 8px 17px;
+    text-align: left;
+    font-size: 13px;
+    font-weight: 500;
+}
+QPushButton#NavSubButton:hover {
+    color: #f5fbfa;
+    background: #143f43;
+    border-left-color: #4d8f89;
+}
+QPushButton#NavSubButton:checked {
+    color: #ffffff;
+    background: #17665f;
+    border-left: 3px solid #8ce3d1;
+    padding-left: 16px;
+    font-weight: 700;
+}
 QFrame#TopBar, QFrame#Card, QGroupBox {
     background: white;
     border: 1px solid #e4eaf2;
     border-radius: 10px;
+}
+QFrame#DashboardMetricCard,
+QFrame#DashboardPanel {
+    background: #ffffff;
+    border: 1px solid #dce8e6;
+    border-radius: 10px;
+}
+QFrame#DashboardMetricCard[tone="teal"] { border-top: 3px solid #1d8178; }
+QFrame#DashboardMetricCard[tone="green"] { border-top: 3px solid #43ad75; }
+QFrame#DashboardMetricCard[tone="orange"] { border-top: 3px solid #f0ad69; }
+QFrame#DashboardMetricCard[tone="blue"] { border-top: 3px solid #4a8bc4; }
+QFrame#DashboardMetricCard[tone="purple"] { border-top: 3px solid #8064b6; }
+QLabel#DashboardMetricTitle {
+    color: #607a78;
+    font-size: 12px;
+    font-weight: 600;
+    border: none;
+    background: transparent;
+}
+QLabel#DashboardMetricValue {
+    font-size: 23px;
+    font-weight: 800;
+    border: none;
+    background: transparent;
+}
+QLabel#DashboardMetricDetail {
+    color: #718785;
+    font-size: 10px;
+    border: none;
+    background: transparent;
+}
+QLabel#DashboardPanelTitle {
+    color: #173a3d;
+    font-size: 14px;
+    font-weight: 700;
+    border: none;
+    background: transparent;
+}
+QPushButton#DashboardPanelAction {
+    min-height: 24px;
+    padding: 3px 10px;
+    color: #1d8178;
+    background: #edf8f5;
+    border: 1px solid #c9e4de;
+    border-radius: 6px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QPushButton#DashboardPanelAction:hover {
+    color: #17665f;
+    background: #e3f4ef;
+    border-color: #9ed2c7;
+}
+QPushButton#DashboardPanelAction:checked {
+    color: #ffffff;
+    background: #1d8178;
+    border-color: #1d8178;
+}
+QTableWidget#DashboardTable {
+    background: #ffffff;
+    alternate-background-color: #f7faf9;
+    border: 1px solid #e1ebe9;
+    border-radius: 7px;
+    color: #365654;
+    selection-background-color: transparent;
+}
+QTableWidget#DashboardTable::item {
+    border-bottom: 1px solid #ebf2f0;
+    padding: 4px 7px;
+}
+QTableWidget#DashboardTable QHeaderView::section {
+    color: #536e6c;
+    background: #eef5f3;
+    border: none;
+    border-bottom: 1px solid #d8e7e3;
+    padding: 6px 8px;
+    font-weight: 700;
 }
 QFrame#TopBar {
     border-radius: 0;

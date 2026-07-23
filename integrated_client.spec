@@ -9,6 +9,7 @@ datas += [
     ('integrated_client/ui/assets/chevron-down.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/chevron-up.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-dashboard.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/nav-data.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-workflow.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-accounts.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-user.svg', 'integrated_client/ui/assets'),

@@ -22,6 +22,7 @@ from ..timing import WorkflowTimingService
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
 from .account_page import AccountPage
 from .auth_dialogs import PasswordDialog
+from .dashboard_page import DashboardPage
 from .frameless import (
     FramelessMainWindow,
     FramelessMessageBox as QMessageBox,
@@ -37,6 +38,12 @@ class MainWindow(FramelessMainWindow):
     logout_requested = pyqtSignal()
     window_closed = pyqtSignal()
     PAGE_CANVAS_SIZE = QSize(1220, 700)
+    DATA_CENTER_VIEWS = {
+        "data_station": "station_distribution",
+        "data_timing": "timing",
+        "data_completion": "completion",
+        "data_violation": "violation",
+    }
 
     def __init__(self, database: Database, account: Account, parent=None):
         super().__init__(parent)
@@ -88,6 +95,8 @@ class MainWindow(FramelessMainWindow):
                 "自动验证码识别需要修复运行环境后再启用。"
             )
         self.statistics_page = StatisticsPage(database, account, warning)
+        self.statistics_page.set_sidebar_navigation(True)
+        self.dashboard_page = DashboardPage(database, account)
         self.workflow_timing = WorkflowTimingService(database, account.id)
         self.workflow_page = WorkflowPage(
             self._record_workflow_summary,
@@ -97,7 +106,8 @@ class MainWindow(FramelessMainWindow):
         self.personal_center_page.change_password_requested.connect(self._change_password)
         self.personal_center_page.logout_requested.connect(self._request_logout)
 
-        self._add_page("home", self.statistics_page)
+        self._add_page("home", self.dashboard_page)
+        self._add_page("statistics", self.statistics_page)
         self._add_page("workflow", self.workflow_page)
         if account.is_admin:
             self.account_page = AccountPage(database, account)
@@ -156,24 +166,52 @@ class MainWindow(FramelessMainWindow):
         layout.addWidget(nav_label)
         layout.addSpacing(2)
 
-        nav_items = [
+        primary_nav_items = [
             ("home", "数据仪表盘", "nav-dashboard.svg"),
             ("workflow", "一键业务处理", "nav-workflow.svg"),
         ]
-        if self.account.is_admin:
-            nav_items.append(("accounts", "账号管理", "nav-accounts.svg"))
-        nav_items.append(("personal", "个人中心", "nav-user.svg"))
-
-        for key, text, icon_name in nav_items:
-            button = QPushButton(text)
-            button.setObjectName("NavButton")
-            button.setCheckable(True)
+        for key, text, icon_name in primary_nav_items:
+            button = self._create_nav_button(key, text)
             button.setIcon(QIcon(_control_asset_path(icon_name)))
             button.setIconSize(QSize(19, 19))
-            button.setMinimumHeight(46)
-            button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-            button.clicked.connect(lambda checked=False, page_key=key: self.show_page(page_key))
-            self._nav_buttons[key] = button
+            layout.addWidget(button)
+
+        self.data_nav_toggle = QPushButton("数据中心    ▸")
+        self.data_nav_toggle.setObjectName("NavGroupButton")
+        self.data_nav_toggle.setCheckable(True)
+        self.data_nav_toggle.setChecked(False)
+        self.data_nav_toggle.setIcon(QIcon(_control_asset_path("nav-data.svg")))
+        self.data_nav_toggle.setIconSize(QSize(19, 19))
+        self.data_nav_toggle.setMinimumHeight(46)
+        self.data_nav_toggle.clicked.connect(self._toggle_data_navigation)
+        layout.addWidget(self.data_nav_toggle)
+
+        self.data_nav_container = QWidget()
+        self.data_nav_container.setObjectName("DataNavContainer")
+        data_nav_layout = QVBoxLayout(self.data_nav_container)
+        data_nav_layout.setContentsMargins(0, 0, 0, 2)
+        data_nav_layout.setSpacing(3)
+        data_nav_items = [
+            ("data_station", "全站分布"),
+            ("data_timing", "用时效率"),
+            ("data_completion", "完成类型"),
+            ("data_violation", "违规原因"),
+        ]
+        for key, text in data_nav_items:
+            data_nav_layout.addWidget(
+                self._create_nav_button(key, text, object_name="NavSubButton")
+            )
+        self.data_nav_container.hide()
+        layout.addWidget(self.data_nav_container)
+
+        trailing_nav_items = []
+        if self.account.is_admin:
+            trailing_nav_items.append(("accounts", "账号管理", "nav-accounts.svg"))
+        trailing_nav_items.append(("personal", "个人中心", "nav-user.svg"))
+        for key, text, icon_name in trailing_nav_items:
+            button = self._create_nav_button(key, text)
+            button.setIcon(QIcon(_control_asset_path(icon_name)))
+            button.setIconSize(QSize(19, 19))
             layout.addWidget(button)
 
         layout.addStretch()
@@ -209,6 +247,29 @@ class MainWindow(FramelessMainWindow):
         layout.addWidget(profile)
         return sidebar
 
+    def _create_nav_button(self, key, text, object_name="NavButton"):
+        button = QPushButton(text)
+        button.setObjectName(object_name)
+        button.setCheckable(True)
+        button.setMinimumHeight(46 if object_name == "NavButton" else 38)
+        button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        button.clicked.connect(
+            lambda checked=False, page_key=key: self.show_page(page_key)
+        )
+        self._nav_buttons[key] = button
+        return button
+
+    def _toggle_data_navigation(self, expanded):
+        self.data_nav_container.setVisible(bool(expanded))
+        self.data_nav_toggle.setText(
+            "数据中心    ▾" if expanded else "数据中心    ▸"
+        )
+
+    def _set_data_navigation_active(self, active):
+        self.data_nav_toggle.setProperty("active", bool(active))
+        self.data_nav_toggle.style().unpolish(self.data_nav_toggle)
+        self.data_nav_toggle.style().polish(self.data_nav_toggle)
+
     @staticmethod
     def _sidebar_avatar_text(name):
         text = str(name or "").strip()
@@ -234,10 +295,12 @@ class MainWindow(FramelessMainWindow):
         self.stack.addWidget(widget)
 
     def _account_name_changed(self, account_id, display_name):
+        self.dashboard_page.refresh()
         self.statistics_page.refresh()
         if account_id != self.account.id:
             return
         self.account = replace(self.account, display_name=display_name)
+        self.dashboard_page.account = self.account
         self.statistics_page.account = self.account
         self.personal_center_page.account = self.account
         self.personal_center_page.name_value.setText(self.account.name_label)
@@ -251,23 +314,36 @@ class MainWindow(FramelessMainWindow):
         self.setWindowTitle(f"{APP_NAME} - {self.account.name_label}")
 
     def _account_data_changed(self, *_args):
+        self.dashboard_page.refresh()
         self.statistics_page.refresh()
 
     def show_page(self, key):
-        if key not in self._pages:
+        data_view = self.DATA_CENTER_VIEWS.get(key)
+        page_key = "statistics" if data_view else key
+        if page_key not in self._pages:
             return
         titles = {
-            "home": "数据仪表盘",
+            "home": "仪表盘",
+            "data_station": "全站分布",
+            "data_timing": "用时效率",
+            "data_completion": "完成类型",
+            "data_violation": "违规原因",
             "workflow": "一键业务处理",
             "accounts": "账号管理",
             "personal": "个人中心",
         }
-        self.stack.setCurrentWidget(self._pages[key])
+        if data_view:
+            self.statistics_page.set_navigation_view(data_view)
+            if not self.data_nav_toggle.isChecked():
+                self.data_nav_toggle.setChecked(True)
+                self._toggle_data_navigation(True)
+        self.stack.setCurrentWidget(self._pages[page_key])
         self.page_title.setText(titles.get(key, APP_NAME))
         for page_key, button in self._nav_buttons.items():
             button.setChecked(page_key == key)
+        self._set_data_navigation_active(bool(data_view))
         if key == "home":
-            self.statistics_page.refresh()
+            self.dashboard_page.refresh()
         elif key == "accounts" and self.account_page:
             self.account_page.refresh()
 
@@ -279,7 +355,9 @@ class MainWindow(FramelessMainWindow):
                 amount=amount,
                 source=source,
             )
-            if self.stack.currentWidget() is self.statistics_page:
+            if self.stack.currentWidget() is self.dashboard_page:
+                self.dashboard_page.refresh()
+            elif self.stack.currentWidget() is self.statistics_page:
                 self.statistics_page.refresh()
         except Exception as exc:
             QMessageBox.warning(self, "统计记录失败", f"业务结果已产生，但统计写入失败：\n{exc}")
@@ -293,7 +371,9 @@ class MainWindow(FramelessMainWindow):
                 details=details,
                 task_id=task_id,
             )
-            if self.stack.currentWidget() is self.statistics_page:
+            if self.stack.currentWidget() is self.dashboard_page:
+                self.dashboard_page.refresh()
+            elif self.stack.currentWidget() is self.statistics_page:
                 self.statistics_page.refresh()
             return True
         except Exception as exc:
