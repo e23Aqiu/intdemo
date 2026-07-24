@@ -193,7 +193,9 @@ class WorkflowPage(QWidget):
 
     browser_check_completed = pyqtSignal(bool, str, str)
     REQUIRED_COLUMNS = ("车辆标识", "已协助补缴")
-    TIMING_DISPLAY_INTERVAL_MS = 50
+    # 约 60 帧/秒刷新计时文本；16 不是 10 的整数倍，可避免毫秒
+    # 末位长期只在少数固定数字间变化。
+    TIMING_DISPLAY_INTERVAL_MS = 16
     TIMING_HEARTBEAT_INTERVAL_MS = 5_000
     BROWSER_CHECK_ANIMATION_FRAMES = (
         "正在检测内置浏览器",
@@ -223,6 +225,7 @@ class WorkflowPage(QWidget):
         self._settings_browser_check_requested = False
         self._browser_start_dialog = None
         self._timing_finished_steps = set()
+        self.last_force_shutdown_error = ""
 
         self._build_ui()
         self._sync_mode_controls()
@@ -1096,6 +1099,8 @@ class WorkflowPage(QWidget):
     def _save_aiqicha_results(self):
         if self.df is None or self.df.empty:
             return True
+        workbook = None
+        temporary_path = ""
         try:
             workbook = openpyxl.load_workbook(self.file_path)
             sheet = workbook.active
@@ -1113,7 +1118,18 @@ class WorkflowPage(QWidget):
                     if pd.isna(value) or str(value).strip() in {"nan", "None"}:
                         continue
                     sheet.cell(excel_row, header[name], str(value).strip())
-            workbook.save(self.file_path)
+            directory = os.path.dirname(os.path.abspath(self.file_path))
+            file_name = os.path.basename(self.file_path)
+            stem, suffix = os.path.splitext(file_name)
+            temporary_path = os.path.join(
+                directory,
+                f".{stem}.{uuid.uuid4().hex}.tmp{suffix}",
+            )
+            workbook.save(temporary_path)
+            workbook.close()
+            workbook = None
+            os.replace(temporary_path, self.file_path)
+            temporary_path = ""
             self._last_file_mtime = os.path.getmtime(self.file_path)
             self._log("爱企查结果已保存到原业务表格。")
             return True
@@ -1121,6 +1137,14 @@ class WorkflowPage(QWidget):
             self._log("❌ 保存失败：请关闭 Excel/WPS 中打开的业务表格。")
         except Exception as exc:
             self._log(f"❌ 保存爱企查结果失败：{exc}")
+        finally:
+            if workbook is not None:
+                workbook.close()
+            if temporary_path and os.path.exists(temporary_path):
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
         return False
 
     @staticmethod
@@ -1383,4 +1407,110 @@ class WorkflowPage(QWidget):
         self.current_worker = None
         self.pipeline_running = False
         self._cleanup_retired_workers()
+        return True
+
+    def _shutdown_threads(self):
+        threads = []
+        for thread in (
+            self.browser_check_worker,
+            self.current_worker,
+            *self._retired_workers,
+        ):
+            if thread is not None and thread not in threads:
+                threads.append(thread)
+        return threads
+
+    def has_running_shutdown_threads(self):
+        return any(
+            thread.isRunning()
+            for thread in self._shutdown_threads()
+        )
+
+    def force_shutdown(self, terminate_wait_ms=1_500):
+        """
+        保存已完成数据和计时状态后，终止仍未响应停止的工作线程。
+
+        返回 False 表示数据保护步骤失败，此时不会调用 QThread.terminate()。
+        """
+        self.last_force_shutdown_error = ""
+        self.preview_timer.stop()
+        self.stopping = True
+        threads = self._shutdown_threads()
+
+        for thread in threads:
+            stop = getattr(thread, "stop", None)
+            if callable(stop):
+                try:
+                    stop()
+                except Exception:
+                    pass
+
+        if self.current_step == 3 and not self._save_aiqicha_results():
+            self.last_force_shutdown_error = (
+                "爱企查已完成结果未能写入业务表格。请关闭 Excel/WPS "
+                "占用后重试，程序尚未强制退出。"
+            )
+            return False
+
+        reason = "用户保存已完成数据后强制结束任务"
+        service = self._timing_service
+        if service is not None and service.is_active:
+            try:
+                service.request_stop(reason)
+                if (
+                    self.current_step
+                    and self.current_step not in self._timing_finished_steps
+                ):
+                    service.finish_step("stopped", reason)
+                    self._timing_finished_steps.add(self.current_step)
+                snapshot = service.finish_run("stopped", reason)
+                self._refresh_timing_label(snapshot)
+            except Exception as exc:
+                self.last_force_shutdown_error = (
+                    f"业务计时状态保存失败：{exc}。程序尚未强制退出。"
+                )
+                self._log(f"❌ {self.last_force_shutdown_error}")
+                return False
+
+        self.timing_timer.stop()
+        self.timing_heartbeat_timer.stop()
+        stubborn_threads = []
+        for thread in threads:
+            if thread.isRunning():
+                try:
+                    thread.requestInterruption()
+                except Exception:
+                    pass
+                try:
+                    thread.terminate()
+                except Exception:
+                    pass
+                try:
+                    thread.wait(terminate_wait_ms)
+                except Exception:
+                    pass
+            if thread.isRunning():
+                stubborn_threads.append(thread)
+            else:
+                thread.deleteLater()
+
+        self.browser_check_worker = (
+            self.browser_check_worker
+            if self.browser_check_worker in stubborn_threads
+            else None
+        )
+        self.current_worker = (
+            self.current_worker
+            if self.current_worker in stubborn_threads
+            else None
+        )
+        self._retired_workers = [
+            thread
+            for thread in stubborn_threads
+            if thread is not self.browser_check_worker
+            and thread is not self.current_worker
+        ]
+        self.pipeline_running = False
+        self.awaiting_login = False
+        self._log("已保存全部已完成数据，卡住的任务已强制结束。")
         return True

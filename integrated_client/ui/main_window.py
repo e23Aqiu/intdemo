@@ -1,4 +1,6 @@
 from dataclasses import replace
+import os
+import threading
 
 from PyQt5.QtCore import QSize, Qt, pyqtSignal
 from PyQt5.QtGui import QIcon
@@ -53,6 +55,7 @@ class MainWindow(FramelessMainWindow):
         self.database = database
         self.account = account
         self._prepared_to_close = False
+        self._hard_exit_timer = None
         self._nav_buttons = {}
         self._pages = {}
 
@@ -389,14 +392,55 @@ class MainWindow(FramelessMainWindow):
         ).exec_()
 
     def _shutdown_tools(self):
-        if not self.workflow_page.shutdown(8000):
-            QMessageBox.warning(
+        if self.workflow_page.shutdown(8000):
+            return True
+
+        dialog = QMessageBox(self)
+        dialog.setWindowTitle("任务仍在结束")
+        dialog.setText("任务仍在结束")
+        dialog.setInformativeText(
+            "浏览器操作尚未完全结束。你可以继续等待，或先保存所有"
+            "已完成记录和计时状态，再强制结束卡住的任务。\n\n"
+            "当前正在处理的一条记录可能需要下次重新执行。"
+        )
+        dialog.setIcon(QMessageBox.Warning)
+        dialog.setStandardButtons(QMessageBox.Save | QMessageBox.Cancel)
+        force_button = dialog.button(QMessageBox.Save)
+        wait_button = dialog.button(QMessageBox.Cancel)
+        force_button.setText("保存并强制退出")
+        force_button.setObjectName("DangerButton")
+        wait_button.setText("继续等待")
+        dialog.setDefaultButton(wait_button)
+        result = dialog.exec_()
+        dialog.deleteLater()
+        if result != QMessageBox.Save:
+            return False
+
+        if not self.workflow_page.force_shutdown():
+            details = getattr(
+                self.workflow_page,
+                "last_force_shutdown_error",
+                "",
+            )
+            QMessageBox.critical(
                 self,
-                "任务仍在结束",
-                "浏览器操作尚未完全结束，请稍后再次退出，避免损坏正在处理的数据。",
+                "数据保护失败",
+                details or "已完成数据未能安全保存，程序没有强制退出。",
             )
             return False
+
+        if self.workflow_page.has_running_shutdown_threads():
+            self._schedule_hard_exit_fallback()
         return True
+
+    def _schedule_hard_exit_fallback(self, delay_seconds=0.5):
+        """仅在线程拒绝 terminate() 时兜底，确保强制退出一定完成。"""
+        if self._hard_exit_timer is not None:
+            return
+        timer = threading.Timer(delay_seconds, os._exit, args=(0,))
+        timer.daemon = True
+        timer.start()
+        self._hard_exit_timer = timer
 
     def _prepare_close(self):
         if self._prepared_to_close:

@@ -2,6 +2,7 @@ import json
 import math
 import os
 import tempfile
+import threading
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
@@ -765,6 +766,359 @@ class ToolAndUiTests(unittest.TestCase):
             timeout=AIQICHA_RESULT_WAIT_SECONDS
         )
         self.assertEqual(AIQICHA_RESULT_WAIT_SECONDS, 120)
+
+    def test_aiqicha_worker_reopens_browser_without_limit_while_waiting_for_login(self):
+        dataframe = pd.DataFrame(
+            {
+                "车辆所有人/企业": ["测试运输有限公司"],
+                "负责人/法人代表": [""],
+                "地址": [""],
+                "电话": [""],
+            }
+        )
+
+        class States:
+            def __init__(self):
+                self.is_alive = True
+
+        class Page:
+            def __init__(self):
+                self.states = States()
+                self.home_calls = 0
+                self.quit_calls = 0
+
+            def get(self, url):
+                self.assert_home_url(url)
+                self.home_calls += 1
+
+            @staticmethod
+            def assert_home_url(url):
+                if url != "https://aiqicha.baidu.com":
+                    raise AssertionError(f"unexpected URL: {url}")
+
+            def quit(self):
+                self.quit_calls += 1
+                self.states.is_alive = False
+
+        closed_pages = [Page() for _ in range(4)]
+        reopened_page = Page()
+        worker = QueryWorker(dataframe, "车辆所有人/企业")
+        login_requests = []
+        logs = []
+        retries = []
+
+        def handle_login_request():
+            login_requests.append(worker.page)
+            if len(login_requests) <= len(closed_pages):
+                worker.page.states.is_alive = False
+            else:
+                worker.confirm_login()
+
+        worker.login_required_signal.connect(handle_login_request)
+        worker.log_signal.connect(logs.append)
+        worker.retry_signal.connect(
+            lambda retry_type, reason: retries.append((retry_type, reason))
+        )
+
+        with patch(
+            "integrated_client.tools.aiqicha_tool.create_browser",
+            side_effect=[*closed_pages, reopened_page],
+        ) as create_browser_mock, patch.object(
+            worker,
+            "_interruptible_sleep",
+            return_value=True,
+        ):
+            self.assertTrue(worker._start_browser_session())
+
+        self.assertEqual(create_browser_mock.call_count, 5)
+        self.assertEqual(login_requests, [*closed_pages, reopened_page])
+        self.assertTrue(all(page.home_calls == 1 for page in closed_pages))
+        self.assertTrue(all(page.quit_calls == 1 for page in closed_pages))
+        self.assertEqual(reopened_page.home_calls, 1)
+        self.assertIs(worker.page, reopened_page)
+        self.assertGreaterEqual(
+            sum(item[0] == "aiqicha_browser_start" for item in retries),
+            4,
+        )
+        self.assertTrue(any("自动重新打开" in line for line in logs))
+        self.assertTrue(any("正在重新启动爱企查浏览器" in line for line in logs))
+
+    def test_aiqicha_stop_interrupts_home_navigation_after_browser_closed(self):
+        dataframe = pd.DataFrame(
+            {
+                "车辆所有人/企业": ["测试运输有限公司"],
+                "负责人/法人代表": [""],
+                "地址": [""],
+                "电话": [""],
+            }
+        )
+
+        class BlockingPage:
+            def __init__(self):
+                self.navigation_started = threading.Event()
+                self.navigation_released = threading.Event()
+                self.quit_finished = threading.Event()
+                self.stop_loading_calls = 0
+                self.quit_calls = 0
+                self.manually_closed = False
+
+            def get(self, url):
+                if url != "https://aiqicha.baidu.com":
+                    raise AssertionError(f"unexpected URL: {url}")
+                self.navigation_started.set()
+                if not self.navigation_released.wait(3):
+                    raise AssertionError("home navigation was not interrupted")
+                return False
+
+            def simulate_manual_close(self):
+                self.manually_closed = True
+
+            def stop_loading(self):
+                self.stop_loading_calls += 1
+                self.navigation_released.set()
+
+            def quit(self):
+                self.quit_calls += 1
+                self.navigation_released.set()
+                self.quit_finished.set()
+
+        page = BlockingPage()
+        worker = QueryWorker(dataframe, "车辆所有人/企业")
+        results = []
+        retries = []
+        worker.finished_signal.connect(results.append)
+        worker.retry_signal.connect(
+            lambda retry_type, reason: retries.append((retry_type, reason))
+        )
+
+        with patch(
+            "integrated_client.tools.aiqicha_tool.create_browser",
+            return_value=page,
+        ) as create_browser_mock:
+            worker.start()
+            self.assertTrue(page.navigation_started.wait(1))
+            page.simulate_manual_close()
+            worker.stop()
+            self.assertTrue(worker.wait(2_000))
+            self.assertTrue(page.quit_finished.wait(1))
+
+        self.app.processEvents()
+        self.assertFalse(worker.isRunning())
+        self.assertTrue(page.manually_closed)
+        self.assertEqual(create_browser_mock.call_count, 1)
+        self.assertEqual(page.stop_loading_calls, 1)
+        self.assertEqual(page.quit_calls, 1)
+        self.assertIsNone(worker.page)
+        self.assertEqual(results, [False])
+        self.assertEqual(retries, [])
+
+    def test_workflow_force_shutdown_atomically_saves_completed_aiqicha_data(self):
+        file_path = Path(self.temp_dir.name) / "force-exit-save.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(
+            ["车辆所有人/企业", "负责人/法人代表", "地址", "电话"]
+        )
+        sheet.append(["测试运输有限公司", "", "", ""])
+        workbook.save(file_path)
+        workbook.close()
+
+        class StuckThread:
+            def __init__(self):
+                self.running = True
+                self.stop_called = False
+                self.interruption_requested = False
+                self.terminated = False
+                self.deleted = False
+
+            def isRunning(self):
+                return self.running
+
+            def stop(self):
+                self.stop_called = True
+
+            def requestInterruption(self):
+                self.interruption_requested = True
+
+            def terminate(self):
+                self.terminated = True
+                self.running = False
+
+            def wait(self, _timeout):
+                return not self.running
+
+            def deleteLater(self):
+                self.deleted = True
+
+        worker = StuckThread()
+        page = WorkflowPage()
+        page.file_path = str(file_path)
+        page.df = pd.DataFrame(
+            {
+                "车辆所有人/企业": ["测试运输有限公司"],
+                "负责人/法人代表": ["张三"],
+                "地址": ["测试地址"],
+                "电话": ["13800138000"],
+            }
+        )
+        page.current_step = 3
+        page.pipeline_running = True
+        page.current_worker = worker
+
+        self.assertTrue(page.force_shutdown(terminate_wait_ms=0))
+        self.assertTrue(worker.stop_called)
+        self.assertTrue(worker.interruption_requested)
+        self.assertTrue(worker.terminated)
+        self.assertTrue(worker.deleted)
+        self.assertIsNone(page.current_worker)
+        self.assertFalse(page.pipeline_running)
+
+        saved = load_workbook(file_path)
+        saved_sheet = saved.active
+        self.assertEqual(saved_sheet.cell(2, 2).value, "张三")
+        self.assertEqual(saved_sheet.cell(2, 3).value, "测试地址")
+        self.assertEqual(saved_sheet.cell(2, 4).value, "13800138000")
+        saved.close()
+        self.assertEqual(
+            list(file_path.parent.glob(f".{file_path.stem}.*.tmp{file_path.suffix}")),
+            [],
+        )
+        page.close()
+
+    def test_workflow_force_shutdown_does_not_terminate_when_save_fails(self):
+        file_path = Path(self.temp_dir.name) / "force-exit-save-failure.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(
+            ["车辆所有人/企业", "负责人/法人代表", "地址", "电话"]
+        )
+        sheet.append(["测试运输有限公司", "", "", ""])
+        workbook.save(file_path)
+        workbook.close()
+
+        class StuckThread:
+            def __init__(self):
+                self.running = True
+                self.stop_called = False
+                self.terminated = False
+
+            def isRunning(self):
+                return self.running
+
+            def stop(self):
+                self.stop_called = True
+
+            def requestInterruption(self):
+                return None
+
+            def terminate(self):
+                self.terminated = True
+                self.running = False
+
+            def wait(self, _timeout):
+                return not self.running
+
+            def deleteLater(self):
+                return None
+
+        worker = StuckThread()
+        page = WorkflowPage()
+        page.file_path = str(file_path)
+        page.df = pd.DataFrame(
+            {
+                "车辆所有人/企业": ["测试运输有限公司"],
+                "负责人/法人代表": ["张三"],
+                "地址": ["测试地址"],
+                "电话": ["13800138000"],
+            }
+        )
+        page.current_step = 3
+        page.pipeline_running = True
+        page.current_worker = worker
+
+        with patch(
+            "integrated_client.ui.workflow_page.os.replace",
+            side_effect=PermissionError("file is locked"),
+        ):
+            self.assertFalse(page.force_shutdown(terminate_wait_ms=0))
+        self.assertTrue(worker.stop_called)
+        self.assertFalse(worker.terminated)
+        self.assertTrue(worker.running)
+        self.assertIn("尚未强制退出", page.last_force_shutdown_error)
+        unchanged = load_workbook(file_path)
+        unchanged_sheet = unchanged.active
+        self.assertIsNone(unchanged_sheet.cell(2, 2).value)
+        self.assertIsNone(unchanged_sheet.cell(2, 3).value)
+        self.assertIsNone(unchanged_sheet.cell(2, 4).value)
+        unchanged.close()
+        self.assertEqual(
+            list(file_path.parent.glob(f".{file_path.stem}.*.tmp{file_path.suffix}")),
+            [],
+        )
+
+        worker.running = False
+        page.current_worker = None
+        page.current_step = 0
+        page.df = pd.DataFrame()
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_main_window_offers_save_and_force_exit_for_stuck_task(self):
+        window = MainWindow(self.db, self.admin)
+        captured = {}
+
+        def execute_dialog(dialog):
+            captured["title"] = dialog.text()
+            captured["message"] = dialog.informativeText()
+            captured["force_text"] = dialog.button(
+                FramelessMessageBox.Save
+            ).text()
+            captured["force_object"] = dialog.button(
+                FramelessMessageBox.Save
+            ).objectName()
+            captured["wait_text"] = dialog.button(
+                FramelessMessageBox.Cancel
+            ).text()
+            captured["wait_default"] = dialog.button(
+                FramelessMessageBox.Cancel
+            ).isDefault()
+            return FramelessMessageBox.Save
+
+        with patch.object(
+            window.workflow_page,
+            "shutdown",
+            return_value=False,
+        ), patch.object(
+            window.workflow_page,
+            "force_shutdown",
+            return_value=True,
+        ) as force_shutdown, patch.object(
+            window.workflow_page,
+            "has_running_shutdown_threads",
+            return_value=True,
+        ), patch.object(
+            window,
+            "_schedule_hard_exit_fallback",
+        ) as hard_exit, patch.object(
+            FramelessMessageBox,
+            "exec_",
+            new=execute_dialog,
+        ):
+            self.assertTrue(window._shutdown_tools())
+
+        force_shutdown.assert_called_once_with()
+        hard_exit.assert_called_once_with()
+        self.assertEqual(captured["title"], "任务仍在结束")
+        self.assertIn("保存所有已完成记录和计时状态", captured["message"])
+        self.assertIn("当前正在处理的一条记录", captured["message"])
+        self.assertEqual(captured["force_text"], "保存并强制退出")
+        self.assertEqual(captured["force_object"], "DangerButton")
+        self.assertEqual(captured["wait_text"], "继续等待")
+        self.assertTrue(captured["wait_default"])
+
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
 
     def test_main_window_contains_integrated_pages(self):
         window = MainWindow(self.db, self.admin)
@@ -2093,8 +2447,15 @@ class ToolAndUiTests(unittest.TestCase):
             page.timing_timer.interval(),
             page.TIMING_DISPLAY_INTERVAL_MS,
         )
-        self.assertEqual(page.TIMING_DISPLAY_INTERVAL_MS, 50)
+        self.assertEqual(page.TIMING_DISPLAY_INTERVAL_MS, 16)
         self.assertEqual(page.timing_timer.timerType(), Qt.PreciseTimer)
+        displayed_last_digits = {
+            service.format_duration(
+                tick * page.TIMING_DISPLAY_INTERVAL_MS
+            )[-1]
+            for tick in range(10)
+        }
+        self.assertGreater(len(displayed_last_digits), 2)
         self.assertEqual(
             page.timing_heartbeat_timer.interval(),
             page.TIMING_HEARTBEAT_INTERVAL_MS,

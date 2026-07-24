@@ -382,6 +382,7 @@ class QueryWorker(QThread):
         self.company_col = company_col
         self.page = None
         self._should_stop = False
+        self._browser_lock = threading.RLock()
         self._login_wait = threading.Event()
         # 暂停控制：set=运行中，clear=已暂停
         self._pause_event = threading.Event()
@@ -391,15 +392,44 @@ class QueryWorker(QThread):
         self._should_stop = True
         self._pause_event.set()   # 确保暂停状态下也能响应停止
         self._login_wait.set()    # 确保登录等待/验证码等待也能立即中断
+        # page.get() 由 DrissionPage 同步等待页面加载，仅设置停止标志
+        # 无法唤醒它。另起守护线程中断加载，避免阻塞 GUI 线程。
+        page = self._detach_browser()
+        if page is not None:
+            threading.Thread(
+                target=self._close_browser_page,
+                args=(page,),
+                kwargs={"interrupt_loading": True},
+                name="aiqicha-browser-stop",
+                daemon=True,
+            ).start()
 
-    def close_browser(self):
-        """关闭浏览器（线程安全，可多次调用）"""
-        if self.page is not None:
+    def _detach_browser(self):
+        with self._browser_lock:
+            page = self.page
+            self.page = None
+        return page
+
+    @staticmethod
+    def _close_browser_page(page, interrupt_loading=False):
+        if interrupt_loading:
             try:
-                self.page.quit()
+                page.stop_loading()
             except Exception:
                 pass
-            self.page = None
+        try:
+            page.quit()
+        except Exception:
+            pass
+
+    def close_browser(self, interrupt_loading=False):
+        """从当前会话摘除并关闭浏览器，可安全重复或跨线程调用。"""
+        page = self._detach_browser()
+        if page is not None:
+            self._close_browser_page(
+                page,
+                interrupt_loading=interrupt_loading,
+            )
 
     def pause(self):
         """暂停查询"""
@@ -485,6 +515,7 @@ class QueryWorker(QThread):
         self._login_wait.set()
 
     def _wait_for_login_confirmation(self, timeout=1800):
+        """等待用户确认登录，同时持续监测浏览器是否仍然可用。"""
         self._login_wait.clear()
         self.login_required_signal.emit()
         deadline = time.monotonic() + timeout
@@ -493,8 +524,16 @@ class QueryWorker(QThread):
             if remaining <= 0:
                 self.log_signal.emit("❌ 等待登录超时")
                 return False
+            # 人工登录阶段也属于浏览器会话的一部分。用户手动关闭
+            # Chromium 或连接异常时，抛给外层会话循环立即重建。
+            self._ensure_browser_available()
             if self._login_wait.wait(timeout=min(0.2, remaining)):
-                return not self._should_stop
+                if self._should_stop:
+                    return False
+                # 确认按钮与浏览器关闭可能几乎同时发生，返回前再检查一次，
+                # 避免带着已经失效的页面进入正式查询。
+                self._ensure_browser_available()
+                return True
         return False
 
     def _start_browser_session(self, recovery=False):
@@ -504,15 +543,23 @@ class QueryWorker(QThread):
             attempt += 1
             try:
                 self.close_browser()
+                is_restart = recovery or attempt > 1
                 self.log_signal.emit(
                     "♻️ 正在重新启动爱企查浏览器..."
-                    if recovery
+                    if is_restart
                     else "🚀 正在启动浏览器..."
                 )
-                self.page = create_browser()
+                page = create_browser()
+                with self._browser_lock:
+                    self.page = page
+                if self._should_stop:
+                    self.close_browser()
+                    return False
                 self.log_signal.emit("✅ 浏览器已启动")
                 self.log_signal.emit("📌 正在打开爱企查首页...")
-                self.page.get("https://aiqicha.baidu.com")
+                page.get("https://aiqicha.baidu.com")
+                if self._should_stop:
+                    return False
                 if not self._interruptible_sleep(2):
                     return False
                 self.log_signal.emit(
@@ -520,13 +567,15 @@ class QueryWorker(QThread):
                 )
                 return self._wait_for_login_confirmation()
             except Exception as exc:
+                if self._should_stop:
+                    return False
                 reason = str(exc).strip() or exc.__class__.__name__
                 self.retry_signal.emit(
                     "aiqicha_browser_start",
                     f"爱企查浏览器启动第 {attempt} 次失败：{reason[:120]}",
                 )
                 self.log_signal.emit(
-                    "⚠️ 爱企查浏览器启动失败，将继续重试"
+                    "⚠️ 爱企查浏览器不可用，将自动重新打开"
                     f"（已尝试 {attempt} 次，无次数上限）：{reason[:120]}"
                 )
                 self.close_browser()
@@ -745,6 +794,8 @@ class QueryWorker(QThread):
                         break
 
                     except Exception as e:
+                        if self._should_stop:
+                            break
                         if not is_recoverable_aiqicha_browser_error(e):
                             self.log_signal.emit(f"  [{total}] ❌ 出错: {e}")
                             break
