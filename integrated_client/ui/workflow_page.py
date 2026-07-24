@@ -193,6 +193,8 @@ class WorkflowPage(QWidget):
 
     browser_check_completed = pyqtSignal(bool, str, str)
     REQUIRED_COLUMNS = ("车辆标识", "已协助补缴")
+    TIMING_DISPLAY_INTERVAL_MS = 50
+    TIMING_HEARTBEAT_INTERVAL_MS = 5_000
     BROWSER_CHECK_ANIMATION_FRAMES = (
         "正在检测内置浏览器",
         "正在检测内置浏览器 ·",
@@ -221,7 +223,6 @@ class WorkflowPage(QWidget):
         self._settings_browser_check_requested = False
         self._browser_start_dialog = None
         self._timing_finished_steps = set()
-        self._timing_heartbeat_ticks = 0
 
         self._build_ui()
         self._sync_mode_controls()
@@ -231,8 +232,13 @@ class WorkflowPage(QWidget):
         self.preview_timer.start(800)
 
         self.timing_timer = QTimer(self)
+        self.timing_timer.setTimerType(Qt.PreciseTimer)
         self.timing_timer.timeout.connect(self._timing_tick)
-        self.timing_timer.start(1000)
+        self.timing_timer.start(self.TIMING_DISPLAY_INTERVAL_MS)
+
+        self.timing_heartbeat_timer = QTimer(self)
+        self.timing_heartbeat_timer.timeout.connect(self._timing_heartbeat)
+        self.timing_heartbeat_timer.start(self.TIMING_HEARTBEAT_INTERVAL_MS)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -606,16 +612,14 @@ class WorkflowPage(QWidget):
 
     def _timing_tick(self):
         service = self._timing_service
-        if service is None:
+        if service is None or not service.is_active:
             return
         self._refresh_timing_label()
-        if not service.is_active:
-            self._timing_heartbeat_ticks = 0
+
+    def _timing_heartbeat(self):
+        service = self._timing_service
+        if service is None or not service.is_active:
             return
-        self._timing_heartbeat_ticks += 1
-        if self._timing_heartbeat_ticks < 5:
-            return
-        self._timing_heartbeat_ticks = 0
         try:
             service.heartbeat()
         except Exception as exc:
@@ -885,7 +889,6 @@ class WorkflowPage(QWidget):
         self._task_id = uuid.uuid4().hex
         self._stats_recorded = False
         self._timing_finished_steps = set()
-        self._timing_heartbeat_ticks = 0
         timing_result = None
         if self._timing_service is not None:
             try:
@@ -1376,6 +1379,7 @@ class WorkflowPage(QWidget):
                 )
             self._timing_finish_run("stopped", "客户端退出或注销")
         self.timing_timer.stop()
+        self.timing_heartbeat_timer.stop()
         self.current_worker = None
         self.pipeline_running = False
         self._cleanup_retired_workers()

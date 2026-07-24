@@ -46,6 +46,35 @@ TARGET_COLUMNS = ["负责人/法人代表", "地址", "电话"]  # 目标列（�
 LEGAL_COL_NAME = "负责人/法人代表"          # 目标列：法人
 ADDR_COL_NAME = "地址"                      # 目标列：地址
 PHONE_COL_NAME = "电话"                     # 目标列：电话
+AIQICHA_RESULT_WAIT_SECONDS = 120
+AIQICHA_BROWSER_RETRY_DELAY_SECONDS = 1
+
+
+class AiqichaBrowserRecoveryError(RuntimeError):
+    """爱企查浏览器或结果页面失效，需要重建浏览器并重试当前记录。"""
+
+
+def is_recoverable_aiqicha_browser_error(error):
+    if isinstance(error, AiqichaBrowserRecoveryError):
+        return True
+    message = str(error or "").casefold()
+    markers = (
+        "browser",
+        "target page",
+        "page closed",
+        "tab closed",
+        "connection closed",
+        "connection disconnected",
+        "connection reset",
+        "disconnected",
+        "cdp",
+        "timeout",
+        "浏览器",
+        "页面已关闭",
+        "连接已断开",
+        "超时",
+    )
+    return any(marker in message for marker in markers)
 
 
 def has_meaningful_value(value):
@@ -77,7 +106,13 @@ def create_browser():
         )
     co.set_user_agent(ua)
     co.set_browser_path(get_builtin_chromium_path())
-    return ChromiumPage(co)
+    page = ChromiumPage(co)
+    page.set.timeouts(
+        base=AIQICHA_RESULT_WAIT_SECONDS,
+        page_load=AIQICHA_RESULT_WAIT_SECONDS,
+        script=AIQICHA_RESULT_WAIT_SECONDS,
+    )
+    return page
 
 
 def search_company(page, company_name):
@@ -392,7 +427,7 @@ class QueryWorker(QThread):
             elapsed += interval
         return True
 
-    def _wait_for_results(self, timeout=8):
+    def _wait_for_results(self, timeout=AIQICHA_RESULT_WAIT_SECONDS):
         """
         等待搜索结果页面加载完成（结果区域或"无结果"提示出现）。
         优先用 DrissionPage 元素检测（更快更准），HTML 兜底。
@@ -432,8 +467,9 @@ class QueryWorker(QThread):
                     html = self.page.html or ""
                     if len(html) > 10000:
                         return True
-            except Exception:
-                pass
+            except Exception as exc:
+                if is_recoverable_aiqicha_browser_error(exc):
+                    raise AiqichaBrowserRecoveryError(str(exc)) from exc
 
             # 暂停状态也阻塞
             if not self._pause_event.is_set():
@@ -447,6 +483,75 @@ class QueryWorker(QThread):
     def confirm_login(self):
         """主线程调用：用户点击了'继续执行'"""
         self._login_wait.set()
+
+    def _wait_for_login_confirmation(self, timeout=1800):
+        self._login_wait.clear()
+        self.login_required_signal.emit()
+        deadline = time.monotonic() + timeout
+        while not self._should_stop:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.log_signal.emit("❌ 等待登录超时")
+                return False
+            if self._login_wait.wait(timeout=min(0.2, remaining)):
+                return not self._should_stop
+        return False
+
+    def _start_browser_session(self, recovery=False):
+        """持续创建爱企查浏览器，直到可用、登录超时或用户主动停止。"""
+        attempt = 0
+        while not self._should_stop:
+            attempt += 1
+            try:
+                self.close_browser()
+                self.log_signal.emit(
+                    "♻️ 正在重新启动爱企查浏览器..."
+                    if recovery
+                    else "🚀 正在启动浏览器..."
+                )
+                self.page = create_browser()
+                self.log_signal.emit("✅ 浏览器已启动")
+                self.log_signal.emit("📌 正在打开爱企查首页...")
+                self.page.get("https://aiqicha.baidu.com")
+                if not self._interruptible_sleep(2):
+                    return False
+                self.log_signal.emit(
+                    "⏳ 请在浏览器中登录爱企查，然后点击「继续执行」..."
+                )
+                return self._wait_for_login_confirmation()
+            except Exception as exc:
+                reason = str(exc).strip() or exc.__class__.__name__
+                self.retry_signal.emit(
+                    "aiqicha_browser_start",
+                    f"爱企查浏览器启动第 {attempt} 次失败：{reason[:120]}",
+                )
+                self.log_signal.emit(
+                    "⚠️ 爱企查浏览器启动失败，将继续重试"
+                    f"（已尝试 {attempt} 次，无次数上限）：{reason[:120]}"
+                )
+                self.close_browser()
+                if not self._interruptible_sleep(
+                    AIQICHA_BROWSER_RETRY_DELAY_SECONDS
+                ):
+                    return False
+        return False
+
+    def _ensure_browser_available(self):
+        page = self.page
+        if page is None:
+            raise AiqichaBrowserRecoveryError("爱企查浏览器不存在")
+        try:
+            states = getattr(page, "states", None)
+            if states is not None and not states.is_alive:
+                raise AiqichaBrowserRecoveryError("爱企查页面已关闭")
+            browser = getattr(page, "browser", None)
+            browser_states = getattr(browser, "states", None)
+            if browser_states is not None and not browser_states.is_alive:
+                raise AiqichaBrowserRecoveryError("爱企查浏览器已关闭")
+        except AiqichaBrowserRecoveryError:
+            raise
+        except Exception as exc:
+            raise AiqichaBrowserRecoveryError(str(exc)) from exc
     
     def _check_captcha(self):
         """检测页面是否出现验证码/安全验证"""
@@ -481,31 +586,18 @@ class QueryWorker(QThread):
             
             return False
         except Exception as e:
+            if is_recoverable_aiqicha_browser_error(e):
+                raise AiqichaBrowserRecoveryError(str(e)) from e
             self.log_signal.emit(f"  ⚠️ 验证码检测异常: {e}")
             return False
     
     def run(self):
         try:
-            # 1. 创建浏览器
-            self.log_signal.emit("🚀 正在启动浏览器...")
-            self.page = create_browser()
-            self.log_signal.emit("✅ 浏览器已启动")
-            
-            # 2. 打开首页，等待登录
-            self.log_signal.emit("📌 正在打开爱企查首页...")
-            self.page.get("https://aiqicha.baidu.com")
-            self._interruptible_sleep(2)
-
-            # 发出登录请求信号，等待主线程确认
-            self.login_required_signal.emit()
-            self.log_signal.emit("⏳ 请在浏览器中登录爱企查，然后点击「开始查询」按钮...")
-            
-            # 等待用户点击继续（最多等待30分钟）
-            if not self._login_wait.wait(timeout=1800):
-                self.log_signal.emit("❌ 等待登录超时")
+            # 1. 创建浏览器并等待登录
+            if not self._start_browser_session():
                 self.finished_signal.emit(False)
                 return
-            
+
             if self._should_stop:
                 self.finished_signal.emit(False)
                 return
@@ -564,62 +656,114 @@ class QueryWorker(QThread):
                 
                 # 查询
                 self.log_signal.emit(f"  [{total}] 🔍 查询：{company_name}")
+                browser_restarts = 0
+                while not self._should_stop:
+                    try:
+                        self._ensure_browser_available()
+                        search_company(self.page, company_name)
 
-                try:
-                    search_company(self.page, company_name)
-
-                    # 等待搜索结果区域出现（最多 10 秒，可中断）
-                    loaded = self._wait_for_results(timeout=10)
-                    if not loaded:
-                        if self._should_stop:
-                            break
-                        # 超时但未停止，继续尝试提取
-
-                    # 检测是否遇到验证码/安全验证
-                    if self._check_captcha():
-                        captcha_count += 1
-                        self.retry_signal.emit(
-                            "aiqicha_captcha",
-                            f"爱企查触发第 {captcha_count} 次安全验证",
+                        # 搜索结果页面最多等待 2 分钟，可暂停或停止。
+                        loaded = self._wait_for_results(
+                            timeout=AIQICHA_RESULT_WAIT_SECONDS
                         )
-                        self.log_signal.emit(f"  ⚠️ 检测到验证码（第{captcha_count}次），请在浏览器中完成验证后点击「继续」")
+                        if not loaded:
+                            if self._should_stop:
+                                break
+                            raise AiqichaBrowserRecoveryError(
+                                "等待爱企查搜索结果超时"
+                                f"（{AIQICHA_RESULT_WAIT_SECONDS}秒）"
+                            )
+                        self._ensure_browser_available()
 
-                        # 通过暂停机制等待用户处理验证码
-                        self._pause_event.clear()
-                        self.pause_signal.emit()
-                        self._pause_event.wait()
-                        if self._should_stop:
+                        # 检测是否遇到验证码/安全验证
+                        if self._check_captcha():
+                            captcha_count += 1
+                            self.retry_signal.emit(
+                                "aiqicha_captcha",
+                                f"爱企查触发第 {captcha_count} 次安全验证",
+                            )
+                            self.log_signal.emit(
+                                f"  ⚠️ 检测到验证码（第{captcha_count}次），"
+                                "请在浏览器中完成验证后点击「继续」"
+                            )
+
+                            # 通过暂停机制等待用户处理验证码
+                            self._pause_event.clear()
+                            self.pause_signal.emit()
+                            self._pause_event.wait()
+                            if self._should_stop:
+                                break
+                            self.resume_signal.emit()
+
+                            self.log_signal.emit("  ✅ 验证码已处理，继续查询...")
+
+                        # 先检测是否为0结果（非常快，只读一个元素）
+                        # 如果是0结果，直接跳过耗时的 extract_info
+                        if check_no_results(self.page):
+                            self.log_signal.emit(f"  [{total}] ⚠️ 未查询到公司")
+                            row_data = {}
+                            if not has_meaningful_value(
+                                row.get(LEGAL_COL_NAME, '')
+                            ):
+                                row_data[LEGAL_COL_NAME] = "未查询到公司"
+                        else:
+                            # 有搜索结果，执行完整的信息提取
+                            info = extract_info(self.page)
+                            self._ensure_browser_available()
+                            # 回填数据
+                            row_data = {}
+                            if (
+                                info.get("法定代表人")
+                                and not has_meaningful_value(
+                                    row.get(LEGAL_COL_NAME, '')
+                                )
+                            ):
+                                row_data[LEGAL_COL_NAME] = info["法定代表人"]
+                            if (
+                                info.get("地址")
+                                and not has_meaningful_value(
+                                    row.get(ADDR_COL_NAME, '')
+                                )
+                            ):
+                                row_data[ADDR_COL_NAME] = info["地址"]
+                            if (
+                                info.get("电话")
+                                and not has_meaningful_value(
+                                    row.get(PHONE_COL_NAME, '')
+                                )
+                            ):
+                                row_data[PHONE_COL_NAME] = info["电话"]
+
+                            status = (
+                                f"  [{total}] ✅ 法人:{info['法定代表人'] or '-'}"
+                                f" | 地址:{info['地址'] or '-'}"
+                                f" | 电话:{info['电话'] or '-'}"
+                            )
+                            self.log_signal.emit(status)
+
+                        self.row_done_signal.emit(idx, row_data)
+                        break
+
+                    except Exception as e:
+                        if not is_recoverable_aiqicha_browser_error(e):
+                            self.log_signal.emit(f"  [{total}] ❌ 出错: {e}")
                             break
-                        self.resume_signal.emit()
-
-                        self.log_signal.emit(f"  ✅ 验证码已处理，继续查询...")
-
-                    # 先检测是否为0结果（非常快，只读一个元素）
-                    # 如果是0结果，直接跳过耗时的 extract_info
-                    if check_no_results(self.page):
-                        self.log_signal.emit(f"  [{total}] ⚠️ 未查询到公司")
-                        row_data = {}
-                        if not has_meaningful_value(row.get(LEGAL_COL_NAME, '')):
-                            row_data[LEGAL_COL_NAME] = "未查询到公司"
-                    else:
-                        # 有搜索结果，执行完整的信息提取
-                        info = extract_info(self.page)
-                        # 回填数据
-                        row_data = {}
-                        if info.get("法定代表人") and not has_meaningful_value(row.get(LEGAL_COL_NAME, '')):
-                            row_data[LEGAL_COL_NAME] = info["法定代表人"]
-                        if info.get("地址") and not has_meaningful_value(row.get(ADDR_COL_NAME, '')):
-                            row_data[ADDR_COL_NAME] = info["地址"]
-                        if info.get("电话") and not has_meaningful_value(row.get(PHONE_COL_NAME, '')):
-                            row_data[PHONE_COL_NAME] = info["电话"]
-
-                        status = f"  [{total}] ✅ 法人:{info['法定代表人'] or '-'} | 地址:{info['地址'] or '-'} | 电话:{info['电话'] or '-'}"
-                        self.log_signal.emit(status)
-
-                    self.row_done_signal.emit(idx, row_data)
-
-                except Exception as e:
-                    self.log_signal.emit(f"  [{total}] ❌ 出错: {e}")
+                        browser_restarts += 1
+                        reason = str(e).strip() or e.__class__.__name__
+                        self.retry_signal.emit(
+                            "aiqicha_browser",
+                            f"爱企查浏览器异常重启：{reason[:120]}",
+                        )
+                        self.log_signal.emit(
+                            "  ⚠️ 爱企查浏览器或结果页失效，正在重启并重试"
+                            f"当前记录（第 {browser_restarts} 次，无次数上限）"
+                        )
+                        if not self._start_browser_session(recovery=True):
+                            if self._should_stop:
+                                break
+                            raise RuntimeError(
+                                "爱企查浏览器恢复期间等待登录超时"
+                            )
 
                 done += 1
                 self.progress_signal.emit(total, len(self.df))

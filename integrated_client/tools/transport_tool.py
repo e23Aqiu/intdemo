@@ -184,11 +184,12 @@ CONFIG = {
         "港": "香港特别行政", "澳": "澳门特别行政", "台": "台湾省"
     },
     "BUSINESS_QUERY_URL": "https://ysfw.mot.gov.cn/NetRoadCGSS-web/information/query?searchType=car",
+    "BROWSER_WAIT_TIMEOUT_MS": 120000,
     "CAPTCHA_WAIT_SEC": 5,
-    "BUSINESS_WEB_TIMEOUT_MS": 60000,
+    "BUSINESS_WEB_TIMEOUT_MS": 120000,
     "BUSINESS_CAPTCHA_POLL_MS": 250,
     "BUSINESS_CAPTCHA_STABLE_MS": 800,
-    "BROWSER_RETRY_LIMIT": 3,
+    "BROWSER_RETRY_DELAY_SEC": 1,
 }
 
 
@@ -223,6 +224,20 @@ def ensure_successful_navigation(response, page_name):
     if status is not None and int(status) >= 400:
         raise BrowserRecoveryError(f"{page_name}返回 HTTP {int(status)}")
     return response
+
+
+def wait_before_browser_retry(check_stopped, seconds=None):
+    """浏览器恢复失败后短暂等待，同时保持暂停和停止操作可响应。"""
+    delay = float(
+        CONFIG["BROWSER_RETRY_DELAY_SEC"] if seconds is None else seconds
+    )
+    deadline = time.monotonic() + max(0.0, delay)
+    while True:
+        check_stopped()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(0.2, remaining))
 
 # ====================== 工具函数（通用功能） ======================
 def clean_company_name(name):
@@ -503,6 +518,25 @@ class Worker(QThread):
             self._close_browser()
             return False
 
+    def _create_browser_until_ready(self, retry_type, reason):
+        """持续启动浏览器，直到成功或用户主动停止。"""
+        attempt = 0
+        while self._running:
+            self._check_stopped()
+            attempt += 1
+            if self._create_new_browser():
+                return True
+            self.retry_signal.emit(
+                retry_type,
+                f"{reason}，浏览器启动第 {attempt} 次失败",
+            )
+            self.log.emit(
+                f"⚠️ {reason}，将在稍后继续重试"
+                f"（已尝试 {attempt} 次，无次数上限）"
+            )
+            wait_before_browser_retry(self._check_stopped)
+        return False
+
     def run(self):
         workbook_writer = None
         current_row_index = None
@@ -551,7 +585,10 @@ class Worker(QThread):
                     self.log.emit("❌ 无法保存原始表，请先关闭 Excel/WPS 表格后再运行程序！")
                     raise
 
-            if not self._create_new_browser():
+            if not self._create_browser_until_ready(
+                "transport_browser_start",
+                "运输证查询浏览器启动失败",
+            ):
                 self.finished.emit("失败")
                 return
 
@@ -601,7 +638,10 @@ class Worker(QThread):
                     self.log.emit("✅ 已补缴，无需查询")
                     save_results(idx)
                     try:
-                        self.page.goto(CONFIG["TARGET_URL"], timeout=30000)
+                        self.page.goto(
+                            CONFIG["TARGET_URL"],
+                            timeout=CONFIG["BROWSER_WAIT_TIMEOUT_MS"],
+                        )
                         self.page.wait_for_timeout(1000)
                     except:
                         pass
@@ -640,7 +680,10 @@ class Worker(QThread):
 
                 try:
                     self._check_stopped()
-                    response = self.page.goto(CONFIG["TARGET_URL"], timeout=60000)
+                    response = self.page.goto(
+                        CONFIG["TARGET_URL"],
+                        timeout=CONFIG["BROWSER_WAIT_TIMEOUT_MS"],
+                    )
                     ensure_successful_navigation(response, "运输证查询页")
                     self.log.emit("✓ 切换到外省查询")
                     self.page.locator("text='外省查询'").click()
@@ -728,7 +771,10 @@ class Worker(QThread):
                                 # 正确，退出循环
                                 self.log.emit("✅ 验证码验证成功")
                                 break
-                            self.page.wait_for_selector(".user_zige, :has-text('查询不到信息')", timeout=10000)
+                            self.page.wait_for_selector(
+                                ".user_zige, :has-text('查询不到信息')",
+                                timeout=CONFIG["BROWSER_WAIT_TIMEOUT_MS"],
+                            )
                         self._check_stopped()
 
                     list_loaded = False
@@ -897,11 +943,18 @@ class Worker(QThread):
                         if not list_loaded and "查询不到信息" in self.page.content():
                             raise Exception("查询不到信息")
 
-                        self.page.wait_for_selector(".user_zige", state="visible", timeout=6000)
+                        self.page.wait_for_selector(
+                            ".user_zige",
+                            state="visible",
+                            timeout=CONFIG["BROWSER_WAIT_TIMEOUT_MS"],
+                        )
                         self.log.emit("✅ 列表已加载，准备点击条目")
                         self.page.evaluate("document.querySelector('.user_zige').click()")
                         self.log.emit("✅ 已点击列表条目，等待详情页跳转")
-                        self.page.wait_for_url("**/vehicle_out_inquiry_detail.html**", timeout=8000)
+                        self.page.wait_for_url(
+                            "**/vehicle_out_inquiry_detail.html**",
+                            timeout=CONFIG["BROWSER_WAIT_TIMEOUT_MS"],
+                        )
                         self.log.emit("✅ 已进入详情页")
 
                         tr = ""
@@ -966,19 +1019,21 @@ class Worker(QThread):
                 except Exception as e:
                     if is_recoverable_browser_error(e):
                         browser_restarts += 1
-                        retry_limit = CONFIG["BROWSER_RETRY_LIMIT"]
                         reason = str(e).strip() or e.__class__.__name__
                         self.retry_signal.emit(
                             "transport_browser",
                             f"运输证浏览器异常重启：{reason[:120]}",
                         )
-                        if browser_restarts <= retry_limit:
-                            self.log.emit(
-                                "⚠️ 浏览器或查询页失效，正在重新启动浏览器并重试"
-                                f"当前记录（{browser_restarts}/{retry_limit}）"
-                            )
-                            if self._create_new_browser():
-                                continue
+                        self.log.emit(
+                            "⚠️ 浏览器或查询页失效，正在重新启动浏览器并重试"
+                            f"当前记录（第 {browser_restarts} 次，无次数上限）"
+                        )
+                        if self._create_browser_until_ready(
+                            "transport_browser_start",
+                            "运输证查询浏览器恢复失败",
+                        ):
+                            continue
+                        self._check_stopped()
                         raise BrowserRecoveryError(
                             "运输证浏览器恢复失败，当前记录未跳过，步骤 1 已停止"
                         ) from e
@@ -1128,19 +1183,22 @@ class BusinessBackfillWorker(QThread):
             return False
 
     def _create_browser_with_retries(self, retry_type, reason):
-        retry_limit = CONFIG["BROWSER_RETRY_LIMIT"]
-        for attempt in range(1, retry_limit + 1):
+        """持续启动浏览器，直到成功或用户主动停止。"""
+        attempt = 0
+        while self._running:
             self._check_stopped()
+            attempt += 1
             if self._create_new_browser():
                 return True
             self.retry_signal.emit(
                 retry_type,
                 f"{reason}，浏览器启动第 {attempt} 次失败",
             )
-            if attempt < retry_limit:
-                self.log.emit(
-                    f"⚠️ 浏览器启动失败，正在重试（{attempt}/{retry_limit}）"
-                )
+            self.log.emit(
+                "⚠️ 浏览器启动失败，正在继续重试"
+                f"（已尝试 {attempt} 次，无次数上限）"
+            )
+            wait_before_browser_retry(self._check_stopped)
         return False
 
     def _captcha_prompt_is_visible(self):
@@ -1872,29 +1930,24 @@ class BusinessBackfillWorker(QThread):
                     if is_recoverable_browser_error(e):
                         attempt = browser_restart_counts.get(idx, 0) + 1
                         browser_restart_counts[idx] = attempt
-                        retry_limit = CONFIG["BROWSER_RETRY_LIMIT"]
                         self.retry_signal.emit(
                             "business_browser",
                             f"营运查询浏览器异常重启：{err_msg[:80]}",
                         )
-                        if attempt <= retry_limit:
-                            self.log.emit(
-                                "⚠️ 营运查询页或浏览器失效，正在重新启动并重试"
-                                f"当前记录（{attempt}/{retry_limit}）"
-                            )
-                            if self._create_browser_with_retries(
-                                "business_browser",
-                                "营运查询浏览器恢复失败",
-                            ):
-                                need_retry = True
-                                company = ""
-                            else:
-                                raise BrowserRecoveryError(
-                                    "营运查询浏览器重新启动失败"
-                                ) from e
+                        self.log.emit(
+                            "⚠️ 营运查询页或浏览器失效，正在重新启动并重试"
+                            f"当前记录（第 {attempt} 次，无次数上限）"
+                        )
+                        if self._create_browser_with_retries(
+                            "business_browser",
+                            "营运查询浏览器恢复失败",
+                        ):
+                            need_retry = True
+                            company = ""
                         else:
+                            self._check_stopped()
                             raise BrowserRecoveryError(
-                                "营运查询页连续失效，当前记录未跳过，步骤 2 已停止"
+                                "营运查询浏览器重新启动失败"
                             ) from e
                     else:
                         company = ""

@@ -43,13 +43,16 @@ from integrated_client.database import (
 from integrated_client.tools.aiqicha_tool import MainWindow as AiqichaToolWidget
 from integrated_client.tools.aiqicha_tool import (
     ADDR_COL_NAME,
+    AIQICHA_RESULT_WAIT_SECONDS,
     LEGAL_COL_NAME,
     PHONE_COL_NAME,
+    QueryWorker,
     TARGET_COLUMNS,
     has_meaningful_value,
 )
 from integrated_client.tools.transport_tool import (
     BusinessBackfillWorker,
+    CONFIG,
     TargetedWorkbookWriter,
     Worker,
 )
@@ -344,7 +347,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(sheet.cell(2, headers["查询状态"]).value, "已有企业信息（跳过）")
         saved.close()
 
-    def test_transport_worker_restarts_closed_browser_and_retries_same_row(self):
+    def test_transport_worker_restarts_closed_browser_without_limit(self):
         file_path = Path(self.temp_dir.name) / "transport-browser-restart.xlsx"
         workbook = Workbook()
         sheet = workbook.active
@@ -448,10 +451,13 @@ class ToolAndUiTests(unittest.TestCase):
             def start(self):
                 return self.runtime
 
-        closed_page = Page(closed=True)
+        closed_pages = [Page(closed=True) for _ in range(4)]
         recovered_page = Page()
         managers = iter(
-            (Manager(Runtime(closed_page)), Manager(Runtime(recovered_page)))
+            [
+                *(Manager(Runtime(page)) for page in closed_pages),
+                Manager(Runtime(recovered_page)),
+            ]
         )
         worker = Worker(str(file_path), True, False, 2, True, 2, False)
         logs = []
@@ -472,11 +478,15 @@ class ToolAndUiTests(unittest.TestCase):
         ):
             worker.run()
 
-        self.assertEqual(closed_page.goto_calls, 1)
+        self.assertTrue(all(page.goto_calls == 1 for page in closed_pages))
         self.assertGreaterEqual(recovered_page.goto_calls, 1)
         self.assertEqual(results, ["完成"])
-        self.assertTrue(any(item[0] == "transport_browser" for item in retries))
+        self.assertGreaterEqual(
+            sum(item[0] == "transport_browser" for item in retries),
+            4,
+        )
         self.assertTrue(any("重试当前记录" in line for line in logs))
+        self.assertTrue(any("无次数上限" in line for line in logs))
         saved = load_workbook(file_path, data_only=True)
         headers = {
             cell.value: cell.column
@@ -489,7 +499,7 @@ class ToolAndUiTests(unittest.TestCase):
         )
         saved.close()
 
-    def test_business_worker_restarts_after_http_404_and_emits_once(self):
+    def test_business_worker_restarts_after_repeated_http_404(self):
         file_path = Path(self.temp_dir.name) / "business-browser-restart.xlsx"
         workbook = Workbook()
         sheet = workbook.active
@@ -565,10 +575,13 @@ class ToolAndUiTests(unittest.TestCase):
             def start(self):
                 return self.runtime
 
-        not_found_page = Page(404)
+        not_found_pages = [Page(404) for _ in range(4)]
         recovered_page = Page(200)
         managers = iter(
-            (Manager(Runtime(not_found_page)), Manager(Runtime(recovered_page)))
+            [
+                *(Manager(Runtime(page)) for page in not_found_pages),
+                Manager(Runtime(recovered_page)),
+            ]
         )
         worker = BusinessBackfillWorker(str(file_path), True, True, 2, False)
         logs = []
@@ -590,11 +603,15 @@ class ToolAndUiTests(unittest.TestCase):
         ), patch.object(BusinessBackfillWorker, "solve_captcha", return_value=False):
             worker.run()
 
-        self.assertEqual(not_found_page.goto_calls, 1)
+        self.assertTrue(all(page.goto_calls == 1 for page in not_found_pages))
         self.assertEqual(recovered_page.goto_calls, 1)
         self.assertEqual(results, ["结束"])
-        self.assertTrue(any(item[0] == "business_browser" for item in retries))
+        self.assertGreaterEqual(
+            sum(item[0] == "business_browser" for item in retries),
+            4,
+        )
         self.assertTrue(any("重新启动并重试当前记录" in line for line in logs))
+        self.assertTrue(any("无次数上限" in line for line in logs))
         saved = load_workbook(file_path, data_only=True)
         headers = {
             cell.value: cell.column
@@ -633,7 +650,8 @@ class ToolAndUiTests(unittest.TestCase):
         ):
             response_state = worker._wait_for_business_response()
 
-        self.assertEqual(worker.web_timeout, 60_000)
+        self.assertEqual(worker.web_timeout, 120_000)
+        self.assertEqual(CONFIG["BROWSER_WAIT_TIMEOUT_MS"], 120_000)
         self.assertEqual(response_state, "captcha")
         self.assertEqual(page.waits, [250, 800, 250, 800])
         self.assertTrue(any("等待营运查询响应" in line for line in logs))
@@ -647,6 +665,106 @@ class ToolAndUiTests(unittest.TestCase):
         ):
             self.assertTrue(worker._wait_for_business_result())
         self.assertEqual(page.waits, [250, 250])
+
+    def test_aiqicha_worker_restarts_browser_without_limit_and_retries_same_row(self):
+        dataframe = pd.DataFrame(
+            {
+                "车辆所有人/企业": ["测试运输有限公司"],
+                "负责人/法人代表": [""],
+                "地址": [""],
+                "电话": [""],
+            }
+        )
+
+        class Page:
+            def __init__(self, fail_search=False):
+                self.fail_search = fail_search
+                self.home_calls = 0
+                self.search_calls = 0
+
+            def get(self, url):
+                if url == "https://aiqicha.baidu.com":
+                    self.home_calls += 1
+                    return None
+                self.search_calls += 1
+                if self.fail_search:
+                    raise RuntimeError("connection disconnected: browser closed")
+                return None
+
+            def quit(self):
+                return None
+
+        failed_pages = [Page(fail_search=True) for _ in range(4)]
+        recovered_page = Page()
+        pages = iter([*failed_pages, recovered_page])
+        worker = QueryWorker(dataframe, "车辆所有人/企业")
+        worker.login_required_signal.connect(worker.confirm_login)
+        logs = []
+        retries = []
+        rows = []
+        results = []
+        worker.log_signal.connect(logs.append)
+        worker.retry_signal.connect(
+            lambda retry_type, reason: retries.append((retry_type, reason))
+        )
+        worker.row_done_signal.connect(
+            lambda row_index, values: rows.append((row_index, values))
+        )
+        worker.finished_signal.connect(results.append)
+
+        with patch(
+            "integrated_client.tools.aiqicha_tool.create_browser",
+            side_effect=lambda: next(pages),
+        ), patch.object(
+            worker,
+            "_interruptible_sleep",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_wait_for_results",
+            return_value=True,
+        ) as wait_for_results, patch.object(
+            worker,
+            "_check_captcha",
+            return_value=False,
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.check_no_results",
+            return_value=False,
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.extract_info",
+            return_value={
+                "法定代表人": "张三",
+                "地址": "测试地址",
+                "电话": "13800138000",
+            },
+        ):
+            worker.run()
+
+        self.assertTrue(all(page.search_calls == 1 for page in failed_pages))
+        self.assertEqual(recovered_page.search_calls, 1)
+        self.assertEqual(results, [True])
+        self.assertEqual(
+            rows,
+            [
+                (
+                    0,
+                    {
+                        "负责人/法人代表": "张三",
+                        "地址": "测试地址",
+                        "电话": "13800138000",
+                    },
+                )
+            ],
+        )
+        self.assertGreaterEqual(
+            sum(item[0] == "aiqicha_browser" for item in retries),
+            4,
+        )
+        self.assertTrue(any("无次数上限" in line for line in logs))
+        wait_for_results.assert_called_once_with(
+            timeout=AIQICHA_RESULT_WAIT_SECONDS
+        )
+        self.assertEqual(AIQICHA_RESULT_WAIT_SECONDS, 120)
 
     def test_main_window_contains_integrated_pages(self):
         window = MainWindow(self.db, self.admin)
@@ -1942,6 +2060,56 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.log_panel.is_expanded())
         self.assertFalse(page.log_text.isHidden())
         self.assertTrue(page.collapsed_content_spacer.isHidden())
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_workflow_timing_refreshes_milliseconds_independently(self):
+        class TimingService:
+            is_active = True
+
+            def __init__(self):
+                self.heartbeat_count = 0
+
+            @staticmethod
+            def format_duration(milliseconds):
+                return WorkflowTimingService.format_duration(milliseconds)
+
+            @staticmethod
+            def snapshot():
+                return {
+                    "state": "running",
+                    "run_active_ms": 57,
+                    "run_paused_ms": 0,
+                    "batch_active_ms": 1_057,
+                }
+
+            def heartbeat(self):
+                self.heartbeat_count += 1
+
+        service = TimingService()
+        page = WorkflowPage(timing_service=service)
+
+        self.assertEqual(
+            page.timing_timer.interval(),
+            page.TIMING_DISPLAY_INTERVAL_MS,
+        )
+        self.assertEqual(page.TIMING_DISPLAY_INTERVAL_MS, 50)
+        self.assertEqual(page.timing_timer.timerType(), Qt.PreciseTimer)
+        self.assertEqual(
+            page.timing_heartbeat_timer.interval(),
+            page.TIMING_HEARTBEAT_INTERVAL_MS,
+        )
+        self.assertEqual(page.TIMING_HEARTBEAT_INTERVAL_MS, 5_000)
+
+        page._timing_tick()
+        self.assertIn("本次有效用时 00:00:00.057", page.timing_label.text())
+        self.assertIn("本批次累计 00:00:01.057", page.timing_label.text())
+        self.assertEqual(service.heartbeat_count, 0)
+
+        page._timing_heartbeat()
+        self.assertEqual(service.heartbeat_count, 1)
+
+        service.is_active = False
         self.assertTrue(page.shutdown())
         page.close()
 
