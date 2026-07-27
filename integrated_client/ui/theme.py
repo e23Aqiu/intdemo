@@ -214,10 +214,65 @@ QLabel#SidebarSectionLabel {
     font-size: 11px;
     font-weight: 700;
 }
-QLabel#SidebarStatus {
-    color: #72d2bd;
-    padding: 3px 10px;
+QFrame#SidebarSyncCard {
+    background: #0e373b;
+    border: 1px solid #28565a;
+    border-radius: 10px;
+}
+QFrame#SidebarSyncCard[state="online"] {
+    border-color: #287565;
+    background: #103c3d;
+}
+QFrame#SidebarSyncCard[state="offline"],
+QFrame#SidebarSyncCard[state="error"],
+QFrame#SidebarSyncCard[state="reauth_required"] {
+    border-color: #76584b;
+}
+QLabel#SyncStateDot {
+    color: #78a4a2;
+    border: none;
+    background: transparent;
     font-size: 11px;
+}
+QLabel#SyncStateDot[state="online"] { color: #59d3a6; }
+QLabel#SyncStateDot[state="syncing"] { color: #74b9ff; }
+QLabel#SyncStateDot[state="offline"] { color: #f0ad69; }
+QLabel#SyncStateDot[state="error"],
+QLabel#SyncStateDot[state="reauth_required"] { color: #ff787d; }
+QLabel#SyncStateTitle {
+    color: #eef9f7;
+    border: none;
+    background: transparent;
+    font-size: 11px;
+    font-weight: 700;
+}
+QLabel#SyncPendingBadge {
+    color: #a9c9c6;
+    background: #173f43;
+    border: 1px solid #2b5c5f;
+    border-radius: 7px;
+    padding: 1px 5px;
+    font-size: 9px;
+    font-weight: 600;
+}
+QLabel#SyncPendingBadge[hasPending="true"] {
+    color: #ffd29a;
+    background: #4a3b2d;
+    border-color: #76583e;
+}
+QLabel#SyncDetail {
+    color: #91b9b6;
+    border: none;
+    background: transparent;
+    font-size: 9px;
+}
+QLabel#SyncError {
+    color: #ffc1bf;
+    background: #4c3031;
+    border: 1px solid #724647;
+    border-radius: 5px;
+    padding: 3px 5px;
+    font-size: 9px;
 }
 QFrame#SidebarProfile {
     background: #123b40;
@@ -817,6 +872,17 @@ QPushButton#PrimaryButton {
 QPushButton#PrimaryButton:hover {
     background: #2868db;
 }
+QPushButton#UpdateButton {
+    color: #245fc7;
+    background: #edf4ff;
+    border-color: #c8daf8;
+    font-weight: 600;
+}
+QPushButton#UpdateButton:hover {
+    color: #174ea6;
+    background: #dfeaff;
+    border-color: #adc7f1;
+}
 QPushButton#AnomalyButton {
     color: #9a6415;
     background: #fff7e5;
@@ -986,6 +1052,7 @@ QLabel#ModeHint:disabled {
 }
 QPushButton:disabled,
 QPushButton#PrimaryButton:disabled,
+QPushButton#UpdateButton:disabled,
 QPushButton#AnomalyButton:disabled,
 QPushButton#DangerButton:disabled,
 QPushButton#ViolationModeButton:checked:disabled {

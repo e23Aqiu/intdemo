@@ -942,6 +942,14 @@ class DashboardPage(QWidget):
             for account in self.database.list_accounts()
             if not account.is_admin
         ]
+        restricted_online_scope = (
+            self.account.server_account_id is not None
+            and not self.account.can_view_all_stats
+        )
+        if restricted_online_scope:
+            stations = [
+                account for account in stations if account.id == self.account.id
+            ]
         stations.sort(
             key=lambda item: (
                 default_order.get(item.username, 999),
@@ -960,9 +968,12 @@ class DashboardPage(QWidget):
         elif had_options and current_id is None:
             target_id = None
         else:
-            target_id = None if self.account.is_admin else self.account.id
+            target_id = (
+                None if self.account.can_view_all_stats else self.account.id
+            )
         target_index = self.station_combo.findData(target_id)
         self.station_combo.setCurrentIndex(target_index if target_index >= 0 else 0)
+        self.station_combo.setEnabled(not restricted_online_scope)
         self.station_combo.blockSignals(False)
 
     def _scope(self):

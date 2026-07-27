@@ -1,0 +1,397 @@
+from __future__ import annotations
+
+import uuid
+
+from fastapi import APIRouter, Query, Request
+from sqlalchemy import func, select, update
+
+from ..database import utcnow
+from ..dependencies import AdminContext, Db
+from ..errors import ApiError
+from ..models import (
+    Account,
+    ActivityEvent,
+    AuditLog,
+    Device,
+    WorkflowBatch,
+    WorkflowRun,
+)
+from ..realtime import update_hub
+from ..schemas import (
+    AccountCreate,
+    AccountUpdate,
+    AccountView,
+    DataResetRequest,
+    DeviceView,
+)
+from ..security import hash_password
+from ..services import (
+    account_view,
+    append_change,
+    audit,
+    device_view,
+    latest_revision,
+    revoke_refresh_sessions,
+)
+
+router = APIRouter(prefix="/admin", tags=["administration"])
+
+
+def _account_or_404(db: Db, account_id: uuid.UUID) -> Account:
+    account = db.get(Account, account_id)
+    if not account:
+        raise ApiError("account_not_found", "账号不存在", status_code=404)
+    return account
+
+
+def _account_change_payload(account: Account) -> dict:
+    return {
+        "username": account.username,
+        "display_name": account.display_name,
+        "role": account.role,
+        "stats_scope": account.stats_scope,
+        "device_limit": account.device_limit,
+        "is_active": account.is_active,
+        "is_archived": account.is_archived,
+        "entitlement_revision": account.entitlement_revision,
+    }
+
+
+@router.get("/accounts", response_model=list[AccountView])
+def list_accounts(context: AdminContext, db: Db) -> list[dict]:
+    accounts = db.scalars(select(Account).order_by(Account.username)).all()
+    return [account_view(db, account) for account in accounts]
+
+
+@router.post("/accounts", response_model=AccountView, status_code=201)
+async def create_account(
+    payload: AccountCreate,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> dict:
+    if db.scalar(select(Account.id).where(Account.username == payload.username)):
+        raise ApiError("username_exists", "登录名已存在", status_code=409)
+    account = Account(
+        username=payload.username,
+        display_name=payload.display_name.strip(),
+        password_hash=hash_password("123456"),
+        role=payload.role,
+        stats_scope=payload.stats_scope,
+        device_limit=payload.device_limit,
+        is_active=payload.is_active,
+        must_change_password=True,
+    )
+    db.add(account)
+    db.flush()
+    change = append_change(
+        db,
+        account_id=account.id,
+        kind="account",
+        entity_id=str(account.id),
+        entity_revision=account.entitlement_revision,
+        payload=_account_change_payload(account),
+    )
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.create",
+        target_type="account",
+        target_id=str(account.id),
+        details={"username": account.username},
+    )
+    db.commit()
+    await update_hub.broadcast_revision(change.revision)
+    return account_view(db, account)
+
+
+@router.patch("/accounts/{account_id}", response_model=AccountView)
+async def update_account(
+    account_id: uuid.UUID,
+    payload: AccountUpdate,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> dict:
+    account = _account_or_404(db, account_id)
+    changes = payload.model_dump(exclude_unset=True)
+    if "device_limit" in changes:
+        active_devices = int(
+            db.scalar(
+                select(func.count(Device.id)).where(
+                    Device.account_id == account.id,
+                    Device.revoked_at.is_(None),
+                )
+            )
+            or 0
+        )
+        if changes["device_limit"] < active_devices:
+            raise ApiError(
+                "device_limit_below_active_count",
+                "设备上限不能低于当前有效设备数，请先撤销设备",
+                status_code=409,
+                details={"active_device_count": active_devices},
+            )
+    if account.id == context.account.id and changes.get("is_active") is False:
+        raise ApiError("cannot_disable_self", "不能停用当前管理员账号", status_code=409)
+    if account.id == context.account.id and changes.get("role") == "user":
+        raise ApiError("cannot_demote_self", "不能降低当前管理员权限", status_code=409)
+
+    security_changed = any(
+        name in changes and changes[name] != getattr(account, name)
+        for name in ("role", "stats_scope", "is_active")
+    )
+    for name, value in changes.items():
+        if name == "display_name":
+            value = value.strip()
+        setattr(account, name, value)
+    account.entitlement_revision += 1
+    if security_changed:
+        account.token_version += 1
+        revoke_refresh_sessions(db, account_id=account.id, reason="account_updated")
+    change = append_change(
+        db,
+        account_id=account.id,
+        kind="account",
+        entity_id=str(account.id),
+        entity_revision=account.entitlement_revision,
+        payload=_account_change_payload(account),
+    )
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.update",
+        target_type="account",
+        target_id=str(account.id),
+        details={"fields": sorted(changes)},
+    )
+    db.commit()
+    await update_hub.broadcast_revision(change.revision)
+    return account_view(db, account)
+
+
+@router.post("/accounts/{account_id}/archive", response_model=AccountView)
+async def archive_account(
+    account_id: uuid.UUID,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> dict:
+    account = _account_or_404(db, account_id)
+    if account.id == context.account.id:
+        raise ApiError("cannot_archive_self", "不能归档当前管理员账号", status_code=409)
+    account.is_archived = True
+    account.is_active = False
+    account.entitlement_revision += 1
+    account.token_version += 1
+    revoke_refresh_sessions(db, account_id=account.id, reason="account_archived")
+    change = append_change(
+        db,
+        account_id=account.id,
+        kind="account",
+        entity_id=str(account.id),
+        entity_revision=account.entitlement_revision,
+        operation="upsert",
+        payload=_account_change_payload(account),
+    )
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.archive",
+        target_type="account",
+        target_id=str(account.id),
+    )
+    db.commit()
+    await update_hub.broadcast_revision(change.revision)
+    return account_view(db, account)
+
+
+@router.post("/accounts/{account_id}/restore", response_model=AccountView)
+async def restore_account(
+    account_id: uuid.UUID,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> dict:
+    account = _account_or_404(db, account_id)
+    account.is_archived = False
+    account.entitlement_revision += 1
+    change = append_change(
+        db,
+        account_id=account.id,
+        kind="account",
+        entity_id=str(account.id),
+        entity_revision=account.entitlement_revision,
+        payload=_account_change_payload(account),
+    )
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.restore",
+        target_type="account",
+        target_id=str(account.id),
+    )
+    db.commit()
+    await update_hub.broadcast_revision(change.revision)
+    return account_view(db, account)
+
+
+@router.post("/accounts/{account_id}/reset-password", status_code=204)
+async def reset_password(
+    account_id: uuid.UUID,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> None:
+    account = _account_or_404(db, account_id)
+    account.password_hash = hash_password("123456")
+    account.must_change_password = True
+    account.token_version += 1
+    account.entitlement_revision += 1
+    revoke_refresh_sessions(db, account_id=account.id, reason="password_reset")
+    change = append_change(
+        db,
+        account_id=account.id,
+        kind="account",
+        entity_id=str(account.id),
+        entity_revision=account.entitlement_revision,
+        payload=_account_change_payload(account),
+    )
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.password_reset",
+        target_type="account",
+        target_id=str(account.id),
+    )
+    db.commit()
+    await update_hub.broadcast_revision(change.revision)
+
+
+@router.get("/accounts/{account_id}/devices", response_model=list[DeviceView])
+def list_devices(
+    account_id: uuid.UUID,
+    context: AdminContext,
+    db: Db,
+) -> list[dict]:
+    _account_or_404(db, account_id)
+    devices = db.scalars(
+        select(Device).where(Device.account_id == account_id).order_by(Device.created_at.desc())
+    ).all()
+    return [device_view(device) for device in devices]
+
+
+@router.post("/devices/{device_id}/revoke", status_code=204)
+async def revoke_device(
+    device_id: uuid.UUID,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> None:
+    device = db.get(Device, device_id)
+    if not device:
+        raise ApiError("device_not_found", "设备不存在", status_code=404)
+    if device.id == context.device.id:
+        raise ApiError("cannot_revoke_current_device", "不能撤销当前登录设备", status_code=409)
+    if device.revoked_at is None:
+        device.revoked_at = utcnow()
+        device.revoked_reason = "revoked_by_admin"
+        revoke_refresh_sessions(db, device_id=device.id, reason="device_revoked")
+        account = db.get(Account, device.account_id)
+        account.entitlement_revision += 1
+        change = append_change(
+            db,
+            account_id=account.id,
+            kind="device_revoked",
+            entity_id=str(device.device_uid),
+            entity_revision=account.entitlement_revision,
+            operation="delete",
+            payload={"device_uid": str(device.device_uid)},
+        )
+        audit(
+            db,
+            request,
+            actor_id=context.account.id,
+            action="device.revoke",
+            target_type="device",
+            target_id=str(device.id),
+        )
+        db.commit()
+        await update_hub.broadcast_revision(change.revision)
+
+
+@router.post("/data-reset", status_code=204)
+async def reset_data(
+    payload: DataResetRequest,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> None:
+    account = _account_or_404(db, payload.account_id)
+    reset_at = utcnow()
+    account.data_reset_at = reset_at
+    account.entitlement_revision += 1
+    for model in (ActivityEvent, WorkflowBatch, WorkflowRun):
+        db.execute(
+            update(model)
+            .where(model.account_id == account.id, model.deleted_at.is_(None))
+            .values(deleted_at=reset_at)
+        )
+    change = append_change(
+        db,
+        account_id=account.id,
+        kind="account_data_reset",
+        entity_id=str(account.id),
+        entity_revision=account.entitlement_revision,
+        operation="delete",
+        payload={"reset_at": reset_at.isoformat()},
+    )
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.data_reset",
+        target_type="account",
+        target_id=str(account.id),
+        details={"reset_at": reset_at.isoformat()},
+    )
+    db.commit()
+    await update_hub.broadcast_revision(change.revision)
+
+
+@router.get("/audit")
+def list_audit_logs(
+    context: AdminContext,
+    db: Db,
+    limit: int = Query(default=100, ge=1, le=500),
+    before_id: int | None = Query(default=None, ge=1),
+) -> dict:
+    query = select(AuditLog)
+    if before_id is not None:
+        query = query.where(AuditLog.id < before_id)
+    rows = db.scalars(query.order_by(AuditLog.id.desc()).limit(limit + 1)).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+    return {
+        "items": [
+            {
+                "id": row.id,
+                "actor_account_id": row.actor_account_id,
+                "action": row.action,
+                "target_type": row.target_type,
+                "target_id": row.target_id,
+                "request_id": row.request_id,
+                "ip_address": row.ip_address,
+                "details": row.details,
+                "created_at": row.created_at,
+            }
+            for row in rows
+        ],
+        "has_more": has_more,
+        "latest_revision": latest_revision(db),
+    }

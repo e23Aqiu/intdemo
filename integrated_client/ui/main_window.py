@@ -1,8 +1,8 @@
-from dataclasses import replace
 import os
 import threading
+from dataclasses import replace
 
-from PyQt5.QtCore import QSize, Qt, pyqtSignal
+from PyQt5.QtCore import QProcess, QSize, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication,
@@ -27,9 +27,12 @@ from .auth_dialogs import PasswordDialog
 from .dashboard_page import DashboardPage
 from .frameless import (
     FramelessMainWindow,
-    FramelessMessageBox as QMessageBox,
     WindowControls,
 )
+from .frameless import (
+    FramelessMessageBox as QMessageBox,
+)
+from .online_account_page import OnlineAccountPage
 from .personal_center_page import PersonalCenterPage
 from .statistics_page import StatisticsPage
 from .theme import _control_asset_path, install_disabled_cursor_filter
@@ -47,17 +50,30 @@ class MainWindow(FramelessMainWindow):
         "data_violation": "violation",
     }
 
-    def __init__(self, database: Database, account: Account, parent=None):
+    def __init__(
+        self,
+        database: Database,
+        account: Account,
+        parent=None,
+        session_manager=None,
+        sync_coordinator=None,
+        update_coordinator=None,
+    ):
         super().__init__(parent)
         application = QApplication.instance()
         if application is not None:
             install_disabled_cursor_filter(application)
         self.database = database
         self.account = account
+        self.session_manager = session_manager
+        self.sync_coordinator = sync_coordinator
+        self.update_coordinator = update_coordinator
+        self.available_update = None
         self._prepared_to_close = False
         self._hard_exit_timer = None
         self._nav_buttons = {}
         self._pages = {}
+        self._reauth_scheduled = False
 
         self.setWindowTitle(f"{APP_NAME} - {account.name_label}")
         self.setMinimumSize(800, 600)
@@ -113,7 +129,14 @@ class MainWindow(FramelessMainWindow):
         self._add_page("statistics", self.statistics_page)
         self._add_page("workflow", self.workflow_page)
         if account.is_admin:
-            self.account_page = AccountPage(database, account)
+            if self.session_manager is not None:
+                self.account_page = OnlineAccountPage(
+                    database,
+                    account,
+                    self.session_manager,
+                )
+            else:
+                self.account_page = AccountPage(database, account)
             self.account_page.account_name_changed.connect(
                 self._account_name_changed
             )
@@ -130,6 +153,25 @@ class MainWindow(FramelessMainWindow):
         else:
             self.account_page = None
         self._add_page("personal", self.personal_center_page)
+
+        if self.sync_coordinator is not None:
+            self.sync_coordinator.status_changed.connect(
+                self._update_sync_status
+            )
+            self.sync_coordinator.data_changed.connect(
+                self._online_data_changed
+            )
+            self._update_sync_status(self.sync_coordinator.engine.status())
+        if self.update_coordinator is not None:
+            self.update_coordinator.update_available.connect(
+                self._update_available
+            )
+            self.update_coordinator.state_changed.connect(
+                self._update_download_state
+            )
+            self.update_coordinator.download_completed.connect(
+                self._update_downloaded
+            )
 
         self.show_page("home" if account.is_admin else "workflow")
 
@@ -154,8 +196,9 @@ class MainWindow(FramelessMainWindow):
         brand_text = QVBoxLayout()
         brand_text.setContentsMargins(0, 0, 0, 0)
         brand_text.setSpacing(1)
-        brand = QLabel("运输业务平台")
+        brand = QLabel(APP_NAME.replace("查询工具", "\n查询工具"))
         brand.setObjectName("BrandTitle")
+        brand.setWordWrap(True)
         sub = QLabel(f"INTDEMO  ·  v{APP_VERSION}")
         sub.setObjectName("BrandSubTitle")
         brand_text.addWidget(brand)
@@ -219,9 +262,51 @@ class MainWindow(FramelessMainWindow):
 
         layout.addStretch()
 
-        status = QLabel("●  本地数据已连接")
-        status.setObjectName("SidebarStatus")
-        layout.addWidget(status)
+        sync_card = QFrame()
+        sync_card.setObjectName("SidebarSyncCard")
+        self.sync_status_card = sync_card
+        sync_layout = QVBoxLayout(sync_card)
+        sync_layout.setContentsMargins(11, 9, 11, 9)
+        sync_layout.setSpacing(5)
+
+        sync_header = QHBoxLayout()
+        sync_header.setContentsMargins(0, 0, 0, 0)
+        sync_header.setSpacing(5)
+        self.sync_state_dot = QLabel("●")
+        self.sync_state_dot.setObjectName("SyncStateDot")
+        self.sync_state_dot.setProperty("state", "local")
+        self.sync_state_dot.setFixedWidth(12)
+        sync_header.addWidget(self.sync_state_dot)
+        self.sync_state_title = QLabel(
+            "等待连接" if self.sync_coordinator is not None else "本地模式"
+        )
+        self.sync_state_title.setObjectName("SyncStateTitle")
+        sync_header.addWidget(self.sync_state_title)
+        sync_header.addStretch()
+        self.sync_pending_badge = QLabel("待上传 0")
+        self.sync_pending_badge.setObjectName("SyncPendingBadge")
+        self.sync_pending_badge.setProperty("hasPending", False)
+        self.sync_pending_badge.setVisible(self.sync_coordinator is not None)
+        sync_header.addWidget(self.sync_pending_badge)
+        sync_layout.addLayout(sync_header)
+
+        self.sync_detail_label = QLabel(
+            "数据仅保存在本机"
+            if self.sync_coordinator is None
+            else "正在读取同步状态"
+        )
+        self.sync_detail_label.setObjectName("SyncDetail")
+        self.sync_detail_label.setWordWrap(True)
+        sync_layout.addWidget(self.sync_detail_label)
+
+        self.sync_error_label = QLabel("")
+        self.sync_error_label.setObjectName("SyncError")
+        self.sync_error_label.setWordWrap(True)
+        self.sync_error_label.hide()
+        sync_layout.addWidget(self.sync_error_label)
+        # Compatibility alias for older UI automation.
+        self.sync_status_label = self.sync_detail_label
+        layout.addWidget(sync_card)
 
         profile = QFrame()
         profile.setObjectName("SidebarProfile")
@@ -288,10 +373,213 @@ class MainWindow(FramelessMainWindow):
         self.page_title.setStyleSheet("font-size:16px;font-weight:700;color:#173a3d;")
         layout.addWidget(self.page_title)
         layout.addStretch()
+        self.update_button = QPushButton("检查更新")
+        self.update_button.setObjectName("UpdateButton")
+        self.update_button.setVisible(self.update_coordinator is not None)
+        self.update_button.clicked.connect(self._update_button_clicked)
+        layout.addWidget(self.update_button)
+        self.sync_retry_button = QPushButton("立即同步")
+        self.sync_retry_button.setObjectName("PrimaryButton")
+        self.sync_retry_button.setVisible(self.sync_coordinator is not None)
+        self.sync_retry_button.clicked.connect(self._retry_sync)
+        layout.addWidget(self.sync_retry_button)
         self.window_controls = WindowControls(self, bar)
         layout.addWidget(self.window_controls)
         self.register_window_drag_region(bar)
         return bar
+
+    def _update_available(self, update):
+        self.available_update = update
+        self.update_button.setText(f"发现新版本 v{update.version}")
+        self.update_button.setEnabled(True)
+        self.update_button.show()
+
+    def _update_button_clicked(self):
+        if self.available_update is not None:
+            self._download_available_update()
+        elif self.update_coordinator is not None:
+            self.update_coordinator.check(manual=True)
+
+    def _download_available_update(self):
+        update = self.available_update
+        if update is None or self.update_coordinator is None:
+            return
+        notes = update.notes or "本次更新包含功能改进和问题修复。"
+        reply = QMessageBox.question(
+            self,
+            "下载程序更新",
+            f"发现新版本 v{update.version}。\n\n{notes}\n\n"
+            "是否现在下载？下载完成后会再次询问是否安装。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.update_coordinator.download(update)
+
+    def _update_download_state(self, state, message):
+        if state == "checking":
+            self.update_button.setEnabled(False)
+            self.update_button.setText(message)
+        elif state == "up_to_date":
+            self.update_button.setEnabled(True)
+            self.update_button.setText(f"已是最新 v{APP_VERSION}")
+            QTimer.singleShot(2500, self._reset_update_button)
+        elif state == "check_error":
+            self.update_button.setEnabled(True)
+            self.update_button.setText("重新检查更新")
+            QMessageBox.warning(self, "检查更新失败", message)
+        elif state == "downloading":
+            self.update_button.setEnabled(False)
+            self.update_button.setText(message)
+        elif state == "download_error":
+            self.update_button.setEnabled(True)
+            update = self.available_update
+            if update is not None:
+                self.update_button.setText(f"重新下载 v{update.version}")
+            QMessageBox.warning(self, "更新下载失败", message)
+
+    def _reset_update_button(self):
+        if self.available_update is None and hasattr(self, "update_button"):
+            self.update_button.setText("检查更新")
+
+    def _update_downloaded(self, installer_path):
+        update = self.available_update
+        version = update.version if update is not None else "新版本"
+        self.update_button.setEnabled(True)
+        self.update_button.setText(f"安装 v{version}")
+        reply = QMessageBox.question(
+            self,
+            "安装程序更新",
+            "更新包已经完成 SHA-256 校验。\n\n"
+            "安装前程序需要安全结束当前任务并退出，是否现在安装？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        if not self._prepare_close():
+            return
+        launched = QProcess.startDetached(
+            str(installer_path),
+            ["/SP-", "/CLOSEAPPLICATIONS"],
+        )
+        if isinstance(launched, tuple):
+            launched = launched[0]
+        if not launched:
+            self._prepared_to_close = False
+            QMessageBox.critical(
+                self,
+                "无法启动安装包",
+                f"请手动运行：\n{installer_path}",
+            )
+            return
+        self.close()
+
+    def _retry_sync(self):
+        if self.sync_coordinator is not None:
+            self.sync_coordinator.retry_now()
+
+    def _update_sync_status(self, status):
+        if not hasattr(self, "sync_status_card"):
+            return
+        labels = {
+            "online": "在线",
+            "syncing": "同步中",
+            "offline": "离线",
+            "error": "同步错误",
+            "reauth_required": "登录已失效",
+        }
+        state_label = labels.get(status.state, status.state)
+        self.sync_state_title.setText(state_label)
+        for widget in (self.sync_status_card, self.sync_state_dot):
+            widget.setProperty("state", status.state)
+            widget.style().unpolish(widget)
+            widget.style().polish(widget)
+
+        pending_text = f"待上传 {status.pending_count}"
+        if status.quarantined_count:
+            pending_text += f" / 隔离 {status.quarantined_count}"
+        self.sync_pending_badge.setText(pending_text)
+        self.sync_pending_badge.setProperty(
+            "hasPending",
+            bool(status.pending_count or status.quarantined_count),
+        )
+        self.sync_pending_badge.style().unpolish(self.sync_pending_badge)
+        self.sync_pending_badge.style().polish(self.sync_pending_badge)
+
+        details = []
+        if (
+            status.state == "offline"
+            and self.session_manager is not None
+            and self.session_manager.state is not None
+        ):
+            expires = self.session_manager.state.offline_expires_at
+            details.append(
+                f"离线授权至 {str(expires).replace('T', ' ')[:19]}"
+            )
+        if status.last_sync_at:
+            details.append(
+                f"上次同步 {str(status.last_sync_at).replace('T', ' ')[:19]}"
+            )
+        elif status.state == "syncing":
+            details.append("正在与服务器核对数据")
+        else:
+            details.append("尚未完成首次同步")
+        self.sync_detail_label.setText("\n".join(details))
+
+        if status.error:
+            concise_error = str(status.error).replace("\r", " ").replace("\n", " ")
+            if len(concise_error) > 62:
+                concise_error = concise_error[:59] + "…"
+            self.sync_error_label.setText(concise_error)
+            self.sync_error_label.setToolTip(str(status.error))
+            self.sync_error_label.show()
+        else:
+            self.sync_error_label.clear()
+            self.sync_error_label.setToolTip("")
+            self.sync_error_label.hide()
+        self.sync_status_card.setToolTip(status.error or "")
+        if hasattr(self, "sync_retry_button"):
+            self.sync_retry_button.setEnabled(status.state != "syncing")
+            self.sync_retry_button.setText(
+                "立即同步"
+                if not status.quarantined_count
+                else f"立即同步（隔离 {status.quarantined_count}）"
+            )
+            quarantined = self.database.get_sync_quarantined_items(limit=5)
+            self.sync_retry_button.setToolTip(
+                "\n".join(
+                    f"{row['kind']}: {row['last_error_message']}"
+                    for row in quarantined
+                )
+            )
+        if status.state == "reauth_required" and not self._reauth_scheduled:
+            self._reauth_scheduled = True
+            QTimer.singleShot(0, self._require_reauthentication)
+
+    def _require_reauthentication(self):
+        QMessageBox.warning(
+            self,
+            "登录已失效",
+            "账号、密码或设备授权已在服务器端变更。"
+            "为保护数据，客户端将退出到登录页面。",
+        )
+        if self._prepare_close():
+            self.logout_requested.emit()
+
+    def _online_data_changed(self):
+        refreshed_account = self.database.get_account(self.account.id)
+        if refreshed_account is not None:
+            self.account = refreshed_account
+            self.dashboard_page.account = refreshed_account
+            self.statistics_page.account = refreshed_account
+            self.personal_center_page.account = refreshed_account
+            if self.account_page is not None:
+                self.account_page.current_account = refreshed_account
+        self.dashboard_page.refresh()
+        self.statistics_page.refresh()
+        if self.account_page is not None and isinstance(
+            self.account_page, OnlineAccountPage
+        ) and self.stack.currentWidget() is self.account_page:
+            self.account_page.refresh()
 
     def _add_page(self, key, widget):
         self._pages[key] = widget
@@ -362,6 +650,8 @@ class MainWindow(FramelessMainWindow):
                 self.dashboard_page.refresh()
             elif self.stack.currentWidget() is self.statistics_page:
                 self.statistics_page.refresh()
+            if self.sync_coordinator is not None:
+                self._update_sync_status(self.sync_coordinator.engine.status())
         except Exception as exc:
             QMessageBox.warning(self, "统计记录失败", f"业务结果已产生，但统计写入失败：\n{exc}")
 
@@ -378,18 +668,23 @@ class MainWindow(FramelessMainWindow):
                 self.dashboard_page.refresh()
             elif self.stack.currentWidget() is self.statistics_page:
                 self.statistics_page.refresh()
+            if self.sync_coordinator is not None:
+                self._update_sync_status(self.sync_coordinator.engine.status())
             return True
         except Exception as exc:
             QMessageBox.warning(self, "统计记录失败", f"完整流程已完成，但统计写入失败：\n{exc}")
             return False
 
     def _change_password(self):
-        PasswordDialog(
+        dialog = PasswordDialog(
             self.database,
             self.account.id,
             require_current=True,
             parent=self,
-        ).exec_()
+            session_manager=self.session_manager,
+        )
+        if dialog.exec_() == dialog.Accepted and dialog.account is not None:
+            self.account = dialog.account
 
     def _shutdown_tools(self):
         if self.workflow_page.shutdown(8000):

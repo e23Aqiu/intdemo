@@ -1194,7 +1194,8 @@ class StatisticsPage(QWidget):
         self.title_label.setObjectName("PageTitle")
         title_box.addWidget(self.title_label)
         self.subtitle_label = QLabel(
-            "按站点查看完成类型或违规原因统计。" if account.is_admin
+            "按站点查看完成类型或违规原因统计。"
+            if account.can_view_all_stats
             else "默认显示当前站点，可切换查看全部或其他站点的数据。"
         )
         self.subtitle_label.setObjectName("Muted")
@@ -1496,6 +1497,14 @@ class StatisticsPage(QWidget):
         self.station_combo.addItem("全部站点", None)
         order = {username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)}
         accounts = [account for account in self.database.list_accounts() if not account.is_admin]
+        restricted_online_scope = (
+            self.account.server_account_id is not None
+            and not self.account.can_view_all_stats
+        )
+        if restricted_online_scope:
+            accounts = [
+                account for account in accounts if account.id == self.account.id
+            ]
         accounts.sort(key=lambda item: (order.get(item.username, 999), item.name_label))
         for station in accounts:
             self.station_combo.addItem(station.name_label, station.id)
@@ -1505,11 +1514,11 @@ class StatisticsPage(QWidget):
                 Qt.ToolTipRole,
             )
         target_id = current_id if had_options else (
-            None if self.account.is_admin else self.account.id
+            None if self.account.can_view_all_stats else self.account.id
         )
         index = self.station_combo.findData(target_id)
         self.station_combo.setCurrentIndex(index if index >= 0 else 0)
-        self.station_combo.setEnabled(True)
+        self.station_combo.setEnabled(not restricted_online_scope)
         self.station_combo.blockSignals(False)
 
     def _selected_user_id(self):

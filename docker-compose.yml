@@ -1,0 +1,136 @@
+name: intdemo-v02
+
+services:
+  postgres:
+    image: postgres:17.5-bookworm@sha256:fbcea1bd13b6a882cd6caa6b58db3ae5c102efe50ec625b3e2a5cbc50db5bfe4
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-intdemo}
+      POSTGRES_USER: ${POSTGRES_USER:-intdemo}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      TZ: Asia/Shanghai
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-intdemo} -d ${POSTGRES_DB:-intdemo}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - backend
+
+  api:
+    build:
+      context: ./server
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
+      dockerfile: Dockerfile
+    image: intdemo-api:0.2.0
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    environment:
+      INTDEMO_ENVIRONMENT: production
+      INTDEMO_DATABASE_HOST: postgres
+      INTDEMO_DATABASE_PORT: "5432"
+      INTDEMO_DATABASE_NAME: ${POSTGRES_DB:-intdemo}
+      INTDEMO_DATABASE_USER: ${POSTGRES_USER:-intdemo}
+      INTDEMO_DATABASE_PASSWORD_FILE: /run/secrets/postgres_password
+      INTDEMO_JWT_SECRET_FILE: /run/secrets/jwt_secret
+      INTDEMO_OFFLINE_PRIVATE_KEY_FILE: /run/secrets/offline_private_key
+      INTDEMO_BOOTSTRAP_ENABLED: "1"
+      INTDEMO_MAINTENANCE_MODE: ${INTDEMO_MAINTENANCE_MODE:-0}
+      INTDEMO_TRUSTED_PROXY_HEADERS: "1"
+      TZ: Asia/Shanghai
+    secrets:
+      - postgres_password
+      - jwt_secret
+      - offline_private_key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=3)",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - backend
+
+  caddy:
+    image: caddy:2.10.0-alpine@sha256:ae4458638da8e1a91aafffb231c5f8778e964bca650c8a8cb23a7e8ac557aa3c
+    restart: unless-stopped
+    environment:
+      SERVER_ADDRESS: ${SERVER_ADDRESS:?set SERVER_ADDRESS in .env}
+    ports:
+      - "${CADDY_BIND_ADDRESS:-0.0.0.0}:80:80"
+      - "${CADDY_BIND_ADDRESS:-0.0.0.0}:443:443"
+      - "${CADDY_BIND_ADDRESS:-0.0.0.0}:443:443/udp"
+    volumes:
+      - ${CADDYFILE_PATH:-./deploy/caddy/Caddyfile.domain}:/etc/caddy/Caddyfile:ro
+      - ./deploy/updates:/srv/updates:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - frontend
+      - backend
+
+  backup:
+    image: postgres:17.5-bookworm@sha256:fbcea1bd13b6a882cd6caa6b58db3ae5c102efe50ec625b3e2a5cbc50db5bfe4
+    restart: unless-stopped
+    environment:
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-intdemo}
+      PGDATABASE: ${POSTGRES_DB:-intdemo}
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      BACKUP_RETENTION_DAYS: "30"
+      TZ: Asia/Shanghai
+    secrets:
+      - postgres_password
+    volumes:
+      - ./deploy/backup:/scripts:ro
+      - postgres_backups:/backups
+    command: ["/bin/bash", "/scripts/backup-loop.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+
+secrets:
+  postgres_password:
+    file: ./deploy/secrets/postgres_password.txt
+  jwt_secret:
+    file: ./deploy/secrets/jwt_secret.txt
+  offline_private_key:
+    file: ./deploy/secrets/offline_private_key.txt
+
+volumes:
+  postgres_data:
+  postgres_backups:
+  caddy_data:
+  caddy_config:
+
+networks:
+  frontend:
+  backend:
+    internal: true

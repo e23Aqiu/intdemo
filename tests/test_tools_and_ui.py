@@ -58,6 +58,8 @@ from integrated_client.tools.transport_tool import (
     Worker,
 )
 from integrated_client.timing import WorkflowTimingService
+from integrated_client.online.coordinator import SyncCoordinator
+from integrated_client.online.sync import SyncStatus
 from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
 from integrated_client.ui.dashboard_page import (
@@ -74,6 +76,7 @@ from integrated_client.ui.frameless import (
     MINMAXINFO,
     WVR_REDRAW,
 )
+from integrated_client.ui.online_account_page import OnlineAccountPage
 from integrated_client.ui.statistics_page import (
     AnimatedDonutChart,
     StatisticsPage,
@@ -1152,6 +1155,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(window.sidebar_brand_badge.objectName(), "BrandBadge")
         self.assertEqual(window.sidebar_role.text(), "管理员  ·  admin")
         self.assertEqual(window.sidebar_avatar.text(), "系")
+
         expected_nav = {
             "home": ("数据仪表盘", "nav-dashboard.svg"),
             "workflow": ("一键业务处理", "nav-workflow.svg"),
@@ -1367,6 +1371,52 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(window.workflow_page.shutdown())
         window._prepared_to_close = True
         window.close()
+
+    def test_online_admin_page_does_not_request_network_during_construction(self):
+        class Api:
+            def __init__(self):
+                self.account_requests = 0
+
+            def admin_accounts(self, _token):
+                self.account_requests += 1
+                raise AssertionError("startup must not make a blocking request")
+
+        class State:
+            is_online = True
+
+        class Session:
+            def __init__(self):
+                self.api = Api()
+                self.state = State()
+
+            @staticmethod
+            def access_token():
+                return "test-token"
+
+        session = Session()
+        page = OnlineAccountPage(self.db, self.admin, session)
+        self.assertEqual(session.api.account_requests, 0)
+        self.assertFalse(page.edit_btn.isEnabled())
+        page.deleteLater()
+
+    def test_sync_coordinator_uses_pyqt5_socket_state_without_crashing(self):
+        class Engine:
+            pass
+
+        coordinator = SyncCoordinator(Engine())
+        coordinator._running = True
+        status = SyncStatus(
+            state="online",
+            pending_count=0,
+            quarantined_count=0,
+            last_sync_at="2026-07-27T22:00:00+08:00",
+        )
+        with patch.object(coordinator, "_connect_websocket") as connect:
+            coordinator._on_worker_finished(status)
+        connect.assert_called_once_with()
+        self.assertFalse(coordinator._running)
+        coordinator.stop()
+        coordinator.deleteLater()
 
     def test_frameless_controls_are_embedded_without_an_extra_title_bar(self):
         window = MainWindow(self.db, self.admin)

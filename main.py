@@ -6,10 +6,12 @@ from PyQt5.QtWidgets import QApplication
 from integrated_client.app_controller import ApplicationController
 from integrated_client.config import APP_NAME, ORGANIZATION_NAME
 from integrated_client.database import Database
+from integrated_client.diagnostics import configure_diagnostics, get_logger
 from integrated_client.ui.theme import APP_STYLESHEET, install_disabled_cursor_filter
 
 
 def main():
+    configure_diagnostics()
     if hasattr(Qt, "AA_EnableHighDpiScaling"):
         QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     if hasattr(Qt, "AA_UseHighDpiPixmaps"):
@@ -23,10 +25,14 @@ def main():
     install_disabled_cursor_filter(app)
     app.setQuitOnLastWindowClosed(False)
 
-    database = Database()
-    controller = ApplicationController(app, database)
-    controller.start()
-    return app.exec_()
+    try:
+        database = Database()
+        controller = ApplicationController(app, database)
+        controller.start()
+        return app.exec_()
+    except Exception:
+        get_logger().exception("Fatal error while starting the application")
+        raise
 
 
 if __name__ == "__main__":

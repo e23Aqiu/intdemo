@@ -1,0 +1,36 @@
+{
+	admin off
+}
+
+{$SERVER_ADDRESS} {
+	encode zstd gzip
+
+	request_body {
+		max_size 7MB
+	}
+
+	handle /updates/* {
+		root * /srv
+		header Cache-Control "no-store"
+		file_server
+	}
+
+	handle {
+		reverse_proxy api:8000 {
+			health_uri /api/v1/health/live
+			health_interval 30s
+		}
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

@@ -1,0 +1,7 @@
+{
+  "base_url": "",
+  "ca_bundle": null,
+  "channel": "test",
+  "connect_timeout": 5,
+  "read_timeout": 20
+}

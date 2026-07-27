@@ -1,17 +1,42 @@
-# 运输业务一体化客户端（IntDemo）
+# 营运信息批量查询工具（IntDemo）
 
 IntDemo 是一个面向运输业务处理场景的 Windows 桌面客户端。项目将“运输证查询回填”和“爱企查批量查询”整合为统一的 PyQt5 应用，通过一条可暂停、继续和停止的处理流水线，完成运输证号查询、营运企业回填以及企业法人、地址、电话补齐。
 
-当前版本：`0.1.0`
+当前版本：`0.2.2` 在线同步测试版。`v0.1` 的本地数据库和发布包保持不变，
+`v0.2` 使用独立应用名称及独立数据目录，不迁移测试数据。
 
-## 项目介绍
+## v0.2 在线架构
+
+Windows 客户端仍在本机完成三步业务并以 SQLite 离线优先运行，服务器只接收
+账号权限、指标数量、违规原因汇总、批次/运行状态、用时和不可逆输入指纹。
+原始 Excel、逐行车辆信息、文件路径、运行日志和浏览器 Cookie 永不上传。
+
+```mermaid
+flowchart LR
+    A["Windows 客户端 A<br/>SQLite + outbox"] -->|HTTPS / WSS| C["Caddy"]
+    B["Windows 客户端 B<br/>SQLite + cache"] -->|HTTPS / WSS| C
+    C --> D["FastAPI<br/>单 Uvicorn worker"]
+    D --> E["PostgreSQL 17"]
+    F["每日 02:00 备份"] --> E
+```
+
+- 首次登录必须联网；成功后可凭密码和 Ed25519 离线授权连续离线使用 7 天。
+- 有待发送数据时每 5 秒尝试上传，WebSocket 通知后增量拉取，30 秒轮询兜底。
+- 访问/刷新令牌和离线资料由 Windows DPAPI 加密；密码本身不落盘。
+- 在线测试数据库位于
+  `%LOCALAPPDATA%\IntDemoClientOnlineTest\client-v2.db`。
+- 服务端、部署与迁移说明见 [部署手册](docs/DEPLOYMENT.md)、
+  [同步协议](docs/SYNC_PROTOCOL.md)、[恢复演练](docs/RESTORE_DRILL.md) 和
+  [迁移手册](docs/MIGRATION.md)。
+
+## 客户端业务能力
 
 项目主要提供以下能力：
 
 - 使用统一登录入口和主界面管理运输业务处理流程。
 - 登录页、主内容区、数据控件、弹窗和分层侧边栏统一使用深青绿、薄荷绿与暖橙色主题；当前账号集中展示在侧边栏身份卡中。
-- 支持管理员和普通用户两种角色，以及账号创建、名称与权限修改、重置密码、启停和安全删除；删除账号时同步清除其统计数据。
-- 管理员可按所选普通用户站点和日期范围导出、导入或重置统计数据；重复导入的事件会自动跳过，重置时保留账号信息。
+- 支持管理员和普通用户两种角色；在线账号由服务器统一创建和编辑，可设置数据范围与设备上限，并支持密码重置、启停、归档/恢复和设备撤销。归档保留历史统计，统计重置是独立且受审计的操作。
+- 仪表盘继续从本地 SQLite 缓存按站点和日期范围查询、展示及导出汇总数据，断网时仍可查看最近一次同步结果。
 - 对同一份 `.xlsx` 文件依次执行运输证查询、营运企业回填和爱企查信息补齐。
 - 三步结果均使用 `openpyxl` 定向回写目标单元格，并通过同目录临时文件原子替换保存，避免中途停止时重建整表或丢失下方数据；“已协助补缴”后的带格式空列会优先复用，旧版追加到右侧的结果列会在再次写入时自动迁回。
 - 重新执行流程时，已有运输证号、已有车辆所有人/企业信息或已协助补缴的记录会跳过运输证查询，避免重复访问网站。
@@ -29,7 +54,7 @@ IntDemo 是一个面向运输业务处理场景的 Windows 桌面客户端。项
 - 提供按站点、日期范围、完成类型和违规原因筛选的数据仪表盘，开始与结束日期均包含当天。
 - 管理员可在完成类型中查看“空”异常数据总数，并按用户（站）追溯异常条数、本站总数和占比；普通用户不显示异常入口。
 - 仪表盘环形分区和完成类型、违规原因计量条支持悬停查看数量、占比或电话拆分详情；各站分布同时提供总计数、有电话数、总耗时和有效耗时四个圆环图。
-- 将账号、角色、密码哈希和统计事件保存在本地 SQLite 数据库中。
+- 将账号镜像、统计缓存、本机业务记录和待同步队列保存在本地 SQLite；服务端密码使用 Argon2id，客户端只保存 DPAPI 加密资料及 PBKDF2 离线验证器。
 - 提供离线自动化测试，并支持使用 PyInstaller 构建 Windows 客户端。
 
 > 查询网站的验证码、页面结构和访问策略可能变化。涉及真实网站的功能需要使用合法账号、授权数据和当前网络环境进行验收。
@@ -89,19 +114,30 @@ python -m pip install -r requirements-dev.txt
 在已激活虚拟环境的终端中执行：
 
 ```powershell
+@'
+{
+  "base_url": "https://api.example.com",
+  "ca_bundle": null,
+  "channel": "test"
+}
+'@ | Set-Content .\client-online.json -Encoding UTF8
 python main.py
 ```
 
+公网 IP 测试必须把 `ca_bundle` 改为随包 Caddy 根证书路径；客户端拒绝
+`http://`、缺少私有 CA 的 IP 地址以及 `verify=False` 式绕过。
+
 也可以在资源管理器中双击 `run.bat`。该脚本会优先使用项目目录内的 `.venv`。
 
-### 首次登录
+### v0.2 首次登录
 
 - 管理员账号：`admin`
-- 初始密码：`Admin@123`
+- 初始密码：`123456`
 
 首次登录后系统会要求修改初始密码。正式使用前应创建个人管理员账号，并妥善保管密码。
 
-系统还会幂等创建以下普通站点账号，重复启动不会重置已有密码：
+服务器还会幂等创建以下普通站点账号。五个站点初始均停用，管理员改密后需
+逐个启用；所有初始账号首次登录均必须修改密码：
 
 | 用户名称 | 登录账号 | 初始密码 |
 | --- | --- | --- |
@@ -113,32 +149,75 @@ python main.py
 
 ### 本地数据
 
-Windows 默认数据目录为：
+v0.2 Windows 默认数据目录为：
 
 ```text
-%LOCALAPPDATA%\IntDemoClient\client.db
+%LOCALAPPDATA%\IntDemoClientOnlineTest\client-v2.db
 ```
 
-可通过环境变量 `INTDEMO_DATA_DIR` 指定其他数据目录。数据库保存账号、密码哈希、角色、状态、统计事件以及业务批次计时记录，不保存明文密码。数据库、日志、用户表格和导出结果均已通过 `.gitignore` 排除，不应提交到 Git。
+可通过环境变量 `INTDEMO_DATA_DIR` 指定其他数据目录。数据库保存离线缓存、
+待同步队列、隔离项和本机业务计时；令牌及离线资料以 DPAPI 密文保存，不保存
+明文密码。v0.1 原目录 `%LOCALAPPDATA%\IntDemoClient\client.db` 不会被读取
+或覆盖。
 
 ## 测试与构建
 
-运行离线自动化测试：
+运行 Windows 客户端测试（包含原 65 项离线回归及在线安全测试）：
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'
 python -m unittest discover -s tests -v
 ```
 
-测试覆盖账号与权限、密码处理、统计口径、持久化计时与异常恢复、主窗口装配、实时表格模型、三步自动衔接和 Excel 结果回写。在线查询仍需单独进行人工验收。
-
-构建 Windows 可执行程序：
+服务端测试：
 
 ```powershell
-pyinstaller integrated_client.spec
+cd server
+python -m pip install -e ".[test]"
+python -m pytest
 ```
 
-构建产物会生成在 `build/` 和 `dist/`，这两个目录不会进入 Git。
+完整 Compose 验收由 GitHub Actions 执行真实 PostgreSQL、两台逻辑客户端、
+WebSocket、私有 CA、备份和全新数据库恢复。真实运输证、营运查询及爱企查
+流程仍需在授权环境人工验收。
+
+同时构建 Windows 免安装便携包和安装包（公网 IP 测试方案）：
+
+```powershell
+winget install --id JRSoftware.InnoSetup --exact
+.\scripts\build-releases.ps1 `
+  -BaseUrl https://203.0.113.10 `
+  -CaBundle .\intdemo-caddy-root.crt `
+  -Version 0.2.2
+```
+
+构建结果同时生成：
+
+- `dist\portable\IntDemoOnline-Portable-0.2.2.zip`：完整解压后直接运行，
+  不写注册表、不创建快捷方式，适合临时测试和压缩包分发。
+- `dist\installer\IntDemoOnline-Setup-0.2.2.exe`：按当前用户安装到
+`%LOCALAPPDATA%\Programs\IntDemoOnline`，提供开始菜单、可选桌面快捷方式
+和标准卸载入口；本地数据库仍留在独立的数据目录，升级或卸载程序不会删除
+业务缓存。
+
+当前测试包由 Inno Setup 6.7.3 构建。公司正式商用发布前需购买对应商业
+许可证，或改用公司已有授权的安装工具。
+
+准备并发布后续更新：
+
+```powershell
+.\scripts\publish-update.ps1 `
+  -Installer .\dist\installer\IntDemoOnline-Setup-0.2.2.exe `
+  -Version 0.2.2 `
+  -Notes "本次更新说明" `
+  -RemoteHost intdemo-test `
+  -RemotePath /opt/intdemo/deploy/updates
+```
+
+发布脚本先上传完整安装包，再原子替换 `test.json`。客户端后台检查同一
+HTTPS 服务器的 `/updates/test.json`，下载后同时核对文件大小与 SHA-256，
+不会绕过私有 CA。在线版顶部始终提供“检查更新”按钮；安装版可以直接
+下载并启动新安装包，便携版也可以通过该按钮下载安装版进行升级。
 
 ## 项目目录结构
 
@@ -149,12 +228,14 @@ intdemo/
 ├── requirements.txt                # 运行依赖
 ├── requirements-dev.txt            # 构建与开发依赖
 ├── integrated_client.spec          # PyInstaller 构建配置
+├── installer/                       # Inno Setup 安装包定义和版本资源
 ├── integrated_client/
 │   ├── app_controller.py           # 应用生命周期与窗口协调
 │   ├── config.py                   # 应用常量与数据目录配置
 │   ├── database.py                 # 账号、权限与统计数据持久化
 │   ├── models.py                   # 领域数据模型
 │   ├── security.py                 # 密码哈希与校验
+│   ├── online/                     # 在线认证、DPAPI、同步与 WebSocket
 │   ├── timing.py                   # 流水线批次、运行和步骤计时
 │   ├── tools/
 │   │   ├── transport_tool.py       # 运输证查询与营运信息回填
@@ -166,20 +247,18 @@ intdemo/
 │       ├── statistics_page.py      # 数据仪表盘
 │       ├── theme.py                # 全局界面主题
 │       └── workflow_page.py        # 一体化业务流水线页面
-├── tests/                           # 离线自动化测试
+├── server/                          # FastAPI、SQLAlchemy 与 Alembic
+├── deploy/                          # Caddy、备份、恢复及 Ubuntu 脚本
+├── docker-compose.yml               # api/postgres/caddy/backup
+├── tests/                           # 客户端离线与在线自动化测试
 ├── DEVELOPMENT_LOG.md              # 历史开发记录
 └── README.md                        # 项目说明
 ```
 
-## 后续开发计划
+## v0.2 明确不包含
 
-- 建立 GitHub Actions，在提交和 Pull Request 上自动运行离线测试。
-- 将网站选择器和业务适配器进一步模块化，降低外部页面变化带来的维护成本。
-- 增加受控的集成测试数据和端到端验收清单，提升在线流程回归效率。
-- 完善错误恢复、任务断点续跑、结构化日志和问题诊断能力。
-- 优化首次启动流程，逐步减少代码内预置账号密码，并加强敏感配置管理。
-- 建立版本号、变更日志、发布包和升级说明的标准发布流程。
-- 持续梳理依赖版本与安全更新，并验证 Python 新版本兼容性。
+本测试版不建设 Web 管理后台、文件云盘、静默强制更新、Redis、多 API
+实例或多节点高可用。目标规模为 20 个以内 Windows 终端。
 
 ## 维护说明
 

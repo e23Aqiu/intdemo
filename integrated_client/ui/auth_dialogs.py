@@ -21,7 +21,8 @@ from .frameless import FramelessDialog, FramelessMessageBox as QMessageBox
 class PasswordDialog(FramelessDialog):
     def __init__(
         self, database: Database, account_id: int, forced=False,
-        must_change_after=False, require_current=False, parent=None
+        must_change_after=False, require_current=False, parent=None,
+        session_manager=None, initial_current_password=""
     ):
         super().__init__(parent)
         self.database = database
@@ -29,6 +30,9 @@ class PasswordDialog(FramelessDialog):
         self.forced = forced
         self.must_change_after = must_change_after
         self.require_current = require_current
+        self.session_manager = session_manager
+        self.initial_current_password = initial_current_password
+        self.account = None
         self.setWindowTitle("修改密码")
         self.setModal(True)
         self.setMinimumWidth(390)
@@ -83,7 +87,17 @@ class PasswordDialog(FramelessDialog):
             QMessageBox.warning(self, "密码不一致", "两次输入的密码不一致。")
             return
         try:
-            if self.require_current:
+            if self.session_manager is not None:
+                current_password = (
+                    self.current_password_edit.text()
+                    if self.current_password_edit is not None
+                    else self.initial_current_password
+                )
+                self.account = self.session_manager.change_password(
+                    current_password,
+                    password,
+                )
+            elif self.require_current:
                 self.database.change_own_password(
                     self.account_id,
                     self.current_password_edit.text(),
@@ -97,8 +111,12 @@ class PasswordDialog(FramelessDialog):
                 )
         except AuthenticationError as exc:
             QMessageBox.warning(self, "原密码错误", str(exc))
-            self.current_password_edit.selectAll()
-            self.current_password_edit.setFocus()
+            if self.current_password_edit is not None:
+                self.current_password_edit.selectAll()
+                self.current_password_edit.setFocus()
+            return
+        except RuntimeError as exc:
+            QMessageBox.warning(self, "修改失败", str(exc))
             return
         except ValueError as exc:
             QMessageBox.warning(self, "密码无效", str(exc))
@@ -108,7 +126,13 @@ class PasswordDialog(FramelessDialog):
 
 
 class LoginDialog(FramelessDialog):
-    def __init__(self, database: Database, parent=None):
+    def __init__(
+        self,
+        database: Database,
+        parent=None,
+        session_manager=None,
+        configuration_error="",
+    ):
         super().__init__(
             parent,
             resizable=False,
@@ -116,6 +140,9 @@ class LoginDialog(FramelessDialog):
             show_maximize=False,
         )
         self.database = database
+        self.session_manager = session_manager
+        self.configuration_error = str(configuration_error or "")
+        self.session_state = None
         self.account = None
         self.setWindowTitle(f"登录 - {APP_NAME}")
         self.setFixedSize(470, 430)
@@ -159,10 +186,24 @@ class LoginDialog(FramelessDialog):
         root.addStretch()
 
     def _login(self):
-        try:
-            account = self.database.authenticate(
-                self.username_edit.text(), self.password_edit.text()
+        if self.configuration_error:
+            QMessageBox.warning(
+                self,
+                "在线服务未配置",
+                self.configuration_error,
             )
+            return
+        password = self.password_edit.text()
+        try:
+            if self.session_manager is not None:
+                account = self.session_manager.login(
+                    self.username_edit.text(),
+                    password,
+                )
+            else:
+                account = self.database.authenticate(
+                    self.username_edit.text(), password
+                )
         except AuthenticationError as exc:
             QMessageBox.warning(self, "登录失败", str(exc))
             self.password_edit.selectAll()
@@ -170,10 +211,30 @@ class LoginDialog(FramelessDialog):
             return
 
         if account.must_change_password:
-            dialog = PasswordDialog(self.database, account.id, forced=True, parent=self)
+            dialog = PasswordDialog(
+                self.database,
+                account.id,
+                forced=True,
+                parent=self,
+                session_manager=self.session_manager,
+                initial_current_password=password,
+            )
             if dialog.exec_() != QDialog.Accepted:
                 return
-            account = replace(account, must_change_password=False)
+            account = (
+                dialog.account
+                if dialog.account is not None
+                else replace(account, must_change_password=False)
+            )
+        if self.session_manager is not None:
+            self.session_state = self.session_manager.state
+            if self.session_state and not self.session_state.is_online:
+                QMessageBox.information(
+                    self,
+                    "离线登录",
+                    "当前无法连接服务器，已使用本机 7 天离线授权登录。"
+                    "业务数据会保存在待上传队列中。",
+                )
         self.account = account
         self.accept()
 
