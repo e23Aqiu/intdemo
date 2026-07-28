@@ -1,4 +1,4 @@
-"""Enable built-in accounts and remove practical device-count restrictions.
+"""Enable built-in accounts and raise their default device-count limits.
 
 Revision ID: 0002_public_multi_device_access
 Revises: 0001_initial

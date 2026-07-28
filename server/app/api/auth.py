@@ -31,6 +31,7 @@ from ..security import (
 )
 from ..services import (
     account_view,
+    active_device_count,
     aware,
     device_view,
     latest_revision,
@@ -138,7 +139,11 @@ def _bundle(
 def login(payload: LoginRequest, request: Request, db: Db) -> TokenBundle:
     ip_address = _client_ip(request)
     _check_login_throttle(db, payload.username, ip_address)
-    account = db.scalar(select(Account).where(Account.username == payload.username))
+    account = db.scalar(
+        select(Account)
+        .where(Account.username == payload.username)
+        .with_for_update()
+    )
     if not account or not verify_password(payload.password, account.password_hash):
         _record_login_failure(db, payload.username, ip_address)
         raise ApiError(
@@ -160,6 +165,17 @@ def login(payload: LoginRequest, request: Request, db: Db) -> TokenBundle:
     if device and device.revoked_at is not None:
         raise ApiError("device_revoked", "当前设备已被撤销", status_code=403)
     if device is None:
+        active_count = active_device_count(db, account.id)
+        if active_count >= account.device_limit:
+            raise ApiError(
+                "device_limit_reached",
+                "已达到账号设备上限，请先由管理员撤销旧设备或提高设备数量",
+                status_code=409,
+                details={
+                    "device_limit": account.device_limit,
+                    "active_device_count": active_count,
+                },
+            )
         device = Device(
             account_id=account.id,
             device_uid=payload.device_uid,

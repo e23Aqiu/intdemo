@@ -60,13 +60,17 @@ class UpdateClient:
         self,
         config: OnlineConfig,
         session: requests.Session | None = None,
+        current_version: str | None = None,
     ):
         self.config = config.validate()
+        self.current_version = str(current_version or APP_VERSION).strip()
+        version_key(self.current_version)
         self.session = session or requests.Session()
         self.session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": f"IntDemoUpdater/{APP_VERSION}",
+                "User-Agent": f"IntDemoUpdater/{self.current_version}",
+                "X-IntDemo-Version": self.current_version,
             }
         )
 
@@ -119,7 +123,7 @@ class UpdateClient:
         }
 
     @staticmethod
-    def _matching_delta(payload: dict) -> dict | None:
+    def _matching_delta(payload: dict, current_version: str) -> dict | None:
         candidates = payload.get("deltas")
         if candidates is None and isinstance(payload.get("delta"), dict):
             candidates = [payload["delta"]]
@@ -133,7 +137,9 @@ class UpdateClient:
                 from_versions = [candidate.get("from_version")]
             if not isinstance(from_versions, list):
                 continue
-            if APP_VERSION in {str(item or "").strip() for item in from_versions}:
+            if current_version in {
+                str(item or "").strip() for item in from_versions
+            }:
                 return candidate
         return None
 
@@ -155,7 +161,7 @@ class UpdateClient:
             raise UpdateError("服务器更新通道与客户端不匹配")
 
         version = str(payload.get("version") or "").strip()
-        if version_key(version) <= version_key(APP_VERSION):
+        if version_key(version) <= version_key(self.current_version):
             return None
 
         full_payload = (
@@ -166,7 +172,7 @@ class UpdateClient:
         package = self._validated_package(full_payload, label="全量更新包")
         package_kind = "full"
         from_version = None
-        delta = self._matching_delta(payload)
+        delta = self._matching_delta(payload, self.current_version)
         if delta is not None:
             try:
                 package = self._validated_package(delta, label="增量更新包")
@@ -178,7 +184,7 @@ class UpdateClient:
                 )
             else:
                 package_kind = "delta"
-                from_version = APP_VERSION
+                from_version = self.current_version
 
         return UpdateInfo(
             version=version,

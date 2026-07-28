@@ -9,6 +9,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 _TEST_DIR = Path(tempfile.mkdtemp(prefix="intdemo-server-tests-"))
+_UPDATES_DIR = _TEST_DIR / "updates"
+_UPDATES_DIR.mkdir(parents=True, exist_ok=True)
 os.environ.setdefault("INTDEMO_ENVIRONMENT", "test")
 os.environ.setdefault(
     "INTDEMO_DATABASE_URL",
@@ -19,6 +21,7 @@ os.environ.setdefault(
     "test-secret-that-is-long-enough-for-intdemo",
 )
 os.environ.setdefault("INTDEMO_BOOTSTRAP_ENABLED", "1")
+os.environ.setdefault("INTDEMO_UPDATES_DIR", str(_UPDATES_DIR))
 
 from app.bootstrap import bootstrap_database  # noqa: E402
 from app.database import Base, SessionLocal, engine  # noqa: E402

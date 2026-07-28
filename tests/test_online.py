@@ -353,6 +353,67 @@ class OnlineClientTests(unittest.TestCase):
         self.assertEqual(update.size, len(delta))
         self.assertIn("Patch-0.2.5-to-0.2.6", update.installer_name)
 
+    def test_update_manifest_uses_delta_only_for_exact_current_version(self):
+        full = b"full-package"
+        delta = b"delta-package"
+        manifest = {
+            "schema_version": 1,
+            "channel": "test",
+            "version": "0.2.6",
+            "installer_path": "/updates/files/IntDemoOnline-Setup-0.2.6.exe",
+            "sha256": hashlib.sha256(full).hexdigest(),
+            "size": len(full),
+            "full": {
+                "installer_path": "/updates/files/IntDemoOnline-Setup-0.2.6.exe",
+                "sha256": hashlib.sha256(full).hexdigest(),
+                "size": len(full),
+            },
+            "deltas": [
+                {
+                    "from_version": "0.2.4",
+                    "installer_path": (
+                        "/updates/files/IntDemoOnline-Patch-0.2.4-to-0.2.6.exe"
+                    ),
+                    "sha256": hashlib.sha256(delta).hexdigest(),
+                    "size": len(delta),
+                }
+            ],
+        }
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+
+        for current_version, expected_kind, expected_name in (
+            ("0.2.3", "full", "IntDemoOnline-Setup-0.2.6.exe"),
+            ("0.2.4", "delta", "IntDemoOnline-Patch-0.2.4-to-0.2.6.exe"),
+            ("0.2.5", "full", "IntDemoOnline-Setup-0.2.6.exe"),
+        ):
+            with self.subTest(current_version=current_version):
+                response = Mock()
+                response.raise_for_status.return_value = None
+                response.json.return_value = manifest
+                session = Mock()
+                session.headers = {}
+                session.get.return_value = response
+
+                update = UpdateClient(
+                    config,
+                    session=session,
+                    current_version=current_version,
+                ).check()
+
+                self.assertEqual(update.package_kind, expected_kind)
+                self.assertEqual(update.installer_name, expected_name)
+                self.assertEqual(
+                    session.headers["User-Agent"],
+                    f"IntDemoUpdater/{current_version}",
+                )
+                self.assertEqual(
+                    session.headers["X-IntDemo-Version"],
+                    current_version,
+                )
+
     def test_update_download_verifies_size_and_sha256(self):
         content = b"verified-installer-content"
 

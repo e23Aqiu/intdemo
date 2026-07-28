@@ -27,6 +27,7 @@ from ..schemas import (
 from ..security import hash_password
 from ..services import (
     account_view,
+    active_device_count,
     append_change,
     audit,
     device_view,
@@ -116,6 +117,15 @@ async def update_account(
 ) -> dict:
     account = _account_or_404(db, account_id)
     changes = payload.model_dump(exclude_unset=True)
+    if "device_limit" in changes:
+        current_active_devices = active_device_count(db, account.id)
+        if changes["device_limit"] < current_active_devices:
+            raise ApiError(
+                "device_limit_below_active_count",
+                "设备上限不能低于当前有效设备数，请先在设备列表中撤销多余设备",
+                status_code=409,
+                details={"active_device_count": current_active_devices},
+            )
     if account.id == context.account.id and changes.get("is_active") is False:
         raise ApiError("cannot_disable_self", "不能停用当前管理员账号", status_code=409)
     if account.id == context.account.id and changes.get("role") == "user":

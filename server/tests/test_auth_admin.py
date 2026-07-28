@@ -141,7 +141,7 @@ def test_login_throttle_locks_username_and_ip(client):
     assert locked.json()["code"] == "login_locked"
 
 
-def test_account_lifecycle_multi_device_login_and_audit(client):
+def test_account_lifecycle_device_limit_and_audit(client):
     admin = changed_admin(client)
     headers = auth_header(admin)
     created = client.post(
@@ -175,8 +175,12 @@ def test_account_lifecycle_multi_device_login_and_audit(client):
             "client_version": "test",
         },
     )
-    assert second.status_code == 200
-    assert second.json()["device"]["device_uid"] == device_uid(21)
+    assert second.status_code == 409
+    assert second.json()["code"] == "device_limit_reached"
+    assert second.json()["details"] == {
+        "device_limit": 1,
+        "active_device_count": 1,
+    }
 
     too_low = client.patch(
         f"/api/v1/admin/accounts/{account_id}",
@@ -190,12 +194,8 @@ def test_account_lifecycle_multi_device_login_and_audit(client):
         headers=headers,
     )
     assert devices.status_code == 200
-    assert len(devices.json()) == 2
-    device_id = next(
-        item["id"]
-        for item in devices.json()
-        if item["device_uid"] == device_uid(20)
-    )
+    assert len(devices.json()) == 1
+    device_id = devices.json()[0]["id"]
     revoked = client.post(
         f"/api/v1/admin/devices/{device_id}/revoke",
         headers=headers,
@@ -234,7 +234,7 @@ def test_account_lifecycle_multi_device_login_and_audit(client):
     assert {"account.create", "device.revoke", "account.archive", "account.restore"} <= actions
 
 
-def test_legacy_device_limit_does_not_block_additional_computers(client):
+def test_device_limit_cannot_be_lowered_below_active_count(client):
     admin = changed_admin(client)
     headers = auth_header(admin)
     own_id = admin["account"]["id"]
@@ -251,9 +251,9 @@ def test_legacy_device_limit_does_not_block_additional_computers(client):
         headers=headers,
         json={"device_limit": 1},
     )
-    assert lowered.status_code == 200
-    third = login(client, "admin", "Admin!23456", device=3)
-    assert third["device"]["device_uid"] == device_uid(3)
+    assert lowered.status_code == 409
+    assert lowered.json()["code"] == "device_limit_below_active_count"
+    assert lowered.json()["details"] == {"active_device_count": 2}
 
 
 def test_account_update_rejects_explicit_null(client):

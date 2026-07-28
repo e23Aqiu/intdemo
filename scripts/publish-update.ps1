@@ -49,6 +49,7 @@ $manifest = [ordered]@{
     installer_path = "/updates/files/$publishedName"
     sha256 = $hash
     size = $file.Length
+    primary_kind = "full"
     mandatory = [bool]$Mandatory
     notes = $Notes
 }
@@ -66,6 +67,11 @@ if ($DeltaInstaller -or $DeltaFromVersion) {
     $deltaHash = (
         Get-FileHash -LiteralPath $publishedDelta -Algorithm SHA256
     ).Hash.ToLowerInvariant()
+    $manifest.full = [ordered]@{
+        installer_path = "/updates/files/$publishedName"
+        sha256 = $hash
+        size = $file.Length
+    }
     $manifest.deltas = @(
         [ordered]@{
             from_version = $DeltaFromVersion
@@ -75,16 +81,11 @@ if ($DeltaInstaller -or $DeltaFromVersion) {
         }
     )
     if ($LegacyDeltaPrimary) {
-        $manifest.full = [ordered]@{
-            installer_path = "/updates/files/$publishedName"
-            sha256 = $hash
-            size = $file.Length
-        }
-        $manifest.installer_path = "/updates/files/$deltaPublishedName"
-        $manifest.sha256 = $deltaHash
-        $manifest.size = $deltaFile.Length
-        $manifest.primary_kind = "delta"
-        $manifest.primary_from_version = $DeltaFromVersion
+        Write-Warning (
+            "LegacyDeltaPrimary is deprecated. The canonical manifest now " +
+            "keeps the full installer at the top level; the update endpoint " +
+            "selects the exact delta from the client version header."
+        )
     }
 } elseif ($LegacyDeltaPrimary) {
     throw "LegacyDeltaPrimary requires a delta installer"

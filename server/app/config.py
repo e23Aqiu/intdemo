@@ -43,6 +43,7 @@ class Settings:
     trusted_proxy_headers: bool
     max_sync_items: int
     max_sync_item_bytes: int
+    updates_dir: Path
 
     @property
     def is_production(self) -> bool:
@@ -98,6 +99,12 @@ def get_settings() -> Settings:
         trusted_proxy_headers=_env_bool("INTDEMO_TRUSTED_PROXY_HEADERS", True),
         max_sync_items=int(os.getenv("INTDEMO_MAX_SYNC_ITEMS", "100")),
         max_sync_item_bytes=int(os.getenv("INTDEMO_MAX_SYNC_ITEM_BYTES", str(64 * 1024))),
+        updates_dir=Path(
+            os.getenv(
+                "INTDEMO_UPDATES_DIR",
+                str(Path.cwd().joinpath("deploy", "updates")),
+            )
+        ).expanduser().resolve(),
     )
     settings.validate()
     return settings

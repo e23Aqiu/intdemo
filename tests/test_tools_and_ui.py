@@ -89,7 +89,10 @@ from integrated_client.ui.frameless import (
     FramelessMessageBox,
 )
 from integrated_client.ui.main_window import MainWindow
-from integrated_client.ui.online_account_page import OnlineAccountPage
+from integrated_client.ui.online_account_page import (
+    OnlineAccountPage,
+    _AccountSettingsDialog,
+)
 from integrated_client.ui.tencent_docs_dialog import TencentDocsProgressDialog
 from integrated_client.ui.statistics_page import (
     AnimatedDonutChart,
@@ -1561,6 +1564,15 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(session.api.account_requests, 0)
         self.assertFalse(page.edit_btn.isEnabled())
         page.deleteLater()
+
+    def test_online_account_settings_exposes_device_limit(self):
+        dialog = _AccountSettingsDialog()
+        self.assertEqual(dialog.device_limit.minimum(), 1)
+        self.assertEqual(dialog.device_limit.maximum(), 10000)
+        self.assertEqual(dialog.device_limit.value(), 10000)
+        dialog.device_limit.setValue(3)
+        self.assertEqual(dialog.values()["device_limit"], 3)
+        dialog.deleteLater()
 
     def test_sync_coordinator_uses_pyqt5_socket_state_without_crashing(self):
         class Engine:

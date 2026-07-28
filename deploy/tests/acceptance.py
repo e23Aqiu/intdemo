@@ -170,13 +170,19 @@ def main():
     )
     device_b = str(uuid.uuid4())
     admin_b = login(client, "admin", "Admin!23456", device_b)
-    third = login(
-        client,
-        "admin",
-        "Admin!23456",
-        str(uuid.uuid4()),
+    third = client.request(
+        "POST",
+        "/auth/login",
+        {
+            "username": "admin",
+            "password": "Admin!23456",
+            "device_uid": str(uuid.uuid4()),
+            "device_name": "acceptance-device",
+            "client_version": "acceptance",
+        },
+        expected=409,
     )
-    assert third["account"]["id"] == account_id
+    assert third["code"] == "device_limit_reached"
 
     item = activity_item(amount=4)
     event_uid = item["event_uid"]

@@ -16,6 +16,7 @@
 #ifndef SetupIcon
   #define SetupIcon "..\integrated_client\ui\assets\app-icon.ico"
 #endif
+#define ShortcutIconName "IntDemoOnline-icon-" + MyAppVersion + ".ico"
 
 [Setup]
 AppId={{{#MyAppId}}
@@ -45,8 +46,9 @@ WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
 SetupLogging=yes
+ChangesAssociations=yes
 UninstallDisplayName={#MyAppName}
-UninstallDisplayIcon={app}\{#MyAppExeName}
+UninstallDisplayIcon={app}\{#ShortcutIconName}
 VersionInfoCompany=IntDemo
 VersionInfoDescription={#MyAppName} 安装程序
 VersionInfoProductName={#MyAppName}
@@ -61,6 +63,7 @@ Name: "chinesesimplified"; MessagesFile: "{#LanguageFile}"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
 
 [InstallDelete]
+Type: files; Name: "{app}\IntDemoOnline-icon-*.ico"
 #ifdef PatchMode
   #ifdef PatchDeleteFile
     #include PatchDeleteFile
@@ -71,16 +74,41 @@ Type: filesandordirs; Name: "{app}\_internal"
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SetupIcon}"; DestDir: "{app}"; DestName: "{#ShortcutIconName}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#ShortcutIconName}"; IconIndex: 0
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\{#ShortcutIconName}"; IconIndex: 0; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
 
-#ifdef PatchMode
 [Code]
+const
+  SHCNE_ASSOCCHANGED = $08000000;
+  SHCNF_IDLIST = $0000;
+  SHCNF_FLUSHNOWAIT = $2000;
+
+procedure SHChangeNotify(
+  wEventId: LongWord;
+  uFlags: LongWord;
+  dwItem1: Integer;
+  dwItem2: Integer
+);
+  external 'SHChangeNotify@shell32.dll stdcall';
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    SHChangeNotify(
+      SHCNE_ASSOCCHANGED,
+      SHCNF_IDLIST or SHCNF_FLUSHNOWAIT,
+      0,
+      0
+    );
+end;
+
+#ifdef PatchMode
 function InitializeSetup(): Boolean;
 var
   InstalledVersion: String;

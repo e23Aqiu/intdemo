@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -49,23 +50,35 @@ class _AccountSettingsDialog(FramelessDialog):
         self.scope = QComboBox()
         self.scope.addItem("仅本人数据", "own")
         self.scope.addItem("全部站点数据", "all")
+        self.device_limit = QSpinBox()
+        self.device_limit.setRange(1, 10000)
+        self.device_limit.setSuffix(" 台")
+        self.device_limit.setToolTip(
+            "按已登记且未撤销的设备计算；10000 台可视为不限制"
+        )
         self.active = QCheckBox("允许登录")
         if account:
             self.role.setCurrentIndex(self.role.findData(account.role))
             self.scope.setCurrentIndex(self.scope.findData(account.stats_scope))
+            self.device_limit.setValue(
+                int(getattr(account, "_device_limit", 10000) or 10000)
+            )
             self.active.setChecked(account.is_active)
         else:
+            self.device_limit.setValue(10000)
             self.active.setChecked(True)
         form.addRow("登录名", self.username)
         form.addRow("站点显示名", self.display_name)
         form.addRow("角色", self.role)
         form.addRow("数据范围", self.scope)
+        form.addRow("登录设备上限", self.device_limit)
         form.addRow("状态", self.active)
         layout.addLayout(form)
         hint = QLabel(
-            "新账号初始密码固定为 123456，首次登录必须修改。"
+            "新账号初始密码为 123456，首次登录必须修改；"
+            "达到设备上限后，新电脑将无法登录。"
             if account is None
-            else "账号可在任意数量的电脑上登录，仍可单独撤销异常设备。"
+            else "设备上限按未撤销设备计算；降低上限前请先在设备列表中撤销多余设备。"
         )
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
@@ -93,6 +106,7 @@ class _AccountSettingsDialog(FramelessDialog):
             "display_name": self.display_name.text().strip(),
             "role": self.role.currentData(),
             "stats_scope": self.scope.currentData(),
+            "device_limit": self.device_limit.value(),
             "is_active": self.active.isChecked(),
         }
 
@@ -356,7 +370,7 @@ class OnlineAccountPage(AccountPage):
 
         self.create_btn.setText("＋ 新建在线账号")
         self.rename_btn.setText("修改名称")
-        self.permission_btn.setText("权限与状态")
+        self.permission_btn.setText("权限与设备数")
         self.reset_btn.setText("重置密码")
         self.toggle_btn.setText("停用/启用")
         self.delete_btn.setText("归档账号")
@@ -407,7 +421,7 @@ class OnlineAccountPage(AccountPage):
                 "角色",
                 "数据范围",
                 "状态",
-                "设备",
+                "设备/上限",
                 "在线",
                 "创建时间",
                 "最后登录",
@@ -496,7 +510,10 @@ class OnlineAccountPage(AccountPage):
                 account.role_label,
                 "全部" if account.stats_scope == "all" else "本人",
                 "启用" if account.is_active else "停用",
-                str(server.get("active_device_count", 0)),
+                (
+                    f"{server.get('active_device_count', 0)}/"
+                    f"{server.get('device_limit', 10000)}"
+                ),
                 str(server.get("online_device_count", 0)),
                 str(server.get("created_at") or account.created_at)
                 .replace("T", " ")[:19],
@@ -576,7 +593,8 @@ class OnlineAccountPage(AccountPage):
             self.selection_hint.setText(
                 f"已选择：{account.name_label} · {account.role_label} · {state}"
                 f" · 数据范围 {'全部' if account.stats_scope == 'all' else '本人'}"
-                f" · 已登记设备 {server.get('active_device_count', 0)}{suffix}"
+                f" · 设备 {server.get('active_device_count', 0)}/"
+                f"{server.get('device_limit', 10000)}{suffix}"
             )
         else:
             self.selection_hint.setText("请选择一个账号进行管理")

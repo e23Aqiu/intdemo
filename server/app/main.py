@@ -16,6 +16,7 @@ from .config import get_settings
 from .database import Base, SessionLocal, engine
 from .errors import error_body, install_error_handlers
 from .models import Account
+from .update_manifest import router as update_manifest_router
 
 REQUEST_COUNT = Counter(
     "intdemo_http_requests_total",
@@ -55,11 +56,16 @@ def create_app() -> FastAPI:
     @app.middleware("http")
     async def request_context(request: Request, call_next):
         request.state.request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-        if settings.maintenance_mode and request.url.path not in {
-            "/api/v1/health/live",
-            "/api/v1/health/ready",
-            "/api/v1/metrics",
-        }:
+        if (
+            settings.maintenance_mode
+            and request.url.path
+            not in {
+                "/api/v1/health/live",
+                "/api/v1/health/ready",
+                "/api/v1/metrics",
+            }
+            and not request.url.path.startswith("/updates/")
+        ):
             return JSONResponse(
                 status_code=503,
                 content=error_body(
@@ -129,6 +135,7 @@ def create_app() -> FastAPI:
         return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
     app.include_router(api)
+    app.include_router(update_manifest_router)
     return app
 
 

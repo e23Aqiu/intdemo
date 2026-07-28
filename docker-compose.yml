@@ -49,11 +49,14 @@ services:
       INTDEMO_BOOTSTRAP_ENABLED: "1"
       INTDEMO_MAINTENANCE_MODE: ${INTDEMO_MAINTENANCE_MODE:-0}
       INTDEMO_TRUSTED_PROXY_HEADERS: "1"
+      INTDEMO_UPDATES_DIR: /srv/updates
       TZ: Asia/Shanghai
     secrets:
       - postgres_password
       - jwt_secret
       - offline_private_key
+    volumes:
+      - ./deploy/updates:/srv/updates:ro
     depends_on:
       postgres:
         condition: service_healthy

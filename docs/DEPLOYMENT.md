@@ -137,8 +137,9 @@ sudo bash ./deploy/scripts/configure-docker-firewall.sh \
 ```
 
 腾讯云轻量服务器防火墙和宿主机 `DOCKER-USER` 必须同时放行；只修改其中
-一层仍会连接超时。客户端不绑定公网 IP，也不再以设备数量阻止新电脑登录；
-管理员仍可单独撤销异常设备。
+一层仍会连接超时。客户端不绑定公网 IP；内置账号默认设备上限为 10000 台，
+管理员可在账号管理中按账号调整。达到上限后新电脑会被拒绝登录，需先撤销
+旧设备或提高上限。
 
 Compose 默认仅绑定 IPv4 的 `0.0.0.0`。如使用 AAAA，必须调整
 `CADDY_BIND_ADDRESS` 并用等价的 `ip6tables` 规则限制 IPv6 来源；未完成前
@@ -207,20 +208,20 @@ CA 证书也是 HTTPS 校验的一部分。安装包位于
   -Installer .\dist\installer\IntDemoOnline-Setup-0.2.5.exe `
   -DeltaInstaller .\dist\installer\IntDemoOnline-Patch-0.2.4-to-0.2.5.exe `
   -DeltaFromVersion 0.2.4 `
-  -LegacyDeltaPrimary `
   -Version 0.2.5 `
   -Notes "本次更新说明" `
   -RemoteHost intdemo-test `
   -RemotePath /opt/intdemo/deploy/updates
 ```
 
-Compose 将服务器的 `deploy/updates/` 只读挂载给 Caddy，并通过
-`/updates/` 提供版本清单和安装包。发布顺序固定为：
+Compose 将服务器的 `deploy/updates/` 同时只读挂载给 API 和 Caddy。
+`/updates/test.json`、`/updates/stable.json` 由 API 根据
+`X-IntDemo-Version` 或 `IntDemoUpdater/<版本>` User-Agent 动态选择包；
+其余 `/updates/files/*` 仍由 Caddy 直接下载。只有当前版本精确匹配
+`deltas.from_version` 才返回增量包，其余情况返回完整包。
 
-`-LegacyDeltaPrimary` 仅用于 0.2.4→0.2.5 的一次性引导。它让旧更新器
-读取差异包作为主下载，同时在清单保留完整包；差异安装器还会验证已安装
-版本。0.2.5 之后由客户端根据 `deltas.from_version` 自动选择，不再使用
-该开关。
+`-LegacyDeltaPrimary` 仅作为旧发布命令的兼容参数保留，已经不会把增量包
+写入公共清单顶层，新的发布命令无需使用。
 
 1. 本地完整构建并执行安装、启动、卸载冒烟测试。
 2. 生成 SHA-256 和 `test.json`。
