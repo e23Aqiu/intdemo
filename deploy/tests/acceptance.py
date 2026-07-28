@@ -66,7 +66,7 @@ def login(client: Client, username: str, password: str, device_uid: str):
             "password": password,
             "device_uid": device_uid,
             "device_name": f"acceptance-{device_uid[-4:]}",
-            "client_version": "0.2.0-acceptance",
+            "client_version": "0.2.4-acceptance",
         },
     )
 
@@ -170,19 +170,13 @@ def main():
     )
     device_b = str(uuid.uuid4())
     admin_b = login(client, "admin", "Admin!23456", device_b)
-    third = client.request(
-        "POST",
-        "/auth/login",
-        {
-            "username": "admin",
-            "password": "Admin!23456",
-            "device_uid": str(uuid.uuid4()),
-            "device_name": "over-limit",
-            "client_version": "0.2.0-acceptance",
-        },
-        expected=409,
+    third = login(
+        client,
+        "admin",
+        "Admin!23456",
+        str(uuid.uuid4()),
     )
-    assert third["code"] == "device_limit_reached"
+    assert third["account"]["id"] == account_id
 
     item = activity_item(amount=4)
     event_uid = item["event_uid"]
@@ -313,19 +307,13 @@ def main():
         station_device,
     )
 
-    over_limit = client.request(
-        "POST",
-        "/auth/login",
-        {
-            "username": "acceptance_station",
-            "password": "Station!234",
-            "device_uid": str(uuid.uuid4()),
-            "device_name": "station-over-limit",
-            "client_version": "0.2.0-acceptance",
-        },
-        expected=409,
+    additional_station = login(
+        client,
+        "acceptance_station",
+        "Station!234",
+        str(uuid.uuid4()),
     )
-    assert over_limit["code"] == "device_limit_reached"
+    assert additional_station["account"]["id"] == created["id"]
     station_devices = client.request(
         "GET",
         f"/admin/accounts/{created['id']}/devices",

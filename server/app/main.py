@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from sqlalchemy import select, text
 
-from .api import admin, auth, sync, websocket
+from .api import admin, announcements, auth, sync, websocket
 from .bootstrap import bootstrap_database
 from .config import get_settings
 from .database import Base, SessionLocal, engine
@@ -44,7 +44,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title="IntDemo Sync API",
-        version="0.2.0",
+        version="0.2.5",
         docs_url="/api/v1/docs" if not settings.is_production else None,
         redoc_url=None,
         openapi_url="/api/v1/openapi.json" if not settings.is_production else None,
@@ -90,19 +90,20 @@ def create_app() -> FastAPI:
             CORSMiddleware,
             allow_origins=list(settings.cors_origins),
             allow_credentials=False,
-            allow_methods=["GET", "POST", "PATCH"],
+            allow_methods=["GET", "POST", "PATCH", "DELETE"],
             allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
         )
 
     api = APIRouter(prefix="/api/v1")
     api.include_router(auth.router)
     api.include_router(admin.router)
+    api.include_router(announcements.router)
     api.include_router(sync.router)
     api.include_router(websocket.router)
 
     @api.get("/health/live")
     def live() -> dict:
-        return {"status": "live", "version": "0.2.0"}
+        return {"status": "live", "version": "0.2.5"}
 
     @api.get("/health/ready")
     def ready() -> dict:

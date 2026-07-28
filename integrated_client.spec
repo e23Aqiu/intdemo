@@ -14,6 +14,14 @@ datas += [
     ('integrated_client/ui/assets/nav-workflow.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-accounts.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-user.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/announcement.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/nav-announcement.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-align-left.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-align-center.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-align-right.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-bullets.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/app-icon.png', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/app-icon.ico', 'integrated_client/ui/assets'),
     ('integrated_client/online/client-online.json', 'integrated_client/online'),
 ]
 hiddenimports = [
@@ -63,6 +71,7 @@ exe = EXE(
     codesign_identity=None,
     entitlements_file=None,
     version='installer/version_info.txt',
+    icon='integrated_client/ui/assets/app-icon.ico',
 )
 
 coll = COLLECT(

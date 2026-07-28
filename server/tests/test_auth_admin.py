@@ -38,6 +38,16 @@ def test_bootstrap_requires_admin_password_change(client):
     assert client.get("/api/v1/health/ready").status_code == 200
 
 
+def test_bootstrap_station_can_login_from_multiple_computers(client):
+    first = login(client, "luogang", "123456", device=30)
+    second = login(client, "luogang", "123456", device=31)
+
+    assert first["account"]["is_active"] is True
+    assert first["account"]["must_change_password"] is True
+    assert first["device"]["device_uid"] == device_uid(30)
+    assert second["device"]["device_uid"] == device_uid(31)
+
+
 def test_errors_use_the_stable_envelope(client):
     response = client.get("/api/v1/does-not-exist")
     assert response.status_code == 404
@@ -131,7 +141,7 @@ def test_login_throttle_locks_username_and_ip(client):
     assert locked.json()["code"] == "login_locked"
 
 
-def test_account_lifecycle_device_limit_and_audit(client):
+def test_account_lifecycle_multi_device_login_and_audit(client):
     admin = changed_admin(client)
     headers = auth_header(admin)
     created = client.post(
@@ -165,8 +175,8 @@ def test_account_lifecycle_device_limit_and_audit(client):
             "client_version": "test",
         },
     )
-    assert second.status_code == 409
-    assert second.json()["code"] == "device_limit_reached"
+    assert second.status_code == 200
+    assert second.json()["device"]["device_uid"] == device_uid(21)
 
     too_low = client.patch(
         f"/api/v1/admin/accounts/{account_id}",
@@ -180,7 +190,12 @@ def test_account_lifecycle_device_limit_and_audit(client):
         headers=headers,
     )
     assert devices.status_code == 200
-    device_id = devices.json()[0]["id"]
+    assert len(devices.json()) == 2
+    device_id = next(
+        item["id"]
+        for item in devices.json()
+        if item["device_uid"] == device_uid(20)
+    )
     revoked = client.post(
         f"/api/v1/admin/devices/{device_id}/revoke",
         headers=headers,
@@ -219,7 +234,7 @@ def test_account_lifecycle_device_limit_and_audit(client):
     assert {"account.create", "device.revoke", "account.archive", "account.restore"} <= actions
 
 
-def test_device_limit_cannot_be_lowered_below_active_count(client):
+def test_legacy_device_limit_does_not_block_additional_computers(client):
     admin = changed_admin(client)
     headers = auth_header(admin)
     own_id = admin["account"]["id"]
@@ -236,8 +251,9 @@ def test_device_limit_cannot_be_lowered_below_active_count(client):
         headers=headers,
         json={"device_limit": 1},
     )
-    assert lowered.status_code == 409
-    assert lowered.json()["code"] == "device_limit_below_active_count"
+    assert lowered.status_code == 200
+    third = login(client, "admin", "Admin!23456", device=3)
+    assert third["device"]["device_uid"] == device_uid(3)
 
 
 def test_account_update_rejects_explicit_null(client):
@@ -249,3 +265,46 @@ def test_account_update_rejects_explicit_null(client):
     )
     assert response.status_code == 422
     assert response.json()["code"] == "validation_error"
+
+
+def test_archived_account_can_be_permanently_deleted(client):
+    admin = changed_admin(client)
+    headers = auth_header(admin)
+    created = client.post(
+        "/api/v1/admin/accounts",
+        headers=headers,
+        json={
+            "username": "delete_archive",
+            "display_name": "待删除归档站点",
+            "role": "user",
+            "stats_scope": "own",
+            "device_limit": 3,
+            "is_active": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    account_id = created.json()["id"]
+
+    not_archived = client.delete(
+        f"/api/v1/admin/accounts/{account_id}",
+        headers=headers,
+    )
+    assert not_archived.status_code == 409
+    assert not_archived.json()["code"] == "account_not_archived"
+
+    assert client.post(
+        f"/api/v1/admin/accounts/{account_id}/archive",
+        headers=headers,
+    ).status_code == 200
+    deleted = client.delete(
+        f"/api/v1/admin/accounts/{account_id}",
+        headers=headers,
+    )
+    assert deleted.status_code == 204
+    accounts = client.get("/api/v1/admin/accounts", headers=headers).json()
+    assert account_id not in {str(account["id"]) for account in accounts}
+    audit_rows = client.get("/api/v1/admin/audit", headers=headers).json()["items"]
+    assert any(
+        row["action"] == "account.delete" and row["target_id"] == account_id
+        for row in audit_rows
+    )

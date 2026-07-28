@@ -19,11 +19,13 @@ from integrated_client.online.secure import DpapiProtector, Protector
 from integrated_client.online.session import OnlineSessionManager
 from integrated_client.online.sync import SyncEngine
 from integrated_client.online.update import (
+    UpdateCancelled,
     UpdateClient,
     UpdateError,
     UpdateInfo,
     version_key,
 )
+from integrated_client.preferences import ClientPreferences, LoginCredentialStore
 
 
 def _b64url(value):
@@ -228,6 +230,32 @@ class OnlineClientTests(unittest.TestCase):
         with self.assertRaisesRegex(AuthenticationError, "首次登录"):
             self.session.login("station", "Online!234")
 
+    def test_explicit_offline_login_never_contacts_server(self):
+        account = self.session.login("station", "Online!234")
+        offline_session = OnlineSessionManager(
+            self.database,
+            self.api,
+            protector=self.protector,
+        )
+        original_login = self.api.login
+        self.api.login = Mock(side_effect=AssertionError("network was used"))
+        try:
+            offline_account = offline_session.offline_login(
+                "station",
+                "Online!234",
+            )
+        finally:
+            self.api.login = original_login
+
+        self.assertEqual(offline_account.id, account.id)
+        self.assertEqual(offline_session.state.mode, "offline_untracked")
+        with self.assertRaisesRegex(NetworkUnavailable, "手动离线"):
+            offline_session.access_token()
+        encrypted = self.database.load_secure_online_profile()
+        offline_session.end_offline_session()
+        self.assertIsNone(offline_session.state)
+        self.assertEqual(self.database.load_secure_online_profile(), encrypted)
+
     def test_online_config_requires_https_and_private_ca_for_ip(self):
         with self.assertRaises(OnlineConfigurationError):
             OnlineConfig(base_url="http://api.example.com").validate()
@@ -246,11 +274,12 @@ class OnlineClientTests(unittest.TestCase):
         response.json.return_value = {
             "schema_version": 1,
             "channel": "test",
-            "version": "0.2.3",
-            "installer_path": "/updates/files/IntDemoOnline-Setup-0.2.3.exe",
+            "version": "0.2.6",
+            "installer_path": "/updates/files/IntDemoOnline-Setup-0.2.6.exe",
             "sha256": hashlib.sha256(installer).hexdigest(),
             "size": len(installer),
             "notes": "修复启动问题",
+            "mandatory": True,
         }
         session = Mock()
         session.headers = {}
@@ -262,18 +291,67 @@ class OnlineClientTests(unittest.TestCase):
 
         update = UpdateClient(config, session=session).check()
 
-        self.assertEqual(update.version, "0.2.3")
+        self.assertEqual(update.version, "0.2.6")
         self.assertEqual(
             update.installer_url,
             "https://203.0.113.10/updates/files/"
-            "IntDemoOnline-Setup-0.2.3.exe",
+            "IntDemoOnline-Setup-0.2.6.exe",
         )
-        self.assertGreater(version_key(update.version), version_key("0.2.2"))
+        self.assertGreater(version_key(update.version), version_key("0.2.4"))
+        self.assertTrue(update.mandatory)
         session.get.assert_called_once()
 
         response.json.return_value["installer_path"] = "https://evil.example/x.exe"
         with self.assertRaisesRegex(UpdateError, "路径无效"):
             UpdateClient(config, session=session).check()
+
+    def test_update_manifest_prefers_matching_delta(self):
+        full = b"full"
+        delta = b"delta"
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "schema_version": 1,
+            "channel": "test",
+            "version": "0.2.6",
+            "installer_path": (
+                "/updates/files/IntDemoOnline-Patch-0.2.5-to-0.2.6.exe"
+            ),
+            "sha256": hashlib.sha256(delta).hexdigest(),
+            "size": len(delta),
+            "notes": "增量更新测试",
+            "primary_kind": "delta",
+            "primary_from_version": "0.2.5",
+            "full": {
+                "installer_path": "/updates/files/IntDemoOnline-Setup-0.2.6.exe",
+                "sha256": hashlib.sha256(full).hexdigest(),
+                "size": len(full),
+            },
+            "deltas": [
+                {
+                    "from_version": "0.2.5",
+                    "installer_path": (
+                        "/updates/files/IntDemoOnline-Patch-0.2.5-to-0.2.6.exe"
+                    ),
+                    "sha256": hashlib.sha256(delta).hexdigest(),
+                    "size": len(delta),
+                }
+            ],
+        }
+        session = Mock()
+        session.headers = {}
+        session.get.return_value = response
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+
+        update = UpdateClient(config, session=session).check()
+
+        self.assertTrue(update.is_delta)
+        self.assertEqual(update.from_version, "0.2.5")
+        self.assertEqual(update.size, len(delta))
+        self.assertIn("Patch-0.2.5-to-0.2.6", update.installer_name)
 
     def test_update_download_verifies_size_and_sha256(self):
         content = b"verified-installer-content"
@@ -302,26 +380,124 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         )
         update = UpdateInfo(
-            version="0.2.3",
+            version="0.2.4",
             installer_url=(
                 "https://203.0.113.10/updates/files/"
-                "IntDemoOnline-Setup-0.2.3.exe"
+                "IntDemoOnline-Setup-0.2.4.exe"
             ),
-            installer_name="IntDemoOnline-Setup-0.2.3.exe",
+            installer_name="IntDemoOnline-Setup-0.2.4.exe",
             sha256=hashlib.sha256(content).hexdigest(),
             size=len(content),
             notes="",
         )
         previous = os.environ.get("INTDEMO_DATA_DIR")
         os.environ["INTDEMO_DATA_DIR"] = self.temp_dir.name
+        progress = []
         try:
-            path = UpdateClient(config, session=session).download(update)
+            path = UpdateClient(config, session=session).download(
+                update,
+                progress_callback=lambda received, total: progress.append(
+                    (received, total)
+                ),
+            )
         finally:
             if previous is None:
                 os.environ.pop("INTDEMO_DATA_DIR", None)
             else:
                 os.environ["INTDEMO_DATA_DIR"] = previous
         self.assertEqual(path.read_bytes(), content)
+        self.assertEqual(progress[0], (0, len(content)))
+        self.assertEqual(progress[-1], (len(content), len(content)))
+
+    def test_update_download_can_be_cancelled_and_removes_partial_file(self):
+        content = b"x" * (512 * 1024)
+
+        class DownloadResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def iter_content(chunk_size):
+                yield content[:chunk_size]
+                yield content[chunk_size:]
+
+        session = Mock()
+        session.headers = {}
+        session.get.return_value = DownloadResponse()
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+        update = UpdateInfo(
+            version="0.2.6",
+            installer_url="https://203.0.113.10/updates/files/update.exe",
+            installer_name="cancel-update.exe",
+            sha256=hashlib.sha256(content).hexdigest(),
+            size=len(content),
+            notes="",
+        )
+        previous = os.environ.get("INTDEMO_DATA_DIR")
+        os.environ["INTDEMO_DATA_DIR"] = self.temp_dir.name
+        cancelled = [False]
+        try:
+            with self.assertRaises(UpdateCancelled):
+                UpdateClient(config, session=session).download(
+                    update,
+                    progress_callback=lambda received, _total: (
+                        cancelled.__setitem__(0, True)
+                        if received
+                        else None
+                    ),
+                    cancelled_callback=lambda: cancelled[0],
+                )
+            update_dir = Path(self.temp_dir.name) / "updates"
+            self.assertFalse((update_dir / "cancel-update.exe").exists())
+            self.assertFalse((update_dir / "cancel-update.exe.part").exists())
+        finally:
+            if previous is None:
+                os.environ.pop("INTDEMO_DATA_DIR", None)
+            else:
+                os.environ["INTDEMO_DATA_DIR"] = previous
+
+    def test_remembered_credentials_are_encrypted_and_can_disable_auto_login(self):
+        store = LoginCredentialStore(
+            self.temp_dir.name,
+            protector=self.protector,
+        )
+        store.save("Station", "Secret!234", auto_login=True)
+
+        encrypted = store.path.read_bytes()
+        self.assertNotIn(b"Station", encrypted)
+        self.assertNotIn(b"Secret!234", encrypted)
+        remembered = store.load()
+        self.assertEqual(remembered.username, "station")
+        self.assertEqual(remembered.password, "Secret!234")
+        self.assertTrue(remembered.auto_login)
+
+        store.disable_auto_login()
+        self.assertFalse(store.load().auto_login)
+        store.update_password("station", "Changed!234")
+        self.assertEqual(store.load().password, "Changed!234")
+        store.clear()
+        self.assertIsNone(store.load())
+
+    def test_ignored_update_version_is_persisted_per_version(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        self.assertEqual(preferences.ignored_update_version, "")
+        preferences.ignore_update("0.2.3")
+        self.assertEqual(
+            ClientPreferences(self.temp_dir.name).ignored_update_version,
+            "0.2.3",
+        )
+        preferences.clear_ignored_update()
+        self.assertEqual(preferences.ignored_update_version, "")
 
     def test_expired_offline_entitlement_blocks_login(self):
         expired_bundle = self.api._bundle(

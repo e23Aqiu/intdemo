@@ -1,7 +1,8 @@
 #define MyAppName "营运信息批量查询工具"
 #define MyAppExeName "营运信息批量查询工具.exe"
+#define MyAppId "F9B73C99-E62D-4DB4-8C5A-CE64DEB5609D"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.2"
+  #define MyAppVersion "0.2.5"
 #endif
 #ifndef StageDir
   #define StageDir "..\dist\installer-stage"
@@ -12,9 +13,12 @@
 #ifndef LanguageFile
   #define LanguageFile "compiler:Default.isl"
 #endif
+#ifndef SetupIcon
+  #define SetupIcon "..\integrated_client\ui\assets\app-icon.ico"
+#endif
 
 [Setup]
-AppId={{F9B73C99-E62D-4DB4-8C5A-CE64DEB5609D}
+AppId={{{#MyAppId}}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppVerName={#MyAppName} {#MyAppVersion}
@@ -28,9 +32,15 @@ PrivilegesRequiredOverridesAllowed=dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir={#OutputDir}
+#ifdef PatchMode
+OutputBaseFilename=IntDemoOnline-Patch-{#PatchFromVersion}-to-{#MyAppVersion}
+#else
 OutputBaseFilename=IntDemoOnline-Setup-{#MyAppVersion}
-Compression=lzma2/max
-SolidCompression=yes
+#endif
+; Fast, non-solid compression installs much faster and lets patch packages
+; contain only files changed since the previous release.
+Compression=lzma2/fast
+SolidCompression=no
 WizardStyle=modern
 CloseApplications=yes
 RestartApplications=no
@@ -42,6 +52,7 @@ VersionInfoDescription={#MyAppName} 安装程序
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion={#MyAppVersion}
 VersionInfoVersion={#MyAppVersion}
+SetupIconFile={#SetupIcon}
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "{#LanguageFile}"
@@ -50,7 +61,13 @@ Name: "chinesesimplified"; MessagesFile: "{#LanguageFile}"
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
 
 [InstallDelete]
+#ifdef PatchMode
+  #ifdef PatchDeleteFile
+    #include PatchDeleteFile
+  #endif
+#else
 Type: filesandordirs; Name: "{app}\_internal"
+#endif
 
 [Files]
 Source: "{#StageDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -61,3 +78,51 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "启动 {#MyAppName}"; Flags: nowait postinstall skipifsilent
+
+#ifdef PatchMode
+[Code]
+function InitializeSetup(): Boolean;
+var
+  InstalledVersion: String;
+  UninstallKey: String;
+#ifdef FullInstallerUrl
+  ErrorCode: Integer;
+#endif
+begin
+  UninstallKey :=
+    'Software\Microsoft\Windows\CurrentVersion\Uninstall\{{#MyAppId}}_is1';
+  Result :=
+    (RegQueryStringValue(
+      HKCU, UninstallKey, 'DisplayVersion', InstalledVersion
+    ) or RegQueryStringValue(
+      HKLM, UninstallKey, 'DisplayVersion', InstalledVersion
+    )) and (InstalledVersion = '{#PatchFromVersion}');
+  if not Result then
+#ifdef FullInstallerUrl
+  begin
+    MsgBox(
+      '此增量更新包仅适用于 {#PatchFromVersion}。' + #13#10 +
+      '当前未检测到对应安装版本，将为你打开完整安装包下载地址。',
+      mbError,
+      MB_OK
+    );
+    ShellExec(
+      'open',
+      '{#FullInstallerUrl}',
+      '',
+      '',
+      SW_SHOWNORMAL,
+      ewNoWait,
+      ErrorCode
+    );
+  end;
+#else
+    MsgBox(
+      '此增量更新包仅适用于 {#PatchFromVersion}。' + #13#10 +
+      '当前未检测到对应版本，请联系管理员获取完整安装包。',
+      mbError,
+      MB_OK
+    );
+#endif
+end;
+#endif

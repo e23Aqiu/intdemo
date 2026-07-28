@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import uuid
 
-from fastapi import APIRouter, Query, Request
-from sqlalchemy import func, select, update
+from fastapi import APIRouter, Query, Request, Response
+from sqlalchemy import delete, select, update
 
 from ..database import utcnow
 from ..dependencies import AdminContext, Db
@@ -116,23 +116,6 @@ async def update_account(
 ) -> dict:
     account = _account_or_404(db, account_id)
     changes = payload.model_dump(exclude_unset=True)
-    if "device_limit" in changes:
-        active_devices = int(
-            db.scalar(
-                select(func.count(Device.id)).where(
-                    Device.account_id == account.id,
-                    Device.revoked_at.is_(None),
-                )
-            )
-            or 0
-        )
-        if changes["device_limit"] < active_devices:
-            raise ApiError(
-                "device_limit_below_active_count",
-                "设备上限不能低于当前有效设备数，请先撤销设备",
-                status_code=409,
-                details={"active_device_count": active_devices},
-            )
     if account.id == context.account.id and changes.get("is_active") is False:
         raise ApiError("cannot_disable_self", "不能停用当前管理员账号", status_code=409)
     if account.id == context.account.id and changes.get("role") == "user":
@@ -238,6 +221,54 @@ async def restore_account(
     db.commit()
     await update_hub.broadcast_revision(change.revision)
     return account_view(db, account)
+
+
+@router.delete("/accounts/{account_id}", status_code=204)
+async def delete_archived_account(
+    account_id: uuid.UUID,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> Response:
+    account = _account_or_404(db, account_id)
+    if account.id == context.account.id:
+        raise ApiError(
+            "cannot_delete_self",
+            "不能删除当前管理员账号",
+            status_code=409,
+        )
+    if not account.is_archived:
+        raise ApiError(
+            "account_not_archived",
+            "仅已归档账号可以永久删除",
+            status_code=409,
+        )
+    username = account.username
+    entity_revision = account.entitlement_revision + 1
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.delete",
+        target_type="account",
+        target_id=str(account.id),
+        details={"username": username, "permanent": True},
+    )
+    # Use a SQL delete so database-level ON DELETE rules remove every piece of
+    # archived business, device and session data without ORM nulling children.
+    db.execute(delete(Account).where(Account.id == account.id))
+    change = append_change(
+        db,
+        account_id=None,
+        kind="account",
+        entity_id=str(account_id),
+        entity_revision=entity_revision,
+        operation="delete",
+        payload={"username": username},
+    )
+    db.commit()
+    await update_hub.broadcast_revision(change.revision)
+    return Response(status_code=204)
 
 
 @router.post("/accounts/{account_id}/reset-password", status_code=204)

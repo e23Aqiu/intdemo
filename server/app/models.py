@@ -12,7 +12,9 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
+    Text,
     UniqueConstraint,
     Uuid,
 )
@@ -30,8 +32,8 @@ class Account(Base):
     password_hash: Mapped[str] = mapped_column(String(512))
     role: Mapped[str] = mapped_column(String(16), default="user")
     stats_scope: Mapped[str] = mapped_column(String(8), default="own")
-    device_limit: Mapped[int] = mapped_column(Integer, default=1)
-    is_active: Mapped[bool] = mapped_column(Boolean, default=False)
+    device_limit: Mapped[int] = mapped_column(Integer, default=10000)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
     must_change_password: Mapped[bool] = mapped_column(Boolean, default=True)
     entitlement_revision: Mapped[int] = mapped_column(Integer, default=1)
@@ -237,3 +239,103 @@ class LoginThrottle(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
+
+
+class Announcement(Base):
+    __tablename__ = "announcements"
+    __table_args__ = (Index("ix_announcements_active_created", "is_active", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"),
+        index=True,
+    )
+    title: Mapped[str] = mapped_column(String(200))
+    ticker_text: Mapped[str] = mapped_column(String(500))
+    body_html: Mapped[str] = mapped_column(Text)
+    show_on_startup: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+    targets: Mapped[list[AnnouncementTarget]] = relationship(
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    attachments: Mapped[list[AnnouncementAttachment]] = relationship(
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    receipts: Mapped[list[AnnouncementReceipt]] = relationship(
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class AnnouncementTarget(Base):
+    __tablename__ = "announcement_targets"
+
+    announcement_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("announcements.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+
+
+class AnnouncementAttachment(Base):
+    __tablename__ = "announcement_attachments"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    announcement_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("announcements.id", ondelete="CASCADE"),
+        index=True,
+    )
+    file_name: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(160))
+    kind: Mapped[str] = mapped_column(String(16), default="file")
+    size: Mapped[int] = mapped_column(Integer)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class AnnouncementReceipt(Base):
+    __tablename__ = "announcement_receipts"
+
+    announcement_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("announcements.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        primary_key=True,
+        index=True,
+    )
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    startup_shown_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class AdminContactMessage(Base):
+    __tablename__ = "admin_contact_messages"
+    __table_args__ = (Index("ix_admin_messages_read_created", "read_at", "created_at"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    sender_account_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("accounts.id", ondelete="CASCADE"),
+        index=True,
+    )
+    announcement_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("announcements.id", ondelete="SET NULL"),
+        index=True,
+    )
+    message: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)

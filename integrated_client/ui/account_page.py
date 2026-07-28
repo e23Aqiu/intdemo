@@ -89,6 +89,7 @@ class AccountPage(QWidget):
         card_layout.setSpacing(12)
 
         list_header = QHBoxLayout()
+        self.list_header_layout = list_header
         self.list_title = QLabel("账号列表")
         self.list_title.setStyleSheet(
             "font-size:16px;font-weight:700;color:#173a3d;"

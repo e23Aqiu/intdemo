@@ -59,6 +59,7 @@ class ApiClient:
         token: str | None = None,
         json_body: dict | None = None,
         params: dict | None = None,
+        raw_response: bool = False,
     ) -> Any:
         headers = {}
         if token:
@@ -98,6 +99,8 @@ class ApiClient:
             )
         if response.status_code == 204:
             return None
+        if raw_response:
+            return response
         try:
             return response.json()
         except ValueError as exc:
@@ -204,6 +207,17 @@ class ApiClient:
             "POST", f"/admin/accounts/{account_id}/restore", token=access_token
         )
 
+    def admin_delete_archived_account(
+        self,
+        access_token: str,
+        account_id: str,
+    ) -> None:
+        self._request(
+            "DELETE",
+            f"/admin/accounts/{account_id}",
+            token=access_token,
+        )
+
     def admin_reset_password(self, access_token: str, account_id: str) -> None:
         self._request(
             "POST", f"/admin/accounts/{account_id}/reset-password", token=access_token
@@ -228,4 +242,164 @@ class ApiClient:
     def admin_audit(self, access_token: str, limit: int = 100) -> dict:
         return self._request(
             "GET", "/admin/audit", token=access_token, params={"limit": limit}
+        )
+
+    def announcements(self, access_token: str, limit: int = 50) -> list[dict]:
+        return self._request(
+            "GET",
+            "/announcements",
+            token=access_token,
+            params={"limit": limit},
+        )
+
+    def mark_announcement_read(
+        self,
+        access_token: str,
+        announcement_id: str,
+        *,
+        startup_shown: bool = False,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/announcements/{announcement_id}/read",
+            token=access_token,
+            json_body={"startup_shown": bool(startup_shown)},
+        )
+
+    def send_admin_message(
+        self,
+        access_token: str,
+        announcement_id: str,
+        message: str,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/announcements/{announcement_id}/messages",
+            token=access_token,
+            json_body={"message": str(message)},
+        )
+
+    def download_announcement_attachment(
+        self,
+        access_token: str,
+        attachment_id: str,
+    ) -> bytes:
+        response = self._request(
+            "GET",
+            f"/announcements/attachments/{attachment_id}",
+            token=access_token,
+            raw_response=True,
+        )
+        return bytes(response.content)
+
+    def admin_announcements(
+        self,
+        access_token: str,
+        limit: int = 100,
+    ) -> list[dict]:
+        return self._request(
+            "GET",
+            "/admin/announcements",
+            token=access_token,
+            params={"limit": limit},
+        )
+
+    def admin_create_announcement(
+        self,
+        access_token: str,
+        payload: dict,
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/admin/announcements",
+            token=access_token,
+            json_body=payload,
+        )
+
+    def admin_update_announcement(
+        self,
+        access_token: str,
+        announcement_id: str,
+        payload: dict,
+    ) -> dict:
+        return self._request(
+            "PATCH",
+            f"/admin/announcements/{announcement_id}",
+            token=access_token,
+            json_body=payload,
+        )
+
+    def admin_delete_announcement(
+        self,
+        access_token: str,
+        announcement_id: str,
+    ) -> None:
+        self._request(
+            "DELETE",
+            f"/admin/announcements/{announcement_id}",
+            token=access_token,
+        )
+
+    def admin_add_announcement_attachment(
+        self,
+        access_token: str,
+        announcement_id: str,
+        payload: dict,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/admin/announcements/{announcement_id}/attachments",
+            token=access_token,
+            json_body=payload,
+        )
+
+    def admin_delete_announcement_attachment(
+        self,
+        access_token: str,
+        announcement_id: str,
+        attachment_id: str,
+    ) -> None:
+        self._request(
+            "DELETE",
+            f"/admin/announcements/{announcement_id}/attachments/{attachment_id}",
+            token=access_token,
+        )
+
+    def admin_messages(
+        self,
+        access_token: str,
+        *,
+        unread_only: bool = False,
+        limit: int = 200,
+    ) -> dict:
+        return self._request(
+            "GET",
+            "/admin/messages",
+            token=access_token,
+            params={
+                "unread_only": bool(unread_only),
+                "limit": limit,
+            },
+        )
+
+    def admin_mark_message_read(
+        self,
+        access_token: str,
+        message_id: str,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/admin/messages/{message_id}/read",
+            token=access_token,
+        )
+
+    def admin_delete_message(
+        self,
+        access_token: str,
+        message_id: str,
+    ) -> None:
+        self._request(
+            "DELETE",
+            f"/admin/messages/{message_id}",
+            token=access_token,
         )

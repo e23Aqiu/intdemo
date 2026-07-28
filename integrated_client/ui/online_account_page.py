@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from PyQt5.QtCore import Qt
+import json
+
+from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -11,12 +13,11 @@ from PyQt5.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
-    QWidget,
 )
 
 from ..online.api import ApiResponseError, NetworkUnavailable
@@ -24,7 +25,7 @@ from .account_page import AccountPage
 from .auth_dialogs import RenameAccountDialog
 from .frameless import FramelessDialog
 from .frameless import FramelessMessageBox as QMessageBox
-
+from .loading_dialog import run_with_loading
 
 _CALL_FAILED = object()
 
@@ -48,28 +49,23 @@ class _AccountSettingsDialog(FramelessDialog):
         self.scope = QComboBox()
         self.scope.addItem("仅本人数据", "own")
         self.scope.addItem("全部站点数据", "all")
-        self.device_limit = QSpinBox()
-        self.device_limit.setRange(1, 10000)
         self.active = QCheckBox("允许登录")
         if account:
             self.role.setCurrentIndex(self.role.findData(account.role))
             self.scope.setCurrentIndex(self.scope.findData(account.stats_scope))
-            self.device_limit.setValue(int(getattr(account, "_device_limit", 1) or 1))
             self.active.setChecked(account.is_active)
         else:
-            self.device_limit.setValue(1)
-            self.active.setChecked(False)
+            self.active.setChecked(True)
         form.addRow("登录名", self.username)
         form.addRow("站点显示名", self.display_name)
         form.addRow("角色", self.role)
         form.addRow("数据范围", self.scope)
-        form.addRow("设备上限", self.device_limit)
         form.addRow("状态", self.active)
         layout.addLayout(form)
         hint = QLabel(
             "新账号初始密码固定为 123456，首次登录必须修改。"
             if account is None
-            else "设备上限不能低于当前有效设备数。"
+            else "账号可在任意数量的电脑上登录，仍可单独撤销异常设备。"
         )
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
@@ -97,7 +93,6 @@ class _AccountSettingsDialog(FramelessDialog):
             "display_name": self.display_name.text().strip(),
             "role": self.role.currentData(),
             "stats_scope": self.scope.currentData(),
-            "device_limit": self.device_limit.value(),
             "is_active": self.active.isChecked(),
         }
 
@@ -139,17 +134,16 @@ class _DevicesDialog(FramelessDialog):
         buttons.addWidget(close)
         layout.addLayout(buttons)
         self.devices = []
-        self.refresh()
+        QTimer.singleShot(0, self.refresh)
 
     def refresh(self):
-        try:
-            token = self.page.session.access_token()
-            self.devices = self.page.session.api.admin_devices(
-                token, self.account.server_account_id
-            )
-        except (ApiResponseError, NetworkUnavailable) as exc:
-            QMessageBox.warning(self, "读取失败", str(exc))
+        result = self.page._call(
+            self.page.session.api.admin_devices,
+            self.account.server_account_id,
+        )
+        if result is _CALL_FAILED:
             return
+        self.devices = result
         self.table.setRowCount(len(self.devices))
         for row, device in enumerate(self.devices):
             values = [
@@ -177,13 +171,63 @@ class _DevicesDialog(FramelessDialog):
         )
         if reply != QMessageBox.Yes:
             return
-        try:
-            token = self.page.session.access_token()
-            self.page.session.api.admin_revoke_device(token, device["id"])
-        except (ApiResponseError, NetworkUnavailable) as exc:
-            QMessageBox.warning(self, "撤销失败", str(exc))
+        if (
+            self.page._call(
+                self.page.session.api.admin_revoke_device,
+                device["id"],
+            )
+            is _CALL_FAILED
+        ):
             return
         self.refresh()
+
+
+class _AuditDetailDialog(FramelessDialog):
+    def __init__(self, row, action_label, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("审计记录详情")
+        self.resize(620, 500)
+        layout = QVBoxLayout(self)
+        title = QLabel("审计记录详情")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+        form = QFormLayout()
+        form.addRow(
+            "时间",
+            QLabel(str(row.get("created_at") or "-").replace("T", " ")[:19]),
+        )
+        form.addRow("操作", QLabel(action_label))
+        form.addRow(
+            "目标",
+            QLabel(
+                f"{row.get('target_type') or '-'} · "
+                f"{row.get('target_id') or '-'}"
+            ),
+        )
+        form.addRow("操作账号", QLabel(str(row.get("actor_account_id") or "-")))
+        form.addRow("来源 IP", QLabel(str(row.get("ip_address") or "-")))
+        form.addRow("请求编号", QLabel(str(row.get("request_id") or "-")))
+        layout.addLayout(form)
+        details_label = QLabel("完整数据")
+        details_label.setObjectName("SettingFieldLabel")
+        layout.addWidget(details_label)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setPlainText(
+            json.dumps(
+                row.get("details") or {},
+                ensure_ascii=False,
+                indent=2,
+                default=str,
+            )
+        )
+        layout.addWidget(self.details, 1)
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        close = QPushButton("关闭")
+        close.clicked.connect(self.accept)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
 
 
 class _AuditDialog(FramelessDialog):
@@ -194,7 +238,9 @@ class _AuditDialog(FramelessDialog):
         "account.restore": "恢复账号",
         "account.password_reset": "重置密码",
         "account.data_reset": "重置统计",
+        "account.delete": "永久删除归档账号",
         "device.revoke": "撤销设备",
+        "message.delete": "删除用户消息",
     }
 
     def __init__(self, page, parent=None):
@@ -218,6 +264,7 @@ class _AuditDialog(FramelessDialog):
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
+        self.table.cellDoubleClicked.connect(self._open_detail)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -235,15 +282,16 @@ class _AuditDialog(FramelessDialog):
         buttons.addStretch()
         buttons.addWidget(close)
         layout.addLayout(buttons)
-        self.refresh()
+        self.rows = []
+        QTimer.singleShot(0, self.refresh)
 
     def refresh(self):
         payload = self.page._call(self.page.session.api.admin_audit, 200)
         if payload is _CALL_FAILED:
             return
-        rows = payload.get("items") or []
-        self.table.setRowCount(len(rows))
-        for row_index, row in enumerate(rows):
+        self.rows = list(payload.get("items") or [])
+        self.table.setRowCount(len(self.rows))
+        for row_index, row in enumerate(self.rows):
             details = row.get("details") or {}
             if isinstance(details, dict):
                 details_text = "，".join(
@@ -269,6 +317,16 @@ class _AuditDialog(FramelessDialog):
                     QTableWidgetItem(value),
                 )
 
+    def _open_detail(self, row_index, _column):
+        if 0 <= row_index < len(self.rows):
+            row = self.rows[row_index]
+            action = str(row.get("action") or "-")
+            _AuditDetailDialog(
+                row,
+                self.ACTION_LABELS.get(action, action),
+                self,
+            ).exec_()
+
 
 class OnlineAccountPage(AccountPage):
     """Offline account management UI extended with server-only controls."""
@@ -276,6 +334,7 @@ class OnlineAccountPage(AccountPage):
     def __init__(self, database, current_account, session, parent=None):
         self.session = session
         self.server_rows = {}
+        self.all_accounts = []
         super().__init__(
             database,
             current_account,
@@ -297,20 +356,38 @@ class OnlineAccountPage(AccountPage):
 
         self.create_btn.setText("＋ 新建在线账号")
         self.rename_btn.setText("修改名称")
-        self.permission_btn.setText("权限与设备")
-        self.reset_btn.setText("重置为 123456")
+        self.permission_btn.setText("权限与状态")
+        self.reset_btn.setText("重置密码")
         self.toggle_btn.setText("停用/启用")
         self.delete_btn.setText("归档账号")
         self.delete_btn.setObjectName("DangerButton")
 
         self.devices_btn = QPushButton("设备列表")
         self.devices_btn.clicked.connect(self._devices)
+        toggle_index = self.account_action_layout.indexOf(self.toggle_btn)
+        self.account_action_layout.insertWidget(toggle_index, self.devices_btn)
+
+        self.purge_btn = QPushButton("删除归档数据")
+        self.purge_btn.setObjectName("DangerButton")
+        self.purge_btn.clicked.connect(self._purge_archived_account)
         delete_index = self.account_action_layout.indexOf(self.delete_btn)
-        self.account_action_layout.insertWidget(delete_index, self.devices_btn)
+        self.account_action_layout.insertWidget(delete_index + 1, self.purge_btn)
 
         self.audit_btn = QPushButton("审计记录")
         self.audit_btn.clicked.connect(self._show_audit)
         self.account_action_layout.insertWidget(1, self.audit_btn)
+
+        filter_label = QLabel("查看")
+        filter_label.setObjectName("Muted")
+        self.account_filter = QComboBox()
+        self.account_filter.setObjectName("AccountArchiveFilter")
+        self.account_filter.addItem("在用账号", "active")
+        self.account_filter.addItem("已归档账号", "archived")
+        self.account_filter.addItem("全部账号", "all")
+        self.account_filter.setToolTip("切换在用账号和已归档账号")
+        self.list_header_layout.insertWidget(1, filter_label)
+        self.list_header_layout.insertWidget(2, self.account_filter)
+        self.account_filter.currentIndexChanged.connect(self.refresh)
 
         self.reset_stats_btn.setText("重置在线统计")
         self.reset_stats_btn.setToolTip(
@@ -349,9 +426,23 @@ class OnlineAccountPage(AccountPage):
         self._selection_changed()
 
     def _call(self, function, *args):
+        function_name = getattr(function, "__name__", "")
+        message = (
+            "加载中…"
+            if function_name
+            in {
+                "admin_accounts",
+                "admin_devices",
+                "admin_audit",
+            }
+            else "处理中…"
+        )
         try:
-            token = self.session.access_token()
-            return function(token, *args)
+            return run_with_loading(
+                self,
+                message,
+                lambda: function(self.session.access_token(), *args),
+            )
         except (ApiResponseError, NetworkUnavailable) as exc:
             QMessageBox.warning(self, "在线操作失败", str(exc))
             return _CALL_FAILED
@@ -373,6 +464,7 @@ class OnlineAccountPage(AccountPage):
             )
             self.accounts.append(account)
             self.server_rows[account.server_account_id] = server_row
+        self.all_accounts = list(self.accounts)
         self._refresh_summary()
         self.summary_values["online"].setText(
             str(
@@ -382,6 +474,17 @@ class OnlineAccountPage(AccountPage):
                 )
             )
         )
+        filter_mode = self.account_filter.currentData()
+        if filter_mode == "active":
+            self.accounts = [
+                account for account in self.all_accounts if not account.is_archived
+            ]
+        elif filter_mode == "archived":
+            self.accounts = [
+                account for account in self.all_accounts if account.is_archived
+            ]
+        else:
+            self.accounts = list(self.all_accounts)
         self.table.blockSignals(True)
         self.table.clearSelection()
         self.table.setRowCount(len(self.accounts))
@@ -393,10 +496,7 @@ class OnlineAccountPage(AccountPage):
                 account.role_label,
                 "全部" if account.stats_scope == "all" else "本人",
                 "启用" if account.is_active else "停用",
-                (
-                    f"{server.get('active_device_count', 0)}/"
-                    f"{server.get('device_limit', 1)}"
-                ),
+                str(server.get("active_device_count", 0)),
                 str(server.get("online_device_count", 0)),
                 str(server.get("created_at") or account.created_at)
                 .replace("T", " ")[:19],
@@ -448,6 +548,7 @@ class OnlineAccountPage(AccountPage):
         self.devices_btn.setEnabled(selected)
         self.toggle_btn.setEnabled(other and not account.is_archived if account else False)
         self.archive_btn.setEnabled(other)
+        self.purge_btn.setEnabled(bool(other and account and account.is_archived))
         self.export_btn.setEnabled(is_station)
         self.import_btn.setEnabled(is_station)
         self.reset_stats_btn.setEnabled(other and is_station)
@@ -475,8 +576,7 @@ class OnlineAccountPage(AccountPage):
             self.selection_hint.setText(
                 f"已选择：{account.name_label} · {account.role_label} · {state}"
                 f" · 数据范围 {'全部' if account.stats_scope == 'all' else '本人'}"
-                f" · 设备 {server.get('active_device_count', 0)}/"
-                f"{server.get('device_limit', 1)}{suffix}"
+                f" · 已登记设备 {server.get('active_device_count', 0)}{suffix}"
             )
         else:
             self.selection_hint.setText("请选择一个账号进行管理")
@@ -511,7 +611,7 @@ class OnlineAccountPage(AccountPage):
             QMessageBox.information(
                 self,
                 "创建成功",
-                "账号已创建，初始密码为 123456；请按需启用账号。",
+                "账号已创建并启用，初始密码为 123456；首次登录需要修改密码。",
             )
             self.refresh()
 
@@ -633,6 +733,35 @@ class OnlineAccountPage(AccountPage):
         if self._call(method, account.server_account_id) is not _CALL_FAILED:
             self.account_deleted.emit(account.id)
             self.refresh()
+
+    def _purge_archived_account(self):
+        account = self._selected_account()
+        if (
+            not account
+            or not account.is_archived
+            or account.id == self.current_account.id
+        ):
+            return
+        reply = QMessageBox.question(
+            self,
+            "永久删除归档账号",
+            "将永久删除该账号、业务统计、计时记录、设备和会话数据，"
+            "且无法恢复。\n\n"
+            f"确定永久删除“{account.name_label}（{account.username}）”吗？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        result = self._call(
+            self.session.api.admin_delete_archived_account,
+            account.server_account_id,
+        )
+        if result is _CALL_FAILED:
+            return
+        self.database.purge_remote_account_cache(account.server_account_id)
+        self.account_deleted.emit(account.id)
+        QMessageBox.information(self, "删除完成", "归档账号及其数据已永久删除。")
+        self.refresh()
 
     def _reset_station_statistics(self):
         account = self._selected_account()

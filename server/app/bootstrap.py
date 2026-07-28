@@ -9,11 +9,11 @@ from .services import append_change
 
 BOOTSTRAP_ACCOUNTS = (
     ("admin", "系统管理员", "admin", "all", True),
-    ("luogang", "萝岗中心站", "user", "own", False),
-    ("taiping", "太平中心站", "user", "own", False),
-    ("daojiao", "道滘中心站", "user", "own", False),
-    ("baoan", "宝安中心站", "user", "own", False),
-    ("nantou", "南头中心站", "user", "own", False),
+    ("luogang", "萝岗中心站", "user", "own", True),
+    ("taiping", "太平中心站", "user", "own", True),
+    ("daojiao", "道滘中心站", "user", "own", True),
+    ("baoan", "宝安中心站", "user", "own", True),
+    ("nantou", "南头中心站", "user", "own", True),
 )
 
 DEFAULT_METRICS = (
@@ -38,7 +38,7 @@ def bootstrap_database(db: Session) -> None:
             password_hash=hash_password("123456"),
             role=role,
             stats_scope=scope,
-            device_limit=1,
+            device_limit=10000,
             is_active=active,
             must_change_password=True,
         )

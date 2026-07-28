@@ -160,17 +160,6 @@ def login(payload: LoginRequest, request: Request, db: Db) -> TokenBundle:
     if device and device.revoked_at is not None:
         raise ApiError("device_revoked", "当前设备已被撤销", status_code=403)
     if device is None:
-        active_count = len([item for item in account.devices if item.revoked_at is None])
-        if active_count >= account.device_limit:
-            raise ApiError(
-                "device_limit_reached",
-                "已达到账号设备上限，请先由管理员撤销旧设备",
-                status_code=409,
-                details={
-                    "device_limit": account.device_limit,
-                    "active_device_count": active_count,
-                },
-            )
         device = Device(
             account_id=account.id,
             device_uid=payload.device_uid,

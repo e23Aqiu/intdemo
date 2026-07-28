@@ -174,7 +174,24 @@ class OnlineSessionManager:
             account = self._save_bundle(bundle, password)
         return account
 
-    def _offline_login(self, username: str, password: str) -> Account:
+    def offline_login(self, username: str, password: str) -> Account:
+        """Log in only from the signed local entitlement, without networking."""
+        username = str(username or "").strip().lower()
+        if not username or not password:
+            raise AuthenticationError("请输入账号和密码")
+        return self._offline_login(
+            username,
+            password,
+            mode="offline_untracked",
+        )
+
+    def _offline_login(
+        self,
+        username: str,
+        password: str,
+        *,
+        mode: str = "offline",
+    ) -> Account:
         profile = self._decrypt_profile()
         if not profile:
             raise AuthenticationError("首次登录必须连接在线服务")
@@ -192,7 +209,7 @@ class OnlineSessionManager:
             expected_username=username,
             expected_device_uid=self.device_uid,
         )
-        return self._state_from_bundle(bundle, "offline")
+        return self._state_from_bundle(bundle, mode)
 
     def change_password(self, current_password: str, new_password: str) -> Account:
         if not self._bundle or not self.state or not self.state.access_token:
@@ -217,6 +234,8 @@ class OnlineSessionManager:
     def access_token(self) -> str:
         if not self._bundle or not self.state:
             raise NetworkUnavailable("当前没有可用的在线会话")
+        if self.state.mode == "offline_untracked":
+            raise NetworkUnavailable("当前为手动离线业务模式")
         if not self.state.is_online:
             return self._refresh_access_token()
         expires = self._parse_time(self._bundle["access_expires_at"])
@@ -250,12 +269,25 @@ class OnlineSessionManager:
         return bundle["access_token"]
 
     def note_online(self) -> None:
-        if self.state and self._bundle and not self.state.is_online:
+        if (
+            self.state
+            and self._bundle
+            and self.state.mode == "offline"
+        ):
             self._state_from_bundle(self._bundle, "online")
 
     def note_offline(self) -> None:
-        if self.state and self._bundle:
+        if (
+            self.state
+            and self._bundle
+            and self.state.mode != "offline_untracked"
+        ):
             self._state_from_bundle(self._bundle, "offline")
+
+    def end_offline_session(self) -> None:
+        """End an explicit offline session while retaining its encrypted cache."""
+        self._bundle = None
+        self.state = None
 
     def invalidate_credentials(self) -> None:
         self.database.clear_secure_online_profile()

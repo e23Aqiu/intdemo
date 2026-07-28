@@ -6,7 +6,10 @@ param(
     [string]$CaBundle = "",
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "0.2.2",
+    [string]$Version = "0.2.5",
+
+    [ValidatePattern('^$|^\d+\.\d+\.\d+$')]
+    [string]$DeltaFromVersion = "",
 
     [string]$InnoCompiler = ""
 )
@@ -17,6 +20,7 @@ $portableArguments = @{
     BaseUrl = $BaseUrl
     CaBundle = $CaBundle
     Version = $Version
+    DeltaFromVersion = $DeltaFromVersion
 }
 & (Join-Path $PSScriptRoot "build-portable.ps1") @portableArguments
 if ($LASTEXITCODE -ne 0) {

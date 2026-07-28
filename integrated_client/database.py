@@ -2758,6 +2758,38 @@ class Database:
             ).fetchone()
             return self._account_from_row(row)
 
+    def purge_remote_account_cache(self, server_account_id: str) -> bool:
+        """Remove a permanently deleted remote account and all local mirrors."""
+        normalized = str(server_account_id or "").strip()
+        if not normalized:
+            return False
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT current_server_account_id FROM sync_state WHERE id=1"
+            ).fetchone()
+            if current and current["current_server_account_id"] == normalized:
+                raise DatabaseError("不能删除当前登录账号的本机缓存")
+            row = conn.execute(
+                "SELECT id FROM accounts WHERE server_account_id=?",
+                (normalized,),
+            ).fetchone()
+            conn.execute(
+                "DELETE FROM sync_outbox WHERE server_account_id=?",
+                (normalized,),
+            )
+            conn.execute(
+                "DELETE FROM remote_workflow_runs WHERE server_account_id=?",
+                (normalized,),
+            )
+            conn.execute(
+                "DELETE FROM remote_workflow_batches WHERE server_account_id=?",
+                (normalized,),
+            )
+            if not row:
+                return False
+            conn.execute("DELETE FROM accounts WHERE id=?", (int(row["id"]),))
+            return True
+
     def set_current_online_account(
         self,
         server_account_id: str,

@@ -6,9 +6,12 @@ param(
     [string]$CaBundle = "",
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "0.2.2",
+    [string]$Version = "0.2.5",
 
     [string]$InnoCompiler = "",
+
+    [ValidatePattern('^$|^\d+\.\d+\.\d+$')]
+    [string]$DeltaFromVersion = "",
 
     [switch]$SkipPyInstaller
 )
@@ -157,6 +160,22 @@ try {
     $hash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host "Installer created: $installer"
     Write-Host "SHA-256: $hash"
+    if ($DeltaFromVersion) {
+        $deltaArguments = @{
+            FromVersion = $DeltaFromVersion
+            ToVersion = $Version
+            StageDir = $stage
+            InnoCompiler = $InnoCompiler
+            FullInstallerUrl = (
+                "$($BaseUrl.TrimEnd('/'))/updates/files/" +
+                "IntDemoOnline-Setup-$Version.exe"
+            )
+        }
+        & (Join-Path $PSScriptRoot "build-delta-installer.ps1") @deltaArguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "Delta installer build failed"
+        }
+    }
 }
 finally {
     Pop-Location

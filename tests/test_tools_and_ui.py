@@ -11,7 +11,18 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pandas as pd
-from PyQt5.QtCore import QCoreApplication, QDate, QEvent, QPoint, QSize, Qt
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import PatternFill
+from PyQt5.QtCore import (
+    QCoreApplication,
+    QDate,
+    QEvent,
+    QObject,
+    QPoint,
+    QSize,
+    Qt,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QMouseEvent, QPalette
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
@@ -25,14 +36,11 @@ from PyQt5.QtWidgets import (
     QTableView,
     QToolButton,
 )
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import PatternFill
 
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import (
     DEFAULT_STATION_PASSWORD,
     DEFAULT_STATION_USERS,
-    Database,
     WORKFLOW_EMPTY_METRIC,
     WORKFLOW_HAS_PHONE_METRIC,
     WORKFLOW_INDIVIDUAL_METRIC,
@@ -40,27 +48,31 @@ from integrated_client.database import (
     WORKFLOW_NO_PHONE_METRIC,
     WORKFLOW_NO_TRANSPORT_METRIC,
     WORKFLOW_TOTAL_METRIC,
+    Database,
 )
-from integrated_client.tools.aiqicha_tool import MainWindow as AiqichaToolWidget
+from integrated_client.online.coordinator import SyncCoordinator
+from integrated_client.online.sync import SyncStatus
+from integrated_client.online.update import UpdateInfo
+from integrated_client.preferences import ClientPreferences
+from integrated_client.tencent_docs import TencentDocsImportResult
+from integrated_client.timing import WorkflowTimingService
 from integrated_client.tools.aiqicha_tool import (
     ADDR_COL_NAME,
     AIQICHA_RESULT_WAIT_SECONDS,
     LEGAL_COL_NAME,
     PHONE_COL_NAME,
-    QueryWorker,
     TARGET_COLUMNS,
+    QueryWorker,
+    create_browser,
     has_meaningful_value,
 )
+from integrated_client.tools.aiqicha_tool import MainWindow as AiqichaToolWidget
 from integrated_client.tools.transport_tool import (
-    BusinessBackfillWorker,
     CONFIG,
+    BusinessBackfillWorker,
     TargetedWorkbookWriter,
     Worker,
 )
-from integrated_client.timing import WorkflowTimingService
-from integrated_client.online.coordinator import SyncCoordinator
-from integrated_client.online.sync import SyncStatus
-from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
 from integrated_client.ui.dashboard_page import (
     DashboardMetricIcon,
@@ -68,23 +80,26 @@ from integrated_client.ui.dashboard_page import (
     StationShareChart,
 )
 from integrated_client.ui.frameless import (
-    FramelessMessageBox,
     HTBOTTOMRIGHT,
     HTCAPTION,
     HTCLIENT,
     HTTOPLEFT,
     MINMAXINFO,
     WVR_REDRAW,
+    FramelessMessageBox,
 )
+from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.online_account_page import OnlineAccountPage
+from integrated_client.ui.tencent_docs_dialog import TencentDocsProgressDialog
 from integrated_client.ui.statistics_page import (
     AnimatedDonutChart,
-    StatisticsPage,
     StationDistributionChart,
+    StatisticsPage,
     ViolationReasonChart,
     WorkflowDistributionChart,
 )
 from integrated_client.ui.theme import APP_STYLESHEET, _control_asset_path
+from integrated_client.ui.update_dialog import UpdatePromptDialog
 from integrated_client.ui.workflow_page import DataFrameTableModel, WorkflowPage
 
 
@@ -770,6 +785,153 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertEqual(AIQICHA_RESULT_WAIT_SECONDS, 120)
 
+    def test_aiqicha_browser_profile_and_persisted_login_are_reused(self):
+        profile_directory = Path(self.temp_dir.name) / "aiqicha-profile"
+
+        class Options:
+            def __init__(self):
+                self.user_data_path = None
+                self.local_port = None
+
+            def set_argument(self, _argument):
+                return self
+
+            def set_user_data_path(self, path):
+                self.user_data_path = path
+                return self
+
+            def set_local_port(self, port):
+                self.local_port = port
+                return self
+
+            def set_user_agent(self, _user_agent):
+                return self
+
+            def set_browser_path(self, _path):
+                return self
+
+        class Timeouts:
+            def timeouts(self, **_kwargs):
+                return None
+
+        options = Options()
+        browser_page = type("BrowserPage", (), {"set": Timeouts()})()
+        with patch(
+            "integrated_client.tools.aiqicha_tool.ChromiumOptions",
+            return_value=options,
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.ChromiumPage",
+            return_value=browser_page,
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ), patch(
+            "integrated_client.tools.aiqicha_tool._available_local_port",
+            return_value=19321,
+        ):
+            self.assertIs(
+                create_browser(profile_directory),
+                browser_page,
+            )
+
+        self.assertTrue(profile_directory.is_dir())
+        self.assertEqual(
+            options.user_data_path,
+            str(profile_directory.resolve()),
+        )
+        self.assertEqual(options.local_port, 19321)
+
+        dataframe = pd.DataFrame({"车辆所有人/企业": []})
+
+        class Page:
+            def __init__(self):
+                self.home_calls = 0
+
+            def get(self, url):
+                self.assertEqualUrl(url)
+                self.home_calls += 1
+
+            @staticmethod
+            def assertEqualUrl(url):
+                if url != "https://aiqicha.baidu.com":
+                    raise AssertionError(url)
+
+            @staticmethod
+            def cookies(all_domains=False):
+                if not all_domains:
+                    raise AssertionError("expected all-domain cookies")
+                return [
+                    {
+                        "name": "BDUSS",
+                        "value": "persisted-session",
+                        "domain": ".baidu.com",
+                    }
+                ]
+
+            def quit(self):
+                return None
+
+        page = Page()
+        worker = QueryWorker(
+            dataframe,
+            "车辆所有人/企业",
+            browser_profile_directory=profile_directory,
+        )
+        login_requests = []
+        logs = []
+        worker.login_required_signal.connect(lambda: login_requests.append(True))
+        worker.log_signal.connect(logs.append)
+        with patch(
+            "integrated_client.tools.aiqicha_tool.create_browser",
+            return_value=page,
+        ) as create_browser_mock, patch.object(
+            worker,
+            "_interruptible_sleep",
+            return_value=True,
+        ):
+            self.assertTrue(worker._start_browser_session())
+
+        create_browser_mock.assert_called_once_with(profile_directory.resolve())
+        self.assertEqual(page.home_calls, 1)
+        self.assertEqual(login_requests, [])
+        self.assertTrue(any("无需重复登录" in message for message in logs))
+
+    def test_aiqicha_persisted_login_requires_baidu_auth_cookie(self):
+        class Page:
+            def __init__(self, cookies):
+                self._cookies = cookies
+
+            def cookies(self, all_domains=False):
+                self.assert_all_domains = all_domains
+                return self._cookies
+
+        self.assertFalse(
+            QueryWorker._has_persisted_login(
+                Page(
+                    [
+                        {
+                            "name": "BAIDUID",
+                            "value": "anonymous",
+                            "domain": ".baidu.com",
+                        }
+                    ]
+                )
+            )
+        )
+        self.assertFalse(
+            QueryWorker._has_persisted_login(
+                Page(
+                    [
+                        {
+                            "name": "BDUSS",
+                            "value": "other-site",
+                            "domain": ".example.com",
+                        }
+                    ]
+                )
+            )
+        )
+
     def test_aiqicha_worker_reopens_browser_without_limit_while_waiting_for_login(self):
         dataframe = pd.DataFrame(
             {
@@ -1160,7 +1322,7 @@ class ToolAndUiTests(unittest.TestCase):
             "home": ("数据仪表盘", "nav-dashboard.svg"),
             "workflow": ("一键业务处理", "nav-workflow.svg"),
             "accounts": ("账号管理", "nav-accounts.svg"),
-            "personal": ("个人中心", "nav-user.svg"),
+            "personal": ("系统设置", "nav-user.svg"),
         }
         for key, (label, icon_name) in expected_nav.items():
             button = window._nav_buttons[key]
@@ -1212,7 +1374,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(window.stack.minimumSize(), window.PAGE_CANVAS_SIZE)
         self.assertIs(window.stack.currentWidget(), window.dashboard_page)
         self.assertTrue(window._nav_buttons["home"].isChecked())
-        self.assertEqual(window.page_title.text(), "仪表盘")
+        self.assertTrue(window.page_title.isHidden())
+        self.assertEqual(window.page_title.text(), "")
         self.assertEqual(
             set(window.dashboard_page.metric_cards),
             {"total", "today", "phone", "no_phone", "time"},
@@ -1236,7 +1399,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(window.data_nav_toggle.isChecked())
         self.assertFalse(window.data_nav_container.isHidden())
         self.assertTrue(window._nav_buttons["data_station"].isChecked())
-        self.assertEqual(window.page_title.text(), "全站分布")
+        self.assertEqual(window.page_title.text(), "")
         window.show_page("data_timing")
         self.assertEqual(window.statistics_page.navigation_view, "timing")
         self.assertFalse(window.statistics_page.timing_section.isHidden())
@@ -1257,7 +1420,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(window.statistics_page.anomaly_button.isHidden())
         window.statistics_page.anomaly_button.click()
         self.assertEqual(window.statistics_page.navigation_view, "anomaly")
-        self.assertEqual(window.page_title.text(), "完成类型")
+        self.assertEqual(window.page_title.text(), "")
         window.statistics_page.anomaly_button.click()
         self.assertEqual(window.statistics_page.navigation_view, "completion")
         window.show_page("data_violation")
@@ -1281,7 +1444,7 @@ class ToolAndUiTests(unittest.TestCase):
         window.show_page("personal")
         self.assertIs(window.stack.currentWidget(), window.personal_center_page)
         self.assertTrue(window._nav_buttons["personal"].isChecked())
-        self.assertEqual(window.page_title.text(), "个人中心")
+        self.assertEqual(window.page_title.text(), "")
         window.show_page("home")
         self.assertEqual(window.statistics_page.detail_tabs.count(), 2)
         self.assertFalse(window.statistics_page.detail_tabs.documentMode())
@@ -1418,6 +1581,192 @@ class ToolAndUiTests(unittest.TestCase):
         coordinator.stop()
         coordinator.deleteLater()
 
+    def test_sync_action_and_update_details_live_in_the_sidebar_and_settings(self):
+        class FakeEngine:
+            def __init__(self):
+                self.current_status = SyncStatus(
+                    state="online",
+                    pending_count=0,
+                    quarantined_count=0,
+                    last_sync_at=None,
+                )
+
+            def status(self):
+                return self.current_status
+
+        class FakeSyncCoordinator(QObject):
+            status_changed = pyqtSignal(object)
+            data_changed = pyqtSignal()
+
+            def __init__(self):
+                super().__init__()
+                self.engine = FakeEngine()
+                self.retry_count = 0
+
+            def retry_now(self):
+                self.retry_count += 1
+
+        class FakeUpdateCoordinator(QObject):
+            update_available = pyqtSignal(object)
+            state_changed = pyqtSignal(str, str)
+            download_progress = pyqtSignal(int, int)
+            download_completed = pyqtSignal(object)
+
+            @staticmethod
+            def check(manual=False):
+                return manual
+
+            @staticmethod
+            def download(_update):
+                return True
+
+        sync = FakeSyncCoordinator()
+        updates = FakeUpdateCoordinator()
+        preferences = ClientPreferences(self.temp_dir.name)
+        preferences.ignore_update("0.2.4")
+        window = MainWindow(
+            self.db,
+            self.admin,
+            sync_coordinator=sync,
+            update_coordinator=updates,
+            client_preferences=preferences,
+        )
+        status = SyncStatus(
+            state="online",
+            pending_count=35,
+            quarantined_count=0,
+            last_sync_at="2026-07-28T10:00:00+08:00",
+        )
+        window._update_sync_status(status)
+        self.assertIn("待同步：35", window.sync_retry_button.text())
+        self.assertTrue(
+            window.sync_status_card.isAncestorOf(window.sync_retry_button)
+        )
+        window.sync_retry_button.click()
+        self.assertEqual(sync.retry_count, 1)
+
+        update = UpdateInfo(
+            version="0.2.4",
+            installer_url="https://example.com/updates/files/update.exe",
+            installer_name="update.exe",
+            sha256="0" * 64,
+            size=10,
+            notes="新增更新弹窗与系统设置。",
+            mandatory=False,
+        )
+        window._update_available(update)
+        self.assertEqual(
+            window.personal_center_page.latest_version_value.text(),
+            "v0.2.4",
+        )
+        self.assertIn(
+            "新增更新弹窗",
+            window.personal_center_page.update_notes.toPlainText(),
+        )
+        self.assertIn("●", window._nav_buttons["personal"].text())
+        self.assertEqual(
+            window._nav_buttons["personal"].toolTip(),
+            "新版本发布!",
+        )
+
+        window._update_download_state("downloading", "正在下载 v0.2.4…")
+        self.assertTrue(window.workflow_page.isEnabled())
+        self.assertTrue(window.personal_center_page.isEnabled())
+        window._update_download_progress(5, 10)
+        self.assertEqual(
+            window.personal_center_page.update_progress.value(),
+            50,
+        )
+        with patch(
+            "integrated_client.ui.main_window.QMessageBox.question",
+            return_value=QMessageBox.No,
+        ):
+            window._update_downloaded(Path(self.temp_dir.name) / "update.exe")
+        self.assertTrue(window.workflow_page.isEnabled())
+        self.assertEqual(
+            window.personal_center_page.update_action_btn.text(),
+            "重启并安装",
+        )
+
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
+    def test_update_prompt_enforces_mandatory_and_reports_progress(self):
+        mandatory_update = UpdateInfo(
+            version="0.2.4",
+            installer_url="https://example.com/updates/files/update.exe",
+            installer_name="update.exe",
+            sha256="0" * 64,
+            size=100,
+            notes="必须安装的安全更新。",
+            mandatory=True,
+        )
+        dialog = UpdatePromptDialog(mandatory_update)
+        dialog.show()
+        self.app.processEvents()
+        self.assertTrue(dialog.ignore_button.isHidden())
+        self.assertTrue(dialog.cancel_button.isHidden())
+        self.assertTrue(dialog.window_controls.close_button.isHidden())
+        dialog.reject()
+        self.app.processEvents()
+        self.assertTrue(dialog.isVisible())
+
+        dialog.begin_download()
+        dialog.set_progress(40, 100)
+        self.assertEqual(dialog.progress.value(), 40)
+        self.assertFalse(dialog.update_button.isEnabled())
+        dialog.set_downloaded()
+        self.assertEqual(dialog.update_button.text(), "重启并安装")
+        dialog.allow_close()
+        dialog.reject()
+        self.app.processEvents()
+        self.assertFalse(dialog.isVisible())
+        dialog.deleteLater()
+
+    def test_login_preferences_are_saved_after_successful_login(self):
+        class Store:
+            is_available = True
+
+            def __init__(self):
+                self.saved = None
+                self.cleared = False
+
+            @staticmethod
+            def load():
+                return None
+
+            def save(self, username, password, *, auto_login):
+                self.saved = (username, password, auto_login)
+
+            def clear(self):
+                self.cleared = True
+
+        self.db.change_password(
+            self.admin.id,
+            DEFAULT_ADMIN_PASSWORD,
+            must_change=False,
+        )
+        store = Store()
+        dialog = LoginDialog(self.db, credential_store=store)
+        dialog.username_edit.setText(DEFAULT_ADMIN_USERNAME)
+        dialog.password_edit.setText(DEFAULT_ADMIN_PASSWORD)
+        dialog.auto_login_checkbox.setChecked(True)
+        self.assertTrue(dialog.remember_password_checkbox.isChecked())
+
+        dialog._login()
+
+        self.assertEqual(dialog.result(), dialog.Accepted)
+        self.assertEqual(
+            store.saved,
+            (
+                DEFAULT_ADMIN_USERNAME,
+                DEFAULT_ADMIN_PASSWORD,
+                True,
+            ),
+        )
+        dialog.deleteLater()
+
     def test_frameless_controls_are_embedded_without_an_extra_title_bar(self):
         window = MainWindow(self.db, self.admin)
         window.show()
@@ -1484,6 +1833,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(login.minimumSize(), login.maximumSize())
         self.assertEqual(login._window_hit_test(QPoint(60, 20)), HTCAPTION)
         self.assertEqual(login.username_edit.text(), "")
+        self.assertEqual(login.remember_password_checkbox.text(), "记住密码")
+        self.assertEqual(login.auto_login_checkbox.text(), "自动登录")
         self.assertFalse(
             any(
                 "首次启动已创建管理员" in label.text()
@@ -1547,7 +1898,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIs(window.stack.currentWidget(), window.workflow_page)
         self.assertTrue(window._nav_buttons["workflow"].isChecked())
         self.assertFalse(window._nav_buttons["home"].isChecked())
-        self.assertEqual(window.page_title.text(), "一键业务处理")
+        self.assertTrue(window.page_title.isHidden())
+        self.assertEqual(window.page_title.text(), "")
         window.show_page("data_anomaly")
         self.assertIs(window.stack.currentWidget(), window.workflow_page)
         self.assertTrue(window._nav_buttons["workflow"].isChecked())
@@ -2436,6 +2788,44 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.browser_detail_label.isHidden())
         self.assertEqual(page.browser_detail_toggle_btn.text(), "查看详情")
 
+        preview_header = page.preview_panel.header_layout
+        self.assertLess(
+            preview_header.indexOf(page.open_workbook_btn),
+            preview_header.indexOf(page.open_workbook_folder_btn),
+        )
+        self.assertLess(
+            preview_header.indexOf(page.open_workbook_folder_btn),
+            preview_header.indexOf(page.preview_toggle_btn),
+        )
+        self.assertFalse(page.open_workbook_btn.isEnabled())
+        self.assertFalse(page.open_workbook_folder_btn.isEnabled())
+
+        workbook_path = Path(self.temp_dir.name) / "preview-actions.xlsx"
+        workbook = Workbook()
+        workbook.active.append(["车辆标识", "已协助补缴"])
+        workbook.active.append(["粤A12345", ""])
+        workbook.save(workbook_path)
+        workbook.close()
+        page.file_path = str(workbook_path)
+        page.file_edit.setText(str(workbook_path))
+        self.assertTrue(page._reload_preview(force=True))
+        self.assertTrue(page.open_workbook_btn.isEnabled())
+        self.assertTrue(page.open_workbook_folder_btn.isEnabled())
+        with patch(
+            "integrated_client.ui.workflow_page.QDesktopServices.openUrl",
+            return_value=True,
+        ) as open_url:
+            page.open_workbook_btn.click()
+            page.open_workbook_folder_btn.click()
+        opened_paths = [
+            Path(invocation.args[0].toLocalFile()).resolve()
+            for invocation in open_url.call_args_list
+        ]
+        self.assertEqual(
+            opened_paths,
+            [workbook_path.resolve(), workbook_path.parent.resolve()],
+        )
+
         self.assertTrue(page.preview_panel.is_expanded())
         self.assertTrue(page.log_panel.is_expanded())
         file_group_height = page.file_group.height()
@@ -2464,6 +2854,170 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.log_panel.is_expanded())
         self.assertFalse(page.log_text.isHidden())
         self.assertTrue(page.collapsed_content_spacer.isHidden())
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_tencent_docs_button_reuses_account_link_without_starting_timing(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        old_url = "https://docs.qq.com/sheet/old"
+        new_url = "https://docs.qq.com/sheet/new"
+        preferences.set_tencent_document_url("admin", old_url)
+        timing = WorkflowTimingService(self.db, self.admin.id)
+        page = WorkflowPage(
+            timing_service=timing,
+            client_preferences=preferences,
+            account_key="admin",
+        )
+
+        self.assertEqual(page.tencent_docs_btn.text(), "导入腾讯文档")
+        file_layout = page.file_group.layout()
+        self.assertEqual(
+            file_layout.indexOf(page.tencent_docs_btn),
+            file_layout.indexOf(page.choose_btn) + 1,
+        )
+        self.assertFalse(timing.is_active)
+
+        with patch(
+            "integrated_client.ui.workflow_page.TencentDocsLinkDialog",
+        ) as dialog_type, patch(
+            "integrated_client.ui.workflow_page.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ), patch.object(
+            page,
+            "_start_tencent_docs_import",
+        ) as start_import:
+            dialog = dialog_type.return_value
+            dialog.Accepted = 1
+            dialog.exec_.return_value = 1
+            dialog.value.return_value = new_url
+            page.tencent_docs_btn.click()
+
+        dialog_type.assert_called_once_with(old_url, page)
+        start_import.assert_called_once_with(new_url)
+        self.assertEqual(
+            ClientPreferences(self.temp_dir.name).tencent_document_url(
+                "ADMIN"
+            ),
+            new_url,
+        )
+        self.assertFalse(timing.is_active)
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_tencent_docs_dialog_displays_percentage_progress(self):
+        dialog = TencentDocsProgressDialog()
+        self.assertEqual(dialog.progress.minimum(), 0)
+        self.assertEqual(dialog.progress.maximum(), 100)
+        self.assertTrue(dialog.progress.isTextVisible())
+        self.assertEqual(dialog.progress.value(), 0)
+        dialog.set_progress(63)
+        self.assertEqual(dialog.progress.value(), 63)
+        dialog.set_progress(150)
+        self.assertEqual(dialog.progress.value(), 100)
+        dialog.finish()
+        dialog.close()
+
+    def test_workflow_run_settings_are_persisted_per_program_account(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        page = WorkflowPage(
+            client_preferences=preferences,
+            account_key="Admin",
+        )
+        page.mode_combo.setCurrentIndex(page.mode_combo.findData(True))
+        page.manual_captcha.setChecked(False)
+        page.auto_continue.setChecked(False)
+        page.only_yellow.setChecked(False)
+        page.infinite_captcha.setChecked(True)
+        page.page_retry.setValue(17)
+        page.captcha_retry.setValue(56)
+
+        saved = ClientPreferences(
+            self.temp_dir.name
+        ).workflow_run_settings("ADMIN")
+        self.assertEqual(
+            saved,
+            {
+                "auto_mode": True,
+                "manual_captcha": False,
+                "auto_continue": False,
+                "only_yellow": False,
+                "infinite_captcha": True,
+                "page_retry": 17,
+                "captcha_retry": 56,
+            },
+        )
+        self.assertTrue(page.shutdown())
+        page.close()
+
+        restored = WorkflowPage(
+            client_preferences=ClientPreferences(self.temp_dir.name),
+            account_key="admin",
+        )
+        self.assertTrue(bool(restored.mode_combo.currentData()))
+        self.assertFalse(restored.manual_captcha.isChecked())
+        self.assertFalse(restored.auto_continue.isChecked())
+        self.assertFalse(restored.only_yellow.isChecked())
+        self.assertTrue(restored.infinite_captcha.isChecked())
+        self.assertEqual(restored.page_retry.value(), 17)
+        self.assertEqual(restored.captcha_retry.value(), 56)
+
+        other_account = WorkflowPage(
+            client_preferences=ClientPreferences(self.temp_dir.name),
+            account_key="station",
+        )
+        self.assertFalse(bool(other_account.mode_combo.currentData()))
+        self.assertTrue(other_account.manual_captcha.isChecked())
+        self.assertTrue(other_account.only_yellow.isChecked())
+        self.assertEqual(other_account.page_retry.value(), 5)
+        self.assertTrue(restored.shutdown())
+        self.assertTrue(other_account.shutdown())
+        restored.close()
+        other_account.close()
+
+    def test_tencent_docs_result_is_automatically_loaded_without_timing(self):
+        workbook_path = Path(self.temp_dir.name) / "tencent-pending.xlsx"
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["车辆标识", "公司名称", "已协助补缴"])
+        worksheet.append(["粤A12345", "", "否"])
+        workbook.save(workbook_path)
+        workbook.close()
+
+        timing = WorkflowTimingService(self.db, self.admin.id)
+        page = WorkflowPage(timing_service=timing)
+        worker = object()
+        page.tencent_import_worker = worker
+
+        class Dialog:
+            finished = False
+
+            def finish(self):
+                self.finished = True
+
+        dialog = Dialog()
+        result = TencentDocsImportResult(
+            path=workbook_path,
+            copied_rows=1,
+            source_start_row=10,
+            source_row_count=9,
+            company_header="公司名称",
+        )
+        with patch(
+            "integrated_client.ui.workflow_page.QMessageBox.information"
+        ) as information:
+            page._tencent_docs_import_succeeded(
+                worker,
+                dialog,
+                result,
+            )
+
+        self.assertTrue(dialog.finished)
+        self.assertEqual(page.file_path, str(workbook_path))
+        self.assertEqual(len(page.df), 1)
+        self.assertEqual(page.df.iloc[0]["车辆标识"], "粤A12345")
+        self.assertFalse(timing.is_active)
+        self.assertIn("第 10 行", information.call_args.args[2])
+        page.tencent_import_worker = None
         self.assertTrue(page.shutdown())
         page.close()
 
@@ -2521,6 +3075,51 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(service.heartbeat_count, 1)
 
         service.is_active = False
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_aiqicha_login_wait_pauses_and_resumes_business_timing(self):
+        class TimingService:
+            is_active = False
+
+            def __init__(self):
+                self.pause_reasons = []
+                self.resume_reasons = []
+
+            def pause(self, reason):
+                self.pause_reasons.append(reason)
+
+            def resume(self, reason):
+                self.resume_reasons.append(reason)
+
+        timing = TimingService()
+        page = WorkflowPage(timing_service=timing)
+        worker = QueryWorker(
+            pd.DataFrame({"车辆所有人/企业": []}),
+            "车辆所有人/企业",
+        )
+        page.current_worker = worker
+        page.current_step = 3
+        with patch.object(
+            page,
+            "_refresh_timing_label",
+        ), patch.object(
+            worker,
+            "isRunning",
+            return_value=True,
+        ):
+            page._on_login_required()
+            self.assertTrue(page.awaiting_login)
+            self.assertEqual(
+                timing.pause_reasons,
+                ["等待用户登录爱企查"],
+            )
+            page.continue_pipeline()
+
+        self.assertTrue(worker._login_wait.is_set())
+        self.assertFalse(page.awaiting_login)
+        self.assertEqual(timing.resume_reasons, ["用户继续执行"])
+        page.current_worker = None
         self.assertTrue(page.shutdown())
         page.close()
 

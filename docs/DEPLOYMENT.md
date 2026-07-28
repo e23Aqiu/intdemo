@@ -3,8 +3,8 @@
 ## 1. 前置条件
 
 - 腾讯轻量应用服务器 Ubuntu 24.04，建议至少 2 核 2 GB。
-- 腾讯防火墙先只允许管理员公网 IP 访问 TCP/UDP 443；域名方案需要公网
-  TCP 80 用于 ACME 和 HTTPS 跳转。
+- 腾讯防火墙允许全部 IPv4 来源访问 TCP 80、TCP/UDP 443；数据库和 API
+  容器端口不对宿主机发布。
 - 域名方案先配置 A/AAAA；中国大陆实例正式以域名提供服务前完成 ICP 备案。
 - 服务器只需 Docker Engine 与 Compose 插件，不在宿主机安装 Python 或
   PostgreSQL。
@@ -19,15 +19,16 @@ sudo bash ./deploy/scripts/install-docker-ubuntu.sh
 Docker 的 `DOCKER-USER` 链：
 
 ```bash
-sudo bash ./deploy/scripts/configure-docker-firewall.sh 203.0.113.25/32
+sudo bash ./deploy/scripts/configure-docker-firewall.sh public allow-http
 ```
 
 该脚本只过滤外部网卡进入 Docker 发布端口的流量，不影响容器访问外网。
-默认关闭 TCP 80；域名方案需要 ACME 时使用第三个参数显式开放：
+`public` 模式允许任意 IPv4 客户端访问 HTTP/HTTPS。若以后需要重新限制
+来源，可切换为 `private` 模式：
 
 ```bash
 sudo bash ./deploy/scripts/configure-docker-firewall.sh \
-  203.0.113.25/32 "" allow-http
+  private 203.0.113.25/32 198.51.100.0/24 allow-http
 ```
 
 ## 2. 初始化配置和密钥
@@ -115,37 +116,36 @@ API 和 WebSocket 都显式加载该 CA；代码中没有 `verify=False` 或 HTT
 
 ## 5. 首次上线顺序
 
-1. 维持 443 仅管理员公网 IP 可达。
+1. 启动阶段可以先使用 `private` 模式，仅允许管理员公网 IP。
 2. 启动 Compose；`/api/v1/health/live` 应为 200。
 3. `/api/v1/health/ready` 应为 503，原因是管理员尚未改密。
 4. 使用 v0.2 客户端以 `admin / 123456` 登录并修改密码。
-5. `health/ready` 变为 200 后，管理员启用所需站点。
-6. 再在腾讯防火墙和 `DOCKER-USER` 规则中扩大客户端来源范围，例如允许
-   公司出口网段：
+5. `health/ready` 变为 200 后，确认普通站点账号均处于启用状态。
+6. 将腾讯防火墙和 `DOCKER-USER` 同时切换为全部 IPv4 可访问：
 
 ```bash
 sudo bash ./deploy/scripts/configure-docker-firewall.sh \
-  203.0.113.25/32 198.51.100.0/24
+  public allow-http
 ```
 
-多个测试公网 IP 可以用逗号分隔：
+如需重新限制为多个测试公网 IP，可用逗号分隔：
 
 ```bash
 sudo bash ./deploy/scripts/configure-docker-firewall.sh \
-  203.0.113.25/32 \
+  private 203.0.113.25/32 \
   198.51.100.10/32,198.51.100.11/32,198.51.100.12/32
 ```
 
-同一批来源 CIDR 还必须在腾讯云轻量服务器防火墙中放行 TCP 443；只修改
-其中一层仍会连接超时。客户端程序本身不绑定电脑的公网 IP，但每个账号仍
-受管理员设置的设备上限约束。
+腾讯云轻量服务器防火墙和宿主机 `DOCKER-USER` 必须同时放行；只修改其中
+一层仍会连接超时。客户端不绑定公网 IP，也不再以设备数量阻止新电脑登录；
+管理员仍可单独撤销异常设备。
 
 Compose 默认仅绑定 IPv4 的 `0.0.0.0`。如使用 AAAA，必须调整
 `CADDY_BIND_ADDRESS` 并用等价的 `ip6tables` 规则限制 IPv6 来源；未完成前
 不要在腾讯防火墙开放公网 IPv6 443。
 
 初始站点账号为 `luogang`、`taiping`、`daojiao`、`baoan`、`nantou`，
-密码均为 `123456`，初始停用且要求首次改密。
+密码均为 `123456`，初始启用且要求首次改密。
 
 ## 6. 日常命令
 
@@ -168,7 +168,7 @@ Uvicorn worker，SQLAlchemy 连接池为 `5 + 5`。
 winget install --id JRSoftware.InnoSetup --exact
 .\scripts\build-installer.ps1 `
   -BaseUrl https://api.example.com `
-  -Version 0.2.2
+  -Version 0.2.5
 ```
 
 IP 私有 CA 包：
@@ -177,7 +177,7 @@ IP 私有 CA 包：
 .\scripts\build-installer.ps1 `
   -BaseUrl https://203.0.113.10 `
   -CaBundle .\intdemo-caddy-root.crt `
-  -Version 0.2.2
+  -Version 0.2.5
 ```
 
 脚本生成外置 `client-online.json` 和按当前用户安装的中文安装包。v0.2
@@ -190,20 +190,25 @@ IP 私有 CA 包：
 .\scripts\build-releases.ps1 `
   -BaseUrl https://203.0.113.10 `
   -CaBundle .\intdemo-caddy-root.crt `
-  -Version 0.2.2
+  -Version 0.2.5 `
+  -DeltaFromVersion 0.2.4
 ```
 
-便携包位于 `dist\portable\IntDemoOnline-Portable-0.2.2.zip`。用户必须
+便携包位于 `dist\portable\IntDemoOnline-Portable-0.2.5.zip`。用户必须
 完整解压，不能只复制其中的 EXE，因为同目录的连接配置及 `certs` 私有
 CA 证书也是 HTTPS 校验的一部分。安装包位于
-`dist\installer\IntDemoOnline-Setup-0.2.2.exe`。
+`dist\installer\IntDemoOnline-Setup-0.2.5.exe`，从 0.2.4 升级的差异包位于
+`dist\installer\IntDemoOnline-Patch-0.2.4-to-0.2.5.exe`。
 
 后续发布测试通道更新：
 
 ```powershell
 .\scripts\publish-update.ps1 `
-  -Installer .\dist\installer\IntDemoOnline-Setup-0.2.2.exe `
-  -Version 0.2.2 `
+  -Installer .\dist\installer\IntDemoOnline-Setup-0.2.5.exe `
+  -DeltaInstaller .\dist\installer\IntDemoOnline-Patch-0.2.4-to-0.2.5.exe `
+  -DeltaFromVersion 0.2.4 `
+  -LegacyDeltaPrimary `
+  -Version 0.2.5 `
   -Notes "本次更新说明" `
   -RemoteHost intdemo-test `
   -RemotePath /opt/intdemo/deploy/updates
@@ -211,6 +216,11 @@ CA 证书也是 HTTPS 校验的一部分。安装包位于
 
 Compose 将服务器的 `deploy/updates/` 只读挂载给 Caddy，并通过
 `/updates/` 提供版本清单和安装包。发布顺序固定为：
+
+`-LegacyDeltaPrimary` 仅用于 0.2.4→0.2.5 的一次性引导。它让旧更新器
+读取差异包作为主下载，同时在清单保留完整包；差异安装器还会验证已安装
+版本。0.2.5 之后由客户端根据 `deltas.from_version` 自动选择，不再使用
+该开关。
 
 1. 本地完整构建并执行安装、启动、卸载冒烟测试。
 2. 生成 SHA-256 和 `test.json`。
@@ -221,6 +231,11 @@ Compose 将服务器的 `deploy/updates/` 只读挂载给 Caddy，并通过
 安装包前核对清单声明的大小及 SHA-256。未购买 Windows 代码签名证书前，
 其他电脑首次运行安装包可能显示“未知发布者”；这不应通过关闭
 SmartScreen 或禁用 TLS 校验来规避，正式发布建议购买组织代码签名证书。
+
+发布时加 `-Mandatory` 会生成强制更新清单。客户端检测到强制更新后不能
+关闭提示窗口，必须下载并重启安装；普通更新提供“立即更新”“不再提示”和
+“取消”。“不再提示”只对当前版本生效，用户仍可在“系统设置”中手动下载。
+下载期间系统设置与弹窗会显示进度，其他业务页面会被锁定。
 
 当前测试安装包使用 Inno Setup 6.7.3。该版本编译器会明确标注仅限
 非商业用途；迁入公司正式商用前需购买 Inno Setup 商业许可证，或替换成
