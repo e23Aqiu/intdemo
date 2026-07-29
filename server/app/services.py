@@ -35,6 +35,7 @@ def active_device_count(db: Session, account_id: uuid.UUID) -> int:
             select(func.count(Device.id)).where(
                 Device.account_id == account_id,
                 Device.revoked_at.is_(None),
+                Device.is_control_client.is_(False),
             )
         )
         or 0
@@ -48,6 +49,7 @@ def account_view(db: Session, account: Account) -> dict[str, Any]:
             select(func.count(Device.id)).where(
                 Device.account_id == account.id,
                 Device.revoked_at.is_(None),
+                Device.is_control_client.is_(False),
                 Device.last_seen_at >= online_cutoff,
             )
         )

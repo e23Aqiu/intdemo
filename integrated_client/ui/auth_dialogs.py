@@ -16,6 +16,7 @@ from PyQt5.QtWidgets import (
 
 from ..config import APP_NAME
 from ..database import AuthenticationError, Database
+from ..models import Account
 from ..online.secure import SecureStorageUnavailable
 from ..preferences import LoginCredentialStore
 from .frameless import FramelessDialog
@@ -213,15 +214,12 @@ class LoginDialog(FramelessDialog):
         self.login_btn.setObjectName("PrimaryButton")
         self.login_btn.setMinimumHeight(42)
         self.login_btn.clicked.connect(self._login)
-        self.offline_login_btn = QPushButton("离线登录")
+        self.offline_login_btn = QPushButton("离线登录（游客）")
         self.offline_login_btn.setMinimumHeight(42)
         self.offline_login_btn.setToolTip(
-            "仅使用本机有效离线授权登录；本次业务不计入统计，也不会同步。"
+            "无需账号和密码，仅可处理业务；本次不记录统计、计时或同步数据。"
         )
-        self.offline_login_btn.clicked.connect(
-            lambda _checked=False: self._login(explicit_offline=True)
-        )
-        self.offline_login_btn.setEnabled(self.session_manager is not None)
+        self.offline_login_btn.clicked.connect(self._guest_login)
         login_actions = QHBoxLayout()
         login_actions.setSpacing(10)
         login_actions.addWidget(self.offline_login_btn)
@@ -262,7 +260,7 @@ class LoginDialog(FramelessDialog):
         automatic=False,
         explicit_offline=False,
     ):
-        if self._login_in_progress:
+        if self._login_in_progress or self.result() == QDialog.Accepted:
             return
         if explicit_offline and self.session_manager is None:
             QMessageBox.warning(
@@ -321,8 +319,8 @@ class LoginDialog(FramelessDialog):
             self._login_in_progress = False
             self.login_btn.setEnabled(True)
             self.login_btn.setText("登录")
-            self.offline_login_btn.setEnabled(self.session_manager is not None)
-            self.offline_login_btn.setText("离线登录")
+            self.offline_login_btn.setEnabled(True)
+            self.offline_login_btn.setText("离线登录（游客）")
 
         if account.must_change_password:
             dialog = PasswordDialog(
@@ -375,6 +373,23 @@ class LoginDialog(FramelessDialog):
         else:
             self.credential_store.clear()
         self.account = account
+        self.accept()
+
+    def _guest_login(self, _checked=False):
+        """Enter an untracked, in-memory guest session without credentials."""
+        if self._login_in_progress or self.result() == QDialog.Accepted:
+            return
+        self.session_state = None
+        self.offline_business_mode = True
+        self.account = Account(
+            id=-1,
+            username="guest",
+            display_name="离线游客",
+            role="user",
+            is_active=True,
+            created_at="",
+            last_login=None,
+        )
         self.accept()
 
 

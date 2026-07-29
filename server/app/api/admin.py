@@ -5,8 +5,9 @@ import uuid
 from fastapi import APIRouter, Query, Request, Response
 from sqlalchemy import delete, select, update
 
+from ..connection_test import connection_test_gate
 from ..database import utcnow
-from ..dependencies import AdminContext, Db
+from ..dependencies import AdminContext, ControlAdminContext, Db
 from ..errors import ApiError
 from ..models import (
     Account,
@@ -21,6 +22,8 @@ from ..schemas import (
     AccountCreate,
     AccountUpdate,
     AccountView,
+    ConnectionTestActionResult,
+    ConnectionTestOverview,
     DataResetRequest,
     DeviceView,
 )
@@ -56,6 +59,17 @@ def _account_change_payload(account: Account) -> dict:
         "is_archived": account.is_archived,
         "entitlement_revision": account.entitlement_revision,
     }
+
+
+def _connection_test_device_or_404(db: Db, device_id: uuid.UUID) -> Device:
+    device = db.get(Device, device_id)
+    if (
+        device is None
+        or device.revoked_at is not None
+        or device.is_control_client
+    ):
+        raise ApiError("connection_test_client_not_found", "业务客户端不存在", status_code=404)
+    return device
 
 
 @router.get("/accounts", response_model=list[AccountView])
@@ -364,6 +378,160 @@ async def revoke_device(
         )
         db.commit()
         await update_hub.broadcast_revision(change.revision)
+
+
+@router.get(
+    "/connection-test/clients",
+    response_model=ConnectionTestOverview,
+)
+async def list_connection_test_clients(
+    context: ControlAdminContext,
+    db: Db,
+) -> dict:
+    connected_device_ids = await update_hub.connected_device_ids()
+    rows = db.execute(
+        select(Device, Account)
+        .join(Account, Account.id == Device.account_id)
+        .where(Device.revoked_at.is_(None))
+        .order_by(Device.last_seen_at.desc())
+    ).all()
+    clients = [
+        {
+            "id": device.id,
+            "account_id": account.id,
+            "username": account.username,
+            "display_name": account.display_name,
+            "device_uid": device.device_uid,
+            "name": device.name,
+            "client_version": device.client_version,
+            "last_seen_at": device.last_seen_at,
+            "connected": device.id in connected_device_ids,
+            "blocked": connection_test_gate.is_blocked(device.id),
+        }
+        for device, account in rows
+        if not device.is_control_client
+    ]
+    return {
+        "global_blocked": connection_test_gate.global_blocked,
+        "clients": clients,
+    }
+
+
+@router.post(
+    "/connection-test/all/disconnect",
+    response_model=ConnectionTestActionResult,
+)
+async def disconnect_all_clients(
+    request: Request,
+    context: ControlAdminContext,
+    db: Db,
+) -> dict:
+    connection_test_gate.disconnect_all()
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="connection_test.disconnect_all",
+        target_type="client_connection",
+        details={"scope": "all"},
+    )
+    db.commit()
+    closed = await update_hub.close_blocked(
+        lambda device_id: (
+            not connection_test_gate.is_control_device(device_id)
+            and connection_test_gate.is_blocked(device_id)
+        )
+    )
+    return {
+        "global_blocked": True,
+        "blocked": True,
+        "closed_websockets": closed,
+    }
+
+
+@router.post(
+    "/connection-test/all/restore",
+    response_model=ConnectionTestActionResult,
+)
+async def restore_all_clients(
+    request: Request,
+    context: ControlAdminContext,
+    db: Db,
+) -> dict:
+    connection_test_gate.restore_all()
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="connection_test.restore_all",
+        target_type="client_connection",
+        details={"scope": "all"},
+    )
+    db.commit()
+    return {
+        "global_blocked": False,
+        "blocked": False,
+        "closed_websockets": 0,
+    }
+
+
+@router.post(
+    "/connection-test/devices/{device_id}/disconnect",
+    response_model=ConnectionTestActionResult,
+)
+async def disconnect_client(
+    device_id: uuid.UUID,
+    request: Request,
+    context: ControlAdminContext,
+    db: Db,
+) -> dict:
+    device = _connection_test_device_or_404(db, device_id)
+    connection_test_gate.disconnect_device(device.id)
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="connection_test.disconnect_device",
+        target_type="device",
+        target_id=str(device.id),
+    )
+    db.commit()
+    closed = await update_hub.close_device(device.id)
+    return {
+        "global_blocked": connection_test_gate.global_blocked,
+        "device_id": device.id,
+        "blocked": True,
+        "closed_websockets": closed,
+    }
+
+
+@router.post(
+    "/connection-test/devices/{device_id}/restore",
+    response_model=ConnectionTestActionResult,
+)
+async def restore_client(
+    device_id: uuid.UUID,
+    request: Request,
+    context: ControlAdminContext,
+    db: Db,
+) -> dict:
+    device = _connection_test_device_or_404(db, device_id)
+    connection_test_gate.restore_device(device.id)
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="connection_test.restore_device",
+        target_type="device",
+        target_id=str(device.id),
+    )
+    db.commit()
+    return {
+        "global_blocked": connection_test_gate.global_blocked,
+        "device_id": device.id,
+        "blocked": False,
+        "closed_websockets": 0,
+    }
 
 
 @router.post("/data-reset", status_code=204)

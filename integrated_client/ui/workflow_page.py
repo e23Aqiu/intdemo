@@ -232,10 +232,12 @@ class WorkflowPage(QWidget):
         *,
         client_preferences=None,
         account_key="",
+        untracked_mode=False,
     ):
         super().__init__(parent)
         self._stats_recorder = stats_recorder
         self._timing_service = timing_service
+        self._untracked_mode = bool(untracked_mode)
         self.client_preferences = client_preferences
         self.account_key = str(account_key or "").strip().lower()
         self.file_path = ""
@@ -1547,6 +1549,12 @@ class WorkflowPage(QWidget):
 
     def _record_workflow_stats(self):
         if self._stats_recorded:
+            return
+        if self._untracked_mode:
+            self._stats_recorded = True
+            self._log(
+                "游客模式：业务结果已保存，本次不记录统计、计时或待同步数据。"
+            )
             return
         counts = self.calculate_workflow_counts(self.df)
         details = {

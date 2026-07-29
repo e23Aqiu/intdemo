@@ -9,6 +9,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
+from ..connection_test import connection_test_gate
 from ..database import get_db, utcnow
 from ..dependencies import CurrentContext
 from ..errors import ApiError
@@ -155,6 +156,12 @@ def login(payload: LoginRequest, request: Request, db: Db) -> TokenBundle:
         raise ApiError("account_archived", "账号已归档", status_code=403)
     if not account.is_active:
         raise ApiError("account_disabled", "账号尚未启用", status_code=403)
+    if payload.control_client and account.role != "admin":
+        raise ApiError(
+            "admin_required",
+            "只有管理员可以登录连接测试控制端",
+            status_code=403,
+        )
 
     device = db.scalar(
         select(Device).where(
@@ -165,29 +172,36 @@ def login(payload: LoginRequest, request: Request, db: Db) -> TokenBundle:
     if device and device.revoked_at is not None:
         raise ApiError("device_revoked", "当前设备已被撤销", status_code=403)
     if device is None:
-        active_count = active_device_count(db, account.id)
-        if active_count >= account.device_limit:
-            raise ApiError(
-                "device_limit_reached",
-                "已达到账号设备上限，请先由管理员撤销旧设备或提高设备数量",
-                status_code=409,
-                details={
-                    "device_limit": account.device_limit,
-                    "active_device_count": active_count,
-                },
-            )
+        if not payload.control_client:
+            active_count = active_device_count(db, account.id)
+            if active_count >= account.device_limit:
+                raise ApiError(
+                    "device_limit_reached",
+                    "已达到账号设备上限，请先由管理员撤销旧设备或提高设备数量",
+                    status_code=409,
+                    details={
+                        "device_limit": account.device_limit,
+                        "active_device_count": active_count,
+                    },
+                )
         device = Device(
             account_id=account.id,
             device_uid=payload.device_uid,
             name=payload.device_name,
             client_version=payload.client_version,
+            is_control_client=payload.control_client,
         )
         db.add(device)
         db.flush()
     else:
         device.name = payload.device_name
         device.client_version = payload.client_version
+        device.is_control_client = payload.control_client
         device.last_seen_at = utcnow()
+
+    if not payload.control_client:
+        connection_test_gate.require_available(device.id)
+        connection_test_gate.unregister_control_device(device.id)
 
     account.last_login_at = utcnow()
     raw_refresh, session = _new_refresh_session(db, account, device)
@@ -195,6 +209,8 @@ def login(payload: LoginRequest, request: Request, db: Db) -> TokenBundle:
         delete(LoginThrottle).where(LoginThrottle.key == throttle_key(payload.username, ip_address))
     )
     db.commit()
+    if payload.control_client:
+        connection_test_gate.register_control_device(device.id)
     return _bundle(db, account, device, raw_refresh, session)
 
 
@@ -227,6 +243,10 @@ def refresh(payload: RefreshRequest, db: Db) -> TokenBundle:
         raise ApiError("account_unavailable", "账号已停用或归档", status_code=403)
     if device.revoked_at is not None:
         raise ApiError("device_revoked", "当前设备已被撤销", status_code=403)
+    if device.is_control_client:
+        connection_test_gate.register_control_device(device.id)
+    else:
+        connection_test_gate.require_available(device.id)
 
     row.used_at = utcnow()
     raw_refresh, replacement = _new_refresh_session(

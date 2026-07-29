@@ -6,7 +6,7 @@ import threading
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -37,6 +37,7 @@ from PyQt5.QtWidgets import (
     QToolButton,
 )
 
+from integrated_client.app_controller import ApplicationController
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import (
     DEFAULT_STATION_PASSWORD,
@@ -50,6 +51,7 @@ from integrated_client.database import (
     WORKFLOW_TOTAL_METRIC,
     Database,
 )
+from integrated_client.online.api import ApiResponseError
 from integrated_client.online.coordinator import SyncCoordinator
 from integrated_client.online.sync import SyncStatus
 from integrated_client.online.update import UpdateInfo
@@ -93,7 +95,6 @@ from integrated_client.ui.online_account_page import (
     OnlineAccountPage,
     _AccountSettingsDialog,
 )
-from integrated_client.ui.tencent_docs_dialog import TencentDocsProgressDialog
 from integrated_client.ui.statistics_page import (
     AnimatedDonutChart,
     StationDistributionChart,
@@ -101,6 +102,7 @@ from integrated_client.ui.statistics_page import (
     ViolationReasonChart,
     WorkflowDistributionChart,
 )
+from integrated_client.ui.tencent_docs_dialog import TencentDocsProgressDialog
 from integrated_client.ui.theme import APP_STYLESHEET, _control_asset_path
 from integrated_client.ui.update_dialog import UpdatePromptDialog
 from integrated_client.ui.workflow_page import DataFrameTableModel, WorkflowPage
@@ -1593,6 +1595,54 @@ class ToolAndUiTests(unittest.TestCase):
         coordinator.stop()
         coordinator.deleteLater()
 
+    def test_sync_coordinator_checks_immediately_when_server_blocks_connection(self):
+        coordinator = SyncCoordinator(Mock())
+        with patch.object(coordinator, "request_sync") as request_sync:
+            coordinator._on_websocket_message(
+                '{"type":"test_connection_blocked"}'
+            )
+        request_sync.assert_called_once_with()
+        coordinator.stop()
+        coordinator.deleteLater()
+
+    def test_websocket_reconnect_keeps_test_block_in_offline_state(self):
+        class Session:
+            state = object()
+
+            @staticmethod
+            def access_token():
+                raise ApiResponseError(
+                    "test_connection_blocked",
+                    "测试工具已断开连接",
+                    status_code=503,
+                    retryable=True,
+                )
+
+        class Engine:
+            session = Session()
+
+            @staticmethod
+            def status(state, error):
+                return SyncStatus(
+                    state=state,
+                    pending_count=0,
+                    quarantined_count=0,
+                    last_sync_at=None,
+                    error=error,
+                )
+
+        coordinator = SyncCoordinator(Engine())
+        coordinator._stopped = False
+        statuses = []
+        coordinator.status_changed.connect(statuses.append)
+
+        coordinator._connect_websocket()
+
+        self.assertEqual(statuses[-1].state, "offline")
+        self.assertIn("断开连接", statuses[-1].error)
+        coordinator.stop()
+        coordinator.deleteLater()
+
     def test_sync_action_and_update_details_live_in_the_sidebar_and_settings(self):
         class FakeEngine:
             def __init__(self):
@@ -1778,6 +1828,126 @@ class ToolAndUiTests(unittest.TestCase):
             ),
         )
         dialog.deleteLater()
+
+    def test_offline_login_enters_guest_without_credentials_or_account_access(self):
+        store = Mock()
+        store.is_available = True
+        store.load.return_value = None
+        session_manager = Mock()
+        before_accounts = self.db.list_accounts()
+
+        dialog = LoginDialog(
+            self.db,
+            session_manager=session_manager,
+            configuration_error="服务器未配置",
+            credential_store=store,
+        )
+        self.assertEqual(dialog.username_edit.text(), "")
+        self.assertEqual(dialog.password_edit.text(), "")
+        self.assertTrue(dialog.offline_login_btn.isEnabled())
+        self.assertIn("游客", dialog.offline_login_btn.text())
+
+        with patch.object(self.db, "authenticate") as authenticate:
+            dialog.offline_login_btn.click()
+
+        self.assertEqual(dialog.result(), dialog.Accepted)
+        self.assertTrue(dialog.offline_business_mode)
+        self.assertEqual(dialog.account.id, -1)
+        self.assertEqual(dialog.account.username, "guest")
+        self.assertEqual(dialog.account.name_label, "离线游客")
+        authenticate.assert_not_called()
+        session_manager.login.assert_not_called()
+        session_manager.offline_login.assert_not_called()
+        store.save.assert_not_called()
+        store.clear.assert_not_called()
+        self.assertEqual(self.db.list_accounts(), before_accounts)
+        dialog.deleteLater()
+
+    def test_guest_window_only_exposes_business_and_never_writes_metrics(self):
+        dialog = LoginDialog(self.db)
+        dialog._guest_login()
+        guest = dialog.account
+
+        tracked_tables = (
+            "activity_events",
+            "workflow_batches",
+            "workflow_runs",
+            "workflow_step_attempts",
+            "workflow_timer_events",
+            "sync_outbox",
+        )
+
+        def row_counts():
+            with self.db._connect() as connection:
+                return {
+                    table: connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                    for table in tracked_tables
+                }
+
+        before = row_counts()
+        window = MainWindow(
+            self.db,
+            guest,
+            session_manager=Mock(),
+            sync_coordinator=Mock(),
+            update_coordinator=Mock(),
+            business_metrics_enabled=True,
+            offline_business_mode=True,
+        )
+
+        self.assertFalse(window.business_metrics_enabled)
+        self.assertIsNone(window.session_manager)
+        self.assertIsNone(window.sync_coordinator)
+        self.assertIsNone(window.update_coordinator)
+        self.assertIsNone(window.workflow_timing)
+        self.assertIsNone(window.dashboard_page)
+        self.assertIsNone(window.statistics_page)
+        self.assertIsNone(window.personal_center_page)
+        self.assertEqual(set(window._pages), {"workflow"})
+        self.assertEqual(set(window._nav_buttons), {"workflow"})
+        self.assertIsNone(window.account_page)
+        self.assertFalse(window.announcement_service_available)
+        self.assertTrue(window.guest_logout_button.isVisibleTo(window.sidebar))
+        self.assertTrue(
+            window._record_workflow_summary(
+                {WORKFLOW_TOTAL_METRIC: 9},
+                source="unified_workflow",
+                task_id="guest-task",
+            )
+        )
+        window.workflow_page._record_workflow_stats()
+        self.assertIn("不记录统计", window.workflow_page.log_text.toPlainText())
+        self.assertEqual(row_counts(), before)
+        self.assertEqual(self.db.list_accounts(), [self.admin])
+
+        self.assertTrue(window.workflow_page.shutdown())
+        window._prepared_to_close = True
+        window.close()
+        dialog.deleteLater()
+
+    def test_guest_logout_does_not_clear_online_session_or_saved_profile(self):
+        session_manager = Mock()
+        session_manager.state = None
+        controller = ApplicationController(
+            self.app,
+            self.db,
+            session_manager=session_manager,
+        )
+        controller.window = Mock()
+        controller.offline_business_mode = True
+        controller.credential_store = Mock()
+
+        with patch(
+            "integrated_client.app_controller.QTimer.singleShot"
+        ) as single_shot:
+            controller._handle_logout()
+
+        session_manager.logout.assert_not_called()
+        session_manager.end_offline_session.assert_not_called()
+        controller.credential_store.disable_auto_login.assert_not_called()
+        single_shot.assert_called_once()
 
     def test_frameless_controls_are_embedded_without_an_extra_title_bar(self):
         window = MainWindow(self.db, self.admin)

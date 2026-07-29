@@ -45,6 +45,7 @@ class LoginRequest(StrictModel):
     device_uid: uuid.UUID
     device_name: str = Field(default="Windows device", min_length=1, max_length=160)
     client_version: str = Field(default="0.2.5", min_length=1, max_length=40)
+    control_client: bool = False
 
     @field_validator("username")
     @classmethod
@@ -129,6 +130,31 @@ class AccountUpdate(StrictModel):
 class DataResetRequest(StrictModel):
     account_id: uuid.UUID
     confirmation: Literal["RESET"]
+
+
+class ConnectionTestClientView(StrictModel):
+    id: uuid.UUID
+    account_id: uuid.UUID
+    username: str
+    display_name: str
+    device_uid: uuid.UUID
+    name: str
+    client_version: str
+    last_seen_at: datetime
+    connected: bool
+    blocked: bool
+
+
+class ConnectionTestOverview(StrictModel):
+    global_blocked: bool
+    clients: list[ConnectionTestClientView]
+
+
+class ConnectionTestActionResult(StrictModel):
+    global_blocked: bool
+    device_id: uuid.UUID | None = None
+    blocked: bool
+    closed_websockets: int = 0
 
 
 class SyncItem(StrictModel):

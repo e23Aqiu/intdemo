@@ -37,6 +37,20 @@ $publishedName = "IntDemoOnline-Setup-$Version.exe"
 $publishedInstaller = Join-Path $filesRoot $publishedName
 $manifestPath = Join-Path $releaseRoot "$Channel.json"
 
+$sourceCommit = [string](& git -C $repoRoot rev-parse HEAD)
+if ($LASTEXITCODE -ne 0 -or -not $sourceCommit.Trim()) {
+    throw "Could not resolve the source Git commit"
+}
+$sourceCommit = $sourceCommit.Trim()
+$sourceChanges = @(& git -C $repoRoot status --porcelain=v1)
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not inspect the source Git worktree"
+}
+$sourceDirty = $sourceChanges.Count -gt 0
+if ($RemoteHost -and $sourceDirty) {
+    throw "Remote publishing requires a clean Git worktree"
+}
+
 New-Item -ItemType Directory -Force -Path $filesRoot | Out-Null
 Copy-Item -LiteralPath $sourceInstaller -Destination $publishedInstaller -Force
 $file = Get-Item -LiteralPath $publishedInstaller
@@ -46,6 +60,8 @@ $manifest = [ordered]@{
     channel = $Channel
     version = $Version
     published_at = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH:mm:ssZ")
+    source_commit = $sourceCommit
+    source_dirty = $sourceDirty
     installer_path = "/updates/files/$publishedName"
     sha256 = $hash
     size = $file.Length
@@ -121,6 +137,31 @@ if ($RemoteHost) {
     & ssh @sshArgs $RemoteHost "mkdir -p '$RemotePath/files' '$incoming'"
     if ($LASTEXITCODE -ne 0) {
         throw "Could not create the remote update directories"
+    }
+    $remoteManifestText = [string](
+        & ssh @sshArgs $RemoteHost `
+            "if [ -f '$RemotePath/$Channel.json' ]; then cat '$RemotePath/$Channel.json'; fi"
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not inspect the currently published manifest"
+    }
+    $remoteManifestText = $remoteManifestText.Trim()
+    if ($remoteManifestText) {
+        try {
+            $remoteManifest = $remoteManifestText | ConvertFrom-Json
+            $remoteVersion = [string]$remoteManifest.version
+            $parsedRemoteVersion = [version]$remoteVersion
+            $parsedTargetVersion = [version]$Version
+        }
+        catch {
+            throw "The currently published manifest has an invalid version"
+        }
+        if ($parsedRemoteVersion -ge $parsedTargetVersion) {
+            throw (
+                "Remote channel $Channel already publishes version " +
+                "$remoteVersion. Published versions cannot be replaced or downgraded."
+            )
+        }
     }
     $remoteFullHash = [string](
         & ssh @sshArgs $RemoteHost `

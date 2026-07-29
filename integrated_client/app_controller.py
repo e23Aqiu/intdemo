@@ -93,6 +93,7 @@ class ApplicationController(QObject):
         if not self.window:
             return
         self._logging_out = True
+        guest_mode = self.offline_business_mode
         window = self.window
         self.window = None
         if self.sync_coordinator is not None:
@@ -101,15 +102,21 @@ class ApplicationController(QObject):
         if self.update_coordinator is not None:
             self.update_coordinator.stop()
             self.update_coordinator = None
-        if self.session_manager is not None and self.offline_business_mode:
-            self.session_manager.end_offline_session()
+        if self.offline_business_mode:
+            if (
+                self.session_manager is not None
+                and self.session_manager.state is not None
+                and self.session_manager.state.mode == "offline_untracked"
+            ):
+                self.session_manager.end_offline_session()
         elif self.session_manager is not None:
             run_with_loading(window, "退出中…", self.session_manager.logout)
         self.offline_business_mode = False
-        try:
-            self.credential_store.disable_auto_login()
-        except (OSError, RuntimeError, ValueError):
-            pass
+        if not guest_mode:
+            try:
+                self.credential_store.disable_auto_login()
+            except (OSError, RuntimeError, ValueError):
+                pass
         window.close()
         window.deleteLater()
         QTimer.singleShot(0, self._show_login)

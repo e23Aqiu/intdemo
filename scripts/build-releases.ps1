@@ -20,20 +20,22 @@ $portableArguments = @{
     BaseUrl = $BaseUrl
     CaBundle = $CaBundle
     Version = $Version
-    DeltaFromVersion = $DeltaFromVersion
 }
 & (Join-Path $PSScriptRoot "build-portable.ps1") @portableArguments
-if ($LASTEXITCODE -ne 0) {
-    exit $LASTEXITCODE
+if (-not $?) {
+    throw "Portable package build failed"
 }
 
 $installerArguments = @{
     BaseUrl = $BaseUrl
     CaBundle = $CaBundle
     Version = $Version
+    DeltaFromVersion = $DeltaFromVersion
 }
 if ($InnoCompiler) {
     $installerArguments.InnoCompiler = $InnoCompiler
 }
 & (Join-Path $PSScriptRoot "build-installer.ps1") @installerArguments
-exit $LASTEXITCODE
+if (-not $?) {
+    throw "Installer package build failed"
+}

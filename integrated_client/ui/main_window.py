@@ -76,12 +76,20 @@ class MainWindow(FramelessMainWindow):
             install_disabled_cursor_filter(application)
         self.database = database
         self.account = account
-        self.session_manager = session_manager
-        self.sync_coordinator = sync_coordinator
-        self.update_coordinator = update_coordinator
-        self.credential_store = credential_store
-        self.business_metrics_enabled = bool(business_metrics_enabled)
         self.offline_business_mode = bool(offline_business_mode)
+        self.session_manager = (
+            None if self.offline_business_mode else session_manager
+        )
+        self.sync_coordinator = (
+            None if self.offline_business_mode else sync_coordinator
+        )
+        self.update_coordinator = (
+            None if self.offline_business_mode else update_coordinator
+        )
+        self.credential_store = credential_store
+        self.business_metrics_enabled = (
+            bool(business_metrics_enabled) and not self.offline_business_mode
+        )
         self.client_preferences = client_preferences or ClientPreferences(
             self.database.path.parent
         )
@@ -142,9 +150,12 @@ class MainWindow(FramelessMainWindow):
                 "当前环境的 ddddocr/onnxruntime 未能加载。客户端和人工验证码模式可正常使用，"
                 "自动验证码识别需要修复运行环境后再启用。"
             )
-        self.statistics_page = StatisticsPage(database, account, warning)
-        self.statistics_page.set_sidebar_navigation(True)
-        self.dashboard_page = DashboardPage(database, account)
+        self.statistics_page = None
+        self.dashboard_page = None
+        if not self.offline_business_mode:
+            self.statistics_page = StatisticsPage(database, account, warning)
+            self.statistics_page.set_sidebar_navigation(True)
+            self.dashboard_page = DashboardPage(database, account)
         self.workflow_timing = (
             WorkflowTimingService(database, account.id)
             if self.business_metrics_enabled
@@ -155,35 +166,34 @@ class MainWindow(FramelessMainWindow):
             timing_service=self.workflow_timing,
             client_preferences=self.client_preferences,
             account_key=account.username,
+            untracked_mode=self.offline_business_mode,
         )
-        self.personal_center_page = PersonalCenterPage(
-            account,
-            updates_enabled=self.update_coordinator is not None,
-        )
-        if self.offline_business_mode:
-            self.personal_center_page.change_password_btn.setEnabled(False)
-            self.personal_center_page.change_password_btn.setToolTip(
-                "离线业务模式不能修改密码，请联网登录后操作"
+        self.personal_center_page = None
+        if not self.offline_business_mode:
+            self.personal_center_page = PersonalCenterPage(
+                account,
+                updates_enabled=self.update_coordinator is not None,
             )
-        self.personal_center_page.change_password_requested.connect(
-            self._change_password
-        )
-        self.personal_center_page.logout_requested.connect(self._request_logout)
-        self.personal_center_page.check_update_requested.connect(
-            self._manual_update_check
-        )
-        self.personal_center_page.update_requested.connect(
-            self._download_available_update
-        )
-        self.personal_center_page.cancel_update_requested.connect(
-            self._cancel_update_download
-        )
-        self.personal_center_page.install_update_requested.connect(
-            self._install_downloaded_update
-        )
+            self.personal_center_page.change_password_requested.connect(
+                self._change_password
+            )
+            self.personal_center_page.logout_requested.connect(self._request_logout)
+            self.personal_center_page.check_update_requested.connect(
+                self._manual_update_check
+            )
+            self.personal_center_page.update_requested.connect(
+                self._download_available_update
+            )
+            self.personal_center_page.cancel_update_requested.connect(
+                self._cancel_update_download
+            )
+            self.personal_center_page.install_update_requested.connect(
+                self._install_downloaded_update
+            )
 
-        self._add_page("home", self.dashboard_page)
-        self._add_page("statistics", self.statistics_page)
+        if not self.offline_business_mode:
+            self._add_page("home", self.dashboard_page)
+            self._add_page("statistics", self.statistics_page)
         self._add_page("workflow", self.workflow_page)
         if account.is_admin and not self.offline_business_mode:
             if self.announcement_service_available:
@@ -217,7 +227,8 @@ class MainWindow(FramelessMainWindow):
             self._add_page("accounts", self.account_page)
         else:
             self.account_page = None
-        self._add_page("personal", self.personal_center_page)
+        if not self.offline_business_mode:
+            self._add_page("personal", self.personal_center_page)
 
         if self.sync_coordinator is not None:
             self.sync_coordinator.status_changed.connect(self._update_sync_status)
@@ -309,10 +320,14 @@ class MainWindow(FramelessMainWindow):
         layout.addWidget(nav_label)
         layout.addSpacing(2)
 
-        primary_nav_items = [
-            ("home", "数据仪表盘", "nav-dashboard.svg"),
-            ("workflow", "一键业务处理", "nav-workflow.svg"),
-        ]
+        primary_nav_items = (
+            [("workflow", "一键业务处理", "nav-workflow.svg")]
+            if self.offline_business_mode
+            else [
+                ("home", "数据仪表盘", "nav-dashboard.svg"),
+                ("workflow", "一键业务处理", "nav-workflow.svg"),
+            ]
+        )
         for key, text, icon_name in primary_nav_items:
             button = self._create_nav_button(key, text)
             button.setIcon(QIcon(_control_asset_path(icon_name)))
@@ -327,6 +342,7 @@ class MainWindow(FramelessMainWindow):
         self.data_nav_toggle.setIconSize(QSize(19, 19))
         self.data_nav_toggle.setMinimumHeight(46)
         self.data_nav_toggle.clicked.connect(self._toggle_data_navigation)
+        self.data_nav_toggle.setVisible(not self.offline_business_mode)
         layout.addWidget(self.data_nav_toggle)
 
         self.data_nav_container = QWidget()
@@ -334,12 +350,16 @@ class MainWindow(FramelessMainWindow):
         data_nav_layout = QVBoxLayout(self.data_nav_container)
         data_nav_layout.setContentsMargins(0, 0, 0, 2)
         data_nav_layout.setSpacing(3)
-        data_nav_items = [
-            ("data_station", "全站分布"),
-            ("data_timing", "用时效率"),
-            ("data_completion", "完成类型"),
-            ("data_violation", "违规原因"),
-        ]
+        data_nav_items = (
+            []
+            if self.offline_business_mode
+            else [
+                ("data_station", "全站分布"),
+                ("data_timing", "用时效率"),
+                ("data_completion", "完成类型"),
+                ("data_violation", "违规原因"),
+            ]
+        )
         for key, text in data_nav_items:
             data_nav_layout.addWidget(
                 self._create_nav_button(key, text, object_name="NavSubButton")
@@ -358,12 +378,19 @@ class MainWindow(FramelessMainWindow):
                     )
                 )
             trailing_nav_items.append(("accounts", "账号管理", "nav-accounts.svg"))
-        trailing_nav_items.append(("personal", "系统设置", "nav-user.svg"))
+        if not self.offline_business_mode:
+            trailing_nav_items.append(("personal", "系统设置", "nav-user.svg"))
         for key, text, icon_name in trailing_nav_items:
             button = self._create_nav_button(key, text)
             button.setIcon(QIcon(_control_asset_path(icon_name)))
             button.setIconSize(QSize(19, 19))
             layout.addWidget(button)
+        if self.offline_business_mode:
+            self.guest_logout_button = QPushButton("退出游客模式")
+            self.guest_logout_button.setObjectName("DangerButton")
+            self.guest_logout_button.setMinimumHeight(42)
+            self.guest_logout_button.clicked.connect(self._request_logout)
+            layout.addWidget(self.guest_logout_button)
 
         layout.addStretch()
 
@@ -383,7 +410,7 @@ class MainWindow(FramelessMainWindow):
         self.sync_state_dot.setFixedWidth(12)
         sync_header.addWidget(self.sync_state_dot)
         self.sync_state_title = QLabel(
-            "离线业务模式"
+            "离线游客模式"
             if self.offline_business_mode
             else (
                 "等待连接"
@@ -397,7 +424,7 @@ class MainWindow(FramelessMainWindow):
         sync_layout.addLayout(sync_header)
 
         self.sync_detail_label = QLabel(
-            "本次业务不计入数据"
+            "仅处理业务，不记录统计、计时或同步数据"
             if self.offline_business_mode
             else (
                 "数据仅保存在本机"
@@ -444,7 +471,9 @@ class MainWindow(FramelessMainWindow):
         self.sidebar_user.setObjectName("SidebarUser")
         self.sidebar_user.setToolTip(self.account.name_label)
         self.sidebar_role = QLabel(
-            f"{self.account.role_label}  ·  {self.account.username}"
+            "游客  ·  不记录数据"
+            if self.offline_business_mode
+            else f"{self.account.role_label}  ·  {self.account.username}"
         )
         self.sidebar_role.setObjectName("SidebarRole")
         identity_layout.addWidget(self.sidebar_user)
@@ -490,7 +519,7 @@ class MainWindow(FramelessMainWindow):
         self.page_title = QLabel(bar)
         self.page_title.hide()
         self.offline_mode_badge = QLabel(
-            "离线业务模式 · 本次处理不计入数据"
+            "离线游客模式 · 仅处理业务，不记录统计、计时或同步数据"
         )
         self.offline_mode_badge.setObjectName("OfflineBusinessBadge")
         self.offline_mode_badge.setVisible(self.offline_business_mode)
@@ -1178,8 +1207,12 @@ class MainWindow(FramelessMainWindow):
     def _request_logout(self):
         reply = QMessageBox.question(
             self,
-            "退出登录",
-            "确定退出当前账号吗？正在执行的任务将被停止。",
+            "退出游客模式" if self.offline_business_mode else "退出登录",
+            (
+                "确定退出游客模式吗？正在执行的任务将被停止。"
+                if self.offline_business_mode
+                else "确定退出当前账号吗？正在执行的任务将被停止。"
+            ),
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes or not self._prepare_close():

@@ -59,6 +59,7 @@ class Device(Base):
     device_uid: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
     name: Mapped[str] = mapped_column(String(160), default="Windows device")
     client_version: Mapped[str] = mapped_column(String(40), default="unknown")
+    is_control_client: Mapped[bool] = mapped_column(Boolean, default=False)
     token_version: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

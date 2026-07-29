@@ -4,6 +4,7 @@ import uuid
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from ..connection_test import connection_test_gate
 from ..database import SessionLocal, utcnow
 from ..models import Account, Device
 from ..realtime import update_hub
@@ -37,6 +38,8 @@ async def updates(websocket: WebSocket) -> None:
     with SessionLocal() as db:
         account = db.get(Account, account_id)
         device = db.get(Device, device_id)
+        if device is not None and device.is_control_client:
+            connection_test_gate.register_control_device(device.id)
         valid = (
             account is not None
             and device is not None
@@ -47,6 +50,10 @@ async def updates(websocket: WebSocket) -> None:
             and not account.must_change_password
             and account.token_version == int(claims.get("ver", -1))
             and device.token_version == int(claims.get("dver", -1))
+            and (
+                device.is_control_client
+                or not connection_test_gate.is_blocked(device.id)
+            )
         )
         if valid:
             device.last_seen_at = utcnow()
@@ -57,7 +64,7 @@ async def updates(websocket: WebSocket) -> None:
     if not valid:
         await websocket.close(code=4403, reason="session unavailable")
         return
-    await update_hub.connect(websocket)
+    await update_hub.connect(websocket, device_id)
     try:
         await websocket.send_json({"type": "connected", "revision": revision})
         while True:

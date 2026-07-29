@@ -10,6 +10,7 @@ from PyQt5.QtNetwork import (
 from PyQt5.QtWebSockets import QWebSocket, QWebSocketProtocol
 
 from ..diagnostics import get_logger
+from .api import ApiResponseError, NetworkUnavailable
 
 
 class _SyncTask(QRunnable):
@@ -145,6 +146,19 @@ class SyncCoordinator(QObject):
                 )
                 request.setSslConfiguration(ssl_configuration)
             self._websocket.open(request)
+        except (NetworkUnavailable, ApiResponseError) as exc:
+            offline = (
+                isinstance(exc, NetworkUnavailable)
+                or exc.retryable
+                or exc.status_code >= 500
+            )
+            self.status_changed.emit(
+                self.engine.status(
+                    "offline" if offline else "error",
+                    str(exc),
+                )
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - Qt slots must not leak exceptions
             get_logger().exception("Could not connect WebSocket")
             self.status_changed.emit(
@@ -153,7 +167,11 @@ class SyncCoordinator(QObject):
             return
 
     def _on_websocket_message(self, message):
-        if "revision_changed" in message or '"type":"connected"' in message:
+        if (
+            "revision_changed" in message
+            or '"type":"connected"' in message
+            or "test_connection_blocked" in message
+        ):
             self.request_sync()
 
     def _on_websocket_disconnected(self):

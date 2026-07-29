@@ -1,0 +1,760 @@
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import re
+import shutil
+import subprocess
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
+REMOTE_HOST_PATTERN = re.compile(r"^[A-Za-z0-9._@:-]+$")
+REMOTE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._/-]+$")
+
+
+class PublisherError(ValueError):
+    pass
+
+
+def _version_key(value: str) -> tuple[int, int, int]:
+    normalized = str(value or "").strip()
+    if not VERSION_PATTERN.fullmatch(normalized):
+        raise PublisherError(f"版本号必须使用 x.y.z 格式：{normalized or '-'}")
+    return tuple(int(part) for part in normalized.split("."))
+
+
+@dataclass(frozen=True)
+class PublisherSettings:
+    base_url: str = ""
+    ca_bundle: str = ""
+    control_username: str = "admin"
+    inno_compiler: str = ""
+    remote_host: str = ""
+    remote_path: str = "/opt/intdemo/deploy/updates"
+    identity_file: str = ""
+    channel: str = "test"
+    build_portable: bool = True
+
+
+class SettingsStore:
+    VERSION = 1
+
+    def __init__(self, path: str | Path | None = None):
+        if path is None:
+            if os.name == "nt":
+                root = Path(
+                    os.environ.get(
+                        "LOCALAPPDATA",
+                        Path.home() / "AppData" / "Local",
+                    )
+                )
+                path = root / "IntDemoReleasePublisher" / "settings.json"
+            else:
+                root = Path(
+                    os.environ.get(
+                        "XDG_CONFIG_HOME",
+                        Path.home() / ".config",
+                    )
+                )
+                path = root / "intdemo-release-publisher" / "settings.json"
+        self.path = Path(path).expanduser().resolve()
+
+    def load(self) -> PublisherSettings:
+        if not self.path.is_file():
+            return PublisherSettings()
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+            if int(payload.get("schema_version") or 0) != self.VERSION:
+                return PublisherSettings()
+            values = payload.get("settings")
+            if not isinstance(values, dict):
+                return PublisherSettings()
+            allowed = set(PublisherSettings.__dataclass_fields__)
+            return PublisherSettings(
+                **{key: value for key, value in values.items() if key in allowed}
+            )
+        except (OSError, UnicodeError, ValueError, TypeError):
+            return PublisherSettings()
+
+    def save(self, settings: PublisherSettings) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": self.VERSION,
+            "settings": asdict(settings),
+        }
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+@dataclass(frozen=True)
+class ReleaseOptions:
+    repo_root: Path
+    version: str
+    base_url: str
+    notes: str
+    ca_bundle: str = ""
+    delta_from_version: str = ""
+    channel: str = "test"
+    mandatory: bool = False
+    build_portable: bool = True
+    inno_compiler: str = ""
+    remote_host: str = ""
+    remote_path: str = "/opt/intdemo/deploy/updates"
+    identity_file: str = ""
+
+    @property
+    def full_installer(self) -> Path:
+        return (
+            self.repo_root
+            / "dist"
+            / "installer"
+            / f"IntDemoOnline-Setup-{self.version}.exe"
+        )
+
+    @property
+    def delta_installer(self) -> Path | None:
+        if not self.delta_from_version:
+            return None
+        return (
+            self.repo_root
+            / "dist"
+            / "installer"
+            / (
+                f"IntDemoOnline-Patch-{self.delta_from_version}"
+                f"-to-{self.version}.exe"
+            )
+        )
+
+    @property
+    def snapshot_path(self) -> Path:
+        return (
+            self.repo_root
+            / "dist"
+            / "release-snapshots"
+            / f"{self.version}.json"
+        )
+
+
+@dataclass(frozen=True)
+class CommandStep:
+    key: str
+    title: str
+    program: str
+    arguments: tuple[str, ...]
+    working_directory: Path
+
+    def display_command(self) -> str:
+        return subprocess.list2cmdline([self.program, *self.arguments])
+
+
+def project_version(repo_root: str | Path) -> str:
+    path = Path(repo_root) / "integrated_client" / "config.py"
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PublisherError(f"无法读取项目版本：{path}") from exc
+    match = re.search(r'(?m)^APP_VERSION\s*=\s*"(?P<version>[^"]+)"\s*$', content)
+    if not match:
+        raise PublisherError("integrated_client/config.py 中缺少 APP_VERSION")
+    version = match.group("version")
+    _version_key(version)
+    return version
+
+
+def _version_sources(repo_root: Path) -> tuple[tuple[Path, re.Pattern[str], int], ...]:
+    sources = (
+        (
+            repo_root / "integrated_client" / "config.py",
+            re.compile(r'(?m)^APP_VERSION\s*=\s*"(?P<version>[^"]+)"\s*$'),
+            1,
+        ),
+        (
+            repo_root / "integrated_client" / "__init__.py",
+            re.compile(r'(?m)^__version__\s*=\s*"(?P<version>[^"]+)"\s*$'),
+            1,
+        ),
+        (
+            repo_root / "server" / "app" / "__init__.py",
+            re.compile(r'(?m)^__version__\s*=\s*"(?P<version>[^"]+)"\s*$'),
+            1,
+        ),
+        (
+            repo_root / "server" / "pyproject.toml",
+            re.compile(r'(?m)^version\s*=\s*"(?P<version>[^"]+)"\s*$'),
+            1,
+        ),
+        (
+            repo_root / "server" / "app" / "main.py",
+            re.compile(r'(?m)^\s*version="(?P<version>[^"]+)",\s*$'),
+            1,
+        ),
+        (
+            repo_root / "server" / "app" / "main.py",
+            re.compile(
+                r'(?m)^\s*return \{"status": "live", '
+                r'"version": "(?P<version>[^"]+)"\}\s*$'
+            ),
+            1,
+        ),
+        (
+            repo_root / "server" / "app" / "schemas.py",
+            re.compile(
+                r'(?m)^\s*client_version: str = Field'
+                r'\(default="(?P<version>[^"]+)",'
+            ),
+            1,
+        ),
+        (
+            repo_root / "installer" / "intdemo.iss",
+            re.compile(
+                r'(?m)^\s*#define MyAppVersion "(?P<version>[^"]+)"\s*$'
+            ),
+            1,
+        ),
+        (
+            repo_root / "installer" / "version_info.txt",
+            re.compile(
+                r"StringStruct\(u'FileVersion', u'(?P<version>[^']+)'\)"
+            ),
+            1,
+        ),
+        (
+            repo_root / "installer" / "version_info.txt",
+            re.compile(
+                r"StringStruct\(u'ProductVersion', u'(?P<version>[^']+)'\)"
+            ),
+            1,
+        ),
+        (
+            repo_root / "docker-compose.yml",
+            re.compile(r"(?m)^\s*image: intdemo-api:(?P<version>[^\s]+)\s*$"),
+            1,
+        ),
+    )
+    script_sources = tuple(
+        (
+            repo_root / "scripts" / script_name,
+            re.compile(
+                r'(?m)^\s*\[string\]\$Version = '
+                r'"(?P<version>[^"]+)",\s*$'
+            ),
+            1,
+        )
+        for script_name in (
+            "build-installer.ps1",
+            "build-portable.ps1",
+            "build-releases.ps1",
+            "build-online-test.ps1",
+        )
+    )
+    return sources + script_sources
+
+
+def project_version_mismatches(
+    repo_root: str | Path,
+    expected_version: str,
+) -> list[str]:
+    root = Path(repo_root).resolve()
+    _version_key(expected_version)
+    mismatches: list[str] = []
+    for path, pattern, expected_count in _version_sources(root):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            mismatches.append(f"缺少版本文件：{path.relative_to(root)}")
+            continue
+        matches = list(pattern.finditer(content))
+        if len(matches) != expected_count:
+            mismatches.append(
+                f"{path.relative_to(root)}：应找到 {expected_count} 个版本字段，"
+                f"实际为 {len(matches)}"
+            )
+            continue
+        for match in matches:
+            actual = match.group("version")
+            if actual != expected_version:
+                mismatches.append(
+                    f"{path.relative_to(root)}：{actual} ≠ {expected_version}"
+                )
+    version_info = root / "installer" / "version_info.txt"
+    try:
+        content = version_info.read_text(encoding="utf-8")
+    except OSError:
+        return mismatches
+    parts = tuple(int(item) for item in expected_version.split(".")) + (0,)
+    expected_tuple = ", ".join(str(item) for item in parts)
+    for field in ("filevers", "prodvers"):
+        match = re.search(
+            rf"(?m)^\s*{field}=\((?P<version>[^)]+)\),\s*$",
+            content,
+        )
+        if not match or match.group("version").strip() != expected_tuple:
+            actual = match.group("version").strip() if match else "缺失"
+            mismatches.append(
+                f"installer/version_info.txt：{field}={actual} ≠ {expected_tuple}"
+            )
+    return mismatches
+
+
+def git_status(repo_root: str | Path) -> list[str]:
+    result = subprocess.run(
+        ["git", "status", "--porcelain=v1"],
+        cwd=Path(repo_root),
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        raise PublisherError(
+            f"无法读取 Git 工作区状态：{result.stderr.strip() or result.stdout.strip()}"
+        )
+    return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def _replace_exact(
+    content: str,
+    pattern: str,
+    replacement: str,
+    *,
+    path: Path,
+    expected_count: int = 1,
+    flags: int = 0,
+) -> str:
+    updated, count = re.subn(pattern, replacement, content, flags=flags)
+    if count != expected_count:
+        raise PublisherError(
+            f"{path}：版本字段数量异常，应为 {expected_count}，实际为 {count}"
+        )
+    return updated
+
+
+def set_project_version(
+    repo_root: str | Path,
+    new_version: str,
+    *,
+    require_clean: bool = True,
+) -> list[Path]:
+    root = Path(repo_root).resolve()
+    new_key = _version_key(new_version)
+    current = project_version(root)
+    if new_key <= _version_key(current):
+        raise PublisherError(f"新版本 {new_version} 必须高于当前版本 {current}")
+    if require_clean:
+        changes = git_status(root)
+        if changes:
+            raise PublisherError("同步版本号前必须提交或清理现有工作区变更")
+
+    simple_targets = {
+        root / "integrated_client" / "config.py": (
+            r'(?m)^(APP_VERSION\s*=\s*")[^"]+(")\s*$',
+            rf'\g<1>{new_version}\g<2>',
+            1,
+        ),
+        root / "integrated_client" / "__init__.py": (
+            r'(?m)^(__version__\s*=\s*")[^"]+(")\s*$',
+            rf'\g<1>{new_version}\g<2>',
+            1,
+        ),
+        root / "server" / "app" / "__init__.py": (
+            r'(?m)^(__version__\s*=\s*")[^"]+(")\s*$',
+            rf'\g<1>{new_version}\g<2>',
+            1,
+        ),
+        root / "server" / "pyproject.toml": (
+            r'(?m)^(version\s*=\s*")[^"]+(")\s*$',
+            rf'\g<1>{new_version}\g<2>',
+            1,
+        ),
+        root / "server" / "app" / "main.py": (
+            r'(?m)(version=")[^"]+(")|(return \{"status": "live", "version": ")[^"]+(")',
+            lambda match: (
+                f'{match.group(1)}{new_version}{match.group(2)}'
+                if match.group(1)
+                else f'{match.group(3)}{new_version}{match.group(4)}'
+            ),
+            2,
+        ),
+        root / "server" / "app" / "schemas.py": (
+            r'(client_version: str = Field\(default=")[^"]+(",)',
+            rf'\g<1>{new_version}\g<2>',
+            1,
+        ),
+        root / "installer" / "intdemo.iss": (
+            r'(?m)^(\s*#define MyAppVersion ")[^"]+(")\s*$',
+            rf'\g<1>{new_version}\g<2>',
+            1,
+        ),
+        root / "docker-compose.yml": (
+            r"(?m)^(\s*image: intdemo-api:)[^\s]+\s*$",
+            rf"\g<1>{new_version}",
+            1,
+        ),
+    }
+    for script_name in (
+        "build-installer.ps1",
+        "build-portable.ps1",
+        "build-releases.ps1",
+        "build-online-test.ps1",
+    ):
+        simple_targets[root / "scripts" / script_name] = (
+            r'(?m)^(\s*\[string\]\$Version = ")[^"]+(",)\s*$',
+            rf'\g<1>{new_version}\g<2>',
+            1,
+        )
+
+    staged: dict[Path, str] = {}
+    for path, (pattern, replacement, count) in simple_targets.items():
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise PublisherError(f"无法读取版本文件：{path}") from exc
+        staged[path] = _replace_exact(
+            content,
+            pattern,
+            replacement,
+            path=path,
+            expected_count=count,
+        )
+
+    version_info = root / "installer" / "version_info.txt"
+    content = version_info.read_text(encoding="utf-8")
+    parts = (*new_key, 0)
+    tuple_text = ", ".join(str(item) for item in parts)
+    content = _replace_exact(
+        content,
+        r"(?m)^(\s*filevers=\()[^)]+(\),)\s*$",
+        rf"\g<1>{tuple_text}\g<2>",
+        path=version_info,
+    )
+    content = _replace_exact(
+        content,
+        r"(?m)^(\s*prodvers=\()[^)]+(\),)\s*$",
+        rf"\g<1>{tuple_text}\g<2>",
+        path=version_info,
+    )
+    content = _replace_exact(
+        content,
+        r"(StringStruct\(u'FileVersion', u')[^']+('\))",
+        rf"\g<1>{new_version}\g<2>",
+        path=version_info,
+    )
+    content = _replace_exact(
+        content,
+        r"(StringStruct\(u'ProductVersion', u')[^']+('\))",
+        rf"\g<1>{new_version}\g<2>",
+        path=version_info,
+    )
+    staged[version_info] = content
+
+    written: list[Path] = []
+    for path, content in staged.items():
+        temporary = path.with_suffix(path.suffix + ".release-publisher.tmp")
+        try:
+            temporary.write_text(content, encoding="utf-8")
+            os.replace(temporary, path)
+            written.append(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return written
+
+
+def find_inno_compiler(configured: str = "") -> Path | None:
+    if configured:
+        path = Path(configured).expanduser()
+        return path.resolve() if path.is_file() else None
+    candidates: list[Path] = []
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    program_files = os.environ.get("ProgramFiles")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    if local_app_data:
+        candidates.append(
+            Path(local_app_data) / "Programs" / "Inno Setup 6" / "ISCC.exe"
+        )
+    if program_files:
+        candidates.append(Path(program_files) / "Inno Setup 6" / "ISCC.exe")
+    if program_files_x86:
+        candidates.append(Path(program_files_x86) / "Inno Setup 6" / "ISCC.exe")
+    return next((path.resolve() for path in candidates if path.is_file()), None)
+
+
+def validate_test_environment(repo_root: str | Path) -> list[str]:
+    root = Path(repo_root).resolve()
+    errors: list[str] = []
+    try:
+        current = project_version(root)
+    except PublisherError as exc:
+        errors.append(str(exc))
+    else:
+        errors.extend(project_version_mismatches(root, current))
+    for label, path in (
+        ("客户端开发环境", root / ".venv" / "Scripts" / "python.exe"),
+        ("服务端测试环境", root / "server" / ".venv" / "Scripts" / "python.exe"),
+    ):
+        if not path.is_file():
+            errors.append(f"{label}不存在：{path}")
+    return list(dict.fromkeys(errors))
+
+
+def validate_release_options(
+    options: ReleaseOptions,
+    *,
+    for_build: bool = False,
+    for_publish: bool = False,
+    for_pipeline: bool = False,
+) -> list[str]:
+    root = options.repo_root.resolve()
+    errors: list[str] = []
+    try:
+        target_key = _version_key(options.version)
+    except PublisherError as exc:
+        errors.append(str(exc))
+        target_key = None
+
+    parsed = urlparse(options.base_url)
+    if parsed.scheme.lower() != "https" or not parsed.hostname:
+        errors.append("服务地址必须是有效的 HTTPS URL")
+    elif not options.ca_bundle:
+        try:
+            is_ip = ipaddress.ip_address(parsed.hostname) is not None
+        except ValueError:
+            is_ip = False
+        if is_ip:
+            errors.append("使用公网 IP 服务地址时必须选择私有 CA 根证书")
+
+    if options.ca_bundle and not Path(options.ca_bundle).expanduser().is_file():
+        errors.append(f"CA 根证书不存在：{options.ca_bundle}")
+    if options.channel not in {"test", "stable"}:
+        errors.append("发布通道只能是 test 或 stable")
+    if (for_publish or for_pipeline) and not str(options.notes or "").strip():
+        errors.append("更新说明不能为空")
+
+    if options.delta_from_version:
+        try:
+            delta_key = _version_key(options.delta_from_version)
+            if target_key is not None and delta_key >= target_key:
+                errors.append("增量来源版本必须低于目标版本")
+        except PublisherError as exc:
+            errors.append(str(exc))
+        snapshot = (
+            root
+            / "dist"
+            / "release-snapshots"
+            / f"{options.delta_from_version}.json"
+        )
+        if (for_build or for_publish or for_pipeline) and not snapshot.is_file():
+            errors.append(f"缺少增量来源快照：{snapshot}")
+
+    if options.inno_compiler and not Path(options.inno_compiler).expanduser().is_file():
+        errors.append(f"Inno Setup 编译器不存在：{options.inno_compiler}")
+    if for_build and find_inno_compiler(options.inno_compiler) is None:
+        errors.append("未找到 Inno Setup 6 编译器")
+
+    try:
+        current = project_version(root)
+    except PublisherError as exc:
+        errors.append(str(exc))
+    else:
+        if current != options.version:
+            errors.append(f"项目当前版本是 {current}，不是目标版本 {options.version}")
+        errors.extend(project_version_mismatches(root, options.version))
+
+    if for_publish:
+        if not options.full_installer.is_file():
+            errors.append(f"完整安装包不存在：{options.full_installer}")
+        if options.delta_installer is not None and not options.delta_installer.is_file():
+            errors.append(f"增量安装包不存在：{options.delta_installer}")
+    if for_publish or for_pipeline:
+        if options.snapshot_path.exists():
+            errors.append(
+                f"版本 {options.version} 已存在发布快照；已发布版本不可覆盖"
+            )
+        if options.remote_host:
+            if not REMOTE_HOST_PATTERN.fullmatch(options.remote_host):
+                errors.append("远程主机格式无效")
+            if shutil.which("ssh") is None or shutil.which("scp") is None:
+                errors.append("远程发布需要系统提供 ssh 和 scp")
+            try:
+                changes = git_status(root)
+            except PublisherError as exc:
+                errors.append(str(exc))
+            else:
+                if changes:
+                    errors.append("远程发布要求 Git 工作区无未提交变更")
+
+    if not REMOTE_PATH_PATTERN.fullmatch(options.remote_path):
+        errors.append("远程更新目录必须是安全的绝对 Linux 路径")
+    if options.identity_file and not Path(options.identity_file).expanduser().is_file():
+        errors.append(f"SSH 私钥不存在：{options.identity_file}")
+
+    errors.extend(validate_test_environment(root))
+    return list(dict.fromkeys(errors))
+
+
+def _powershell_step(
+    options: ReleaseOptions,
+    *,
+    key: str,
+    title: str,
+    script_name: str,
+    script_arguments: list[str],
+) -> CommandStep:
+    script = options.repo_root / "scripts" / script_name
+    return CommandStep(
+        key=key,
+        title=title,
+        program="powershell.exe",
+        arguments=(
+            "-NoLogo",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(script),
+            *script_arguments,
+        ),
+        working_directory=options.repo_root,
+    )
+
+
+def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
+    root = options.repo_root
+    return [
+        CommandStep(
+            key="compile_client",
+            title="检查客户端 Python 语法",
+            program=str(root / ".venv" / "Scripts" / "python.exe"),
+            arguments=(
+                "-m",
+                "compileall",
+                "-q",
+                "main.py",
+                "integrated_client",
+                "release_publisher",
+            ),
+            working_directory=root,
+        ),
+        CommandStep(
+            key="test_client",
+            title="运行客户端自动化测试",
+            program=str(root / ".venv" / "Scripts" / "python.exe"),
+            arguments=("-m", "pytest", "tests", "-q"),
+            working_directory=root,
+        ),
+        CommandStep(
+            key="test_server",
+            title="运行服务端自动化测试",
+            program=str(root / "server" / ".venv" / "Scripts" / "python.exe"),
+            arguments=("-m", "pytest", "-q"),
+            working_directory=root / "server",
+        ),
+    ]
+
+
+def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
+    arguments = [
+        "-BaseUrl",
+        options.base_url,
+        "-Version",
+        options.version,
+    ]
+    if options.ca_bundle:
+        arguments.extend(["-CaBundle", options.ca_bundle])
+    if options.delta_from_version:
+        arguments.extend(["-DeltaFromVersion", options.delta_from_version])
+    if options.inno_compiler:
+        arguments.extend(["-InnoCompiler", options.inno_compiler])
+    script_name = (
+        "build-releases.ps1" if options.build_portable else "build-installer.ps1"
+    )
+    return [
+        _powershell_step(
+            options,
+            key="build_packages",
+            title=(
+                "构建便携包、完整安装包和增量包"
+                if options.build_portable
+                else "构建完整安装包和增量包"
+            ),
+            script_name=script_name,
+            script_arguments=arguments,
+        )
+    ]
+
+
+def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
+    arguments = [
+        "-Installer",
+        str(options.full_installer),
+        "-Version",
+        options.version,
+        "-Notes",
+        options.notes.strip(),
+        "-Channel",
+        options.channel,
+        "-RemotePath",
+        options.remote_path,
+    ]
+    if options.mandatory:
+        arguments.append("-Mandatory")
+    if options.delta_installer is not None:
+        arguments.extend(
+            [
+                "-DeltaInstaller",
+                str(options.delta_installer),
+                "-DeltaFromVersion",
+                options.delta_from_version,
+            ]
+        )
+    if options.remote_host:
+        arguments.extend(["-RemoteHost", options.remote_host])
+    if options.identity_file:
+        arguments.extend(["-IdentityFile", options.identity_file])
+    return [
+        _powershell_step(
+            options,
+            key="publish",
+            title=(
+                f"发布 {options.version} 到 {options.remote_host}"
+                if options.remote_host
+                else f"生成 {options.version} 本地发布目录"
+            ),
+            script_name="publish-update.ps1",
+            script_arguments=arguments,
+        ),
+        _powershell_step(
+            options,
+            key="snapshot",
+            title=f"保存 {options.version} 发布快照",
+            script_name="save-release-snapshot.ps1",
+            script_arguments=["-Version", options.version],
+        ),
+    ]
+
+
+def build_release_plan(
+    options: ReleaseOptions,
+    *,
+    include_tests: bool,
+    include_build: bool,
+    include_publish: bool,
+) -> list[CommandStep]:
+    steps: list[CommandStep] = []
+    if include_tests:
+        steps.extend(build_test_steps(options))
+    if include_build:
+        steps.extend(build_package_steps(options))
+    if include_publish:
+        steps.extend(build_publish_steps(options))
+    return steps
