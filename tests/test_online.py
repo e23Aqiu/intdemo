@@ -12,6 +12,7 @@ from unittest.mock import Mock
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
+from integrated_client.config import APP_VERSION
 from integrated_client.database import AuthenticationError, Database
 from integrated_client.online.api import NetworkUnavailable
 from integrated_client.online.config import OnlineConfig, OnlineConfigurationError
@@ -30,6 +31,11 @@ from integrated_client.preferences import ClientPreferences, LoginCredentialStor
 
 def _b64url(value):
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _next_patch_version(value):
+    major, minor, patch = (int(part) for part in value.split("."))
+    return f"{major}.{minor}.{patch + 1}"
 
 
 class MemoryProtector(Protector):
@@ -269,13 +275,15 @@ class OnlineClientTests(unittest.TestCase):
 
     def test_update_manifest_accepts_only_newer_same_server_package(self):
         installer = b"signed-by-manifest-hash"
+        target_version = _next_patch_version(APP_VERSION)
+        installer_name = f"IntDemoOnline-Setup-{target_version}.exe"
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {
             "schema_version": 1,
             "channel": "test",
-            "version": "0.2.6",
-            "installer_path": "/updates/files/IntDemoOnline-Setup-0.2.6.exe",
+            "version": target_version,
+            "installer_path": f"/updates/files/{installer_name}",
             "sha256": hashlib.sha256(installer).hexdigest(),
             "size": len(installer),
             "notes": "修复启动问题",
@@ -291,13 +299,12 @@ class OnlineClientTests(unittest.TestCase):
 
         update = UpdateClient(config, session=session).check()
 
-        self.assertEqual(update.version, "0.2.6")
+        self.assertEqual(update.version, target_version)
         self.assertEqual(
             update.installer_url,
-            "https://203.0.113.10/updates/files/"
-            "IntDemoOnline-Setup-0.2.6.exe",
+            f"https://203.0.113.10/updates/files/{installer_name}",
         )
-        self.assertGreater(version_key(update.version), version_key("0.2.4"))
+        self.assertGreater(version_key(update.version), version_key(APP_VERSION))
         self.assertTrue(update.mandatory)
         session.get.assert_called_once()
 
@@ -308,31 +315,32 @@ class OnlineClientTests(unittest.TestCase):
     def test_update_manifest_prefers_matching_delta(self):
         full = b"full"
         delta = b"delta"
+        target_version = _next_patch_version(APP_VERSION)
+        full_name = f"IntDemoOnline-Setup-{target_version}.exe"
+        delta_name = (
+            f"IntDemoOnline-Patch-{APP_VERSION}-to-{target_version}.exe"
+        )
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {
             "schema_version": 1,
             "channel": "test",
-            "version": "0.2.6",
-            "installer_path": (
-                "/updates/files/IntDemoOnline-Patch-0.2.5-to-0.2.6.exe"
-            ),
+            "version": target_version,
+            "installer_path": f"/updates/files/{delta_name}",
             "sha256": hashlib.sha256(delta).hexdigest(),
             "size": len(delta),
             "notes": "增量更新测试",
             "primary_kind": "delta",
-            "primary_from_version": "0.2.5",
+            "primary_from_version": APP_VERSION,
             "full": {
-                "installer_path": "/updates/files/IntDemoOnline-Setup-0.2.6.exe",
+                "installer_path": f"/updates/files/{full_name}",
                 "sha256": hashlib.sha256(full).hexdigest(),
                 "size": len(full),
             },
             "deltas": [
                 {
-                    "from_version": "0.2.5",
-                    "installer_path": (
-                        "/updates/files/IntDemoOnline-Patch-0.2.5-to-0.2.6.exe"
-                    ),
+                    "from_version": APP_VERSION,
+                    "installer_path": f"/updates/files/{delta_name}",
                     "sha256": hashlib.sha256(delta).hexdigest(),
                     "size": len(delta),
                 }
@@ -349,9 +357,9 @@ class OnlineClientTests(unittest.TestCase):
         update = UpdateClient(config, session=session).check()
 
         self.assertTrue(update.is_delta)
-        self.assertEqual(update.from_version, "0.2.5")
+        self.assertEqual(update.from_version, APP_VERSION)
         self.assertEqual(update.size, len(delta))
-        self.assertIn("Patch-0.2.5-to-0.2.6", update.installer_name)
+        self.assertEqual(update.installer_name, delta_name)
 
     def test_update_manifest_uses_delta_only_for_exact_current_version(self):
         full = b"full-package"
