@@ -14,6 +14,7 @@ from PyQt5.QtWidgets import (
     QFormLayout,
     QFrame,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMainWindow,
@@ -38,8 +39,11 @@ from .core import (
     PublisherSettings,
     ReleaseOptions,
     SettingsStore,
+    build_git_commit_steps,
+    build_git_push_plan,
     build_release_plan,
     find_inno_compiler,
+    git_status,
     project_version,
     set_project_version,
     validate_release_options,
@@ -58,6 +62,7 @@ class ReleasePublisherWindow(QMainWindow):
         self._cancel_requested = False
         self._completed_steps = 0
         self._total_steps = 0
+        self._completion_message = "全部步骤执行成功"
         self._output_buffer = b""
         self._connection_client: ConnectionControlClient | None = None
         self._connection_client_key: tuple[str, ...] | None = None
@@ -304,6 +309,18 @@ class ReleasePublisherWindow(QMainWindow):
         self.build_button = QPushButton("构建安装包")
         self.build_button.clicked.connect(self._run_build)
         actions.addWidget(self.build_button)
+        self.commit_changes_button = QPushButton("提交变更")
+        self.commit_changes_button.setToolTip(
+            "预览并暂存当前仓库的全部变更，创建本地 Git 提交；不会推送到远程"
+        )
+        self.commit_changes_button.clicked.connect(self._commit_changes)
+        actions.addWidget(self.commit_changes_button)
+        self.push_button = QPushButton("推送")
+        self.push_button.setToolTip(
+            "预览待推送提交并将当前分支推送到上游；不会强制推送"
+        )
+        self.push_button.clicked.connect(self._push_changes)
+        actions.addWidget(self.push_button)
         actions.addStretch()
         self.publish_button = QPushButton("发布")
         self.publish_button.clicked.connect(self._run_publish)
@@ -806,7 +823,126 @@ class ReleasePublisherWindow(QMainWindow):
             "请检查变更、更新发布说明并提交 Git 后再远程发布。",
         )
 
-    def _run_steps(self, steps: list[CommandStep]) -> None:
+    @staticmethod
+    def _git_changes_preview(changes: list[str], limit: int = 20) -> str:
+        visible = changes[:limit]
+        preview = "\n".join(f"  {line}" for line in visible)
+        remaining = len(changes) - len(visible)
+        if remaining > 0:
+            preview += f"\n  ……另有 {remaining} 项变更"
+        return preview
+
+    def _commit_changes(self) -> None:
+        try:
+            changes = git_status(self.repo_root)
+        except PublisherError as exc:
+            QMessageBox.warning(self, "无法读取 Git 变更", str(exc))
+            self._append_log(f"读取 Git 变更失败：{exc}")
+            return
+        if not changes:
+            self._append_log("Git 工作区没有可提交的变更。")
+            QMessageBox.information(
+                self,
+                "没有变更",
+                "Git 工作区是干净的，没有需要提交的变更。",
+            )
+            return
+
+        preview = self._git_changes_preview(changes)
+        try:
+            version = project_version(self.repo_root)
+            default_message = f"准备 v{version} 发布"
+        except PublisherError:
+            default_message = "提交打包变更"
+        message, accepted = QInputDialog.getText(
+            self,
+            "提交当前变更",
+            f"检测到 {len(changes)} 项 Git 变更：\n\n{preview}\n\n提交说明：",
+            QLineEdit.Normal,
+            default_message,
+        )
+        message = message.strip()
+        if not accepted:
+            return
+        if not message:
+            QMessageBox.warning(self, "无法提交", "Git 提交说明不能为空。")
+            return
+
+        reply = QMessageBox.warning(
+            self,
+            "确认本地提交",
+            f"提交说明：{message}\n\n"
+            f"将提交以下变更：\n{preview}\n\n"
+            "继续后会执行 git add --all，把全部修改、删除和未跟踪文件"
+            "加入本地提交。\n此操作不会推送到远程，是否继续？",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            steps = build_git_commit_steps(self.repo_root, message)
+        except PublisherError as exc:
+            QMessageBox.warning(self, "无法提交", str(exc))
+            self._append_log(f"准备 Git 提交失败：{exc}")
+            return
+        self._run_steps(
+            steps,
+            completion_message="本地 Git 提交已创建（未推送）",
+        )
+
+    def _push_changes(self) -> None:
+        try:
+            plan = build_git_push_plan(self.repo_root)
+        except PublisherError as exc:
+            QMessageBox.warning(self, "无法推送", str(exc))
+            self._append_log(f"准备 Git 推送失败：{exc}")
+            return
+        if plan.upstream is not None and plan.ahead_count == 0:
+            self._append_log(
+                f"Git 分支 {plan.branch} 没有需要推送到 {plan.target} 的提交。"
+            )
+            QMessageBox.information(
+                self,
+                "无需推送",
+                f"当前分支 {plan.branch} 已与 {plan.target} 同步。",
+            )
+            return
+
+        preview = "\n".join(f"  {commit}" for commit in plan.commits)
+        remaining = plan.ahead_count - len(plan.commits)
+        if remaining > 0:
+            preview += f"\n  ……另有 {remaining} 个较早提交"
+        mode = (
+            "首次推送，并设置为当前分支的上游"
+            if plan.sets_upstream
+            else "推送到现有上游"
+        )
+        reply = QMessageBox.warning(
+            self,
+            "确认推送当前分支",
+            f"本地分支：{plan.branch}\n"
+            f"远程目标：{plan.target}\n"
+            f"推送方式：{mode}\n"
+            f"待推送提交：{plan.ahead_count} 个\n\n"
+            f"{preview}\n\n"
+            "将执行普通 Git push，不会强制推送。是否继续？",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._run_steps(
+            [plan.step],
+            completion_message=f"当前分支已推送到 {plan.target}",
+        )
+
+    def _run_steps(
+        self,
+        steps: list[CommandStep],
+        *,
+        completion_message: str = "全部步骤执行成功",
+    ) -> None:
         if self.process is not None:
             return
         if not steps:
@@ -815,6 +951,7 @@ class ReleasePublisherWindow(QMainWindow):
         self._total_steps = len(steps)
         self._completed_steps = 0
         self._cancel_requested = False
+        self._completion_message = completion_message
         self._set_busy(True)
         self._append_log(
             "\n"
@@ -828,7 +965,7 @@ class ReleasePublisherWindow(QMainWindow):
             self._finish_pipeline(False, "操作已停止")
             return
         if not self._steps:
-            self._finish_pipeline(True, "全部步骤执行成功")
+            self._finish_pipeline(True, self._completion_message)
             return
         step = self._steps.popleft()
         self._current_step = step
@@ -963,6 +1100,7 @@ class ReleasePublisherWindow(QMainWindow):
     def _finish_pipeline(self, success: bool, message: str) -> None:
         self._steps.clear()
         self._current_step = None
+        self._completion_message = "全部步骤执行成功"
         self._set_busy(False)
         self.status_label.setText(message)
         self._append_log(
@@ -978,6 +1116,8 @@ class ReleasePublisherWindow(QMainWindow):
             self.preflight_button,
             self.test_button,
             self.build_button,
+            self.commit_changes_button,
+            self.push_button,
             self.publish_button,
             self.pipeline_button,
             self.sync_version_button,

@@ -5,16 +5,21 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from release_publisher.connection_control import ConnectionControlClient
 from release_publisher.core import (
+    CommandStep,
+    GitPushPlan,
     PublisherSettings,
     ReleaseOptions,
     SettingsStore,
+    build_git_commit_steps,
+    build_git_push_plan,
     build_release_plan,
+    git_status,
     project_version,
     project_version_mismatches,
     set_project_version,
@@ -99,6 +104,146 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         )
         self.assertIn("-Mandatory", publish_step.arguments)
         self.assertIn("-RemoteHost", publish_step.arguments)
+
+    def test_git_commit_steps_stage_all_changes_and_create_local_commit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(
+                ["git", "init", "-q"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.name", "IntDemo Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "intdemo@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            tracked = root / "tracked.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--all"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "initial"],
+                cwd=root,
+                check=True,
+            )
+
+            tracked.write_text("after\n", encoding="utf-8")
+            (root / "new.txt").write_text("new\n", encoding="utf-8")
+            steps = build_git_commit_steps(root, "准备测试版本")
+
+            self.assertEqual(
+                [step.key for step in steps],
+                ["git_stage", "git_commit"],
+            )
+            self.assertEqual(steps[0].arguments, ("add", "--all"))
+            self.assertEqual(
+                steps[1].arguments,
+                ("commit", "-m", "准备测试版本"),
+            )
+            for step in steps:
+                subprocess.run(
+                    [step.program, *step.arguments],
+                    cwd=step.working_directory,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+
+            self.assertEqual(git_status(root), [])
+            subject = subprocess.run(
+                ["git", "log", "-1", "--pretty=%s"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            self.assertEqual(subject, "准备测试版本")
+
+    def test_git_push_plan_sets_upstream_then_pushes_only_current_branch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            remote = root / "remote.git"
+            local = root / "local"
+            local.mkdir()
+            subprocess.run(
+                ["git", "init", "--bare", "-q", str(remote)],
+                check=True,
+            )
+            subprocess.run(["git", "init", "-q"], cwd=local, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "IntDemo Test"],
+                cwd=local,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "intdemo@example.invalid"],
+                cwd=local,
+                check=True,
+            )
+            (local / "tracked.txt").write_text("first\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--all"], cwd=local, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "first"],
+                cwd=local,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(remote)],
+                cwd=local,
+                check=True,
+            )
+
+            first_plan = build_git_push_plan(local)
+
+            self.assertTrue(first_plan.sets_upstream)
+            self.assertEqual(first_plan.remote, "origin")
+            self.assertEqual(first_plan.ahead_count, 1)
+            self.assertIn("--set-upstream", first_plan.step.arguments)
+            subprocess.run(
+                [first_plan.step.program, *first_plan.step.arguments],
+                cwd=first_plan.step.working_directory,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            (local / "tracked.txt").write_text("second\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--all"], cwd=local, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "second"],
+                cwd=local,
+                check=True,
+            )
+            second_plan = build_git_push_plan(local)
+
+            self.assertFalse(second_plan.sets_upstream)
+            self.assertEqual(second_plan.ahead_count, 1)
+            self.assertIn("second", second_plan.commits[0])
+            self.assertNotIn("--set-upstream", second_plan.step.arguments)
+            self.assertEqual(
+                second_plan.step.arguments[-1],
+                f"HEAD:refs/heads/{second_plan.branch}",
+            )
+            subprocess.run(
+                [second_plan.step.program, *second_plan.step.arguments],
+                cwd=second_plan.step.working_directory,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            self.assertEqual(build_git_push_plan(local).ahead_count, 0)
 
     def test_version_sync_updates_all_authoritative_fields(self):
         current = project_version(REPO_ROOT)
@@ -309,6 +454,10 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertFalse(window.cancel_button.isEnabled())
         self.assertIn("测试", window.pipeline_button.text())
         self.assertIn("发布", window.pipeline_button.text())
+        self.assertEqual(window.commit_changes_button.text(), "提交变更")
+        self.assertIn("不会推送", window.commit_changes_button.toolTip())
+        self.assertEqual(window.push_button.text(), "推送")
+        self.assertIn("不会强制推送", window.push_button.toolTip())
         self.assertEqual(window.control_username_edit.text(), "admin")
         self.assertEqual(window.control_password_edit.text(), "")
         self.assertIn("断开全部", window.disconnect_all_button.text())
@@ -342,6 +491,87 @@ class ReleasePublisherUiTests(unittest.TestCase):
             "中文日志",
         )
 
+        window.deleteLater()
+
+    def test_commit_button_previews_and_runs_local_commit_steps(self):
+        window = ReleasePublisherWindow(REPO_ROOT)
+
+        with (
+            patch(
+                "release_publisher.ui.git_status",
+                return_value=[" M tracked.txt", "?? new.txt"],
+            ),
+            patch(
+                "release_publisher.ui.project_version",
+                return_value="0.2.5",
+            ),
+            patch(
+                "release_publisher.ui.QInputDialog.getText",
+                return_value=("准备 v0.2.5 发布", True),
+            ),
+            patch(
+                "release_publisher.ui.QMessageBox.warning",
+                return_value=QMessageBox.Yes,
+            ) as warning,
+            patch.object(window, "_run_steps") as run_steps,
+        ):
+            window._commit_changes()
+
+        self.assertIn("git add --all", warning.call_args.args[2])
+        steps = run_steps.call_args.args[0]
+        self.assertEqual(
+            [step.key for step in steps],
+            ["git_stage", "git_commit"],
+        )
+        self.assertEqual(
+            run_steps.call_args.kwargs["completion_message"],
+            "本地 Git 提交已创建（未推送）",
+        )
+        window.deleteLater()
+
+    def test_push_button_previews_and_runs_non_force_push(self):
+        window = ReleasePublisherWindow(REPO_ROOT)
+        plan = GitPushPlan(
+            branch="codex/test",
+            remote="origin",
+            remote_branch="codex/test",
+            upstream="origin/codex/test",
+            ahead_count=1,
+            commits=("abc1234 测试提交",),
+            step=CommandStep(
+                key="git_push",
+                title="推送 Git 分支 codex/test",
+                program="git",
+                arguments=(
+                    "push",
+                    "--porcelain",
+                    "origin",
+                    "HEAD:refs/heads/codex/test",
+                ),
+                working_directory=REPO_ROOT,
+            ),
+        )
+
+        with (
+            patch(
+                "release_publisher.ui.build_git_push_plan",
+                return_value=plan,
+            ),
+            patch(
+                "release_publisher.ui.QMessageBox.warning",
+                return_value=QMessageBox.Yes,
+            ) as warning,
+            patch.object(window, "_run_steps") as run_steps,
+        ):
+            window._push_changes()
+
+        self.assertIn("不会强制推送", warning.call_args.args[2])
+        self.assertNotIn("--force", plan.step.arguments)
+        self.assertEqual(run_steps.call_args.args[0], [plan.step])
+        self.assertEqual(
+            run_steps.call_args.kwargs["completion_message"],
+            "当前分支已推送到 origin/codex/test",
+        )
         window.deleteLater()
 
 

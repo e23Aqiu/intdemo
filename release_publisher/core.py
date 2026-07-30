@@ -157,6 +157,25 @@ class CommandStep:
         return subprocess.list2cmdline([self.program, *self.arguments])
 
 
+@dataclass(frozen=True)
+class GitPushPlan:
+    branch: str
+    remote: str
+    remote_branch: str
+    upstream: str | None
+    ahead_count: int
+    commits: tuple[str, ...]
+    step: CommandStep
+
+    @property
+    def target(self) -> str:
+        return f"{self.remote}/{self.remote_branch}"
+
+    @property
+    def sets_upstream(self) -> bool:
+        return self.upstream is None
+
+
 def project_version(repo_root: str | Path) -> str:
     path = Path(repo_root) / "integrated_client" / "config.py"
     try:
@@ -307,20 +326,233 @@ def project_version_mismatches(
 
 
 def git_status(repo_root: str | Path) -> list[str]:
-    result = subprocess.run(
-        ["git", "status", "--porcelain=v1"],
-        cwd=Path(repo_root),
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        result = subprocess.run(
+            ["git", "status", "--porcelain=v1"],
+            cwd=Path(repo_root),
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise PublisherError(f"无法运行 Git：{exc}") from exc
     if result.returncode != 0:
         raise PublisherError(
             f"无法读取 Git 工作区状态：{result.stderr.strip() or result.stdout.strip()}"
         )
     return [line for line in result.stdout.splitlines() if line.strip()]
+
+
+def build_git_commit_steps(
+    repo_root: str | Path,
+    message: str,
+) -> list[CommandStep]:
+    root = Path(repo_root).resolve()
+    normalized_message = str(message or "").strip()
+    if not normalized_message:
+        raise PublisherError("Git 提交说明不能为空")
+    git_program = shutil.which("git")
+    if not git_program:
+        raise PublisherError("未找到 Git，请先安装 Git 并将其加入 PATH")
+    return [
+        CommandStep(
+            key="git_stage",
+            title="暂存全部 Git 变更",
+            program=git_program,
+            arguments=("add", "--all"),
+            working_directory=root,
+        ),
+        CommandStep(
+            key="git_commit",
+            title="创建本地 Git 提交",
+            program=git_program,
+            arguments=("commit", "-m", normalized_message),
+            working_directory=root,
+        ),
+    ]
+
+
+def _run_git_capture(
+    repo_root: Path,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git", *arguments],
+            cwd=repo_root,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise PublisherError(f"无法运行 Git：{exc}") from exc
+
+
+def _git_output(
+    repo_root: Path,
+    *arguments: str,
+    action: str,
+) -> str:
+    result = _run_git_capture(repo_root, *arguments)
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip()
+        raise PublisherError(f"{action}失败：{detail or 'Git 未返回错误详情'}")
+    return result.stdout.strip()
+
+
+def build_git_push_plan(repo_root: str | Path) -> GitPushPlan:
+    root = Path(repo_root).resolve()
+    changes = git_status(root)
+    if changes:
+        raise PublisherError("推送前请先提交全部 Git 工作区变更")
+
+    branch = _git_output(
+        root,
+        "branch",
+        "--show-current",
+        action="读取当前 Git 分支",
+    )
+    if not branch:
+        raise PublisherError("当前处于 detached HEAD，无法安全推送")
+    _git_output(
+        root,
+        "rev-parse",
+        "--verify",
+        "HEAD",
+        action="读取当前 Git 提交",
+    )
+
+    upstream_result = _run_git_capture(
+        root,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    )
+    upstream = (
+        upstream_result.stdout.strip()
+        if upstream_result.returncode == 0
+        else None
+    )
+    if upstream:
+        remote = _git_output(
+            root,
+            "config",
+            "--get",
+            f"branch.{branch}.remote",
+            action="读取 Git 上游远程",
+        )
+        merge_ref = _git_output(
+            root,
+            "config",
+            "--get",
+            f"branch.{branch}.merge",
+            action="读取 Git 上游分支",
+        )
+        if remote == "." or not merge_ref.startswith("refs/heads/"):
+            raise PublisherError(f"当前上游 {upstream} 不是可推送的远程分支")
+        remote_branch = merge_ref.removeprefix("refs/heads/")
+        counts = _git_output(
+            root,
+            "rev-list",
+            "--left-right",
+            "--count",
+            f"{upstream}...HEAD",
+            action="比较本地与上游提交",
+        ).split()
+        if len(counts) != 2:
+            raise PublisherError("无法解析本地与上游的提交差异")
+        behind_count, ahead_count = (int(value) for value in counts)
+        if behind_count:
+            raise PublisherError(
+                f"当前分支落后 {upstream} {behind_count} 个提交，"
+                "请先拉取并处理差异后再推送"
+            )
+        commit_range = f"{upstream}..HEAD"
+        push_arguments = (
+            "push",
+            "--porcelain",
+            remote,
+            f"HEAD:{merge_ref}",
+        )
+    else:
+        remotes = _git_output(
+            root,
+            "remote",
+            action="读取 Git 远程仓库",
+        ).splitlines()
+        if "origin" in remotes:
+            remote = "origin"
+        elif len(remotes) == 1:
+            remote = remotes[0]
+        elif not remotes:
+            raise PublisherError("尚未配置 Git 远程仓库，无法推送")
+        else:
+            raise PublisherError(
+                "当前分支没有上游且存在多个远程仓库，请先手动设置上游"
+            )
+        _git_output(
+            root,
+            "remote",
+            "get-url",
+            "--push",
+            remote,
+            action=f"读取 Git 远程 {remote}",
+        )
+        remote_branch = branch
+        ahead_count = int(
+            _git_output(
+                root,
+                "rev-list",
+                "--count",
+                "HEAD",
+                action="统计当前分支提交",
+            )
+        )
+        commit_range = "HEAD"
+        merge_ref = f"refs/heads/{remote_branch}"
+        push_arguments = (
+            "push",
+            "--porcelain",
+            "--set-upstream",
+            remote,
+            f"HEAD:{merge_ref}",
+        )
+
+    commits = tuple(
+        line
+        for line in _git_output(
+            root,
+            "log",
+            "--format=%h %s",
+            "--max-count=20",
+            commit_range,
+            action="读取待推送提交",
+        ).splitlines()
+        if line.strip()
+    )
+    git_program = shutil.which("git")
+    if not git_program:
+        raise PublisherError("未找到 Git，请先安装 Git 并将其加入 PATH")
+    return GitPushPlan(
+        branch=branch,
+        remote=remote,
+        remote_branch=remote_branch,
+        upstream=upstream,
+        ahead_count=ahead_count,
+        commits=commits,
+        step=CommandStep(
+            key="git_push",
+            title=f"推送 Git 分支 {branch}",
+            program=git_program,
+            arguments=push_arguments,
+            working_directory=root,
+        ),
+    )
 
 
 def _replace_exact(
