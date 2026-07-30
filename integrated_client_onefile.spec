@@ -13,6 +13,7 @@ datas += [
     ('integrated_client/ui/assets/nav-data.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-workflow.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-accounts.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/nav-ml.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-user.svg', 'integrated_client/ui/assets'),
     ('integrated_client/online/client-online.json', 'integrated_client/online'),
 ]

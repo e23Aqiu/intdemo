@@ -10,7 +10,7 @@ from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 from sqlalchemy import select, text
 
-from .api import admin, announcements, auth, sync, websocket
+from .api import admin, announcements, auth, captcha_learning, sync, websocket
 from .bootstrap import bootstrap_database
 from .config import get_settings
 from .database import Base, SessionLocal, engine
@@ -104,6 +104,7 @@ def create_app() -> FastAPI:
     api.include_router(auth.router)
     api.include_router(admin.router)
     api.include_router(announcements.router)
+    api.include_router(captcha_learning.router)
     api.include_router(sync.router)
     api.include_router(websocket.router)
 

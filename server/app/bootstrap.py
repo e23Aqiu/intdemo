@@ -3,7 +3,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Account, MetricDefinition
+from .models import Account, CaptchaLearningPolicy, MetricDefinition
 from .security import hash_password
 from .services import append_change
 
@@ -28,6 +28,14 @@ DEFAULT_METRICS = (
 
 
 def bootstrap_database(db: Session) -> None:
+    if db.get(CaptchaLearningPolicy, 1) is None:
+        db.add(
+            CaptchaLearningPolicy(
+                id=1,
+                upload_enabled=False,
+                revision=1,
+            )
+        )
     existing_usernames = set(db.scalars(select(Account.username)))
     for username, display_name, role, scope, active in BOOTSTRAP_ACCOUNTS:
         if username in existing_usernames:

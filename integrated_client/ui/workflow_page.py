@@ -233,6 +233,9 @@ class WorkflowPage(QWidget):
         client_preferences=None,
         account_key="",
         untracked_mode=False,
+        captcha_reporter=None,
+        captcha_model_manager=None,
+        captcha_collection_enabled=None,
     ):
         super().__init__(parent)
         self._stats_recorder = stats_recorder
@@ -240,6 +243,9 @@ class WorkflowPage(QWidget):
         self._untracked_mode = bool(untracked_mode)
         self.client_preferences = client_preferences
         self.account_key = str(account_key or "").strip().lower()
+        self.captcha_reporter = captcha_reporter
+        self.captcha_model_manager = captcha_model_manager
+        self.captcha_collection_enabled = captcha_collection_enabled
         self.file_path = ""
         self.df = pd.DataFrame()
         self.model = DataFrameTableModel(self.df, self)
@@ -1093,6 +1099,14 @@ class WorkflowPage(QWidget):
     def _captcha_retry_count(self):
         return 9999 if self.infinite_captcha.isChecked() else self.captcha_retry.value()
 
+    def _report_captcha_attempt(self, event):
+        if self._untracked_mode or not callable(self.captcha_reporter):
+            return
+        try:
+            self.captcha_reporter(event)
+        except Exception as exc:
+            self._log(f"⚠️ 验证码学习数据上报失败：{exc}")
+
     def _set_controls_running(self, running):
         self.pipeline_running = running
         self.choose_btn.setEnabled(not running)
@@ -1269,6 +1283,8 @@ class WorkflowPage(QWidget):
             self.auto_continue.isChecked(),
             self._captcha_retry_count(),
             self.only_yellow.isChecked(),
+            captcha_model_manager=self.captcha_model_manager,
+            captcha_collection_enabled=self.captcha_collection_enabled,
         )
         self.current_worker = worker
         worker.log.connect(self._log)
@@ -1277,6 +1293,8 @@ class WorkflowPage(QWidget):
         worker.input_signal.connect(self._transport_manual_input)
         if hasattr(worker, "retry_signal"):
             worker.retry_signal.connect(self._timing_retry)
+        if hasattr(worker, "captcha_attempt_signal"):
+            worker.captcha_attempt_signal.connect(self._report_captcha_attempt)
         worker.finished.connect(lambda result, obj=worker: self._transport_finished(obj, result))
         worker.start()
 
@@ -1313,6 +1331,8 @@ class WorkflowPage(QWidget):
             auto_mode,
             self._captcha_retry_count(),
             self.manual_captcha.isChecked() if not auto_mode else False,
+            captcha_model_manager=self.captcha_model_manager,
+            captcha_collection_enabled=self.captcha_collection_enabled,
         )
         self.current_worker = worker
         worker.log.connect(self._log)
@@ -1321,6 +1341,8 @@ class WorkflowPage(QWidget):
         worker.input_signal.connect(self._business_manual_input)
         if hasattr(worker, "retry_signal"):
             worker.retry_signal.connect(self._timing_retry)
+        if hasattr(worker, "captcha_attempt_signal"):
+            worker.captcha_attempt_signal.connect(self._report_captcha_attempt)
         worker.finished.connect(lambda result, obj=worker: self._backfill_finished(obj, result))
         worker.start()
 

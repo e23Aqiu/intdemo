@@ -9,6 +9,7 @@ from sqlalchemy import (
     Boolean,
     Date,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -340,3 +341,92 @@ class AdminContactMessage(Base):
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
+class CaptchaLearningPolicy(Base):
+    __tablename__ = "captcha_learning_policy"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    upload_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    revision: Mapped[int] = mapped_column(Integer, default=1)
+    updated_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=utcnow,
+        onupdate=utcnow,
+    )
+
+
+class CaptchaAttempt(Base):
+    __tablename__ = "captcha_attempts"
+    __table_args__ = (
+        Index(
+            "ix_captcha_attempt_type_model_time",
+            "captcha_type",
+            "model_version",
+            "occurred_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    captcha_type: Mapped[str] = mapped_column(String(16), index=True)
+    source: Mapped[str] = mapped_column(String(40))
+    model_version: Mapped[str] = mapped_column(String(80), index=True)
+    success: Mapped[bool] = mapped_column(Boolean, index=True)
+    assisted: Mapped[bool] = mapped_column(Boolean, default=False)
+    occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CaptchaSample(Base):
+    __tablename__ = "captcha_samples"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    attempt_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("captcha_attempts.id", ondelete="SET NULL"),
+        unique=True,
+    )
+    captcha_type: Mapped[str] = mapped_column(String(16), index=True)
+    source: Mapped[str] = mapped_column(String(40))
+    sample_fingerprint: Mapped[str] = mapped_column(
+        String(64),
+        unique=True,
+        index=True,
+    )
+    image_mime: Mapped[str] = mapped_column(String(32))
+    image_size: Mapped[int] = mapped_column(Integer)
+    image_data: Mapped[bytes] = mapped_column(LargeBinary)
+    answer: Mapped[dict[str, Any]] = mapped_column(JSON)
+    model_version: Mapped[str] = mapped_column(String(80))
+    origin: Mapped[str] = mapped_column(String(16), default="client")
+    captured_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CaptchaModel(Base):
+    __tablename__ = "captcha_models"
+    __table_args__ = (
+        UniqueConstraint("captcha_type", "version"),
+        Index("ix_captcha_model_type_status", "captcha_type", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    captcha_type: Mapped[str] = mapped_column(String(16), index=True)
+    version: Mapped[str] = mapped_column(String(80))
+    algorithm: Mapped[str] = mapped_column(String(80))
+    status: Mapped[str] = mapped_column(String(16), default="candidate")
+    artifact_sha256: Mapped[str] = mapped_column(String(64))
+    artifact_size: Mapped[int] = mapped_column(Integer)
+    artifact: Mapped[bytes] = mapped_column(LargeBinary)
+    sample_count: Mapped[int] = mapped_column(Integer, default=0)
+    test_count: Mapped[int] = mapped_column(Integer, default=0)
+    correct_count: Mapped[int] = mapped_column(Integer, default=0)
+    accuracy: Mapped[float] = mapped_column(Float, default=0.0)
+    metrics: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_by_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("accounts.id", ondelete="SET NULL"),
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

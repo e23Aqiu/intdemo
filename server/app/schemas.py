@@ -297,3 +297,126 @@ class AdminContactMessageCreate(StrictModel):
         if not value:
             raise ValueError("消息内容不能为空")
         return value
+
+
+class CaptchaModelView(StrictModel):
+    id: uuid.UUID
+    captcha_type: Literal["numeric", "click"]
+    version: str
+    algorithm: str
+    status: Literal["candidate", "current", "archived"]
+    artifact_sha256: str
+    artifact_size: int
+    sample_count: int
+    test_count: int
+    correct_count: int
+    accuracy: float
+    metrics: dict[str, Any]
+    created_at: datetime
+    activated_at: datetime | None
+
+
+class CaptchaLearningPolicyView(StrictModel):
+    upload_enabled: bool
+    revision: int
+    updated_at: datetime
+    active_models: dict[str, CaptchaModelView]
+
+
+class CaptchaLearningPolicyUpdate(StrictModel):
+    upload_enabled: bool
+
+
+class CaptchaAttemptCreate(StrictModel):
+    captcha_type: Literal["numeric", "click"]
+    source: Literal["transport_numeric", "business_click"]
+    model_version: str = Field(min_length=1, max_length=80)
+    success: bool
+    assisted: bool = False
+    occurred_at: datetime
+    image_mime: Literal["image/png", "image/jpeg"] | None = None
+    image_base64: str | None = Field(default=None, max_length=1_500_000)
+    answer: dict[str, Any] | None = None
+
+    @field_validator("model_version")
+    @classmethod
+    def validate_model_version(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("模型版本不能为空")
+        return value
+
+    @model_validator(mode="after")
+    def enforce_success_sample(self) -> CaptchaAttemptCreate:
+        if self.occurred_at.tzinfo is None:
+            raise ValueError("验证码尝试时间必须包含时区")
+        expected_source = {
+            "numeric": "transport_numeric",
+            "click": "business_click",
+        }[self.captcha_type]
+        if self.source != expected_source:
+            raise ValueError("验证码类型与来源不匹配")
+        sample_fields = (self.image_mime, self.image_base64, self.answer)
+        if self.success and any(value is None for value in sample_fields):
+            raise ValueError("成功尝试必须包含验证码图片和答案")
+        if not self.success and any(value is not None for value in sample_fields):
+            raise ValueError("失败尝试不能包含验证码图片或答案")
+        return self
+
+
+class CaptchaAttemptResult(StrictModel):
+    stored: bool
+    sample_stored: bool
+    sample_id: uuid.UUID | None = None
+    policy_revision: int
+
+
+class CaptchaAttemptMetric(StrictModel):
+    captcha_type: Literal["numeric", "click"]
+    model_version: str
+    attempt_count: int
+    success_count: int
+    success_rate: float
+
+
+class CaptchaDatasetStats(StrictModel):
+    total_count: int
+    total_bytes: int
+    numeric_count: int
+    numeric_bytes: int
+    click_count: int
+    click_bytes: int
+
+
+class CaptchaLearningOverview(StrictModel):
+    policy: CaptchaLearningPolicyView
+    dataset: CaptchaDatasetStats
+    attempts: list[CaptchaAttemptMetric]
+    models: list[CaptchaModelView]
+
+
+class CaptchaModelCreate(StrictModel):
+    captcha_type: Literal["numeric", "click"]
+    version: str = Field(
+        min_length=1,
+        max_length=80,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
+    )
+    algorithm: Literal["knn-pixels-v1"]
+    artifact_base64: str = Field(min_length=1, max_length=28_000_000)
+    sample_count: int = Field(ge=1, le=10_000_000)
+    test_count: int = Field(ge=1, le=10_000_000)
+    correct_count: int = Field(ge=0, le=10_000_000)
+    metrics: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> CaptchaModelCreate:
+        if self.correct_count > self.test_count:
+            raise ValueError("正确数量不能大于测试数量")
+        return self
+
+
+class CaptchaDatasetImportResult(StrictModel):
+    imported_count: int
+    duplicate_count: int
+    skipped_count: int

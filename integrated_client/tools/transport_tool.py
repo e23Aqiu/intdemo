@@ -15,6 +15,7 @@ import sys
 import subprocess
 import difflib
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
@@ -295,13 +296,42 @@ def has_nonempty_cell_value(value):
 
 # 普通验证码 OCR（纯数字·自动识别线条+延长补全·全流程可视化版）
 ocr = DdddOcr(show_ad=False) if DdddOcr is not None else None
-def ocr_code(page, selector):
-    if ocr is None:
-        print(f"ddddocr 不可用：{DDDDOCR_IMPORT_ERROR}")
-        return ""
+
+
+def ocr_code(
+    page,
+    selector,
+    model=None,
+    return_details=False,
+    model_failure_callback=None,
+):
+    img_bytes = b""
+
+    def result(code, version):
+        if return_details:
+            return code, img_bytes, version
+        return code
+
     try:
         # 1. 仅截图获取字节流，不保存本地图片
         img_bytes = page.locator(selector).screenshot()
+
+        if model is not None:
+            try:
+                custom_code = str(model.predict_numeric(img_bytes) or "")
+            except Exception:
+                custom_code = ""
+            if re.fullmatch(r"[0-9]{4}", custom_code):
+                return result(custom_code, str(model.version))
+            if callable(model_failure_callback):
+                try:
+                    model_failure_callback(str(model.version))
+                except Exception:
+                    pass
+
+        if ocr is None:
+            print(f"ddddocr 不可用：{DDDDOCR_IMPORT_ERROR}")
+            return result("", "ddddocr-unavailable")
 
         # 2. 转灰度图
         pil_img = Image.open(io.BytesIO(img_bytes)).convert('L')
@@ -395,7 +425,7 @@ def ocr_code(page, selector):
 
         if not results:
             print(f"⚠️ OCR识别失败，原始结果：{raw}")
-            return ""
+            return result("", "ddddocr-builtin")
 
         # 13. 兜底补全
         final_code = ""
@@ -411,11 +441,11 @@ def ocr_code(page, selector):
                 final_code = base + last_digit
 
         print(f"【纯数字验证码·线条延长版】结果：{results} → {final_code}")
-        return final_code
+        return result(final_code, "ddddocr-builtin")
 
     except Exception as e:
         print(f"验证码识别异常：{str(e)}")
-        return ""
+        return result("", "ddddocr-builtin")
 
 
 
@@ -428,11 +458,23 @@ class Worker(QThread):
     input_signal = pyqtSignal(str)
     stat_event = pyqtSignal(str, int)
     retry_signal = pyqtSignal(str, str)
+    captcha_attempt_signal = pyqtSignal(object)
 
     input_result = ""
 
     # 接收所有运行参数
-    def __init__(self, src_path, is_auto_mode, manual_at_captcha, page_retry, auto_continue, captcha_retry, only_yellow_card):
+    def __init__(
+        self,
+        src_path,
+        is_auto_mode,
+        manual_at_captcha,
+        page_retry,
+        auto_continue,
+        captcha_retry,
+        only_yellow_card,
+        captcha_model_manager=None,
+        captcha_collection_enabled=None,
+    ):
         super().__init__()
         self.src = src_path
         self.auto_mode = is_auto_mode
@@ -452,6 +494,9 @@ class Worker(QThread):
         # 自动继续配置
         self.auto_continue = auto_continue
         self.only_yellow_card = only_yellow_card
+        self.captcha_model_manager = captcha_model_manager
+        self.captcha_collection_enabled = captcha_collection_enabled
+        self._pending_captcha_sample = None
 
     def stop(self):
         self._running = False
@@ -491,6 +536,62 @@ class Worker(QThread):
         except Exception:
             pass
         self.playwright = None
+
+    def _collection_enabled(self):
+        callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _active_model(self, captcha_type):
+        manager = self.captcha_model_manager
+        if manager is None:
+            return None
+        try:
+            return manager.get(captcha_type)
+        except Exception:
+            return None
+
+    def _emit_captcha_attempt(
+        self,
+        *,
+        success,
+        model_version,
+        assisted,
+        image_bytes=None,
+        answer=None,
+    ):
+        if not self._collection_enabled():
+            return
+        event = {
+            "captcha_type": "numeric",
+            "source": "transport_numeric",
+            "model_version": str(model_version or "unknown"),
+            "success": bool(success),
+            "assisted": bool(assisted),
+            "occurred_at": datetime.now().astimezone().isoformat(),
+        }
+        if success:
+            if not image_bytes or not isinstance(answer, dict):
+                return
+            event.update(
+                {
+                    "image_bytes": bytes(image_bytes),
+                    "image_mime": "image/png",
+                    "answer": answer,
+                }
+            )
+        self.captcha_attempt_signal.emit(event)
+
+    def _commit_pending_captcha_sample(self):
+        pending = self._pending_captcha_sample
+        self._pending_captcha_sample = None
+        if not pending:
+            return
+        self._emit_captcha_attempt(success=True, **pending)
 
     def _create_new_browser(self):
         self._close_browser()
@@ -677,6 +778,7 @@ class Worker(QThread):
                 # 临时变量存储查询结果
                 tr_original = ""
                 tr_clean = ""
+                self._pending_captcha_sample = None
 
                 try:
                     self._check_stopped()
@@ -698,6 +800,14 @@ class Worker(QThread):
                     if not self.auto_mode and self.manual_at_captcha:
                         while self._running:
                             self._check_stopped()
+                            manual_image_bytes = b""
+                            if self._collection_enabled():
+                                try:
+                                    manual_image_bytes = self.page.locator(
+                                        CONFIG["CAPT_IMG_SELECTOR"]
+                                    ).screenshot()
+                                except Exception:
+                                    pass
 
                             # 自动继续模式：同时检测【4位输入完成】和【输入框消失】，任一满足即触发提交
                             if self.auto_continue:
@@ -737,6 +847,12 @@ class Worker(QThread):
                                 while self._paused and self._running:
                                     time.sleep(0.2)
                             self._check_stopped()
+                            try:
+                                manual_code = self.page.locator(
+                                    CONFIG["CAPT_INPUT_SELECTOR"]
+                                ).input_value(timeout=2000)
+                            except Exception:
+                                manual_code = ""
 
                             # 把焦点切回浏览器，再提交查询
                             try:
@@ -755,6 +871,11 @@ class Worker(QThread):
                             captcha_input_still_exists = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).count() > 0
 
                             if captcha_input_still_exists:
+                                self._emit_captcha_attempt(
+                                    success=False,
+                                    model_version="human-manual",
+                                    assisted=True,
+                                )
                                 # 错误：刷新验证码，清空输入框，重新回到倒计时
                                 self.log.emit("❌ 验证码错误，将重新刷新验证码...")
                                 try:
@@ -769,6 +890,17 @@ class Worker(QThread):
                                 continue
                             else:
                                 # 正确，退出循环
+                                if (
+                                    self._collection_enabled()
+                                    and manual_image_bytes
+                                    and re.fullmatch(r"[0-9]{4}", manual_code or "")
+                                ):
+                                    self._pending_captcha_sample = {
+                                        "model_version": "human-manual",
+                                        "assisted": True,
+                                        "image_bytes": manual_image_bytes,
+                                        "answer": {"value": manual_code},
+                                    }
                                 self.log.emit("✅ 验证码验证成功")
                                 break
                             self.page.wait_for_selector(
@@ -790,10 +922,45 @@ class Worker(QThread):
                             # 验证码重试循环
                             while captcha_err < self.CAPTCHA_RETRY and self._running:
                                 self._check_stopped()
+                                captcha_code = ""
+                                captcha_image_bytes = b""
+                                captcha_model_version = "human-manual"
 
                                 if not (not self.auto_mode and self.manual_at_captcha):
-                                    captcha_code = ocr_code(self.page, CONFIG["CAPT_IMG_SELECTOR"])
+                                    captcha_result = ocr_code(
+                                        self.page,
+                                        CONFIG["CAPT_IMG_SELECTOR"],
+                                        model=self._active_model("numeric"),
+                                        return_details=True,
+                                        model_failure_callback=(
+                                            lambda version: self._emit_captcha_attempt(
+                                                success=False,
+                                                model_version=version,
+                                                assisted=False,
+                                            )
+                                        ),
+                                    )
+                                    if (
+                                        isinstance(captcha_result, tuple)
+                                        and len(captcha_result) == 3
+                                    ):
+                                        (
+                                            captcha_code,
+                                            captcha_image_bytes,
+                                            captcha_model_version,
+                                        ) = captcha_result
+                                    else:
+                                        # Keep compatibility with older OCR
+                                        # adapters and test doubles that return
+                                        # only the recognized text.
+                                        captcha_code = str(captcha_result or "")
+                                        captcha_model_version = "ddddocr-builtin"
                                     if not captcha_code:
+                                        self._emit_captcha_attempt(
+                                            success=False,
+                                            model_version=captcha_model_version,
+                                            assisted=False,
+                                        )
                                         captcha_err += 1
                                         self.retry_signal.emit(
                                             "transport_captcha_ocr",
@@ -819,6 +986,11 @@ class Worker(QThread):
                                 captcha_input_still_exists = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).count() > 0
 
                                 if captcha_input_still_exists:
+                                    self._emit_captcha_attempt(
+                                        success=False,
+                                        model_version=captcha_model_version,
+                                        assisted=False,
+                                    )
                                     captcha_err += 1
                                     self.retry_signal.emit(
                                         "transport_captcha",
@@ -833,6 +1005,20 @@ class Worker(QThread):
                                     continue
 
                                 # 3. 正常验证码成功，跳出循环
+                                if (
+                                    self._collection_enabled()
+                                    and captcha_image_bytes
+                                    and re.fullmatch(
+                                        r"[0-9]{4}",
+                                        captcha_code or "",
+                                    )
+                                ):
+                                    self._pending_captcha_sample = {
+                                        "model_version": captcha_model_version,
+                                        "assisted": False,
+                                        "image_bytes": captcha_image_bytes,
+                                        "answer": {"value": captcha_code},
+                                    }
                                 self.log.emit("✅ 验证码验证成功")
                                 break
 
@@ -843,6 +1029,14 @@ class Worker(QThread):
                                         self._check_stopped()
                                         self.log.emit(f"⚠️ 自动识别重试耗尽，切换为【人工输入验证码】")
                                         self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).fill("",timeout=2000)
+                                        manual_image_bytes = b""
+                                        if self._collection_enabled():
+                                            try:
+                                                manual_image_bytes = self.page.locator(
+                                                    CONFIG["CAPT_IMG_SELECTOR"]
+                                                ).screenshot()
+                                            except Exception:
+                                                pass
 
                                         if self.auto_continue:
                                             # 自动继续：同时检测【4位输入完成】和【输入框消失】
@@ -852,7 +1046,7 @@ class Worker(QThread):
                                                 # 同时检测两个条件：4位输入 或 输入框消失
                                                 try:
                                                     value = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).input_value(timeout=2000)
-                                                    if len(value) == 4 and value.isdigit():
+                                                    if re.fullmatch(r"[0-9]{4}", value):
                                                         self.log.emit(f"✅ 检测到4位验证码，自动提交...")
                                                         break
                                                 except:
@@ -869,6 +1063,12 @@ class Worker(QThread):
                                             while self._paused and self._running:
                                                 time.sleep(0.2)
                                         self._check_stopped()
+                                        try:
+                                            manual_code = self.page.locator(
+                                                CONFIG["CAPT_INPUT_SELECTOR"]
+                                            ).input_value(timeout=2000)
+                                        except Exception:
+                                            manual_code = ""
 
                                         # 人工输完后自动点击查询
                                         self.log.emit("✅ 已恢复执行，自动提交查询...")
@@ -881,6 +1081,11 @@ class Worker(QThread):
                                         captcha_input_still_exists = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).count() > 0
 
                                         if captcha_input_still_exists:
+                                            self._emit_captcha_attempt(
+                                                success=False,
+                                                model_version="human-fallback",
+                                                assisted=True,
+                                            )
                                             # 人工输错 → 提示错误，清空输入框，刷新验证码，重新循环
                                             self.log.emit("❌ 人工输入验证码错误，请重新输入！")
                                             try:
@@ -894,6 +1099,20 @@ class Worker(QThread):
                                             continue
                                         else:
                                             # 验证码正确，退出循环，继续流程
+                                            if (
+                                                self._collection_enabled()
+                                                and manual_image_bytes
+                                                and re.fullmatch(
+                                                    r"[0-9]{4}",
+                                                    manual_code or "",
+                                                )
+                                            ):
+                                                self._pending_captcha_sample = {
+                                                    "model_version": "human-fallback",
+                                                    "assisted": True,
+                                                    "image_bytes": manual_image_bytes,
+                                                    "answer": {"value": manual_code},
+                                                }
                                             self.log.emit("✅ 验证码验证成功")
                                             break
 
@@ -930,6 +1149,16 @@ class Worker(QThread):
                     if self.page.locator(".user_zige").count() > 0:
                         self.log.emit(f"✅ 最后一次检查：列表已加载成功")
                         list_loaded = True
+
+                    try:
+                        captcha_result_confirmed = (
+                            list_loaded
+                            or "查询不到信息" in self.page.content()
+                        )
+                    except Exception:
+                        captcha_result_confirmed = False
+                    if captcha_result_confirmed:
+                        self._commit_pending_captcha_sample()
 
                     # ===================== 如果验证码失败已标记，直接跳过后续所有查询代码 =====================
                     if not list_loaded and str(df.at[idx, "查询状态"]).strip() == "验证码识别失败":
@@ -1110,10 +1339,20 @@ class BusinessBackfillWorker(QThread):
     input_signal = pyqtSignal(str)
     stat_event = pyqtSignal(str, int)
     retry_signal = pyqtSignal(str, str)
+    captcha_attempt_signal = pyqtSignal(object)
 
     input_result = ""
 
-    def __init__(self, original_file, auto_continue, auto_mode, captcha_retry, manual_at_captcha):
+    def __init__(
+        self,
+        original_file,
+        auto_continue,
+        auto_mode,
+        captcha_retry,
+        manual_at_captcha,
+        captcha_model_manager=None,
+        captcha_collection_enabled=None,
+    ):
         super().__init__()
         self.original_file = original_file
         self.auto_continue = auto_continue
@@ -1121,12 +1360,81 @@ class BusinessBackfillWorker(QThread):
         self.web_timeout = CONFIG["BUSINESS_WEB_TIMEOUT_MS"]
         self.captcha_retry = captcha_retry
         self.manual_at_captcha = manual_at_captcha
+        self.captcha_model_manager = captcha_model_manager
+        self.captcha_collection_enabled = captcha_collection_enabled
+        self._pending_captcha_sample = None
         self._running = True
         self._paused = False
         self._global_paused = False
         self.browser = None
         self.playwright = None
         self.page = None
+
+    def _collection_enabled(self):
+        callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _active_model(self, captcha_type):
+        manager = self.captcha_model_manager
+        if manager is None:
+            return None
+        try:
+            return manager.get(captcha_type)
+        except Exception:
+            return None
+
+    def _emit_captcha_attempt(
+        self,
+        *,
+        success,
+        model_version,
+        assisted,
+        image_bytes=None,
+        answer=None,
+    ):
+        if not self._collection_enabled():
+            return
+        event = {
+            "captcha_type": "click",
+            "source": "business_click",
+            "model_version": str(model_version or "unknown"),
+            "success": bool(success),
+            "assisted": bool(assisted),
+            "occurred_at": datetime.now().astimezone().isoformat(),
+        }
+        if success:
+            if not image_bytes or not isinstance(answer, dict):
+                return
+            event.update(
+                {
+                    "image_bytes": bytes(image_bytes),
+                    "image_mime": "image/png",
+                    "answer": answer,
+                }
+            )
+        self.captcha_attempt_signal.emit(event)
+
+    def _commit_pending_captcha_sample(self):
+        pending = self._pending_captcha_sample
+        self._pending_captcha_sample = None
+        if not pending:
+            return
+        self._emit_captcha_attempt(success=True, **pending)
+
+    def _discard_pending_captcha_sample(self, *, emit_failure=False):
+        pending = self._pending_captcha_sample
+        self._pending_captcha_sample = None
+        if emit_failure and pending:
+            self._emit_captcha_attempt(
+                success=False,
+                model_version=pending.get("model_version"),
+                assisted=pending.get("assisted"),
+            )
 
     def stop(self):
         self._running = False
@@ -1330,11 +1638,185 @@ class BusinessBackfillWorker(QThread):
             self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
         return False
 
+    def _prepare_manual_click_capture(self):
+        if not self._collection_enabled():
+            return None
+        try:
+            prompt_text = self.page.locator(".verify-msg").first.inner_text().strip()
+            match = re.search(r"【([^】]+)】", prompt_text)
+            if not match:
+                return None
+            prompt = [
+                character.strip()
+                for character in match.group(1).split(",")
+                if character.strip()
+            ]
+            image = self.page.locator(".back-img").first
+            image_bytes = image.screenshot()
+            image.evaluate(
+                """
+                element => {
+                    window.__intdemoCaptchaClicks = [];
+                    if (element.__intdemoCaptureHandler) {
+                        element.removeEventListener(
+                            'click',
+                            element.__intdemoCaptureHandler,
+                            true
+                        );
+                    }
+                    const handler = event => {
+                        const rect = element.getBoundingClientRect();
+                        if (!rect.width || !rect.height) return;
+                        window.__intdemoCaptchaClicks.push({
+                            x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+                            y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
+                        });
+                    };
+                    element.__intdemoCaptureHandler = handler;
+                    element.addEventListener('click', handler, true);
+                }
+                """
+            )
+            return {
+                "image_bytes": image_bytes,
+                "prompt": prompt,
+            }
+        except Exception:
+            return None
+
+    def _manual_click_points(self, capture):
+        if not capture:
+            return []
+        try:
+            points = self.page.evaluate(
+                "() => (window.__intdemoCaptchaClicks || []).slice()"
+            )
+        except Exception:
+            return []
+        normalized = []
+        for point in points or []:
+            if not isinstance(point, dict):
+                continue
+            try:
+                x = float(point.get("x"))
+                y = float(point.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                normalized.append({"x": round(x, 6), "y": round(y, 6)})
+        return normalized[: len(capture.get("prompt") or [])]
+
+    def _set_pending_click_sample(
+        self,
+        capture,
+        points,
+        *,
+        model_version,
+        assisted,
+    ):
+        if not self._collection_enabled() or not capture:
+            return
+        prompt = list(capture.get("prompt") or [])
+        points = list(points or [])
+        if not prompt or len(prompt) != len(points):
+            return
+        self._pending_captcha_sample = {
+            "model_version": model_version,
+            "assisted": assisted,
+            "image_bytes": capture.get("image_bytes"),
+            "answer": {
+                "prompt": prompt,
+                "points": points,
+            },
+        }
+
+    def _complete_manual_click_captcha(self, model_version):
+        while self._running:
+            self._check_stopped()
+            capture = self._prepare_manual_click_capture()
+            prompt = list((capture or {}).get("prompt") or [])
+            if prompt:
+                expected_count = len(prompt)
+            else:
+                try:
+                    prompt_text = self.page.locator(
+                        ".verify-msg"
+                    ).first.inner_text().strip()
+                    match = re.search(r"【([^】]+)】", prompt_text)
+                    expected_count = len(
+                        [
+                            value.strip()
+                            for value in (match.group(1) if match else "").split(",")
+                            if value.strip()
+                        ]
+                    )
+                except Exception:
+                    expected_count = 3
+
+            if self.auto_continue:
+                if expected_count > 0:
+                    self.log.emit("⏳ 等待用户点完验证码...")
+                    while self._running:
+                        self._check_stopped()
+                        try:
+                            point_count = self.page.locator(".point-area").count()
+                            if point_count >= expected_count:
+                                self.log.emit("✅ 用户已点完验证码")
+                                break
+                        except Exception:
+                            pass
+                        time.sleep(0.2)
+            else:
+                self.log.emit("⏸️ 请完成验证码后点击【继续执行】")
+                self._paused = True
+                self.pause_signal.emit()
+                while self._paused and self._running:
+                    time.sleep(0.2)
+                self._check_stopped()
+
+            points = self._manual_click_points(capture)
+            if self.page.locator(".layui-layer-loading2").count() > 0:
+                try:
+                    self.page.wait_for_selector(
+                        ".layui-layer-loading2",
+                        state="detached",
+                        timeout=self.web_timeout,
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.5)
+            prompt_el = self.page.locator(".verify-msg")
+            passed = prompt_el.count() == 0 or not prompt_el.first.is_visible()
+            if passed:
+                self._set_pending_click_sample(
+                    capture,
+                    points,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self.log.emit("✅ 验证码通过，开始获取信息")
+                return True
+            self._emit_captcha_attempt(
+                success=False,
+                model_version=model_version,
+                assisted=True,
+            )
+            self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
+            time.sleep(0.5)
+        return False
+
     # ======================
     # 封装：你的专属验证码识别逻辑（完全未修改，原样封装）
     # ======================
     def solve_captcha(self):
         if DdddOcr is None:
+            custom_model = self._active_model("click")
+            if custom_model is not None:
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=custom_model.version,
+                    assisted=False,
+                )
             self.log.emit(f"❌ ddddocr 不可用，无法自动识别验证码：{DDDDOCR_IMPORT_ERROR}")
             return False
         try:
@@ -1348,6 +1830,7 @@ class BusinessBackfillWorker(QThread):
             self.log.emit(f"🔢 验证码最大重试次数：{captcha_max_retry}次")
             for i in range(captcha_max_retry):
                 self._check_stopped()
+                attempt_model_version = "ddddocr-builtin"
                 try:
                     if i > 0:
                         response_state = self._wait_for_business_response()
@@ -1488,6 +1971,28 @@ class BusinessBackfillWorker(QThread):
 
                     self.log.emit(f"✅ 文字识别完成：{char_position_map}")
 
+                    custom_model = self._active_model("click")
+                    if custom_model is not None:
+                        try:
+                            custom_positions = custom_model.predict_click_regions(
+                                img_bytes_final,
+                                bboxes,
+                            )
+                        except Exception:
+                            custom_positions = {}
+                        if len(custom_positions) >= len(target_chars):
+                            char_position_map = custom_positions
+                            attempt_model_version = custom_model.version
+                            self.log.emit(
+                                f"✅ 已使用候选点选模型：{attempt_model_version}"
+                            )
+                        else:
+                            self._emit_captcha_attempt(
+                                success=False,
+                                model_version=custom_model.version,
+                                assisted=False,
+                            )
+
                     # 全局匹配+点击
                     self.log.emit("🖱️ 第三步：全局两两对比相似度，开始最优匹配")
                     recog_chars = list(char_position_map.keys())
@@ -1539,14 +2044,40 @@ class BusinessBackfillWorker(QThread):
                     self.page.wait_for_timeout(2000)
 
                     if not prompt_el.is_visible():
+                        normalized_points = [
+                            {
+                                "x": round(x / pil_img_sharpen.width, 6),
+                                "y": round(y / pil_img_sharpen.height, 6),
+                            }
+                            for x, y, _target, _matched in click_list
+                        ]
+                        self._set_pending_click_sample(
+                            {
+                                "image_bytes": img_bytes,
+                                "prompt": target_chars,
+                            },
+                            normalized_points,
+                            model_version=attempt_model_version,
+                            assisted=False,
+                        )
                         self.log.emit("🎉 验证码验证通过！")
                         return True
                     else:
+                        self._emit_captcha_attempt(
+                            success=False,
+                            model_version=attempt_model_version,
+                            assisted=False,
+                        )
                         self.log.emit("⚠️ 验证码未消失，点击错误，自动重试...")
                         self.page.locator(".verify-refresh").click()
                         time.sleep(2)
 
                 except Exception as e:
+                    self._emit_captcha_attempt(
+                        success=False,
+                        model_version=attempt_model_version,
+                        assisted=False,
+                    )
                     self.retry_signal.emit(
                         "business_captcha",
                         f"营运查询验证码第 {i + 1} 次失败：{str(e)[:80]}",
@@ -1632,6 +2163,7 @@ class BusinessBackfillWorker(QThread):
                 company = ""
                 need_retry = False
                 self.input_result = ""
+                self._pending_captcha_sample = None
 
                 try:
                     self._check_stopped()
@@ -1733,141 +2265,24 @@ class BusinessBackfillWorker(QThread):
                             continue
                         else:
                             is_captcha_fail = False
+                            captcha_passed = True
                     else:
                         if not self.manual_at_captcha:
                             success = not has_captcha or self.solve_captcha()
                             if not success:
                                 self.log.emit(f"❌ 自动识别{self.captcha_retry}次失败，转为人工接管")
-                                if self.auto_continue:
-                                    # OCR失败后人工接管：检测用户点完验证码 + 等加载圈消失 + 检查验证码是否通过
-                                    while self._running:
-                                        self._check_stopped()
-                                        # 1. 从验证码提示文字解析出期望点击数
-                                        try:
-                                            prompt_el = self.page.locator(".verify-msg")
-                                            if prompt_el.count() > 0 and prompt_el.first.is_visible():
-                                                prompt_text = prompt_el.first.inner_text().strip()
-                                                match = re.search(r"【([^】]+)】", prompt_text)
-                                                if match:
-                                                    target_chars = [c.strip() for c in match.group(1).split(",") if c.strip()]
-                                                    expected_count = len(target_chars)
-                                                else:
-                                                    expected_count = 3
-                                            else:
-                                                expected_count = 0
-                                        except:
-                                            expected_count = 3
-
-                                        # 2. 等用户点完验证码
-                                        if expected_count > 0:
-                                            self.log.emit(f"⏳ 等待用户点完验证码...")
-                                            while self._running:
-                                                self._check_stopped()
-                                                try:
-                                                    point_count = self.page.locator(".point-area").count()
-                                                    if point_count >= expected_count:
-                                                        self.log.emit(f"✅ 用户已点完验证码")
-                                                        break
-                                                except:
-                                                    pass
-                                                time.sleep(2)
-
-                                        # 3. 等加载圈消失
-                                        if self.page.locator(".layui-layer-loading2").count() > 0:
-                                            try:
-                                                self.page.wait_for_selector(
-                                                    ".layui-layer-loading2",
-                                                    state="detached",
-                                                    timeout=self.web_timeout,
-                                                )
-                                            except:
-                                                pass
-
-                                        # 4. 等一下让验证码响应
-                                        time.sleep(0.5)
-
-                                        # 5. 检查验证码弹窗是否消失
-                                        prompt_el = self.page.locator(".verify-msg")
-                                        if prompt_el.count() == 0 or not prompt_el.first.is_visible():
-                                            self.log.emit("✅ 验证码通过，开始获取信息")
-                                            captcha_passed = True
-                                            break
-                                        # 弹窗还在，说明点击错误，提示重新点击
-                                        self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
-                                        time.sleep(2)
-                                else:
-                                    self.log.emit("⏸️ 请人工完成验证码，点击【继续执行】")
-                                    self._paused = True
-                                    self.pause_signal.emit()
-                                    while self._paused and self._running:
-                                        time.sleep(0.2)
+                                captcha_passed = self._complete_manual_click_captcha(
+                                    "human-fallback"
+                                )
+                            else:
+                                captcha_passed = True
                         else:
                             if not has_captcha:
                                 captcha_passed = True
-                            elif self.auto_continue:
-                                # 人工点完验证码后：先等用户点完验证码，再等加载圈消失，最后检查验证码是否通过
-                                while self._running:
-                                    self._check_stopped()
-                                    # 1. 从验证码提示文字解析出期望点击数（如"【京,海,北】"→3）
-                                    try:
-                                        prompt_el = self.page.locator(".verify-msg")
-                                        if prompt_el.count() > 0 and prompt_el.first.is_visible():
-                                            prompt_text = prompt_el.first.inner_text().strip()
-                                            match = re.search(r"【([^】]+)】", prompt_text)
-                                            if match:
-                                                target_chars = [c.strip() for c in match.group(1).split(",") if c.strip()]
-                                                expected_count = len(target_chars)
-                                            else:
-                                                expected_count = 3  # 默认3个
-                                        else:
-                                            expected_count = 0
-                                    except:
-                                        expected_count = 3
-
-                                    # 2. 等用户点完验证码：等待 .point-area 元素数量达到期望数量
-                                    # 用户每点一个，html里就会多一个 .point-area（文本为1、2、3...）
-                                    if expected_count > 0:
-                                        self.log.emit(f"⏳ 等待用户点完验证码...")
-                                        while self._running:
-                                            self._check_stopped()
-                                            try:
-                                                point_count = self.page.locator(".point-area").count()
-                                                if point_count >= expected_count:
-                                                    self.log.emit(f"✅ 用户已点完验证码")
-                                                    break
-                                            except:
-                                                pass
-                                            time.sleep(2)
-
-                                    # 3. 等加载圈消失
-                                    if self.page.locator(".layui-layer-loading2").count() > 0:
-                                        try:
-                                            self.page.wait_for_selector(
-                                                ".layui-layer-loading2",
-                                                state="detached",
-                                                timeout=self.web_timeout,
-                                            )
-                                        except:
-                                            pass
-
-                                    # 4. 等一下让验证码响应
-                                    time.sleep(0.5)
-
-                                    # 5. 检查验证码弹窗是否消失
-                                    prompt_el = self.page.locator(".verify-msg")
-                                    if prompt_el.count() == 0 or not prompt_el.first.is_visible():
-                                        self.log.emit("✅ 验证码通过，开始获取信息")
-                                        captcha_passed = True
-                                        break
-                                    # 弹窗还在，说明点击错误，提示重新点击
-                                    self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
-                                    time.sleep(2)
                             else:
-                                self.log.emit("⏸️ 请完成验证码后点击【继续执行】")
-                                self._paused = True
-                                self.pause_signal.emit()
-                                while self._paused and self._running:
-                                    time.sleep(0.2)
+                                captcha_passed = self._complete_manual_click_captcha(
+                                    "human-manual"
+                                )
 
                     self._check_stopped()
                     if is_captcha_fail:
@@ -1878,10 +2293,13 @@ class BusinessBackfillWorker(QThread):
                             self.log.emit("⏳ 验证码已通过，继续等待营运信息")
                         result_ready = self._wait_for_business_result()
                         if not result_ready:
+                            self._discard_pending_captcha_sample()
                             self.log.emit(
                                 f"⚠️ 网页加载超过 {self.web_timeout // 1000} 秒，"
                                 "仍未获取到营运信息"
                             )
+                        else:
+                            self._commit_pending_captcha_sample()
 
                         html = self.page.content().lower()
                         tip_loc = self.page.locator(".layui-layer-content")

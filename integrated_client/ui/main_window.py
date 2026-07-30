@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import (
 from ..config import APP_NAME, APP_VERSION
 from ..database import Database
 from ..models import Account
+from ..online.captcha_learning import CaptchaLearningService
 from ..preferences import ClientPreferences
 from ..timing import WorkflowTimingService
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
@@ -38,6 +39,7 @@ from .frameless import (
 from .frameless import (
     FramelessMessageBox as QMessageBox,
 )
+from .machine_learning_page import MachineLearningPage
 from .online_account_page import OnlineAccountPage
 from .personal_center_page import PersonalCenterPage
 from .statistics_page import StatisticsPage
@@ -93,6 +95,14 @@ class MainWindow(FramelessMainWindow):
         self.client_preferences = client_preferences or ClientPreferences(
             self.database.path.parent
         )
+        self.captcha_learning_client_available = (
+            self._captcha_learning_client_is_available()
+        )
+        self.captcha_learning_service = (
+            CaptchaLearningService(self.session_manager, self)
+            if self.captcha_learning_client_available
+            else None
+        )
         self.available_update = None
         self.downloaded_installer_path = None
         self.update_dialog = None
@@ -111,6 +121,10 @@ class MainWindow(FramelessMainWindow):
         self._announcement_rotation_timer = None
         self.announcement_admin_page = None
         self.announcement_service_available = self._announcement_service_is_available()
+        self.machine_learning_page = None
+        self.machine_learning_available = (
+            self._captcha_learning_admin_is_available()
+        )
 
         self.setWindowTitle(f"{APP_NAME} - {account.name_label}")
         self.setMinimumSize(800, 600)
@@ -167,6 +181,21 @@ class MainWindow(FramelessMainWindow):
             client_preferences=self.client_preferences,
             account_key=account.username,
             untracked_mode=self.offline_business_mode,
+            captcha_reporter=(
+                self.captcha_learning_service.record_attempt
+                if self.captcha_learning_service is not None
+                else None
+            ),
+            captcha_model_manager=(
+                self.captcha_learning_service.model_manager
+                if self.captcha_learning_service is not None
+                else None
+            ),
+            captcha_collection_enabled=(
+                self.captcha_learning_service.collection_enabled
+                if self.captcha_learning_service is not None
+                else None
+            ),
         )
         self.personal_center_page = None
         if not self.offline_business_mode:
@@ -210,6 +239,12 @@ class MainWindow(FramelessMainWindow):
                     "announcements_admin",
                     self.announcement_admin_page,
                 )
+            if self.machine_learning_available:
+                self.machine_learning_page = MachineLearningPage(
+                    self.session_manager,
+                    self.captcha_learning_service,
+                )
+                self._add_page("machine_learning", self.machine_learning_page)
             if self.session_manager is not None:
                 self.account_page = OnlineAccountPage(
                     database,
@@ -256,6 +291,8 @@ class MainWindow(FramelessMainWindow):
         )
         if self.announcement_service_available:
             self._start_announcement_polling()
+        if self.captcha_learning_service is not None:
+            self.captcha_learning_service.start()
 
     def _announcement_service_is_available(self):
         api = getattr(self.session_manager, "api", None)
@@ -279,6 +316,37 @@ class MainWindow(FramelessMainWindow):
                     "admin_accounts",
                 ]
             )
+        return api is not None and all(
+            callable(getattr(api, name, None)) for name in required
+        )
+
+    def _captcha_learning_client_is_available(self):
+        api = getattr(self.session_manager, "api", None)
+        required = [
+            "captcha_policy",
+            "submit_captcha_attempt",
+            "current_captcha_model",
+        ]
+        return (
+            not self.offline_business_mode
+            and api is not None
+            and all(callable(getattr(api, name, None)) for name in required)
+        )
+
+    def _captcha_learning_admin_is_available(self):
+        if not self.account.is_admin or not self.captcha_learning_client_available:
+            return False
+        api = getattr(self.session_manager, "api", None)
+        required = [
+            "admin_captcha_learning_overview",
+            "admin_update_captcha_policy",
+            "admin_export_captcha_dataset",
+            "admin_import_captcha_dataset",
+            "admin_create_captcha_model",
+            "admin_activate_captcha_model",
+            "admin_use_builtin_captcha_model",
+            "admin_delete_captcha_model",
+        ]
         return api is not None and all(
             callable(getattr(api, name, None)) for name in required
         )
@@ -376,6 +444,10 @@ class MainWindow(FramelessMainWindow):
                         "公告发布",
                         "nav-announcement.svg",
                     )
+                )
+            if self.machine_learning_available:
+                trailing_nav_items.append(
+                    ("machine_learning", "机器学习", "nav-ml.svg")
                 )
             trailing_nav_items.append(("accounts", "账号管理", "nav-accounts.svg"))
         if not self.offline_business_mode:
@@ -1080,6 +1152,8 @@ class MainWindow(FramelessMainWindow):
             self.account_page.refresh()
         elif key == "announcements_admin" and self.announcement_admin_page:
             self.announcement_admin_page.refresh()
+        elif key == "machine_learning" and self.machine_learning_page:
+            self.machine_learning_page.refresh()
 
     def _record_activity(self, metric_key, amount=1, source=""):
         if not self.business_metrics_enabled:
@@ -1201,6 +1275,10 @@ class MainWindow(FramelessMainWindow):
             return True
         if not self._shutdown_tools():
             return False
+        if self.machine_learning_page is not None:
+            self.machine_learning_page.shutdown()
+        if self.captcha_learning_service is not None:
+            self.captcha_learning_service.stop()
         self._prepared_to_close = True
         return True
 
@@ -1250,5 +1328,7 @@ class MainWindow(FramelessMainWindow):
             self._announcement_poll_timer.stop()
         if self._announcement_rotation_timer is not None:
             self._announcement_rotation_timer.stop()
+        if self.captcha_learning_service is not None:
+            self.captcha_learning_service.stop()
         event.accept()
         self.window_closed.emit()

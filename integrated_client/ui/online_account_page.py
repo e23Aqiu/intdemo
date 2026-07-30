@@ -255,6 +255,13 @@ class _AuditDialog(FramelessDialog):
         "account.delete": "永久删除归档账号",
         "device.revoke": "撤销设备",
         "message.delete": "删除用户消息",
+        "captcha.policy.update": "修改验证码上传策略",
+        "captcha.dataset.export": "导出验证码数据集",
+        "captcha.dataset.import": "导入验证码数据集",
+        "captcha.model.create": "创建验证码候选模型",
+        "captcha.model.activate": "应用验证码模型",
+        "captcha.model.use_builtin": "恢复内置验证码模型",
+        "captcha.model.delete": "删除验证码模型",
     }
 
     def __init__(self, page, parent=None):

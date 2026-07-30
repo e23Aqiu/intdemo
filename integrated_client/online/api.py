@@ -58,18 +58,23 @@ class ApiClient:
         *,
         token: str | None = None,
         json_body: dict | None = None,
+        data_body: bytes | None = None,
+        content_type: str | None = None,
         params: dict | None = None,
         raw_response: bool = False,
     ) -> Any:
         headers = {}
         if token:
             headers["Authorization"] = f"Bearer {token}"
+        if content_type:
+            headers["Content-Type"] = content_type
         try:
             response = self.session.request(
                 method,
                 f"{self.config.api_url}{path}",
                 headers=headers,
-                json=json_body,
+                json=json_body if data_body is None else None,
+                data=data_body,
                 params=params,
                 timeout=(self.config.connect_timeout, self.config.read_timeout),
                 verify=self.config.ca_bundle or True,
@@ -178,6 +183,125 @@ class ApiClient:
 
     def snapshot(self, access_token: str) -> dict:
         return self._request("GET", "/sync/snapshot", token=access_token)
+
+    def captcha_policy(self, access_token: str) -> dict:
+        return self._request("GET", "/captcha/policy", token=access_token)
+
+    def submit_captcha_attempt(
+        self,
+        access_token: str,
+        payload: dict,
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/captcha/attempts",
+            token=access_token,
+            json_body=payload,
+        )
+
+    def current_captcha_model(
+        self,
+        access_token: str,
+        captcha_type: str,
+    ) -> bytes:
+        response = self._request(
+            "GET",
+            f"/captcha/models/{captcha_type}/current",
+            token=access_token,
+            raw_response=True,
+        )
+        return bytes(response.content)
+
+    def admin_captcha_learning_overview(self, access_token: str) -> dict:
+        return self._request(
+            "GET",
+            "/admin/ml/overview",
+            token=access_token,
+        )
+
+    def admin_update_captcha_policy(
+        self,
+        access_token: str,
+        upload_enabled: bool,
+    ) -> dict:
+        return self._request(
+            "PATCH",
+            "/admin/ml/policy",
+            token=access_token,
+            json_body={"upload_enabled": bool(upload_enabled)},
+        )
+
+    def admin_export_captcha_dataset(
+        self,
+        access_token: str,
+        captcha_type: str | None = None,
+    ) -> bytes:
+        response = self._request(
+            "GET",
+            "/admin/ml/dataset/export",
+            token=access_token,
+            params={"captcha_type": captcha_type} if captcha_type else None,
+            raw_response=True,
+        )
+        return bytes(response.content)
+
+    def admin_import_captcha_dataset(
+        self,
+        access_token: str,
+        archive: bytes,
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/admin/ml/dataset/import",
+            token=access_token,
+            data_body=bytes(archive),
+            content_type="application/zip",
+        )
+
+    def admin_create_captcha_model(
+        self,
+        access_token: str,
+        payload: dict,
+    ) -> dict:
+        return self._request(
+            "POST",
+            "/admin/ml/models",
+            token=access_token,
+            json_body=payload,
+        )
+
+    def admin_activate_captcha_model(
+        self,
+        access_token: str,
+        model_id: str,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/admin/ml/models/{model_id}/activate",
+            token=access_token,
+        )
+
+    def admin_use_builtin_captcha_model(
+        self,
+        access_token: str,
+        captcha_type: str,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/admin/ml/models/{captcha_type}/use-builtin",
+            token=access_token,
+        )
+
+    def admin_delete_captcha_model(
+        self,
+        access_token: str,
+        model_id: str,
+    ) -> None:
+        self._request(
+            "DELETE",
+            f"/admin/ml/models/{model_id}",
+            token=access_token,
+        )
 
     def admin_accounts(self, access_token: str) -> list[dict]:
         return self._request("GET", "/admin/accounts", token=access_token)
