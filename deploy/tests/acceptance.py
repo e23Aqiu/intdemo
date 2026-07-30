@@ -57,7 +57,14 @@ class Client:
         return payload
 
 
-def login(client: Client, username: str, password: str, device_uid: str):
+def login(
+    client: Client,
+    username: str,
+    password: str,
+    device_uid: str,
+    *,
+    expected: int = 200,
+):
     return client.request(
         "POST",
         "/auth/login",
@@ -68,6 +75,7 @@ def login(client: Client, username: str, password: str, device_uid: str):
             "device_name": f"acceptance-{device_uid[-4:]}",
             "client_version": "0.2.4-acceptance",
         },
+        expected=expected,
     )
 
 
@@ -313,13 +321,18 @@ def main():
         station_device,
     )
 
-    additional_station = login(
+    additional_station_rejection = login(
         client,
         "acceptance_station",
         "Station!234",
         str(uuid.uuid4()),
+        expected=409,
     )
-    assert additional_station["account"]["id"] == created["id"]
+    assert additional_station_rejection["code"] == "device_limit_reached"
+    assert additional_station_rejection["details"] == {
+        "device_limit": 1,
+        "active_device_count": 1,
+    }
     station_devices = client.request(
         "GET",
         f"/admin/accounts/{created['id']}/devices",
