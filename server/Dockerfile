@@ -16,7 +16,8 @@ RUN pip install --index-url "${PIP_INDEX_URL}" --upgrade pip \
 COPY alembic.ini ./
 COPY alembic ./alembic
 COPY docker-entrypoint.sh ./docker-entrypoint.sh
-RUN chmod 0755 ./docker-entrypoint.sh
+RUN sed -i 's/\r$//' ./docker-entrypoint.sh \
+    && chmod 0755 ./docker-entrypoint.sh
 
 USER root
 EXPOSE 8000
