@@ -138,14 +138,14 @@ if ($RemoteHost) {
     if ($LASTEXITCODE -ne 0) {
         throw "Could not create the remote update directories"
     }
-    $remoteManifestText = [string](
+    $remoteManifestOutput = @(
         & ssh @sshArgs $RemoteHost `
             "if [ -f '$RemotePath/$Channel.json' ]; then cat '$RemotePath/$Channel.json'; fi"
     )
     if ($LASTEXITCODE -ne 0) {
         throw "Could not inspect the currently published manifest"
     }
-    $remoteManifestText = $remoteManifestText.Trim()
+    $remoteManifestText = ($remoteManifestOutput -join "`n").Trim()
     if ($remoteManifestText) {
         try {
             $remoteManifest = $remoteManifestText | ConvertFrom-Json
@@ -163,11 +163,11 @@ if ($RemoteHost) {
             )
         }
     }
-    $remoteFullHash = [string](
+    $remoteFullHashOutput = @(
         & ssh @sshArgs $RemoteHost `
             "if [ -f '$RemotePath/files/$publishedName' ]; then sha256sum '$RemotePath/files/$publishedName' | cut -d ' ' -f 1; fi"
     )
-    $remoteFullHash = $remoteFullHash.Trim()
+    $remoteFullHash = ($remoteFullHashOutput -join "").Trim()
     $fullUploaded = $remoteFullHash -ne $hash
     if ($fullUploaded) {
         & scp @scpArgs $publishedInstaller "${RemoteHost}:$incoming/$publishedName"
@@ -179,11 +179,11 @@ if ($RemoteHost) {
     }
     $deltaUploaded = $false
     if ($publishedDelta) {
-        $remoteDeltaHash = [string](
+        $remoteDeltaHashOutput = @(
             & ssh @sshArgs $RemoteHost `
                 "if [ -f '$RemotePath/files/$deltaPublishedName' ]; then sha256sum '$RemotePath/files/$deltaPublishedName' | cut -d ' ' -f 1; fi"
         )
-        $remoteDeltaHash = $remoteDeltaHash.Trim()
+        $remoteDeltaHash = ($remoteDeltaHashOutput -join "").Trim()
         $deltaUploaded = $remoteDeltaHash -ne $deltaHash
         if ($deltaUploaded) {
             & scp @scpArgs $publishedDelta "${RemoteHost}:$incoming/$deltaPublishedName"
