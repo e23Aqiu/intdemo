@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 
 APP_NAME = "营运信息批量查询工具"
-APP_VERSION = "0.2.5"
+APP_VERSION = "0.2.6"
 ORGANIZATION_NAME = "IntDemo"
 
 DEFAULT_ADMIN_USERNAME = "admin"
