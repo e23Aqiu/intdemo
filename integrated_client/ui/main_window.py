@@ -107,6 +107,7 @@ class MainWindow(FramelessMainWindow):
         self.downloaded_installer_path = None
         self.update_dialog = None
         self._update_busy = False
+        self._update_prompt_blocked = False
         self._prepared_to_close = False
         self._hard_exit_timer = None
         self._nav_buttons = {}
@@ -721,7 +722,11 @@ class MainWindow(FramelessMainWindow):
 
     def _update_announcement_ticker(self):
         has_announcements = bool(self.announcements)
-        controls_enabled = has_announcements and not self._update_busy
+        controls_enabled = (
+            has_announcements
+            and not self._update_busy
+            and not self._update_prompt_blocked
+        )
         self.announcement_horn_button.setEnabled(controls_enabled)
         self.announcement_ticker_button.setEnabled(controls_enabled)
         if not has_announcements:
@@ -848,6 +853,9 @@ class MainWindow(FramelessMainWindow):
             return
         dialog = UpdatePromptDialog(update, self)
         dialog.update_requested.connect(self._download_available_update)
+        dialog.background_update_requested.connect(
+            lambda: self._download_available_update(background=True)
+        )
         dialog.cancel_requested.connect(self._cancel_update_download)
         dialog.ignore_requested.connect(
             lambda version=update.version: self._ignore_update(version)
@@ -857,10 +865,17 @@ class MainWindow(FramelessMainWindow):
         def clear_dialog(*_args):
             if self.update_dialog is dialog:
                 self.update_dialog = None
+                self._set_update_prompt_blocked(False)
 
         dialog.finished.connect(clear_dialog)
         self.update_dialog = dialog
-        dialog.open()
+        # A Qt-modal dialog also blocks the custom title-bar controls. Keep
+        # this prompt modeless and emulate modality only for the application
+        # content so minimize, maximize, and close always remain available.
+        self._set_update_prompt_blocked(True)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _ignore_update(self, version):
         self.client_preferences.ignore_update(version)
@@ -868,19 +883,23 @@ class MainWindow(FramelessMainWindow):
             f"已取消 v{version} 的自动提示；可随时在此手动更新。"
         )
 
-    def _download_available_update(self):
+    def _download_available_update(self, *, background=False):
         update = self.available_update
         if update is None or self.update_coordinator is None:
             return
         dialog = self.update_dialog
-        if dialog is not None and dialog.update is update:
-            dialog.begin_download()
         if not self.update_coordinator.download(update):
             if dialog is not None:
                 dialog.set_error("更新服务正忙，请稍后重试。")
             return
+        if dialog is not None and dialog.update is update:
+            dialog.begin_download()
+        self._set_update_prompt_blocked(False)
         self.client_preferences.clear_ignored_update()
         self._set_update_busy(True)
+        if background and dialog is not None and not dialog.mandatory:
+            dialog.allow_close()
+            dialog.reject()
 
     def _cancel_update_download(self):
         if self.update_coordinator is None:
@@ -901,11 +920,13 @@ class MainWindow(FramelessMainWindow):
             self._set_update_busy(True)
         elif state == "download_cancelled":
             self._set_update_busy(False)
+            self._set_update_prompt_blocked(False)
             dialog = self.update_dialog
             if dialog is not None:
                 dialog.set_cancelled()
         elif state == "download_error":
             self._set_update_busy(False)
+            self._set_update_prompt_blocked(False)
             dialog = self.update_dialog
             if dialog is not None:
                 dialog.set_error(message)
@@ -927,6 +948,7 @@ class MainWindow(FramelessMainWindow):
     def _update_downloaded(self, installer_path):
         self.downloaded_installer_path = installer_path
         self._set_update_busy(False)
+        self._set_update_prompt_blocked(False)
         self.personal_center_page.set_update_state(
             "downloaded",
             "更新包已下载并校验完成，需要重启程序并运行安装程序。",
@@ -1001,6 +1023,23 @@ class MainWindow(FramelessMainWindow):
         button.style().unpolish(button)
         button.style().polish(button)
 
+    def _set_update_prompt_blocked(self, blocked):
+        blocked = bool(blocked)
+        self._update_prompt_blocked = blocked
+        # Reproduce the useful part of a modal prompt without disabling the
+        # top bar. Disabling the whole window would make its custom system
+        # buttons unable to minimize, maximize, or enter closeEvent().
+        self.sidebar.setEnabled(not blocked)
+        self.page_scroll_area.setEnabled(not blocked)
+        self._update_announcement_ticker()
+        self.window_controls.setEnabled(True)
+        for button in (
+            self.window_controls.minimize_button,
+            self.window_controls.maximize_button,
+            self.window_controls.close_button,
+        ):
+            button.setEnabled(True)
+
     def _set_update_busy(self, busy):
         busy = bool(busy)
         if self._update_busy == busy:
@@ -1009,6 +1048,8 @@ class MainWindow(FramelessMainWindow):
         # Downloading is a background operation. Business pages intentionally
         # remain interactive; only another update check is blocked.
         self.personal_center_page.check_update_btn.setEnabled(not busy)
+        self._update_announcement_ticker()
+        self.window_controls.setEnabled(True)
         if self.sync_coordinator is not None:
             self._update_sync_status(self.sync_coordinator.engine.status())
 

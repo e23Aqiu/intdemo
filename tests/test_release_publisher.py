@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -18,11 +20,13 @@ from release_publisher.core import (
     SettingsStore,
     build_git_commit_steps,
     build_git_push_plan,
+    build_pause_distribution_steps,
     build_release_plan,
     git_status,
     project_version,
     project_version_mismatches,
     set_project_version,
+    validate_pause_distribution_options,
     validate_release_options,
 )
 from release_publisher.ui import ReleasePublisherWindow
@@ -104,6 +108,263 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         )
         self.assertIn("-Mandatory", publish_step.arguments)
         self.assertIn("-RemoteHost", publish_step.arguments)
+
+    def test_pause_distribution_plan_only_targets_the_selected_remote_channel(self):
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="not-used",
+            base_url="not-used",
+            notes="",
+            channel="stable",
+            remote_host="intdemo-prod",
+            remote_path="/opt/intdemo/deploy/updates",
+            identity_file="C:/keys/release",
+        )
+
+        steps = build_pause_distribution_steps(options)
+
+        self.assertEqual([step.key for step in steps], ["pause_distribution"])
+        step = steps[0]
+        self.assertTrue(
+            any(
+                Path(argument).name == "pause-update.ps1"
+                for argument in step.arguments
+            )
+        )
+        self.assertIn("-Channel", step.arguments)
+        self.assertIn("stable", step.arguments)
+        self.assertIn("-RemoteHost", step.arguments)
+        self.assertIn("intdemo-prod", step.arguments)
+        self.assertIn("-IdentityFile", step.arguments)
+
+    def test_pause_distribution_validation_is_remote_only_and_rejects_root(self):
+        valid = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="not-used",
+            base_url="not-used",
+            notes="",
+            remote_host="intdemo-test",
+        )
+        missing_host = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="not-used",
+            base_url="not-used",
+            notes="",
+            remote_path="/",
+        )
+
+        with patch("release_publisher.core.shutil.which", return_value="tool"):
+            self.assertEqual(validate_pause_distribution_options(valid), [])
+            errors = validate_pause_distribution_options(missing_host)
+
+        self.assertIn("暂停分发必须填写 SSH 主机", errors)
+        self.assertIn("远程更新目录必须是安全的绝对 Linux 路径", errors)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "requires Windows PowerShell")
+    def test_pause_and_publish_scripts_have_valid_powershell_syntax(self):
+        scripts = [
+            REPO_ROOT / "scripts" / "pause-update.ps1",
+            REPO_ROOT / "scripts" / "publish-update.ps1",
+        ]
+        for script in scripts:
+            with self.subTest(script=script.name):
+                escaped_path = str(script).replace("'", "''")
+                parser = (
+                    "$tokens=$null;$errors=$null;"
+                    "[System.Management.Automation.Language.Parser]::"
+                    f"ParseFile('{escaped_path}',[ref]$tokens,[ref]$errors)"
+                    ">$null;"
+                    "if($errors.Count){$errors|% Message;exit 1}"
+                )
+                result = subprocess.run(
+                    [
+                        "powershell.exe",
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-Command",
+                        parser,
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(
+                    result.returncode,
+                    0,
+                    result.stderr or result.stdout,
+                )
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "requires Windows PowerShell")
+    def test_pause_script_archives_then_atomically_installs_compatible_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest_path = root / "manifest.json"
+            marker_path = root / "marker.json"
+            command_path = root / "remote-command.txt"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "channel": "test",
+                        "version": "1.2.3",
+                        "installer_path": (
+                            "/updates/files/IntDemoOnline-Setup-1.2.3.exe"
+                        ),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "INTDEMO_FAKE_MANIFEST": str(manifest_path),
+                    "INTDEMO_FAKE_MARKER": str(marker_path),
+                    "INTDEMO_FAKE_COMMAND": str(command_path),
+                    "INTDEMO_FAKE_HASH": "a" * 64,
+                    "INTDEMO_PAUSE_SCRIPT": str(
+                        REPO_ROOT / "scripts" / "pause-update.ps1"
+                    ),
+                }
+            )
+            harness = """
+function global:ssh {
+    $command = [string]$args[-1]
+    $global:LASTEXITCODE = 0
+    if ($command.StartsWith("if [ -f")) {
+        Write-Output $env:INTDEMO_FAKE_HASH
+        return
+    }
+    if ($command.StartsWith("cat ")) {
+        Get-Content -Raw -LiteralPath $env:INTDEMO_FAKE_MANIFEST
+        return
+    }
+    if ($command.StartsWith("mkdir ")) {
+        return
+    }
+    if ($command.StartsWith("echo ")) {
+        [IO.File]::WriteAllText($env:INTDEMO_FAKE_COMMAND, $command)
+        return
+    }
+    throw "Unexpected fake ssh command: $command"
+}
+function global:scp {
+    Copy-Item -LiteralPath ([string]$args[0]) -Destination $env:INTDEMO_FAKE_MARKER
+    $global:LASTEXITCODE = 0
+}
+& $env:INTDEMO_PAUSE_SCRIPT `
+    -Channel test `
+    -RemoteHost intdemo-test `
+    -RemotePath /opt/intdemo/deploy/updates
+""".strip()
+
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-Command",
+                    harness,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+            )
+
+            self.assertEqual(
+                result.returncode,
+                0,
+                result.stderr or result.stdout,
+            )
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            self.assertEqual(marker["version"], "0.0.0")
+            self.assertTrue(marker["paused"])
+            self.assertEqual(marker["paused_version"], "1.2.3")
+            remote_command = command_path.read_text(encoding="utf-8")
+            self.assertIn("/updates-paused/test-1.2.3-", remote_command)
+            self.assertIn(" && cp ", remote_command)
+            self.assertIn(" && mv ", remote_command)
+            self.assertIn("Paused version: 1.2.3", result.stdout)
+
+    @unittest.skipUnless(shutil.which("powershell.exe"), "requires Windows PowerShell")
+    def test_publish_script_keeps_version_guard_while_channel_is_paused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            publish_script = scripts / "publish-update.ps1"
+            publish_script.write_bytes(
+                (REPO_ROOT / "scripts" / "publish-update.ps1").read_bytes()
+            )
+            installer = root / "installer.exe"
+            installer.write_bytes(b"test-installer")
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "INTDEMO_PUBLISH_SCRIPT": str(publish_script),
+                    "INTDEMO_TEST_INSTALLER": str(installer),
+                }
+            )
+            harness = """
+function global:git {
+    $global:LASTEXITCODE = 0
+    if ($args -contains "rev-parse") {
+        Write-Output (("a" * 40) -join "")
+        return
+    }
+    if ($args -contains "status") {
+        return
+    }
+    throw "Unexpected fake git command"
+}
+function global:ssh {
+    $command = [string]$args[-1]
+    $global:LASTEXITCODE = 0
+    if ($command.StartsWith("mkdir ")) {
+        return
+    }
+    if ($command.StartsWith("if [ -f") -and $command.Contains("cat ")) {
+        Write-Output '{"schema_version":1,"channel":"test","version":"0.0.0","paused":true,"paused_version":"1.2.3"}'
+        return
+    }
+    throw "Unexpected fake ssh command: $command"
+}
+function global:scp {
+    throw "scp must not run when the version guard rejects publishing"
+}
+& $env:INTDEMO_PUBLISH_SCRIPT `
+    -Installer $env:INTDEMO_TEST_INSTALLER `
+    -Version 1.2.3 `
+    -Notes test `
+    -Channel test `
+    -RemoteHost intdemo-test `
+    -RemotePath /opt/intdemo/deploy/updates
+""".strip()
+
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-Command",
+                    harness,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            output = result.stdout + result.stderr
+            self.assertIn("already publishes version 1.2.3", output)
+            self.assertNotIn("scp must not run", output)
 
     def test_git_commit_steps_stage_all_changes_and_create_local_commit(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -452,6 +713,9 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertEqual(window.channel_combo.currentData(), "test")
         self.assertFalse(window.mandatory_check.isChecked())
         self.assertFalse(window.cancel_button.isEnabled())
+        self.assertEqual(window.pause_distribution_button.text(), "暂停分发")
+        self.assertIn("保留安装包", window.pause_distribution_button.toolTip())
+        self.assertTrue(window.pause_distribution_button.isEnabled())
         self.assertIn("测试", window.pipeline_button.text())
         self.assertIn("发布", window.pipeline_button.text())
         self.assertEqual(window.commit_changes_button.text(), "提交变更")
@@ -491,6 +755,37 @@ class ReleasePublisherUiTests(unittest.TestCase):
             "中文日志",
         )
 
+        window.deleteLater()
+
+    def test_pause_distribution_button_confirms_and_runs_remote_pause(self):
+        window = ReleasePublisherWindow(REPO_ROOT)
+        window.remote_host_edit.setText("intdemo-test")
+        window.remote_path_edit.setText("/opt/intdemo/deploy/updates")
+        window.identity_edit.clear()
+
+        with (
+            patch(
+                "release_publisher.ui.validate_pause_distribution_options",
+                return_value=[],
+            ),
+            patch(
+                "release_publisher.ui.QMessageBox.warning",
+                return_value=QMessageBox.Yes,
+            ) as warning,
+            patch.object(window, "_save_settings") as save_settings,
+            patch.object(window, "_run_steps") as run_steps,
+        ):
+            window._run_pause_distribution()
+
+        self.assertIn("已经取得清单", warning.call_args.args[2])
+        self.assertIn("安装包不会删除", warning.call_args.args[2])
+        save_settings.assert_called_once_with()
+        steps = run_steps.call_args.args[0]
+        self.assertEqual([step.key for step in steps], ["pause_distribution"])
+        self.assertEqual(
+            run_steps.call_args.kwargs["completion_message"],
+            "test 通道已暂停分发",
+        )
         window.deleteLater()
 
     def test_commit_button_previews_and_runs_local_commit_steps(self):

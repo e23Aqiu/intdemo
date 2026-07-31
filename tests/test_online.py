@@ -361,6 +361,30 @@ class OnlineClientTests(unittest.TestCase):
         self.assertEqual(update.size, len(delta))
         self.assertEqual(update.installer_name, delta_name)
 
+    def test_paused_update_distribution_is_treated_as_no_update(self):
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "paused": True,
+            "paused_version": _next_patch_version(APP_VERSION),
+        }
+        session = Mock()
+        session.headers = {}
+        session.get.return_value = response
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+
+        self.assertIsNone(UpdateClient(config, session=session).check())
+
+        no_content = Mock(status_code=204)
+        no_content.raise_for_status.return_value = None
+        session.get.return_value = no_content
+
+        self.assertIsNone(UpdateClient(config, session=session).check())
+        no_content.json.assert_not_called()
+
     def test_update_manifest_uses_delta_only_for_exact_current_version(self):
         full = b"full-package"
         delta = b"delta-package"

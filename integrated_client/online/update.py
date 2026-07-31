@@ -151,10 +151,14 @@ class UpdateClient:
                 **self._request_kwargs(),
             )
             response.raise_for_status()
+            if response.status_code == 204:
+                return None
             payload = response.json()
         except (requests.RequestException, ValueError) as exc:
             raise UpdateError(f"检查更新失败：{exc}") from exc
 
+        if payload.get("paused") is True:
+            return None
         if int(payload.get("schema_version") or 0) != 1:
             raise UpdateError("服务器更新清单版本不受支持")
         if str(payload.get("channel") or "") != self.config.channel:

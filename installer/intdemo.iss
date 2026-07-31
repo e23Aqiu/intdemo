@@ -2,7 +2,7 @@
 #define MyAppExeName "营运信息批量查询工具.exe"
 #define MyAppId "F9B73C99-E62D-4DB4-8C5A-CE64DEB5609D"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.6"
+  #define MyAppVersion "0.2.7"
 #endif
 #ifndef StageDir
   #define StageDir "..\dist\installer-stage"

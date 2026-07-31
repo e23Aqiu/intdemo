@@ -15,6 +15,15 @@ REMOTE_HOST_PATTERN = re.compile(r"^[A-Za-z0-9._@:-]+$")
 REMOTE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._/-]+$")
 
 
+def _safe_remote_path(value: str) -> bool:
+    normalized = str(value or "").strip()
+    return bool(
+        REMOTE_PATH_PATTERN.fullmatch(normalized)
+        and normalized != "/"
+        and all(part not in {"", ".", ".."} for part in normalized.split("/")[1:])
+    )
+
+
 class PublisherError(ValueError):
     pass
 
@@ -825,12 +834,29 @@ def validate_release_options(
                 if changes:
                     errors.append("远程发布要求 Git 工作区无未提交变更")
 
-    if not REMOTE_PATH_PATTERN.fullmatch(options.remote_path):
+    if not _safe_remote_path(options.remote_path):
         errors.append("远程更新目录必须是安全的绝对 Linux 路径")
     if options.identity_file and not Path(options.identity_file).expanduser().is_file():
         errors.append(f"SSH 私钥不存在：{options.identity_file}")
 
     errors.extend(validate_test_environment(root))
+    return list(dict.fromkeys(errors))
+
+
+def validate_pause_distribution_options(options: ReleaseOptions) -> list[str]:
+    errors: list[str] = []
+    if not options.remote_host:
+        errors.append("暂停分发必须填写 SSH 主机")
+    elif not REMOTE_HOST_PATTERN.fullmatch(options.remote_host):
+        errors.append("远程主机格式无效")
+    if options.channel not in {"test", "stable"}:
+        errors.append("发布通道只能是 test 或 stable")
+    if not _safe_remote_path(options.remote_path):
+        errors.append("远程更新目录必须是安全的绝对 Linux 路径")
+    if options.identity_file and not Path(options.identity_file).expanduser().is_file():
+        errors.append(f"SSH 私钥不存在：{options.identity_file}")
+    if shutil.which("ssh") is None or shutil.which("scp") is None:
+        errors.append("暂停分发需要系统提供 ssh 和 scp")
     return list(dict.fromkeys(errors))
 
 
@@ -858,6 +884,28 @@ def _powershell_step(
         ),
         working_directory=options.repo_root,
     )
+
+
+def build_pause_distribution_steps(options: ReleaseOptions) -> list[CommandStep]:
+    arguments = [
+        "-Channel",
+        options.channel,
+        "-RemoteHost",
+        options.remote_host,
+        "-RemotePath",
+        options.remote_path,
+    ]
+    if options.identity_file:
+        arguments.extend(["-IdentityFile", options.identity_file])
+    return [
+        _powershell_step(
+            options,
+            key="pause_distribution",
+            title=f"暂停 {options.channel} 通道分发",
+            script_name="pause-update.ps1",
+            script_arguments=arguments,
+        )
+    ]
 
 
 def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:

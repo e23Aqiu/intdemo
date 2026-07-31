@@ -146,10 +146,16 @@ if ($RemoteHost) {
         throw "Could not inspect the currently published manifest"
     }
     $remoteManifestText = ($remoteManifestOutput -join "`n").Trim()
+    $remoteWasPaused = $false
     if ($remoteManifestText) {
         try {
             $remoteManifest = $remoteManifestText | ConvertFrom-Json
-            $remoteVersion = [string]$remoteManifest.version
+            if ($remoteManifest.paused -eq $true) {
+                $remoteVersion = [string]$remoteManifest.paused_version
+                $remoteWasPaused = $true
+            } else {
+                $remoteVersion = [string]$remoteManifest.version
+            }
             $parsedRemoteVersion = [version]$remoteVersion
             $parsedTargetVersion = [version]$Version
         }
@@ -160,6 +166,12 @@ if ($RemoteHost) {
             throw (
                 "Remote channel $Channel already publishes version " +
                 "$remoteVersion. Published versions cannot be replaced or downgraded."
+            )
+        }
+        if ($remoteWasPaused) {
+            Write-Host (
+                "Remote channel $Channel is paused at version $remoteVersion; " +
+                "publishing $Version will resume distribution"
             )
         }
     }
@@ -212,4 +224,7 @@ if ($RemoteHost) {
         throw "Could not publish the remote update atomically"
     }
     Write-Host "Published to ${RemoteHost}:$RemotePath"
+    if ($remoteWasPaused) {
+        Write-Host "Distribution resumed for channel $Channel"
+    }
 }

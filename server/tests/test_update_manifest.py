@@ -124,3 +124,39 @@ def test_manifest_source_is_not_modified(client, update_manifest_file):
 
     assert json.loads(path.read_text(encoding="utf-8")) == canonical
     assert client.get("/updates/preview.json").status_code == 404
+
+
+def test_paused_manifest_suppresses_updates_for_old_and_headerless_clients(
+    client,
+    update_manifest_file,
+):
+    path, _canonical = update_manifest_file
+    marker = {
+        "schema_version": 1,
+        "channel": "test",
+        "version": "0.0.0",
+        "paused": True,
+        "paused_version": "0.2.5",
+        "paused_at": "2026-07-31T08:00:00Z",
+    }
+    path.write_text(json.dumps(marker), encoding="utf-8")
+
+    versioned = client.get(
+        "/updates/test.json",
+        headers={"User-Agent": "IntDemoUpdater/0.2.4"},
+    )
+    headerless = client.get("/updates/test.json")
+
+    assert versioned.status_code == 200
+    assert versioned.json() == {
+        "schema_version": 1,
+        "channel": "test",
+        "version": "0.2.4",
+        "paused": True,
+        "paused_version": "0.2.5",
+    }
+    assert versioned.headers["x-intdemo-update-package"] == "paused"
+    assert versioned.headers["x-intdemo-update-distribution"] == "paused"
+    assert headerless.status_code == 204
+    assert headerless.content == b""
+    assert json.loads(path.read_text(encoding="utf-8")) == marker

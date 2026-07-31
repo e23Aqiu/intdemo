@@ -25,6 +25,7 @@ def _format_speed(bytes_per_second: float) -> str:
 
 class UpdatePromptDialog(FramelessDialog):
     update_requested = pyqtSignal()
+    background_update_requested = pyqtSignal()
     ignore_requested = pyqtSignal()
     cancel_requested = pyqtSignal()
     restart_requested = pyqtSignal()
@@ -37,7 +38,11 @@ class UpdatePromptDialog(FramelessDialog):
         self._downloaded = False
         self._allow_close = False
         self.setWindowTitle("程序更新")
-        self.setModal(True)
+        # MainWindow applies a soft content-only block while this prompt needs
+        # attention. Native Qt modality would also block the main window's
+        # minimize, maximize, and close buttons.
+        self.setModal(False)
+        self.setWindowModality(Qt.NonModal)
         self.setMinimumSize(560, 450)
         self.resize(610, 480)
 
@@ -92,7 +97,7 @@ class UpdatePromptDialog(FramelessDialog):
         self.state_label = QLabel(
             "此版本必须更新。点击更新后，下载期间仍可处理业务。"
             if self.mandatory
-            else "可以现在更新，也可以稍后在“系统设置”中更新。"
+            else "可以立即更新、转入后台下载，或稍后在“系统设置”中更新。"
         )
         self.state_label.setObjectName("UpdateState")
         self.state_label.setWordWrap(True)
@@ -118,10 +123,18 @@ class UpdatePromptDialog(FramelessDialog):
         self.ignore_button.setVisible(not self.mandatory)
         self.ignore_button.clicked.connect(self._ignore)
         buttons.addWidget(self.ignore_button)
-        self.cancel_button = QPushButton("取消")
+        self.cancel_button = QPushButton("稍后更新")
         self.cancel_button.setVisible(not self.mandatory)
         self.cancel_button.clicked.connect(self._cancel)
         buttons.addWidget(self.cancel_button)
+        self.background_button = QPushButton("后台更新")
+        self.background_button.setObjectName("UpdateButton")
+        self.background_button.setVisible(not self.mandatory)
+        self.background_button.setToolTip(
+            "开始下载并收起此窗口，可在“系统设置”中查看进度。"
+        )
+        self.background_button.clicked.connect(self._background_update)
+        buttons.addWidget(self.background_button)
         self.update_button = QPushButton("立即更新")
         self.update_button.setObjectName("PrimaryButton")
         self.update_button.clicked.connect(self._primary_action)
@@ -141,6 +154,11 @@ class UpdatePromptDialog(FramelessDialog):
         self._allow_close = True
         super().reject()
 
+    def _background_update(self):
+        if self._download_active or self._downloaded or self.mandatory:
+            return
+        self.background_update_requested.emit()
+
     def _cancel(self):
         if self._download_active:
             self.cancel_requested.emit()
@@ -155,10 +173,6 @@ class UpdatePromptDialog(FramelessDialog):
     def begin_download(self):
         self._download_active = True
         self._downloaded = False
-        # Downloading runs in the background; release application-modal input
-        # so the user can inspect data and continue business work.
-        self.setModal(False)
-        self.setWindowModality(Qt.NonModal)
         self.progress.show()
         self.speed_label.show()
         self.progress.setRange(0, 100)
@@ -169,6 +183,7 @@ class UpdatePromptDialog(FramelessDialog):
         self.update_button.setEnabled(False)
         self.update_button.setText("正在下载…")
         self.ignore_button.setEnabled(False)
+        self.background_button.setEnabled(False)
         self.cancel_button.show()
         self.cancel_button.setEnabled(True)
         self.cancel_button.setText("停止下载")
@@ -196,8 +211,10 @@ class UpdatePromptDialog(FramelessDialog):
         self.update_button.setEnabled(True)
         self.update_button.setText("重新下载")
         self.ignore_button.setEnabled(not self.mandatory)
+        self.background_button.setEnabled(not self.mandatory)
+        self.background_button.setVisible(not self.mandatory)
         self.cancel_button.setEnabled(True)
-        self.cancel_button.setText("取消")
+        self.cancel_button.setText("稍后更新")
         self.cancel_button.setVisible(not self.mandatory)
         if not self.mandatory:
             self.window_controls.close_button.show()
@@ -221,6 +238,7 @@ class UpdatePromptDialog(FramelessDialog):
         self.update_button.setEnabled(True)
         self.update_button.setText("重启并安装")
         self.ignore_button.hide()
+        self.background_button.hide()
         if not self.mandatory:
             self.cancel_button.setEnabled(True)
             self.cancel_button.setText("稍后安装")
@@ -242,7 +260,9 @@ class UpdatePromptDialog(FramelessDialog):
         if self._allow_close or (
             not self.mandatory and not self._download_active
         ):
-            event.accept()
+            # Let QDialog reject itself so finished() is emitted. MainWindow
+            # relies on that signal to release its content-only prompt block.
+            super().closeEvent(event)
         else:
             event.ignore()
 

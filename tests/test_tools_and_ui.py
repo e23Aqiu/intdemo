@@ -1754,6 +1754,132 @@ class ToolAndUiTests(unittest.TestCase):
         window._prepared_to_close = True
         window.close()
 
+    def test_optional_update_cancel_releases_input_and_keeps_window_controls_available(self):
+        class FakeUpdateCoordinator(QObject):
+            update_available = pyqtSignal(object)
+            state_changed = pyqtSignal(str, str)
+            download_progress = pyqtSignal(int, int)
+            download_speed = pyqtSignal(object)
+            download_completed = pyqtSignal(object)
+
+            def __init__(self):
+                super().__init__()
+                self.download_calls = 0
+                self.cancel_calls = 0
+
+            def download(self, _update):
+                self.download_calls += 1
+                return True
+
+            def cancel_download(self):
+                self.cancel_calls += 1
+                return True
+
+        updates = FakeUpdateCoordinator()
+        window = MainWindow(
+            self.db,
+            self.admin,
+            update_coordinator=updates,
+        )
+        window.show()
+        self.app.processEvents()
+        update = UpdateInfo(
+            version="0.2.7",
+            installer_url="https://example.com/updates/files/update.exe",
+            installer_name="update.exe",
+            sha256="0" * 64,
+            size=100,
+            notes="修复更新取消后的界面状态。",
+            mandatory=False,
+        )
+        window.available_update = update
+        window.personal_center_page.set_update_available(update)
+        window._show_update_dialog(update)
+        self.app.processEvents()
+
+        dialog = window.update_dialog
+        self.assertIsNotNone(dialog)
+        self.assertEqual(dialog.cancel_button.text(), "稍后更新")
+        self.assertFalse(dialog.background_button.isHidden())
+        self.assertEqual(dialog.background_button.text(), "后台更新")
+        self.assertEqual(dialog.update_button.text(), "立即更新")
+        self.assertIsNone(QApplication.activeModalWidget())
+        self.assertFalse(window.sidebar.isEnabled())
+        self.assertFalse(window.page_scroll_area.isEnabled())
+        for button in (
+            window.window_controls.minimize_button,
+            window.window_controls.maximize_button,
+            window.window_controls.close_button,
+        ):
+            self.assertTrue(button.isEnabled())
+
+        window._download_available_update()
+        self.app.processEvents()
+        self.assertEqual(updates.download_calls, 1)
+        self.assertTrue(window._update_busy)
+        self.assertTrue(window.sidebar.isEnabled())
+        self.assertTrue(window.page_scroll_area.isEnabled())
+        self.assertIsNone(QApplication.activeModalWidget())
+        for button in (
+            window.window_controls.minimize_button,
+            window.window_controls.maximize_button,
+            window.window_controls.close_button,
+        ):
+            self.assertTrue(button.isEnabled())
+
+        with patch(
+            "integrated_client.ui.main_window.QMessageBox.question",
+            return_value=QMessageBox.No,
+        ) as close_prompt:
+            window.close()
+            self.app.processEvents()
+        self.assertTrue(window.isVisible())
+        self.assertEqual(close_prompt.call_args.args[1], "停止更新并退出")
+
+        window._cancel_update_download()
+        self.assertEqual(updates.cancel_calls, 1)
+        window._update_download_state(
+            "download_cancelled",
+            "更新下载已停止，可稍后继续重新下载。",
+        )
+        self.assertEqual(dialog.cancel_button.text(), "稍后更新")
+        self.assertTrue(dialog.background_button.isEnabled())
+        self.assertFalse(dialog.background_button.isHidden())
+        dialog.close()
+        self.app.processEvents()
+
+        self.assertIsNone(window.update_dialog)
+        self.assertIsNone(QApplication.activeModalWidget())
+        self.assertFalse(window._update_busy)
+        self.assertTrue(window.sidebar.isEnabled())
+        self.assertTrue(window.page_scroll_area.isEnabled())
+        for button in (
+            window.window_controls.minimize_button,
+            window.window_controls.maximize_button,
+            window.window_controls.close_button,
+        ):
+            self.assertTrue(button.isEnabled())
+
+        window._show_update_dialog(update)
+        self.app.processEvents()
+        background_dialog = window.update_dialog
+        background_dialog.background_button.click()
+        self.app.processEvents()
+        self.assertEqual(updates.download_calls, 2)
+        self.assertIsNone(window.update_dialog)
+        self.assertTrue(window._update_busy)
+        self.assertTrue(window.sidebar.isEnabled())
+        self.assertTrue(window.page_scroll_area.isEnabled())
+        self.assertIsNone(QApplication.activeModalWidget())
+        window._update_download_state(
+            "download_cancelled",
+            "后台更新下载已停止。",
+        )
+
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
     def test_update_prompt_enforces_mandatory_and_reports_progress(self):
         mandatory_update = UpdateInfo(
             version="0.2.4",
@@ -1769,6 +1895,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertTrue(dialog.ignore_button.isHidden())
         self.assertTrue(dialog.cancel_button.isHidden())
+        self.assertTrue(dialog.background_button.isHidden())
         self.assertTrue(dialog.window_controls.close_button.isHidden())
         dialog.reject()
         self.app.processEvents()

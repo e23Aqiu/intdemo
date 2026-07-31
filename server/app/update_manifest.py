@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from .config import get_settings
 
@@ -86,12 +86,31 @@ def _load_manifest(path: Path) -> dict[str, Any]:
 
 
 @router.get("/updates/{channel}.json", include_in_schema=False)
-def update_manifest(channel: str, request: Request) -> JSONResponse:
+def update_manifest(channel: str, request: Request) -> Response:
     if channel not in _CHANNELS:
         raise HTTPException(status_code=404, detail="update channel not found")
     settings = get_settings()
     payload = _load_manifest(settings.updates_dir / f"{channel}.json")
     current_version = request_client_version(request)
+    if payload.get("paused") is True:
+        headers = {
+            "Cache-Control": "no-store",
+            "X-IntDemo-Update-Package": "paused",
+            "X-IntDemo-Update-Distribution": "paused",
+        }
+        if current_version is None:
+            return Response(status_code=204, headers=headers)
+        headers["X-IntDemo-Client-Version"] = current_version
+        return JSONResponse(
+            {
+                "schema_version": 1,
+                "channel": channel,
+                "version": current_version,
+                "paused": True,
+                "paused_version": str(payload.get("paused_version") or ""),
+            },
+            headers=headers,
+        )
     selected, package_kind = select_manifest_package(payload, current_version)
     headers = {
         "Cache-Control": "no-store",

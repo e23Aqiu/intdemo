@@ -41,11 +41,13 @@ from .core import (
     SettingsStore,
     build_git_commit_steps,
     build_git_push_plan,
+    build_pause_distribution_steps,
     build_release_plan,
     find_inno_compiler,
     git_status,
     project_version,
     set_project_version,
+    validate_pause_distribution_options,
     validate_release_options,
     validate_test_environment,
 )
@@ -91,7 +93,7 @@ class ReleasePublisherWindow(QMainWindow):
         title = QLabel("IntDemo 专用打包发布器")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "开发者本地工具 · 测试、构建、校验、发布和快照归档"
+            "开发者本地工具 · 测试、构建、校验、发布、暂停分发和快照归档"
         )
         subtitle.setObjectName("Muted")
         title_box.addWidget(title)
@@ -322,6 +324,15 @@ class ReleasePublisherWindow(QMainWindow):
         self.push_button.clicked.connect(self._push_changes)
         actions.addWidget(self.push_button)
         actions.addStretch()
+        self.pause_distribution_button = QPushButton("暂停分发")
+        self.pause_distribution_button.setObjectName("DangerButton")
+        self.pause_distribution_button.setToolTip(
+            "暂停所选远程通道的新更新检查；保留安装包并归档当前活动清单"
+        )
+        self.pause_distribution_button.clicked.connect(
+            self._run_pause_distribution
+        )
+        actions.addWidget(self.pause_distribution_button)
         self.publish_button = QPushButton("发布")
         self.publish_button.clicked.connect(self._run_publish)
         actions.addWidget(self.publish_button)
@@ -775,6 +786,35 @@ class ReleasePublisherWindow(QMainWindow):
             )
         )
 
+    def _run_pause_distribution(self) -> None:
+        options = self._options()
+        errors = validate_pause_distribution_options(options)
+        if errors:
+            message = "\n".join(f"• {item}" for item in errors)
+            self._append_log("暂停分发检查未通过：\n" + message)
+            QMessageBox.warning(self, "无法暂停分发", message)
+            return
+        reply = QMessageBox.warning(
+            self,
+            "确认暂停分发",
+            f"即将暂停远程更新分发\n\n"
+            f"目标：{options.remote_host}:{options.remote_path}\n"
+            f"通道：{options.channel}\n\n"
+            "新的更新检查将不再收到该通道版本；服务器上的安装包不会删除，"
+            "当前活动清单会完整归档。已经取得清单或正在下载的客户端不会被"
+            "强制中断。\n\n"
+            "以后发布更高版本时会自动恢复该通道分发。确定继续吗？",
+            QMessageBox.Yes | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._save_settings()
+        self._run_steps(
+            build_pause_distribution_steps(options),
+            completion_message=f"{options.channel} 通道已暂停分发",
+        )
+
     def _run_full_pipeline(self) -> None:
         options = self._validate(for_build=True, for_pipeline=True)
         if options is None:
@@ -1118,6 +1158,7 @@ class ReleasePublisherWindow(QMainWindow):
             self.build_button,
             self.commit_changes_button,
             self.push_button,
+            self.pause_distribution_button,
             self.publish_button,
             self.pipeline_button,
             self.sync_version_button,
