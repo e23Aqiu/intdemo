@@ -79,14 +79,15 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert disabled.status_code == 200
     assert disabled.json()["stored"] is False
 
-    enabled = client.patch(
+    metrics_only = client.patch(
         "/api/v1/admin/ml/policy",
         headers=auth_header(admin),
-        json={"upload_enabled": True},
+        json={"upload_mode": "metrics_only"},
     )
-    assert enabled.status_code == 200
-    assert enabled.json()["upload_enabled"] is True
-    assert enabled.json()["revision"] == 2
+    assert metrics_only.status_code == 200
+    assert metrics_only.json()["upload_mode"] == "metrics_only"
+    assert metrics_only.json()["upload_enabled"] is False
+    assert metrics_only.json()["revision"] == 2
 
     failure = client.post(
         "/api/v1/captcha/attempts",
@@ -96,6 +97,24 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert failure.status_code == 200
     assert failure.json()["stored"] is True
     assert failure.json()["sample_stored"] is False
+
+    metrics_success = client.post(
+        "/api/v1/captcha/attempts",
+        headers=auth_header(user),
+        json=_numeric_attempt(success=True),
+    )
+    assert metrics_success.status_code == 200
+    assert metrics_success.json()["stored"] is True
+    assert metrics_success.json()["sample_stored"] is False
+
+    samples_and_metrics = client.patch(
+        "/api/v1/admin/ml/policy",
+        headers=auth_header(admin),
+        json={"upload_mode": "samples_and_metrics"},
+    )
+    assert samples_and_metrics.status_code == 200
+    assert samples_and_metrics.json()["upload_enabled"] is True
+    assert samples_and_metrics.json()["revision"] == 3
 
     first = client.post(
         "/api/v1/captcha/attempts",
@@ -122,9 +141,9 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert body["dataset"]["numeric_count"] == 1
     assert body["dataset"]["total_bytes"] == len(PNG_1X1)
     metric = body["attempts"][0]
-    assert metric["attempt_count"] == 3
-    assert metric["success_count"] == 2
-    assert metric["success_rate"] == 2 / 3
+    assert metric["attempt_count"] == 4
+    assert metric["success_count"] == 3
+    assert metric["success_rate"] == 3 / 4
 
 
 def test_dataset_export_import_and_model_activation(client):
@@ -133,7 +152,7 @@ def test_dataset_export_import_and_model_activation(client):
     client.patch(
         "/api/v1/admin/ml/policy",
         headers=auth_header(admin),
-        json={"upload_enabled": True},
+        json={"upload_mode": "samples_and_metrics"},
     )
     client.post(
         "/api/v1/captcha/attempts",
@@ -260,7 +279,7 @@ def test_click_samples_require_matching_normalized_coordinates(client):
     client.patch(
         "/api/v1/admin/ml/policy",
         headers=auth_header(admin),
-        json={"upload_enabled": True},
+        json={"upload_mode": "samples_and_metrics"},
     )
 
     accepted = client.post(

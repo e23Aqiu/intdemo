@@ -17,6 +17,14 @@ MAX_MODEL_CACHE_BYTES = 20 * 1024 * 1024
 MAX_SAMPLE_UPLOAD_BYTES = 1 * 1024 * 1024
 MODEL_CACHE_SCHEMA_VERSION = 1
 MAX_BACKGROUND_TASKS = 64
+UPLOAD_MODE_OFF = "off"
+UPLOAD_MODE_METRICS_ONLY = "metrics_only"
+UPLOAD_MODE_SAMPLES_AND_METRICS = "samples_and_metrics"
+UPLOAD_MODES = {
+    UPLOAD_MODE_OFF,
+    UPLOAD_MODE_METRICS_ONLY,
+    UPLOAD_MODE_SAMPLES_AND_METRICS,
+}
 
 
 class _TaskSignals(QObject):
@@ -39,7 +47,7 @@ class _Task(QRunnable):
 
 
 class CaptchaLearningService(QObject):
-    """Fetch collection policy, upload authorized samples, and cache active models."""
+    """Fetch reporting policy, upload authorized data, and cache active models."""
 
     policy_changed = pyqtSignal(object)
     upload_completed = pyqtSignal(object)
@@ -50,6 +58,7 @@ class CaptchaLearningService(QObject):
         self.session_manager = session_manager
         self.model_manager = model_manager or CaptchaModelManager()
         self.policy = {
+            "upload_mode": UPLOAD_MODE_OFF,
             "upload_enabled": False,
             "revision": 0,
             "active_models": {},
@@ -80,8 +89,29 @@ class CaptchaLearningService(QObject):
         self._refresh_pending = False
         self._downloading_models.clear()
 
+    def upload_mode(self) -> str:
+        mode = str(self.policy.get("upload_mode") or "")
+        if mode in UPLOAD_MODES:
+            return mode
+        # Older servers expose only the boolean policy.
+        return (
+            UPLOAD_MODE_SAMPLES_AND_METRICS
+            if self.policy.get("upload_enabled")
+            else UPLOAD_MODE_OFF
+        )
+
+    def reporting_enabled(self) -> bool:
+        return self.upload_mode() != UPLOAD_MODE_OFF and not self._stopped
+
+    def sample_collection_enabled(self) -> bool:
+        return (
+            self.upload_mode() == UPLOAD_MODE_SAMPLES_AND_METRICS
+            and not self._stopped
+        )
+
     def collection_enabled(self) -> bool:
-        return bool(self.policy.get("upload_enabled")) and not self._stopped
+        """Compatibility alias for code that asks whether samples may be captured."""
+        return self.sample_collection_enabled()
 
     def _start_task(self, function, completed):
         if self._stopped:
@@ -343,8 +373,10 @@ class CaptchaLearningService(QObject):
                     pass
 
     def record_attempt(self, event: dict) -> bool:
+        upload_mode = self.upload_mode()
         if (
-            not self.collection_enabled()
+            self._stopped
+            or upload_mode == UPLOAD_MODE_OFF
             or not isinstance(event, dict)
             or len(self._tasks) >= MAX_BACKGROUND_TASKS
         ):
@@ -352,7 +384,6 @@ class CaptchaLearningService(QObject):
         success = bool(event.get("success"))
         payload = {
             "captcha_type": str(event.get("captcha_type") or ""),
-            "source": str(event.get("source") or ""),
             "model_version": str(event.get("model_version") or "unknown")[:80],
             "success": success,
             "assisted": bool(event.get("assisted")),
@@ -361,22 +392,23 @@ class CaptchaLearningService(QObject):
                 or datetime.now().astimezone().isoformat()
             ),
         }
-        if success:
+        if success and upload_mode == UPLOAD_MODE_SAMPLES_AND_METRICS:
             image = bytes(event.get("image_bytes") or b"")
             answer = event.get("answer")
             if (
-                not image
-                or len(image) > MAX_SAMPLE_UPLOAD_BYTES
-                or not isinstance(answer, dict)
+                image
+                and len(image) <= MAX_SAMPLE_UPLOAD_BYTES
+                and isinstance(answer, dict)
             ):
-                return False
-            payload.update(
-                {
-                    "image_mime": str(event.get("image_mime") or "image/png"),
-                    "image_base64": base64.b64encode(image).decode("ascii"),
-                    "answer": answer,
-                }
-            )
+                payload.update(
+                    {
+                        "image_mime": str(
+                            event.get("image_mime") or "image/png"
+                        ),
+                        "image_base64": base64.b64encode(image).decode("ascii"),
+                        "answer": answer,
+                    }
+                )
 
         def upload():
             token = self.session_manager.access_token()

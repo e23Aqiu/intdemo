@@ -474,6 +474,7 @@ class Worker(QThread):
         only_yellow_card,
         captcha_model_manager=None,
         captcha_collection_enabled=None,
+        captcha_sample_collection_enabled=None,
     ):
         super().__init__()
         self.src = src_path
@@ -496,6 +497,9 @@ class Worker(QThread):
         self.only_yellow_card = only_yellow_card
         self.captcha_model_manager = captcha_model_manager
         self.captcha_collection_enabled = captcha_collection_enabled
+        self.captcha_sample_collection_enabled = (
+            captcha_sample_collection_enabled
+        )
         self._pending_captcha_sample = None
 
     def stop(self):
@@ -546,6 +550,17 @@ class Worker(QThread):
         except Exception:
             return False
 
+    def _sample_collection_enabled(self):
+        callback = self.captcha_sample_collection_enabled
+        if callback is None:
+            callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
     def _active_model(self, captcha_type):
         manager = self.captcha_model_manager
         if manager is None:
@@ -574,9 +589,7 @@ class Worker(QThread):
             "assisted": bool(assisted),
             "occurred_at": datetime.now().astimezone().isoformat(),
         }
-        if success:
-            if not image_bytes or not isinstance(answer, dict):
-                return
+        if success and image_bytes and isinstance(answer, dict):
             event.update(
                 {
                     "image_bytes": bytes(image_bytes),
@@ -585,6 +598,33 @@ class Worker(QThread):
                 }
             )
         self.captcha_attempt_signal.emit(event)
+
+    def _set_pending_captcha_attempt(
+        self,
+        *,
+        model_version,
+        assisted,
+        image_bytes=None,
+        answer=None,
+    ):
+        if not self._collection_enabled():
+            return
+        pending = {
+            "model_version": model_version,
+            "assisted": assisted,
+        }
+        if (
+            self._sample_collection_enabled()
+            and image_bytes
+            and isinstance(answer, dict)
+        ):
+            pending.update(
+                {
+                    "image_bytes": image_bytes,
+                    "answer": answer,
+                }
+            )
+        self._pending_captcha_sample = pending
 
     def _commit_pending_captcha_sample(self):
         pending = self._pending_captcha_sample
@@ -801,7 +841,7 @@ class Worker(QThread):
                         while self._running:
                             self._check_stopped()
                             manual_image_bytes = b""
-                            if self._collection_enabled():
+                            if self._sample_collection_enabled():
                                 try:
                                     manual_image_bytes = self.page.locator(
                                         CONFIG["CAPT_IMG_SELECTOR"]
@@ -890,17 +930,19 @@ class Worker(QThread):
                                 continue
                             else:
                                 # 正确，退出循环
-                                if (
-                                    self._collection_enabled()
-                                    and manual_image_bytes
-                                    and re.fullmatch(r"[0-9]{4}", manual_code or "")
-                                ):
-                                    self._pending_captcha_sample = {
-                                        "model_version": "human-manual",
-                                        "assisted": True,
-                                        "image_bytes": manual_image_bytes,
-                                        "answer": {"value": manual_code},
-                                    }
+                                self._set_pending_captcha_attempt(
+                                    model_version="human-manual",
+                                    assisted=True,
+                                    image_bytes=manual_image_bytes,
+                                    answer=(
+                                        {"value": manual_code}
+                                        if re.fullmatch(
+                                            r"[0-9]{4}",
+                                            manual_code or "",
+                                        )
+                                        else None
+                                    ),
+                                )
                                 self.log.emit("✅ 验证码验证成功")
                                 break
                             self.page.wait_for_selector(
@@ -1005,20 +1047,19 @@ class Worker(QThread):
                                     continue
 
                                 # 3. 正常验证码成功，跳出循环
-                                if (
-                                    self._collection_enabled()
-                                    and captcha_image_bytes
-                                    and re.fullmatch(
-                                        r"[0-9]{4}",
-                                        captcha_code or "",
-                                    )
-                                ):
-                                    self._pending_captcha_sample = {
-                                        "model_version": captcha_model_version,
-                                        "assisted": False,
-                                        "image_bytes": captcha_image_bytes,
-                                        "answer": {"value": captcha_code},
-                                    }
+                                self._set_pending_captcha_attempt(
+                                    model_version=captcha_model_version,
+                                    assisted=False,
+                                    image_bytes=captcha_image_bytes,
+                                    answer=(
+                                        {"value": captcha_code}
+                                        if re.fullmatch(
+                                            r"[0-9]{4}",
+                                            captcha_code or "",
+                                        )
+                                        else None
+                                    ),
+                                )
                                 self.log.emit("✅ 验证码验证成功")
                                 break
 
@@ -1030,7 +1071,7 @@ class Worker(QThread):
                                         self.log.emit(f"⚠️ 自动识别重试耗尽，切换为【人工输入验证码】")
                                         self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).fill("",timeout=2000)
                                         manual_image_bytes = b""
-                                        if self._collection_enabled():
+                                        if self._sample_collection_enabled():
                                             try:
                                                 manual_image_bytes = self.page.locator(
                                                     CONFIG["CAPT_IMG_SELECTOR"]
@@ -1099,20 +1140,19 @@ class Worker(QThread):
                                             continue
                                         else:
                                             # 验证码正确，退出循环，继续流程
-                                            if (
-                                                self._collection_enabled()
-                                                and manual_image_bytes
-                                                and re.fullmatch(
-                                                    r"[0-9]{4}",
-                                                    manual_code or "",
-                                                )
-                                            ):
-                                                self._pending_captcha_sample = {
-                                                    "model_version": "human-fallback",
-                                                    "assisted": True,
-                                                    "image_bytes": manual_image_bytes,
-                                                    "answer": {"value": manual_code},
-                                                }
+                                            self._set_pending_captcha_attempt(
+                                                model_version="human-fallback",
+                                                assisted=True,
+                                                image_bytes=manual_image_bytes,
+                                                answer=(
+                                                    {"value": manual_code}
+                                                    if re.fullmatch(
+                                                        r"[0-9]{4}",
+                                                        manual_code or "",
+                                                    )
+                                                    else None
+                                                ),
+                                            )
                                             self.log.emit("✅ 验证码验证成功")
                                             break
 
@@ -1352,6 +1392,7 @@ class BusinessBackfillWorker(QThread):
         manual_at_captcha,
         captcha_model_manager=None,
         captcha_collection_enabled=None,
+        captcha_sample_collection_enabled=None,
     ):
         super().__init__()
         self.original_file = original_file
@@ -1362,6 +1403,9 @@ class BusinessBackfillWorker(QThread):
         self.manual_at_captcha = manual_at_captcha
         self.captcha_model_manager = captcha_model_manager
         self.captcha_collection_enabled = captcha_collection_enabled
+        self.captcha_sample_collection_enabled = (
+            captcha_sample_collection_enabled
+        )
         self._pending_captcha_sample = None
         self._running = True
         self._paused = False
@@ -1372,6 +1416,17 @@ class BusinessBackfillWorker(QThread):
 
     def _collection_enabled(self):
         callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _sample_collection_enabled(self):
+        callback = self.captcha_sample_collection_enabled
+        if callback is None:
+            callback = self.captcha_collection_enabled
         if not callable(callback):
             return False
         try:
@@ -1407,9 +1462,7 @@ class BusinessBackfillWorker(QThread):
             "assisted": bool(assisted),
             "occurred_at": datetime.now().astimezone().isoformat(),
         }
-        if success:
-            if not image_bytes or not isinstance(answer, dict):
-                return
+        if success and image_bytes and isinstance(answer, dict):
             event.update(
                 {
                     "image_bytes": bytes(image_bytes),
@@ -1639,7 +1692,7 @@ class BusinessBackfillWorker(QThread):
         return False
 
     def _prepare_manual_click_capture(self):
-        if not self._collection_enabled():
+        if not self._sample_collection_enabled():
             return None
         try:
             prompt_text = self.page.locator(".verify-msg").first.inner_text().strip()
@@ -1714,21 +1767,30 @@ class BusinessBackfillWorker(QThread):
         model_version,
         assisted,
     ):
-        if not self._collection_enabled() or not capture:
+        if not self._collection_enabled():
+            return
+        pending = {
+            "model_version": model_version,
+            "assisted": assisted,
+        }
+        if not self._sample_collection_enabled() or not capture:
+            self._pending_captcha_sample = pending
             return
         prompt = list(capture.get("prompt") or [])
         points = list(points or [])
         if not prompt or len(prompt) != len(points):
+            self._pending_captcha_sample = pending
             return
-        self._pending_captcha_sample = {
-            "model_version": model_version,
-            "assisted": assisted,
-            "image_bytes": capture.get("image_bytes"),
-            "answer": {
-                "prompt": prompt,
-                "points": points,
-            },
-        }
+        pending.update(
+            {
+                "image_bytes": capture.get("image_bytes"),
+                "answer": {
+                    "prompt": prompt,
+                    "points": points,
+                },
+            }
+        )
+        self._pending_captcha_sample = pending
 
     def _complete_manual_click_captcha(self, model_version):
         while self._running:

@@ -120,7 +120,12 @@ class _FakeApi:
 
     @staticmethod
     def captcha_policy(_token):
-        return {"upload_enabled": False, "revision": 1, "active_models": {}}
+        return {
+            "upload_mode": "off",
+            "upload_enabled": False,
+            "revision": 1,
+            "active_models": {},
+        }
 
     def submit_captcha_attempt(self, _token, payload):
         self.attempts.append(payload)
@@ -135,7 +140,7 @@ class _FakeApi:
         return {}
 
     @staticmethod
-    def admin_update_captcha_policy(_token, _enabled):
+    def admin_update_captcha_policy(_token, _mode):
         return {}
 
     @staticmethod
@@ -217,11 +222,12 @@ class CaptchaLearningTests(unittest.TestCase):
         with self.assertRaises(CaptchaTrainingError):
             train_candidate(_dataset_archive(numeric_count=5, click_count=0), "numeric")
 
-    def test_service_uploads_only_when_policy_allows_and_omits_failed_images(self):
+    def test_service_honors_all_upload_modes(self):
         session = _FakeSession()
         service = CaptchaLearningService(session)
         service._stopped = False
         service.policy = {
+            "upload_mode": "samples_and_metrics",
             "upload_enabled": True,
             "revision": 1,
             "active_models": {},
@@ -260,7 +266,34 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertNotIn("image_base64", session.api.attempts[1])
         self.assertNotIn("answer", session.api.attempts[1])
 
-        service.policy["upload_enabled"] = False
+        service.policy["upload_mode"] = "metrics_only"
+        self.assertTrue(
+            service.record_attempt(
+                {
+                    "captcha_type": "numeric",
+                    "source": "transport_numeric",
+                    "model_version": "ddddocr-builtin",
+                    "success": True,
+                    "assisted": False,
+                    "image_bytes": image,
+                    "answer": {"value": "1234"},
+                }
+            )
+        )
+        self.assertNotIn("image_base64", session.api.attempts[2])
+        self.assertNotIn("answer", session.api.attempts[2])
+        self.assertEqual(
+            set(session.api.attempts[2]),
+            {
+                "captcha_type",
+                "model_version",
+                "success",
+                "assisted",
+                "occurred_at",
+            },
+        )
+
+        service.policy["upload_mode"] = "off"
         self.assertFalse(
             service.record_attempt(
                 {
@@ -270,7 +303,7 @@ class CaptchaLearningTests(unittest.TestCase):
                 }
             )
         )
-        self.assertEqual(len(session.api.attempts), 2)
+        self.assertEqual(len(session.api.attempts), 3)
 
     def test_model_cache_is_checksum_verified_before_install(self):
         candidate = train_candidate(self.archive, "numeric")
@@ -321,6 +354,7 @@ class CaptchaLearningTests(unittest.TestCase):
             service = CaptchaLearningService(_FakeSession())
             service._stopped = False
             service.policy = {
+                "upload_mode": "off",
                 "upload_enabled": False,
                 "revision": 2,
                 "active_models": {},
@@ -391,6 +425,56 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(click_events[0]["captcha_type"], "click")
         self.assertEqual(len(click_events[0]["answer"]["points"]), 2)
 
+    def test_workers_emit_success_metrics_without_sample_data(self):
+        numeric_worker = Worker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            2,
+            False,
+            captcha_collection_enabled=lambda: True,
+            captcha_sample_collection_enabled=lambda: False,
+        )
+        numeric_events = []
+        numeric_worker.captcha_attempt_signal.connect(numeric_events.append)
+        numeric_worker._set_pending_captcha_attempt(
+            model_version="ddddocr-builtin",
+            assisted=False,
+            image_bytes=_numeric_image("1234"),
+            answer={"value": "1234"},
+        )
+        numeric_worker._commit_pending_captcha_sample()
+        self.assertTrue(numeric_events[0]["success"])
+        self.assertNotIn("image_bytes", numeric_events[0])
+        self.assertNotIn("answer", numeric_events[0])
+
+        click_worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            True,
+            2,
+            False,
+            captcha_collection_enabled=lambda: True,
+            captcha_sample_collection_enabled=lambda: False,
+        )
+        click_events = []
+        click_worker.captcha_attempt_signal.connect(click_events.append)
+        click_worker._set_pending_click_sample(
+            {
+                "image_bytes": _click_image(),
+                "prompt": ["甲", "乙"],
+            },
+            [{"x": 0.25, "y": 0.5}, {"x": 0.75, "y": 0.5}],
+            model_version="ddddocr-builtin",
+            assisted=False,
+        )
+        click_worker._commit_pending_captcha_sample()
+        self.assertTrue(click_events[0]["success"])
+        self.assertNotIn("image_bytes", click_events[0])
+        self.assertNotIn("answer", click_events[0])
+
     def test_numeric_custom_model_failure_is_counted_before_builtin_fallback(self):
         class Locator:
             @staticmethod
@@ -446,6 +530,7 @@ class CaptchaLearningTests(unittest.TestCase):
         page._overview_loaded(
             {
                 "policy": {
+                    "upload_mode": "samples_and_metrics",
                     "upload_enabled": True,
                     "revision": 4,
                     "updated_at": "2026-07-30T10:00:00+08:00",
@@ -464,7 +549,10 @@ class CaptchaLearningTests(unittest.TestCase):
             },
             None,
         )
-        self.assertTrue(page.upload_toggle.isChecked())
+        self.assertEqual(
+            page.upload_mode_combo.currentData(),
+            "samples_and_metrics",
+        )
         self.assertEqual(page.total_count_value.text(), "12")
         self.assertIn("2.0 KB", page.total_size_value.text())
         page.deleteLater()

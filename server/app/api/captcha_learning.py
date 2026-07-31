@@ -46,6 +46,14 @@ MAX_MANIFEST_BYTES = 10 * 1024 * 1024
 MAX_MODEL_BYTES = 20 * 1024 * 1024
 DATASET_SCHEMA_VERSION = 1
 CAPTCHA_TYPES = {"numeric", "click"}
+UPLOAD_MODE_OFF = "off"
+UPLOAD_MODE_METRICS_ONLY = "metrics_only"
+UPLOAD_MODE_SAMPLES_AND_METRICS = "samples_and_metrics"
+UPLOAD_MODES = {
+    UPLOAD_MODE_OFF,
+    UPLOAD_MODE_METRICS_ONLY,
+    UPLOAD_MODE_SAMPLES_AND_METRICS,
+}
 CAPTCHA_SOURCE_BY_TYPE = {
     "numeric": "transport_numeric",
     "click": "business_click",
@@ -55,10 +63,20 @@ CAPTCHA_SOURCE_BY_TYPE = {
 def _policy(db: Db) -> CaptchaLearningPolicy:
     row = db.get(CaptchaLearningPolicy, 1)
     if row is None:
-        row = CaptchaLearningPolicy(id=1, upload_enabled=False, revision=1)
+        row = CaptchaLearningPolicy(
+            id=1,
+            upload_mode=UPLOAD_MODE_OFF,
+            upload_enabled=False,
+            revision=1,
+        )
         db.add(row)
         db.flush()
     return row
+
+
+def _policy_mode(row: CaptchaLearningPolicy) -> str:
+    mode = str(row.upload_mode or "")
+    return mode if mode in UPLOAD_MODES else UPLOAD_MODE_OFF
 
 
 def _model_view(model: CaptchaModel) -> dict[str, Any]:
@@ -88,8 +106,10 @@ def _active_models(db: Db) -> dict[str, dict[str, Any]]:
 
 
 def _policy_view(db: Db, row: CaptchaLearningPolicy) -> dict[str, Any]:
+    mode = _policy_mode(row)
     return {
-        "upload_enabled": row.upload_enabled,
+        "upload_mode": mode,
+        "upload_enabled": mode == UPLOAD_MODE_SAMPLES_AND_METRICS,
         "revision": row.revision,
         "updated_at": row.updated_at,
         "active_models": _active_models(db),
@@ -271,7 +291,8 @@ def record_captcha_attempt(
 ) -> dict[str, Any]:
     del context
     policy = _policy(db)
-    if not policy.upload_enabled:
+    mode = _policy_mode(policy)
+    if mode == UPLOAD_MODE_OFF:
         db.commit()
         return {
             "stored": False,
@@ -282,7 +303,7 @@ def record_captcha_attempt(
 
     attempt = CaptchaAttempt(
         captcha_type=payload.captcha_type,
-        source=payload.source,
+        source=CAPTCHA_SOURCE_BY_TYPE[payload.captcha_type],
         model_version=payload.model_version.strip(),
         success=payload.success,
         assisted=payload.assisted,
@@ -293,7 +314,11 @@ def record_captcha_attempt(
 
     sample_id = None
     sample_stored = False
-    if payload.success:
+    if (
+        mode == UPLOAD_MODE_SAMPLES_AND_METRICS
+        and payload.success
+        and payload.image_base64 is not None
+    ):
         image = _decode_base64(
             str(payload.image_base64),
             label="验证码图片",
@@ -319,7 +344,7 @@ def record_captcha_attempt(
             sample = CaptchaSample(
                 attempt_id=attempt.id,
                 captcha_type=payload.captcha_type,
-                source=payload.source,
+                source=CAPTCHA_SOURCE_BY_TYPE[payload.captcha_type],
                 sample_fingerprint=fingerprint,
                 image_mime=detected_mime,
                 image_size=len(image),
@@ -487,8 +512,12 @@ def update_learning_policy(
     db: Db,
 ) -> dict[str, Any]:
     policy = _policy(db)
-    if policy.upload_enabled != payload.upload_enabled:
-        policy.upload_enabled = payload.upload_enabled
+    upload_mode = payload.resolved_upload_mode()
+    if _policy_mode(policy) != upload_mode:
+        policy.upload_mode = upload_mode
+        policy.upload_enabled = (
+            upload_mode == UPLOAD_MODE_SAMPLES_AND_METRICS
+        )
         policy.revision += 1
         policy.updated_by_id = context.account.id
         policy.updated_at = utcnow()
@@ -499,7 +528,7 @@ def update_learning_policy(
             action="captcha.policy.update",
             target_type="captcha_learning_policy",
             target_id="1",
-            details={"upload_enabled": payload.upload_enabled},
+            details={"upload_mode": upload_mode},
         )
     db.commit()
     return _policy_view(db, policy)

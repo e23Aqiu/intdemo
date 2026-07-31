@@ -236,6 +236,7 @@ class WorkflowPage(QWidget):
         captcha_reporter=None,
         captcha_model_manager=None,
         captcha_collection_enabled=None,
+        captcha_sample_collection_enabled=None,
     ):
         super().__init__(parent)
         self._stats_recorder = stats_recorder
@@ -246,6 +247,9 @@ class WorkflowPage(QWidget):
         self.captcha_reporter = captcha_reporter
         self.captcha_model_manager = captcha_model_manager
         self.captcha_collection_enabled = captcha_collection_enabled
+        self.captcha_sample_collection_enabled = (
+            captcha_sample_collection_enabled
+        )
         self.file_path = ""
         self.df = pd.DataFrame()
         self.model = DataFrameTableModel(self.df, self)
@@ -1285,6 +1289,9 @@ class WorkflowPage(QWidget):
             self.only_yellow.isChecked(),
             captcha_model_manager=self.captcha_model_manager,
             captcha_collection_enabled=self.captcha_collection_enabled,
+            captcha_sample_collection_enabled=(
+                self.captcha_sample_collection_enabled
+            ),
         )
         self.current_worker = worker
         worker.log.connect(self._log)
@@ -1333,6 +1340,9 @@ class WorkflowPage(QWidget):
             self.manual_captcha.isChecked() if not auto_mode else False,
             captcha_model_manager=self.captcha_model_manager,
             captcha_collection_enabled=self.captcha_collection_enabled,
+            captcha_sample_collection_enabled=(
+                self.captcha_sample_collection_enabled
+            ),
         )
         self.current_worker = worker
         worker.log.connect(self._log)

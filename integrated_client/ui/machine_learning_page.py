@@ -8,7 +8,7 @@ from pathlib import Path
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QAbstractItemView,
-    QCheckBox,
+    QComboBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -31,6 +31,12 @@ from .announcement_page import start_api_task
 from .frameless import FramelessMessageBox as QMessageBox
 
 MAX_IMPORT_BYTES = 100 * 1024 * 1024
+UPLOAD_MODES = (
+    ("关闭", "off"),
+    ("仅统计", "metrics_only"),
+    ("采集样本并统计", "samples_and_metrics"),
+)
+UPLOAD_MODE_LABELS = dict((mode, label) for label, mode in UPLOAD_MODES)
 
 
 def _format_size(size):
@@ -60,6 +66,7 @@ class MachineLearningPage(QWidget):
         self._refresh_task = None
         self._shutting_down = False
         self._loading_policy = False
+        self._confirmed_upload_mode = "off"
         self._model_rows = []
         self._build_ui()
 
@@ -96,7 +103,7 @@ class MachineLearningPage(QWidget):
         policy_layout = QHBoxLayout(policy_card)
         policy_layout.setContentsMargins(18, 14, 18, 14)
         policy_text = QVBoxLayout()
-        policy_title = QLabel("客户端样本上传")
+        policy_title = QLabel("客户端数据上报策略")
         policy_title.setObjectName("SectionTitle")
         self.policy_detail = QLabel("默认关闭；正在读取服务器策略")
         self.policy_detail.setObjectName("Muted")
@@ -104,9 +111,14 @@ class MachineLearningPage(QWidget):
         policy_text.addWidget(policy_title)
         policy_text.addWidget(self.policy_detail)
         policy_layout.addLayout(policy_text, 1)
-        self.upload_toggle = QCheckBox("允许用户客户端上传")
-        self.upload_toggle.toggled.connect(self._toggle_policy)
-        policy_layout.addWidget(self.upload_toggle)
+        self.upload_mode_combo = QComboBox()
+        for label, mode in UPLOAD_MODES:
+            self.upload_mode_combo.addItem(label, mode)
+        self.upload_mode_combo.setMinimumWidth(180)
+        self.upload_mode_combo.currentIndexChanged.connect(
+            self._change_policy
+        )
+        policy_layout.addWidget(self.upload_mode_combo)
         root.addWidget(policy_card)
 
         stats_layout = QGridLayout()
@@ -295,10 +307,24 @@ class MachineLearningPage(QWidget):
         models = overview.get("models") or []
         attempts = overview.get("attempts") or []
 
+        upload_mode = str(policy.get("upload_mode") or "")
+        if upload_mode not in UPLOAD_MODE_LABELS:
+            upload_mode = (
+                "samples_and_metrics"
+                if policy.get("upload_enabled")
+                else "off"
+            )
+        self._confirmed_upload_mode = upload_mode
         self._loading_policy = True
-        self.upload_toggle.setChecked(bool(policy.get("upload_enabled")))
+        self.upload_mode_combo.setCurrentIndex(
+            max(0, self.upload_mode_combo.findData(upload_mode))
+        )
         self._loading_policy = False
-        state = "已允许上传" if policy.get("upload_enabled") else "已禁止上传"
+        state = {
+            "off": "已关闭：不上传任何验证码数据",
+            "metrics_only": "仅统计：不上传图片和答案",
+            "samples_and_metrics": "采集样本并统计：成功时上传图片和答案",
+        }[upload_mode]
         self.policy_detail.setText(
             f"{state} · 策略修订 {int(policy.get('revision') or 0)} · "
             f"更新时间 {_display_time(policy.get('updated_at'))}"
@@ -391,28 +417,40 @@ class MachineLearningPage(QWidget):
                     item.setTextAlignment(Qt.AlignCenter)
                 self.model_table.setItem(row, column, item)
 
-    def _toggle_policy(self, enabled):
+    def _change_policy(self, _index):
         if self._loading_policy:
             return
-        self.upload_toggle.setEnabled(False)
+        upload_mode = str(self.upload_mode_combo.currentData() or "off")
+        self.upload_mode_combo.setEnabled(False)
 
         def update():
             token = self.session_manager.access_token()
             return self.session_manager.api.admin_update_captcha_policy(
                 token,
-                enabled,
+                upload_mode,
             )
 
         self._start(update, self._policy_updated)
 
     def _policy_updated(self, result, error):
-        self.upload_toggle.setEnabled(True)
+        self.upload_mode_combo.setEnabled(True)
         if error is not None:
             self._loading_policy = True
-            self.upload_toggle.setChecked(not self.upload_toggle.isChecked())
+            self.upload_mode_combo.setCurrentIndex(
+                max(
+                    0,
+                    self.upload_mode_combo.findData(
+                        self._confirmed_upload_mode
+                    ),
+                )
+            )
             self._loading_policy = False
             QMessageBox.warning(self, "策略更新失败", str(error))
             return
+        result = result or {}
+        upload_mode = str(result.get("upload_mode") or "")
+        if upload_mode in UPLOAD_MODE_LABELS:
+            self._confirmed_upload_mode = upload_mode
         if self.learning_service is not None:
             self.learning_service.refresh_policy()
         self.refresh()

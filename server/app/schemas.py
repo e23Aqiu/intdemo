@@ -316,7 +316,13 @@ class CaptchaModelView(StrictModel):
     activated_at: datetime | None
 
 
+CaptchaUploadMode = Literal["off", "metrics_only", "samples_and_metrics"]
+
+
 class CaptchaLearningPolicyView(StrictModel):
+    upload_mode: CaptchaUploadMode
+    # Compatibility for pre-three-mode clients. Metrics-only is exposed as
+    # false so an older client never uploads images under that policy.
     upload_enabled: bool
     revision: int
     updated_at: datetime
@@ -324,12 +330,26 @@ class CaptchaLearningPolicyView(StrictModel):
 
 
 class CaptchaLearningPolicyUpdate(StrictModel):
-    upload_enabled: bool
+    upload_mode: CaptchaUploadMode | None = None
+    upload_enabled: bool | None = None
+
+    @model_validator(mode="after")
+    def validate_policy_update(self) -> CaptchaLearningPolicyUpdate:
+        if self.upload_mode is None and self.upload_enabled is None:
+            raise ValueError("必须提供上传策略")
+        if self.upload_mode is not None and self.upload_enabled is not None:
+            raise ValueError("上传策略不能同时使用新旧字段")
+        return self
+
+    def resolved_upload_mode(self) -> CaptchaUploadMode:
+        if self.upload_mode is not None:
+            return self.upload_mode
+        return "samples_and_metrics" if self.upload_enabled else "off"
 
 
 class CaptchaAttemptCreate(StrictModel):
     captcha_type: Literal["numeric", "click"]
-    source: Literal["transport_numeric", "business_click"]
+    source: Literal["transport_numeric", "business_click"] | None = None
     model_version: str = Field(min_length=1, max_length=80)
     success: bool
     assisted: bool = False
@@ -347,18 +367,19 @@ class CaptchaAttemptCreate(StrictModel):
         return value
 
     @model_validator(mode="after")
-    def enforce_success_sample(self) -> CaptchaAttemptCreate:
+    def validate_attempt_sample(self) -> CaptchaAttemptCreate:
         if self.occurred_at.tzinfo is None:
             raise ValueError("验证码尝试时间必须包含时区")
         expected_source = {
             "numeric": "transport_numeric",
             "click": "business_click",
         }[self.captcha_type]
-        if self.source != expected_source:
+        if self.source is not None and self.source != expected_source:
             raise ValueError("验证码类型与来源不匹配")
         sample_fields = (self.image_mime, self.image_base64, self.answer)
-        if self.success and any(value is None for value in sample_fields):
-            raise ValueError("成功尝试必须包含验证码图片和答案")
+        supplied_count = sum(value is not None for value in sample_fields)
+        if supplied_count not in {0, len(sample_fields)}:
+            raise ValueError("验证码图片、图片类型和答案必须同时提供")
         if not self.success and any(value is not None for value in sample_fields):
             raise ValueError("失败尝试不能包含验证码图片或答案")
         return self

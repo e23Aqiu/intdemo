@@ -222,13 +222,13 @@ class ApiClient:
     def admin_update_captcha_policy(
         self,
         access_token: str,
-        upload_enabled: bool,
+        upload_mode: str,
     ) -> dict:
         return self._request(
             "PATCH",
             "/admin/ml/policy",
             token=access_token,
-            json_body={"upload_enabled": bool(upload_enabled)},
+            json_body={"upload_mode": str(upload_mode)},
         )
 
     def admin_export_captcha_dataset(

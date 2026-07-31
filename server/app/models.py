@@ -347,6 +347,9 @@ class CaptchaLearningPolicy(Base):
     __tablename__ = "captcha_learning_policy"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    upload_mode: Mapped[str] = mapped_column(String(32), default="off")
+    # Kept for older clients and safe rollback. It is true only when sample
+    # collection is enabled; metrics-only therefore remains private by default.
     upload_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     revision: Mapped[int] = mapped_column(Integer, default=1)
     updated_by_id: Mapped[uuid.UUID | None] = mapped_column(

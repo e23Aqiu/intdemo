@@ -32,6 +32,7 @@ def bootstrap_database(db: Session) -> None:
         db.add(
             CaptchaLearningPolicy(
                 id=1,
+                upload_mode="off",
                 upload_enabled=False,
                 revision=1,
             )

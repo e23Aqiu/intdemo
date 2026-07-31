@@ -192,7 +192,12 @@ class MainWindow(FramelessMainWindow):
                 else None
             ),
             captcha_collection_enabled=(
-                self.captcha_learning_service.collection_enabled
+                self.captcha_learning_service.reporting_enabled
+                if self.captcha_learning_service is not None
+                else None
+            ),
+            captcha_sample_collection_enabled=(
+                self.captcha_learning_service.sample_collection_enabled
                 if self.captcha_learning_service is not None
                 else None
             ),
