@@ -1,5 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
+from integrated_client.config import APP_NAME
 
 datas = []
 binaries = []
@@ -13,6 +14,16 @@ datas += [
     ('integrated_client/ui/assets/nav-workflow.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-accounts.svg', 'integrated_client/ui/assets'),
     ('integrated_client/ui/assets/nav-user.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/announcement.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/nav-announcement.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/nav-ml.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-align-left.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-align-center.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-align-right.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/toolbar-bullets.svg', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/app-icon.png', 'integrated_client/ui/assets'),
+    ('integrated_client/ui/assets/app-icon.ico', 'integrated_client/ui/assets'),
+    ('integrated_client/online/client-online.json', 'integrated_client/online'),
 ]
 hiddenimports = [
     'PyQt5', 'PyQt5.sip',
@@ -20,6 +31,7 @@ hiddenimports = [
     'DrissionPage', 'DataRecorder', 'DownloadKit', 'DrissionGet', 'DrissionRecord',
     'playwright', 'playwright.sync_api',
     'ddddocr', 'onnxruntime', 'cv2', 'PIL', 'pinyin',
+    'cryptography', 'cryptography.hazmat.bindings._rust',
 ]
 
 for package in ('ddddocr', 'DrissionPage', 'DataRecorder', 'DownloadKit', 'playwright'):
@@ -46,10 +58,9 @@ pyz = PYZ(a.pure)
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.datas,
     [],
-    name='运输业务一体化客户端',
+    exclude_binaries=True,
+    name=APP_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -60,4 +71,16 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    version='installer/version_info.txt',
+    icon='integrated_client/ui/assets/app-icon.ico',
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.datas,
+    strip=False,
+    upx=True,
+    upx_exclude=[],
+    name=APP_NAME,
 )

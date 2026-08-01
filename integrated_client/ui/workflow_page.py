@@ -1,18 +1,21 @@
 import os
+import re
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 import openpyxl
 import pandas as pd
 from PyQt5.QtCore import (
     QAbstractTableModel,
     QModelIndex,
+    QUrl,
     Qt,
     QThread,
     QTimer,
     pyqtSignal,
 )
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QDesktopServices
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -23,6 +26,7 @@ from PyQt5.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QProgressBar,
@@ -34,18 +38,8 @@ from PyQt5.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
-    QInputDialog,
 )
 
-from ..tools.aiqicha_tool import (
-    ADDR_COL_NAME,
-    COMPANY_COL_NAME,
-    LEGAL_COL_NAME,
-    PHONE_COL_NAME,
-    QueryWorker,
-    TARGET_COLUMNS,
-    has_meaningful_value,
-)
 from ..browser import check_builtin_chromium, get_builtin_chromium_path
 from ..database import (
     WORKFLOW_EMPTY_METRIC,
@@ -57,12 +51,30 @@ from ..database import (
     WORKFLOW_TOTAL_METRIC,
     split_violation_reasons,
 )
+from ..tencent_docs import (
+    TencentDocsImportResult,
+    TencentDocsImportWorker,
+    validate_tencent_docs_url,
+)
+from ..tools.aiqicha_tool import (
+    ADDR_COL_NAME,
+    COMPANY_COL_NAME,
+    LEGAL_COL_NAME,
+    PHONE_COL_NAME,
+    TARGET_COLUMNS,
+    QueryWorker,
+    has_meaningful_value,
+)
 from ..tools.transport_tool import (
     BusinessBackfillWorker,
     Worker,
     is_excel_file_open,
 )
 from .frameless import FramelessMessageBox as QMessageBox
+from .tencent_docs_dialog import (
+    TencentDocsLinkDialog,
+    TencentDocsProgressDialog,
+)
 
 
 class DataFrameTableModel(QAbstractTableModel):
@@ -157,6 +169,7 @@ class CollapsiblePanel(QFrame):
         layout.setSpacing(8)
 
         header = QHBoxLayout()
+        self.header_layout = header
         heading = QLabel(title)
         heading.setStyleSheet("font-size:14px;font-weight:700;color:#264b4c;")
         self.toggle_button = QPushButton("▾ 收起")
@@ -169,6 +182,13 @@ class CollapsiblePanel(QFrame):
 
         self.content = content
         layout.addWidget(content, 1)
+
+    def add_header_widget(self, widget):
+        """在收起按钮左侧添加仅属于当前面板的操作按钮。"""
+        self.header_layout.insertWidget(
+            self.header_layout.indexOf(self.toggle_button),
+            widget,
+        )
 
     def is_expanded(self):
         return self._expanded
@@ -204,10 +224,32 @@ class WorkflowPage(QWidget):
         "正在检测内置浏览器 ···",
     )
 
-    def __init__(self, stats_recorder=None, timing_service=None, parent=None):
+    def __init__(
+        self,
+        stats_recorder=None,
+        timing_service=None,
+        parent=None,
+        *,
+        client_preferences=None,
+        account_key="",
+        untracked_mode=False,
+        captcha_reporter=None,
+        captcha_model_manager=None,
+        captcha_collection_enabled=None,
+        captcha_sample_collection_enabled=None,
+    ):
         super().__init__(parent)
         self._stats_recorder = stats_recorder
         self._timing_service = timing_service
+        self._untracked_mode = bool(untracked_mode)
+        self.client_preferences = client_preferences
+        self.account_key = str(account_key or "").strip().lower()
+        self.captcha_reporter = captcha_reporter
+        self.captcha_model_manager = captcha_model_manager
+        self.captcha_collection_enabled = captcha_collection_enabled
+        self.captcha_sample_collection_enabled = (
+            captcha_sample_collection_enabled
+        )
         self.file_path = ""
         self.df = pd.DataFrame()
         self.model = DataFrameTableModel(self.df, self)
@@ -226,8 +268,12 @@ class WorkflowPage(QWidget):
         self._browser_start_dialog = None
         self._timing_finished_steps = set()
         self.last_force_shutdown_error = ""
+        self.tencent_import_worker = None
+        self.tencent_import_dialog = None
 
         self._build_ui()
+        self._restore_run_settings()
+        self._connect_run_settings_persistence()
         self._sync_mode_controls()
 
         self.preview_timer = QTimer(self)
@@ -284,11 +330,16 @@ class WorkflowPage(QWidget):
         self.file_edit.setPlaceholderText("请选择 .xlsx 业务表格")
         choose_btn = QPushButton("选择表格")
         choose_btn.clicked.connect(self._choose_file)
+        tencent_docs_btn = QPushButton("导入腾讯文档")
+        tencent_docs_btn.clicked.connect(self._prompt_tencent_docs_import)
         reload_btn = QPushButton("刷新预览")
         reload_btn.clicked.connect(lambda: self._reload_preview(force=True))
         self.choose_btn = choose_btn
+        self.tencent_docs_btn = tencent_docs_btn
+        self.reload_btn = reload_btn
         file_layout.addWidget(self.file_edit, 1)
         file_layout.addWidget(choose_btn)
+        file_layout.addWidget(tencent_docs_btn)
         file_layout.addWidget(reload_btn)
         workflow_root.addWidget(file_group)
 
@@ -487,6 +538,16 @@ class WorkflowPage(QWidget):
             "数据预览（随处理结果实时刷新）",
             self.table,
         )
+        self.open_workbook_btn = QPushButton("打开表格")
+        self.open_workbook_btn.setEnabled(False)
+        self.open_workbook_btn.clicked.connect(self._open_current_workbook)
+        self.open_workbook_folder_btn = QPushButton("打开表格所在文件夹")
+        self.open_workbook_folder_btn.setEnabled(False)
+        self.open_workbook_folder_btn.clicked.connect(
+            self._open_current_workbook_folder
+        )
+        self.preview_panel.add_header_widget(self.open_workbook_btn)
+        self.preview_panel.add_header_widget(self.open_workbook_folder_btn)
         self.preview_toggle_btn = self.preview_panel.toggle_button
         self.preview_panel.expanded_changed.connect(self._rebalance_content_panels)
         splitter.addWidget(self.preview_panel)
@@ -726,6 +787,108 @@ class WorkflowPage(QWidget):
         self.infinite_captcha.setEnabled(retry_enabled)
         self.captcha_retry.setEnabled(retry_enabled and not self.infinite_captcha.isChecked())
 
+    def _run_settings_snapshot(self):
+        return {
+            "auto_mode": bool(self.mode_combo.currentData()),
+            "manual_captcha": self.manual_captcha.isChecked(),
+            "auto_continue": self.auto_continue.isChecked(),
+            "only_yellow": self.only_yellow.isChecked(),
+            "infinite_captcha": self.infinite_captcha.isChecked(),
+            "page_retry": self.page_retry.value(),
+            "captcha_retry": self.captcha_retry.value(),
+        }
+
+    def _restore_run_settings(self):
+        if self.client_preferences is None or not self.account_key:
+            return
+        settings = self.client_preferences.workflow_run_settings(
+            self.account_key
+        )
+        if not settings:
+            return
+        mode_index = self.mode_combo.findData(
+            bool(settings.get("auto_mode", False))
+        )
+        if mode_index >= 0:
+            self.mode_combo.setCurrentIndex(mode_index)
+        self.manual_captcha.setChecked(
+            bool(settings.get("manual_captcha", True))
+        )
+        self.auto_continue.setChecked(
+            bool(settings.get("auto_continue", True))
+        )
+        self.only_yellow.setChecked(
+            bool(settings.get("only_yellow", True))
+        )
+        self.infinite_captcha.setChecked(
+            bool(settings.get("infinite_captcha", False))
+        )
+        self.page_retry.setValue(int(settings.get("page_retry", 5)))
+        self.captcha_retry.setValue(int(settings.get("captcha_retry", 10)))
+
+    def _connect_run_settings_persistence(self):
+        self.mode_combo.currentIndexChanged.connect(self._save_run_settings)
+        for checkbox in (
+            self.manual_captcha,
+            self.auto_continue,
+            self.only_yellow,
+            self.infinite_captcha,
+        ):
+            checkbox.toggled.connect(self._save_run_settings)
+        self.page_retry.valueChanged.connect(self._save_run_settings)
+        self.captcha_retry.valueChanged.connect(self._save_run_settings)
+
+    def _save_run_settings(self, *_args):
+        if self.client_preferences is None or not self.account_key:
+            return
+        try:
+            self.client_preferences.set_workflow_run_settings(
+                self.account_key,
+                self._run_settings_snapshot(),
+            )
+        except (OSError, TypeError, ValueError) as exc:
+            self._log(f"⚠️ 运行设置保存失败：{exc}")
+
+    def _update_workbook_action_buttons(self):
+        path_exists = bool(
+            self.file_path and Path(self.file_path).is_file()
+        )
+        import_running = self.tencent_import_worker is not None
+        enabled = path_exists and not self.pipeline_running and not import_running
+        self.open_workbook_btn.setEnabled(enabled)
+        self.open_workbook_folder_btn.setEnabled(enabled)
+
+    def _open_current_workbook(self):
+        path = Path(self.file_path) if self.file_path else None
+        if path is None or not path.is_file():
+            self._update_workbook_action_buttons()
+            QMessageBox.warning(self, "无法打开表格", "当前业务表格不存在。")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve()))):
+            QMessageBox.warning(
+                self,
+                "无法打开表格",
+                "系统没有可用于打开该 Excel 表格的程序。",
+            )
+
+    def _open_current_workbook_folder(self):
+        path = Path(self.file_path) if self.file_path else None
+        if path is None or not path.is_file():
+            self._update_workbook_action_buttons()
+            QMessageBox.warning(
+                self,
+                "无法打开文件夹",
+                "当前业务表格不存在。",
+            )
+            return
+        folder = path.resolve().parent
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            QMessageBox.warning(
+                self,
+                "无法打开文件夹",
+                f"系统无法打开文件夹：\n{folder}",
+            )
+
     def _choose_file(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "选择业务表格", "", "Excel 工作簿 (*.xlsx)"
@@ -736,6 +899,171 @@ class WorkflowPage(QWidget):
         self.file_edit.setText(path)
         self._last_file_mtime = None
         self._reload_preview(force=True)
+        self._update_workbook_action_buttons()
+
+    def _saved_tencent_document_url(self):
+        if self.client_preferences is None:
+            return ""
+        return self.client_preferences.tencent_document_url(self.account_key)
+
+    def _aiqicha_profile_directory(self):
+        if self.client_preferences is None or not self.account_key:
+            return None
+        account_directory = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "-",
+            self.account_key,
+        ).strip("-.")
+        account_directory = account_directory[:80] or "local"
+        return (
+            self.client_preferences.path.parent
+            / "browser-profiles"
+            / "aiqicha"
+            / account_directory
+        )
+
+    def _prompt_tencent_docs_import(self):
+        if self.pipeline_running or (
+            self.tencent_import_worker is not None
+            and self.tencent_import_worker.isRunning()
+        ):
+            return
+        dialog = TencentDocsLinkDialog(
+            self._saved_tencent_document_url(),
+            self,
+        )
+        if dialog.exec_() != dialog.Accepted:
+            return
+        url = dialog.value()
+        try:
+            url = validate_tencent_docs_url(url)
+            get_builtin_chromium_path()
+            if self.client_preferences is not None:
+                self.client_preferences.set_tencent_document_url(
+                    self.account_key,
+                    url,
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self, "无法导入腾讯文档", str(exc))
+            return
+        self._start_tencent_docs_import(url)
+
+    def _start_tencent_docs_import(self, url):
+        data_directory = (
+            self.client_preferences.path.parent
+            if self.client_preferences is not None
+            else None
+        )
+        worker = TencentDocsImportWorker(
+            url,
+            self.account_key,
+            data_directory=data_directory,
+            parent=self,
+        )
+        dialog = TencentDocsProgressDialog(self)
+        dialog.cancel_requested.connect(worker.stop)
+        worker.status_changed.connect(dialog.set_status)
+        worker.progress_changed.connect(dialog.set_progress)
+        worker.import_succeeded.connect(
+            lambda result, current=worker, progress=dialog:
+            self._tencent_docs_import_succeeded(
+                current,
+                progress,
+                result,
+            )
+        )
+        worker.import_failed.connect(
+            lambda message, current=worker, progress=dialog:
+            self._tencent_docs_import_failed(
+                current,
+                progress,
+                message,
+            )
+        )
+        worker.import_cancelled.connect(
+            lambda current=worker, progress=dialog:
+            self._tencent_docs_import_cancelled(current, progress)
+        )
+        worker.finished.connect(
+            lambda current=worker, progress=dialog:
+            self._tencent_docs_import_finished(current, progress)
+        )
+        self.tencent_import_worker = worker
+        self.tencent_import_dialog = dialog
+        self.choose_btn.setEnabled(False)
+        self.tencent_docs_btn.setEnabled(False)
+        self.reload_btn.setEnabled(False)
+        self._update_workbook_action_buttons()
+        self._log("开始导入腾讯文档；此过程不计入业务处理时间。")
+        dialog.open()
+        worker.start()
+
+    def _tencent_docs_import_succeeded(
+        self,
+        worker,
+        dialog,
+        result,
+    ):
+        if (
+            worker is not self.tencent_import_worker
+            or not isinstance(result, TencentDocsImportResult)
+        ):
+            return
+        dialog.finish()
+        self.file_path = str(result.path)
+        self.file_edit.setText(self.file_path)
+        self._last_file_mtime = None
+        loaded = self._reload_preview(force=True)
+        self._update_workbook_action_buttons()
+        self._log(
+            "腾讯文档导入完成：从原表第 "
+            f"{result.source_start_row} 行开始复制 {result.copied_rows} 行，"
+            f"新表位于 {result.path}"
+        )
+        if loaded:
+            QMessageBox.information(
+                self,
+                "腾讯文档导入完成",
+                f"已按“{result.company_header}”列筛选：\n"
+                f"从原表第 {result.source_start_row} 行开始，"
+                f"复制 {result.copied_rows} 行。\n\n"
+                "新 Excel 已自动导入程序，且本次导入不计入业务时间。\n"
+                f"文件位置：\n{result.path}",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "新表读取失败",
+                "腾讯文档内容已生成 Excel，但程序无法读取该文件：\n"
+                f"{result.path}",
+            )
+
+    def _tencent_docs_import_failed(self, worker, dialog, message):
+        if worker is not self.tencent_import_worker:
+            return
+        dialog.finish()
+        self._log(f"腾讯文档导入失败：{message}")
+        QMessageBox.warning(self, "腾讯文档导入失败", str(message))
+
+    def _tencent_docs_import_cancelled(self, worker, dialog):
+        if worker is not self.tencent_import_worker:
+            return
+        dialog.finish()
+        self._log("已取消腾讯文档导入；未开始业务计时。")
+
+    def _tencent_docs_import_finished(self, worker, dialog):
+        if worker is self.tencent_import_worker:
+            self.tencent_import_worker = None
+        if dialog is self.tencent_import_dialog:
+            self.tencent_import_dialog = None
+        if dialog.isVisible():
+            dialog.finish()
+        dialog.deleteLater()
+        worker.deleteLater()
+        self.choose_btn.setEnabled(not self.pipeline_running)
+        self.tencent_docs_btn.setEnabled(not self.pipeline_running)
+        self.reload_btn.setEnabled(not self.pipeline_running)
+        self._update_workbook_action_buttons()
 
     def _read_dataframe(self):
         return pd.read_excel(
@@ -746,6 +1074,7 @@ class WorkflowPage(QWidget):
 
     def _reload_preview(self, force=False):
         if not self.file_path or not os.path.exists(self.file_path):
+            self._update_workbook_action_buttons()
             return False
         try:
             mtime = os.path.getmtime(self.file_path)
@@ -761,6 +1090,7 @@ class WorkflowPage(QWidget):
         self.df = dataframe
         self.model.set_dataframe(self.df)
         self._last_file_mtime = mtime
+        self._update_workbook_action_buttons()
         if force:
             self.table.resizeColumnsToContents()
             self._log(f"已加载表格：{len(self.df)} 行 × {len(self.df.columns)} 列")
@@ -773,9 +1103,26 @@ class WorkflowPage(QWidget):
     def _captcha_retry_count(self):
         return 9999 if self.infinite_captcha.isChecked() else self.captcha_retry.value()
 
+    def _report_captcha_attempt(self, event):
+        if self._untracked_mode or not callable(self.captcha_reporter):
+            return
+        try:
+            self.captcha_reporter(event)
+        except Exception as exc:
+            self._log(f"⚠️ 验证码学习数据上报失败：{exc}")
+
     def _set_controls_running(self, running):
         self.pipeline_running = running
         self.choose_btn.setEnabled(not running)
+        self.tencent_docs_btn.setEnabled(
+            not running
+            and not (
+                self.tencent_import_worker is not None
+                and self.tencent_import_worker.isRunning()
+            )
+        )
+        self.reload_btn.setEnabled(not running)
+        self._update_workbook_action_buttons()
         self.settings_group.setEnabled(not running)
         self.browser_check_btn.setEnabled(not running and self.browser_check_state != "checking")
         self.start_btn.setEnabled(not running)
@@ -940,6 +1287,11 @@ class WorkflowPage(QWidget):
             self.auto_continue.isChecked(),
             self._captcha_retry_count(),
             self.only_yellow.isChecked(),
+            captcha_model_manager=self.captcha_model_manager,
+            captcha_collection_enabled=self.captcha_collection_enabled,
+            captcha_sample_collection_enabled=(
+                self.captcha_sample_collection_enabled
+            ),
         )
         self.current_worker = worker
         worker.log.connect(self._log)
@@ -948,6 +1300,8 @@ class WorkflowPage(QWidget):
         worker.input_signal.connect(self._transport_manual_input)
         if hasattr(worker, "retry_signal"):
             worker.retry_signal.connect(self._timing_retry)
+        if hasattr(worker, "captcha_attempt_signal"):
+            worker.captcha_attempt_signal.connect(self._report_captcha_attempt)
         worker.finished.connect(lambda result, obj=worker: self._transport_finished(obj, result))
         worker.start()
 
@@ -984,6 +1338,11 @@ class WorkflowPage(QWidget):
             auto_mode,
             self._captcha_retry_count(),
             self.manual_captcha.isChecked() if not auto_mode else False,
+            captcha_model_manager=self.captcha_model_manager,
+            captcha_collection_enabled=self.captcha_collection_enabled,
+            captcha_sample_collection_enabled=(
+                self.captcha_sample_collection_enabled
+            ),
         )
         self.current_worker = worker
         worker.log.connect(self._log)
@@ -992,6 +1351,8 @@ class WorkflowPage(QWidget):
         worker.input_signal.connect(self._business_manual_input)
         if hasattr(worker, "retry_signal"):
             worker.retry_signal.connect(self._timing_retry)
+        if hasattr(worker, "captcha_attempt_signal"):
+            worker.captcha_attempt_signal.connect(self._report_captcha_attempt)
         worker.finished.connect(lambda result, obj=worker: self._backfill_finished(obj, result))
         worker.start()
 
@@ -1037,6 +1398,7 @@ class WorkflowPage(QWidget):
         worker = QueryWorker(
             self.df.copy(),
             COMPANY_COL_NAME,
+            browser_profile_directory=self._aiqicha_profile_directory(),
         )
         self.current_worker = worker
         worker.log_signal.connect(self._log)
@@ -1220,6 +1582,12 @@ class WorkflowPage(QWidget):
     def _record_workflow_stats(self):
         if self._stats_recorded:
             return
+        if self._untracked_mode:
+            self._stats_recorded = True
+            self._log(
+                "游客模式：业务结果已保存，本次不记录统计、计时或待同步数据。"
+            )
+            return
         counts = self.calculate_workflow_counts(self.df)
         details = {
             "file_name": os.path.basename(self.file_path),
@@ -1378,6 +1746,13 @@ class WorkflowPage(QWidget):
 
     def shutdown(self, timeout_ms=8000):
         self.preview_timer.stop()
+        tencent_import_worker = self.tencent_import_worker
+        if tencent_import_worker and tencent_import_worker.isRunning():
+            tencent_import_worker.stop()
+            if not tencent_import_worker.wait(timeout_ms):
+                return False
+        if self.tencent_import_dialog is not None:
+            self.tencent_import_dialog.finish()
         browser_check_worker = self.browser_check_worker
         if browser_check_worker and browser_check_worker.isRunning():
             if not browser_check_worker.wait(timeout_ms):
@@ -1413,6 +1788,7 @@ class WorkflowPage(QWidget):
         threads = []
         for thread in (
             self.browser_check_worker,
+            self.tencent_import_worker,
             self.current_worker,
             *self._retired_workers,
         ):
@@ -1497,6 +1873,11 @@ class WorkflowPage(QWidget):
         self.browser_check_worker = (
             self.browser_check_worker
             if self.browser_check_worker in stubborn_threads
+            else None
+        )
+        self.tencent_import_worker = (
+            self.tencent_import_worker
+            if self.tencent_import_worker in stubborn_threads
             else None
         )
         self.current_worker = (
