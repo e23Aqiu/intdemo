@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
+from integrated_client.config import APP_NAME
 from release_publisher.connection_control import ConnectionControlClient
 from release_publisher.core import (
     CommandStep,
@@ -35,6 +36,31 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleasePublisherCoreTests(unittest.TestCase):
+    def test_current_project_product_name_fields_are_consistent(self):
+        expected_name = "逃费车辆智能查询平台"
+        installer = (REPO_ROOT / "installer" / "intdemo.iss").read_text(
+            encoding="utf-8"
+        )
+        version_info = (REPO_ROOT / "installer" / "version_info.txt").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertEqual(APP_NAME, expected_name)
+        self.assertIn(f'#define MyAppName "{expected_name}"', installer)
+        self.assertIn(f'#define MyAppExeName "{expected_name}.exe"', installer)
+        self.assertIn(
+            f"StringStruct(u'FileDescription', u'{expected_name}')",
+            version_info,
+        )
+        self.assertIn(
+            f"StringStruct(u'OriginalFilename', u'{expected_name}.exe')",
+            version_info,
+        )
+        self.assertIn(
+            f"StringStruct(u'ProductName', u'{expected_name}')",
+            version_info,
+        )
+
     def test_current_project_version_fields_are_consistent(self):
         version = project_version(REPO_ROOT)
 

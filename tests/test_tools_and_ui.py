@@ -38,7 +38,11 @@ from PyQt5.QtWidgets import (
 )
 
 from integrated_client.app_controller import ApplicationController
-from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
+from integrated_client.config import (
+    APP_NAME,
+    DEFAULT_ADMIN_PASSWORD,
+    DEFAULT_ADMIN_USERNAME,
+)
 from integrated_client.database import (
     DEFAULT_STATION_PASSWORD,
     DEFAULT_STATION_USERS,
@@ -1292,6 +1296,10 @@ class ToolAndUiTests(unittest.TestCase):
 
     def test_main_window_contains_integrated_pages(self):
         window = MainWindow(self.db, self.admin)
+        self.assertEqual(
+            window.windowTitle(),
+            f"{APP_NAME} - {self.admin.name_label}",
+        )
         self.assertIs(window._pages["home"], window.dashboard_page)
         self.assertIs(window._pages["statistics"], window.statistics_page)
         self.assertIn("workflow", window._pages)
@@ -1318,8 +1326,12 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIn("workflow", window._nav_buttons)
         self.assertIn("personal", window._nav_buttons)
         self.assertEqual(window.sidebar.width(), 230)
-        self.assertEqual(window.sidebar_brand_badge.text(), "运")
+        self.assertEqual(window.sidebar_brand_badge.text(), "逃")
         self.assertEqual(window.sidebar_brand_badge.objectName(), "BrandBadge")
+        self.assertEqual(
+            window.sidebar.findChild(QLabel, "BrandTitle").text(),
+            "逃费车辆智能\n查询平台",
+        )
         self.assertEqual(window.sidebar_role.text(), "管理员  ·  admin")
         self.assertEqual(window.sidebar_avatar.text(), "系")
 
