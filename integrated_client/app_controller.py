@@ -8,6 +8,7 @@ from .online.session import OnlineSessionManager
 from .online.sync import SyncEngine
 from .online.update import UpdateClient
 from .online.update_coordinator import UpdateCoordinator
+from .platform_support import supports_self_update
 from .preferences import LoginCredentialStore
 from .ui.auth_dialogs import LoginDialog
 from .ui.loading_dialog import run_with_loading
@@ -64,9 +65,10 @@ class ApplicationController(QObject):
             self.sync_coordinator = SyncCoordinator(
                 SyncEngine(self.database, self.session_manager)
             )
-            self.update_coordinator = UpdateCoordinator(
-                UpdateClient(self.session_manager.api.config)
-            )
+            if supports_self_update():
+                self.update_coordinator = UpdateCoordinator(
+                    UpdateClient(self.session_manager.api.config)
+                )
         self.window = MainWindow(
             self.database,
             dialog.account,

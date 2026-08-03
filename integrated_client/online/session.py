@@ -14,10 +14,10 @@ from ..database import AuthenticationError, Database
 from ..models import Account
 from .api import ApiClient, ApiResponseError, NetworkUnavailable
 from .secure import (
-    DpapiProtector,
     PasswordVerifier,
     Protector,
     create_password_verifier,
+    get_default_protector,
     verify_password_verifier,
 )
 
@@ -80,7 +80,9 @@ class OnlineSessionManager:
     ):
         self.database = database
         self.api = api
-        self.protector = protector or DpapiProtector()
+        self.protector = (
+            protector if protector is not None else get_default_protector()
+        )
         self.device_uid = self.database.get_or_create_online_device_uid()
         self.state: SessionState | None = None
         self._bundle: dict | None = None
@@ -159,7 +161,7 @@ class OnlineSessionManager:
                 username,
                 password,
                 self.device_uid,
-                platform.node() or "Windows device",
+                platform.node() or f"{platform.system() or 'Desktop'} device",
                 APP_VERSION,
             )
         except NetworkUnavailable:

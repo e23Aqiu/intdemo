@@ -142,7 +142,7 @@ class DataFrameTableModel(QAbstractTableModel):
 
 
 class BrowserCheckWorker(QThread):
-    """在后台实际启动内置 Chromium，避免健康检查阻塞界面。"""
+    """在后台实际启动兼容 Chromium，避免健康检查阻塞界面。"""
 
     result_ready = pyqtSignal(bool, str, str)
 
@@ -345,7 +345,7 @@ class WorkflowPage(QWidget):
 
         browser_group = QGroupBox("内置浏览器状态")
         browser_layout = QGridLayout(browser_group)
-        self.browser_info = QLabel("内置 Chromium（统一使用）")
+        self.browser_info = QLabel("Chromium（自动适配内置/系统）")
         self.browser_info.setStyleSheet("font-size:14px;font-weight:700;color:#264b4c;")
         self.browser_status_label = QLabel("● 尚未检测")
         self.browser_status_label.setStyleSheet("color:#647c7b;font-weight:600;")
@@ -608,7 +608,7 @@ class WorkflowPage(QWidget):
         self.browser_check_state = "checking"
         self.browser_status_label.setText("● 正在启动检测…")
         self.browser_status_label.setStyleSheet("color:#176f68;font-weight:600;")
-        self.browser_detail_label.setText("正在实际启动内置 Chromium 并访问空白页。")
+        self.browser_detail_label.setText("正在实际启动 Chromium 并访问空白页。")
         self.browser_check_btn.setEnabled(False)
 
         worker = BrowserCheckWorker(self)
@@ -1140,7 +1140,7 @@ class WorkflowPage(QWidget):
         dialog.setWindowTitle("启动前浏览器检测")
         dialog.setText("正在检测内置浏览器")
         dialog.setInformativeText(
-            "正在实际启动内置 Chromium。检测成功后将自动开始业务处理。"
+            "正在实际启动 Chromium。检测成功后将自动开始业务处理。"
         )
         dialog.setIcon(QMessageBox.Information)
         dialog.setStandardButtons(QMessageBox.Ignore | QMessageBox.Cancel)

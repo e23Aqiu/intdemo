@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=逃费车辆智能查询平台
+Comment=逃费车辆查询、回填与数据同步客户端
+Exec=@INSTALL_DIR@/intdemo-client
+Icon=@INSTALL_DIR@/app-icon.png
+Terminal=false
+Categories=Office;Utility;
+StartupNotify=true
+StartupWMClass=IntDemo

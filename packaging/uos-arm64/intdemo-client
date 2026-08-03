@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+package_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+
+# UOS 20 Wayland normally provides XWayland.  Qt 5's XCB plugin and Chromium's
+# X11 path are more reliable on this older desktop stack.  Users can override
+# either value before launching when native Wayland has been verified.
+if [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${DISPLAY:-}" ]]; then
+  export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
+  export INTDEMO_CHROMIUM_OZONE_PLATFORM="${INTDEMO_CHROMIUM_OZONE_PLATFORM:-x11}"
+fi
+export QT_AUTO_SCREEN_SCALE_FACTOR="${QT_AUTO_SCREEN_SCALE_FACTOR:-1}"
+
+exec "$package_root/app/intdemo-client" "$@"

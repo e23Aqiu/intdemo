@@ -1128,3 +1128,20 @@
 - 发布前客户端完整回归 `151/151`、服务端完整回归 `36/36`、客户端 Python
   编译检查、服务端 Ruff、版本字段检查和 `git diff --check` 全部通过。
 - 状态：已完成。
+
+### 步骤 117：增加统信 UOS Desktop 20 ARM64 首轮兼容
+
+- 新增 UOS ARM64 专用 conda 环境、依赖清单、PyInstaller onedir 配置、环境准备、
+  诊断、构建以及用户级安装/卸载脚本；目标基线为 UOS Desktop 20 1070、
+  `aarch64`、glibc 2.28、Wayland，并使用隔离的 Python 3.10 环境，不依赖系统
+  Python 3.7。
+- Linux 端优先自动发现统信浏览器或 Chromium，也支持通过
+  `INTDEMO_CHROMIUM_PATH` 指定浏览器；Wayland 会话默认借助 XWayland 运行 Qt
+  与 Chromium，并保留原生 Wayland 覆盖入口。
+- 在线凭据在 Windows 继续使用 DPAPI，在 Linux 改用 Secret Service 保存随机主密钥，
+  再以 AES-GCM 加密本地数据；UOS 配置文件支持 XDG 标准目录。
+- UOS 端暂不启用只适用于 Windows 安装包的自动更新，改为手动下载、覆盖安装；
+  中文字体栈补充 Noto Sans CJK、文泉驿和 DejaVu 回退。
+- 新增真机搭建、诊断、构建、安装和验收文档；本地客户端完整回归 `160/160`、
+  Python 编译检查、PyInstaller spec 编译检查及 Bash 脚本语法检查通过。
+- 状态：首轮代码兼容已完成，等待 UOS ARM64 真机构建和业务流程验证。

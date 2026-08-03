@@ -5,8 +5,13 @@ import ctypes
 import hashlib
 import hmac
 import os
+import shutil
+import subprocess
+import sys
 from ctypes import wintypes
 from dataclasses import dataclass
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 
 class SecureStorageUnavailable(RuntimeError):
@@ -112,6 +117,113 @@ class DpapiProtector(Protector):
             return ctypes.string_at(output.pbData, output.cbData)
         finally:
             self._kernel32.LocalFree(output.pbData)
+
+
+class SecretServiceProtector(Protector):
+    """Encrypt credentials with a key held by the Linux Secret Service."""
+
+    _PREFIX = b"INTDEMO-SECRET-SERVICE-1\0"
+    _AAD = b"IntDemoClientOnlineTest/v0.2/linux"
+    _ATTRIBUTES = (
+        "application",
+        "intdemo-client",
+        "purpose",
+        "credential-encryption-v1",
+    )
+
+    def __init__(self, command=None, runner=None):
+        if not sys.platform.startswith("linux"):
+            raise SecureStorageUnavailable("Secret Service 仅在 Linux 上使用")
+        self.command = command or shutil.which("secret-tool")
+        if not self.command:
+            raise SecureStorageUnavailable(
+                "缺少 secret-tool；请安装 libsecret-tools 后重新启动程序"
+            )
+        self._runner = runner or subprocess.run
+        self._key = self._load_or_create_key()
+
+    def _run(self, arguments, *, input_text=None):
+        try:
+            return self._runner(
+                [self.command, *arguments],
+                input=input_text,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise SecureStorageUnavailable(
+                f"无法访问 Linux Secret Service：{exc}"
+            ) from exc
+
+    @staticmethod
+    def _decode_key(value):
+        try:
+            key = base64.b64decode(str(value or "").strip(), validate=True)
+        except (ValueError, TypeError) as exc:
+            raise SecureStorageUnavailable(
+                "Linux Secret Service 中的应用密钥格式无效"
+            ) from exc
+        if len(key) != 32:
+            raise SecureStorageUnavailable(
+                "Linux Secret Service 中的应用密钥长度无效"
+            )
+        return key
+
+    def _load_or_create_key(self):
+        lookup = self._run(["lookup", *self._ATTRIBUTES])
+        if lookup.returncode == 0 and str(lookup.stdout or "").strip():
+            return self._decode_key(lookup.stdout)
+        if lookup.returncode not in {0, 1}:
+            detail = str(lookup.stderr or "").strip() or "服务不可用"
+            raise SecureStorageUnavailable(
+                f"无法读取 Linux Secret Service：{detail}"
+            )
+
+        key = os.urandom(32)
+        encoded = base64.b64encode(key).decode("ascii")
+        stored = self._run(
+            [
+                "store",
+                "--label=逃费车辆智能查询平台",
+                *self._ATTRIBUTES,
+            ],
+            input_text=encoded + "\n",
+        )
+        if stored.returncode != 0:
+            detail = str(stored.stderr or "").strip() or "服务不可用"
+            raise SecureStorageUnavailable(
+                f"无法写入 Linux Secret Service：{detail}"
+            )
+        return key
+
+    def protect(self, value: bytes) -> bytes:
+        nonce = os.urandom(12)
+        encrypted = AESGCM(self._key).encrypt(nonce, bytes(value), self._AAD)
+        return self._PREFIX + nonce + encrypted
+
+    def unprotect(self, value: bytes) -> bytes:
+        payload = bytes(value)
+        if not payload.startswith(self._PREFIX):
+            raise SecureStorageUnavailable("Linux 本机在线凭据格式无效")
+        encrypted = payload[len(self._PREFIX) :]
+        if len(encrypted) < 12 + 16:
+            raise SecureStorageUnavailable("Linux 本机在线凭据内容不完整")
+        nonce, ciphertext = encrypted[:12], encrypted[12:]
+        try:
+            return AESGCM(self._key).decrypt(nonce, ciphertext, self._AAD)
+        except Exception as exc:
+            raise SecureStorageUnavailable("无法解密 Linux 本机在线凭据") from exc
+
+
+def get_default_protector():
+    if os.name == "nt":
+        return DpapiProtector()
+    if sys.platform.startswith("linux"):
+        return SecretServiceProtector()
+    raise SecureStorageUnavailable("当前系统没有受支持的安全凭据存储")
 
 
 @dataclass(frozen=True)

@@ -1,13 +1,13 @@
 # 逃费车辆智能查询平台
 
-逃费车辆智能查询平台（内部项目代号 `IntDemo`）是一个面向运输业务处理场景的 Windows 桌面客户端。项目将“运输证查询回填”和“爱企查批量查询”整合为统一的 PyQt5 应用，通过一条可暂停、继续和停止的处理流水线，完成运输证号查询、营运企业回填以及企业法人、地址、电话补齐。
+逃费车辆智能查询平台（内部项目代号 `IntDemo`）是一个面向运输业务处理场景的 PyQt5 桌面客户端，支持 Windows x64，并在兼容分支支持统信 UOS 20 ARM64。项目将“运输证查询回填”和“爱企查批量查询”整合为一条可暂停、继续和停止的处理流水线，完成运输证号查询、营运企业回填以及企业法人、地址、电话补齐。
 
 当前版本：`0.2.8` 在线同步测试版。`v0.1` 的本地数据库和发布包保持不变，
 `v0.2` 使用独立应用名称及独立数据目录，不迁移测试数据。
 
 ## v0.2 在线架构
 
-Windows 客户端仍在本机完成三步业务并以 SQLite 离线优先运行，服务器只接收
+桌面客户端仍在本机完成三步业务并以 SQLite 离线优先运行，服务器只接收
 账号权限、指标数量、违规原因汇总、批次/运行状态、用时和不可逆输入指纹，
 以及管理员主动发布的公告正文/附件和普通用户主动发送的文字消息。原始 Excel、
 逐行车辆信息、文件路径、运行日志和浏览器 Cookie 永不上传。
@@ -19,8 +19,8 @@ Windows 客户端仍在本机完成三步业务并以 SQLite 离线优先运行�
 
 ```mermaid
 flowchart LR
-    A["Windows 客户端 A<br/>SQLite + outbox"] -->|HTTPS / WSS| C["Caddy"]
-    B["Windows 客户端 B<br/>SQLite + cache"] -->|HTTPS / WSS| C
+    A["Windows/UOS 客户端 A<br/>SQLite + outbox"] -->|HTTPS / WSS| C["Caddy"]
+    B["Windows/UOS 客户端 B<br/>SQLite + cache"] -->|HTTPS / WSS| C
     C --> D["FastAPI<br/>单 Uvicorn worker"]
     D --> E["PostgreSQL 17"]
     F["每日 02:00 备份"] --> E
@@ -31,10 +31,11 @@ flowchart LR
 - 登录页的“离线登录（游客）”无需账号或密码，只开放一键业务处理；游客
   本次不记录统计、流程计时或待同步数据，也不能查看数据中心和账号功能。
 - 有待发送数据时每 5 秒尝试上传，WebSocket 通知后增量拉取，30 秒轮询兜底。
-- 访问/刷新令牌和离线资料由 Windows DPAPI 加密；只有用户勾选“记住密码”
-  时，登录密码才会以当前 Windows 用户专属的 DPAPI 密文保存。
-- 在线测试数据库位于
-  `%LOCALAPPDATA%\IntDemoClientOnlineTest\client-v2.db`。
+- 访问/刷新令牌和离线资料在 Windows 上由 DPAPI 加密，在 Linux 上由当前用户
+  Secret Service 保存主密钥并以 AES-GCM 加密；只有勾选“记住密码”时才保存
+  登录密码密文。
+- Windows 在线测试数据库位于 `%LOCALAPPDATA%\IntDemoClientOnlineTest\client-v2.db`；
+  UOS 位于 `~/.local/share/intdemo-client-online-test/client-v2.db`。
 - 服务端、部署与迁移说明见 [部署手册](docs/DEPLOYMENT.md)、
   [同步协议](docs/SYNC_PROTOCOL.md)、[验证码机器学习](docs/CAPTCHA_LEARNING.md)、
   [恢复演练](docs/RESTORE_DRILL.md) 和 [迁移手册](docs/MIGRATION.md)。
@@ -52,6 +53,7 @@ flowchart LR
   新版本会通过弹窗及侧边栏红点提示。更新提示等待处理时只锁定业务内容，
   最小化、最大化和关闭按钮始终可用；普通更新可选择稍后更新、后台更新或
   立即更新，下载在后台进行，开始安装时才暂停其他业务。
+  当前自动更新安装器仅适用于 Windows；UOS 使用用户安装脚本手动覆盖升级。
 - 窗口顶部提供公告喇叭和 7 秒轮播入口；管理员可发布富文本公告、上传图片或
   文件、选择开屏展示及指定普通用户，普通用户可在公告详情中发送纯文字消息，
   管理员在“公告发布”页面集中查看并标记已读。
@@ -71,10 +73,10 @@ flowchart LR
 - 持久化记录每次流水线和各步骤的有效用时、暂停时间及重试次数；手动停止后再次处理相同输入数据时，会接续原批次累计用时且不重复计算暂停间隔。
 - 业务处理页使用高精度时钟并以约 60 帧/秒平滑刷新毫秒计时；运行期间仍独立定期保存计时心跳，程序异常退出后会保留最后一次心跳前的累计时间，并在下次启动时将旧运行标记为异常中断。
 - 数据仪表盘只统计三个步骤全部成功的批次，按站点和完成日期范围展示总用时、有效用时、基于总用时计算的整数每小时处理量和效率提升比例；批次完成后会纳入此前停止、异常或重试产生的用时，精简悬停卡片可查看每条平均秒数和毫秒级精确平均等必要明细，升级前无计时记录的历史条数不参与平均值计算。
-- 将运行参数集中在独立标签页，并可实际启动内置 Chromium 执行健康检查。
+- 将运行参数集中在独立标签页，并可实际启动自动适配的 Chromium 执行健康检查。
 - 实时展示数据预览、总体进度、分步骤状态和运行日志。
 - 数据预览和流水线日志可分别收起或展开，按当前工作重点调整页面空间。
-- 流水线日志跨多次执行保留最近 5000 行，并用执行次数分隔；任一步骤的业务浏览器被手动关闭、目标页返回 HTTP 错误或导航超时时，会持续重启内置 Chromium 并重试当前记录，不限制恢复次数，直至恢复成功或用户主动停止；爱企查在等待人工登录和“继续执行”期间也会持续监测浏览器，关闭后自动重新打开并再次提示登录，点击停止则会主动中断仍在等待的页面加载并关闭当前会话。
+- 流水线日志跨多次执行保留最近 5000 行，并用执行次数分隔；任一步骤的业务浏览器被手动关闭、目标页返回 HTTP 错误或导航超时时，会持续重启已适配的 Chromium 并重试当前记录，不限制恢复次数，直至恢复成功或用户主动停止；爱企查在等待人工登录和“继续执行”期间也会持续监测浏览器，关闭后自动重新打开并再次提示登录，点击停止则会主动中断仍在等待的页面加载并关闭当前会话。
 - 退出时若浏览器线程长期未结束，可选择“继续等待”或“保存并强制退出”；强制退出会先原子保存全部已完成记录并结算计时，再终止卡住的线程。若表格或计时状态保存失败，程序会保留原文件并拒绝强制退出。
 - 三步业务查询的页面等待上限为 2 分钟；验证码题目和图片完全加载并保持稳定后才开始自动或人工处理，验证码通过后也会继续等待企业结果真正返回；纯技术超时会触发恢复或记录失败，不会误弹公司人工录入框。
 - 全局禁用控件统一使用禁止指针和低对比度淡化样式，重新启用后自动恢复正常外观。
@@ -85,16 +87,16 @@ flowchart LR
 - 提供按站点、日期范围、完成类型和违规原因筛选的数据仪表盘，开始与结束日期均包含当天。
 - 管理员可在完成类型中查看“空”异常数据总数，并按用户（站）追溯异常条数、本站总数和占比；普通用户不显示异常入口。
 - 仪表盘环形分区和完成类型、违规原因计量条支持悬停查看数量、占比或电话拆分详情；各站分布同时提供总计数、有电话数、总耗时和有效耗时四个圆环图。
-- 将账号镜像、统计缓存、本机业务记录和待同步队列保存在本地 SQLite；服务端密码使用 Argon2id，客户端只保存 DPAPI 加密资料及 PBKDF2 离线验证器。
-- 提供离线自动化测试，并支持使用 PyInstaller 构建 Windows 客户端。
+- 将账号镜像、统计缓存、本机业务记录和待同步队列保存在本地 SQLite；服务端密码使用 Argon2id，Windows 客户端使用 DPAPI，Linux 客户端使用 Secret Service + AES-GCM 保存加密资料及 PBKDF2 离线验证器。
+- 提供离线自动化测试，并支持使用 PyInstaller 构建 Windows x64 与 UOS ARM64 客户端。
 
 > 查询网站的验证码、页面结构和访问策略可能变化。涉及真实网站的功能需要使用合法账号、授权数据和当前网络环境进行验收。
 
 ## 环境要求
 
-- Windows 10/11（项目当前主要支持的平台）
-- 64 位 Python 3.9，推荐 Python 3.9.13
-- 网络连接（执行在线查询时需要；浏览器统一使用项目内置 Chromium）
+- Windows 10/11 x64，或 UOS Desktop 20 Professional ARM64（兼容分支）
+- Windows 使用 64 位 Python 3.9；UOS 使用隔离的 Miniforge Python 3.10，不修改系统 Python 3.7
+- 网络连接（Windows 使用项目内置 Chromium；UOS 自动发现或显式指定系统 Chromium）
 - Git（仅克隆和参与开发时需要）
 
 ## 安装方法
@@ -107,6 +109,18 @@ cd intdemo
 ```
 
 仓库当前为私有仓库，克隆账号需要拥有访问权限。
+
+UOS ARM64 请直接使用兼容分支，并按专项文档操作：
+
+```bash
+git clone --branch codex/uos-arm64-compat --single-branch \
+  https://github.com/e23Aqiu/intdemo.git
+cd intdemo
+bash scripts/uos-arm64/prepare-env.sh
+```
+
+完整说明见 [`docs/UOS_ARM64.md`](docs/UOS_ARM64.md)。下面的虚拟环境与依赖
+安装命令仅适用于 Windows。
 
 ### 2. 创建并激活虚拟环境
 
@@ -187,11 +201,20 @@ v0.2 Windows 默认数据目录为：
 ```
 
 可通过环境变量 `INTDEMO_DATA_DIR` 指定其他数据目录。数据库保存离线缓存、
-待同步队列、隔离项和本机业务计时；令牌及离线资料以 DPAPI 密文保存，不保存
+待同步队列、隔离项和本机业务计时；Windows 令牌及离线资料以 DPAPI 密文保存，不保存
 明文密码。v0.1 原目录 `%LOCALAPPDATA%\IntDemoClient\client.db` 不会被读取
 或覆盖。腾讯文档链接保存在同目录的 `preferences.json`，登录 Cookie 位于
 按程序账号隔离的 `browser-profiles\tencent-docs`，二者都不会同步到服务器；
 自动生成的新表位于 `imports\tencent-docs`。
+
+UOS 默认数据目录为：
+
+```text
+~/.local/share/intdemo-client-online-test/
+```
+
+UOS 在线资料使用桌面 Secret Service 保存主密钥，并以 AES-GCM 密文落库；
+可通过相同的 `INTDEMO_DATA_DIR` 环境变量覆盖数据目录。
 
 ## 测试与构建
 
@@ -213,6 +236,17 @@ python -m pytest
 完整 Compose 验收由 GitHub Actions 执行真实 PostgreSQL、两台逻辑客户端、
 WebSocket、私有 CA、备份和全新数据库恢复。真实运输证、营运查询及爱企查
 流程仍需在授权环境人工验收。
+
+UOS ARM64 真机构建与测试：
+
+```bash
+bash scripts/uos-arm64/diagnose.sh
+bash scripts/uos-arm64/build.sh
+```
+
+产物位于 `dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz`。详细的系统依赖、
+浏览器指定、XWayland 策略与十项验收清单见
+[`docs/UOS_ARM64.md`](docs/UOS_ARM64.md)。
 
 同时构建 Windows 免安装便携包和安装包（公网 IP 测试方案）：
 
@@ -287,7 +321,11 @@ intdemo/
 ├── release_publisher/              # 本地测试、构建与发布 GUI
 ├── requirements.txt                # 运行依赖
 ├── requirements-dev.txt            # 构建与开发依赖
+├── requirements-uos-arm64.txt      # UOS ARM64 pip 运行依赖
+├── environment-uos-arm64.yml       # UOS ARM64 conda/PyQt5 构建环境
 ├── integrated_client.spec          # PyInstaller 构建配置
+├── integrated_client_uos_arm64.spec # UOS ARM64 PyInstaller 构建配置
+├── packaging/uos-arm64/            # UOS 启动器、桌面入口与用户安装脚本
 ├── installer/                       # Inno Setup 安装包定义和版本资源
 ├── integrated_client/
 │   ├── app_controller.py           # 应用生命周期与窗口协调
@@ -295,7 +333,8 @@ intdemo/
 │   ├── database.py                 # 账号、权限与统计数据持久化
 │   ├── models.py                   # 领域数据模型
 │   ├── security.py                 # 密码哈希与校验
-│   ├── online/                     # 在线认证、DPAPI、同步与 WebSocket
+│   ├── online/                     # 在线认证、DPAPI/Secret Service、同步与 WebSocket
+│   ├── platform_support.py         # UOS/ARM64、Qt 与 Chromium 平台适配
 │   ├── timing.py                   # 流水线批次、运行和步骤计时
 │   ├── tools/
 │   │   ├── transport_tool.py       # 运输证查询与营运信息回填
@@ -309,6 +348,7 @@ intdemo/
 │       └── workflow_page.py        # 一体化业务流水线页面
 ├── server/                          # FastAPI、SQLAlchemy 与 Alembic
 ├── deploy/                          # Caddy、备份、恢复及 Ubuntu 脚本
+├── scripts/uos-arm64/               # UOS 环境、诊断、预检与构建脚本
 ├── docker-compose.yml               # api/postgres/caddy/backup
 ├── tests/                           # 客户端离线与在线自动化测试
 ├── DEVELOPMENT_LOG.md              # 历史开发记录

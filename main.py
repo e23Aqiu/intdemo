@@ -1,5 +1,9 @@
 import sys
 
+from integrated_client.platform_support import configure_desktop_environment
+
+configure_desktop_environment()
+
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
@@ -25,6 +29,8 @@ def main():
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName(ORGANIZATION_NAME)
+    if sys.platform.startswith("linux") and hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName("com.e23aqiu.intdemo")
     app.setWindowIcon(QIcon(_control_asset_path("app-icon.png")))
     app.setStyle("Fusion")
     app.setStyleSheet(APP_STYLESHEET)

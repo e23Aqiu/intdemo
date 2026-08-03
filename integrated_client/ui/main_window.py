@@ -21,6 +21,7 @@ from ..config import APP_NAME, APP_VERSION
 from ..database import Database
 from ..models import Account
 from ..online.captcha_learning import CaptchaLearningService
+from ..platform_support import supports_self_update
 from ..preferences import ClientPreferences
 from ..timing import WorkflowTimingService
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
@@ -208,6 +209,11 @@ class MainWindow(FramelessMainWindow):
             self.personal_center_page = PersonalCenterPage(
                 account,
                 updates_enabled=self.update_coordinator is not None,
+                updates_disabled_message=(
+                    "UOS ARM64 暂使用手动安装包更新，业务数据会独立保留。"
+                    if not supports_self_update()
+                    else ""
+                ),
             )
             self.personal_center_page.change_password_requested.connect(
                 self._change_password

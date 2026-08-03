@@ -1483,7 +1483,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(hasattr(window.workflow_page, "browser_combo"))
         self.assertEqual(
             window.workflow_page.browser_info.text(),
-            "内置 Chromium（统一使用）",
+            "Chromium（自动适配内置/系统）",
         )
         self.app.processEvents()
         self.assertEqual(

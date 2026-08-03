@@ -7,9 +7,9 @@ from pathlib import Path
 
 from .config import get_data_dir
 from .online.secure import (
-    DpapiProtector,
     Protector,
     SecureStorageUnavailable,
+    get_default_protector,
 )
 
 
@@ -21,7 +21,7 @@ class RememberedCredentials:
 
 
 class LoginCredentialStore:
-    """Persist remembered login details with Windows user-scoped encryption."""
+    """Persist login details with the current OS user-scoped encryption."""
 
     VERSION = 1
 
@@ -37,7 +37,7 @@ class LoginCredentialStore:
             self.protector = protector
         else:
             try:
-                self.protector = DpapiProtector()
+                self.protector = get_default_protector()
             except SecureStorageUnavailable:
                 self.protector = None
 
