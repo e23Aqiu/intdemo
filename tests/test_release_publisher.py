@@ -328,7 +328,14 @@ function global:scp {
             )
             installer = root / "installer.exe"
             installer.write_bytes(b"test-installer")
-            environment = os.environ.copy()
+            # GitHub Actions runs this test from pwsh.  Do not pass pwsh's
+            # PSModulePath into Windows PowerShell 5.1, otherwise its Utility
+            # module can fail to autoload and Get-FileHash is unavailable.
+            environment = {
+                name: value
+                for name, value in os.environ.items()
+                if name.casefold() != "psmodulepath"
+            }
             environment.update(
                 {
                     "INTDEMO_PUBLISH_SCRIPT": str(publish_script),

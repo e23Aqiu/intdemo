@@ -1142,6 +1142,9 @@
   再以 AES-GCM 加密本地数据；UOS 配置文件支持 XDG 标准目录。
 - UOS 端暂不启用只适用于 Windows 安装包的自动更新，改为手动下载、覆盖安装；
   中文字体栈补充 Noto Sans CJK、文泉驿和 DejaVu 回退。
+- 修复 GitHub Actions 从 PowerShell 7 启动 Windows PowerShell 5.1 测试时继承
+  不兼容 `PSModulePath` 的问题，避免发布脚本版本保护测试无法加载
+  `Get-FileHash`；生产发布脚本不受影响。
 - 新增真机搭建、诊断、构建、安装和验收文档；本地客户端完整回归 `160/160`、
   Python 编译检查、PyInstaller spec 编译检查及 Bash 脚本语法检查通过。
 - 状态：首轮代码兼容已完成，等待 UOS ARM64 真机构建和业务流程验证。
