@@ -4,6 +4,11 @@ set -Eeuo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 env_prefix="${INTDEMO_UOS_ENV_PREFIX:-$repo_root/.conda-uos-arm64}"
+browser_cache="${INTDEMO_UOS_BROWSER_CACHE:-$repo_root/.playwright-uos-arm64}"
+browser_download_timeout="${PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT:-120000}"
+if [[ "$browser_cache" != /* ]]; then
+  browser_cache="$repo_root/$browser_cache"
+fi
 cd "$repo_root"
 
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -64,7 +69,18 @@ fi
   python -m pip install --upgrade \
   --requirement "$repo_root/requirements-uos-arm64.txt"
 
+echo "安装项目内置 Chromium: $browser_cache"
+mkdir -p "$browser_cache"
+PLAYWRIGHT_BROWSERS_PATH="$browser_cache" \
+PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT="$browser_download_timeout" \
+  "$conda_cmd" run --prefix "$env_prefix" \
+  python -m playwright install chromium
+
 "$conda_cmd" run --prefix "$env_prefix" \
   python -c 'import platform, PyQt5.QtCore; print("环境就绪:", platform.python_version(), "Qt", PyQt5.QtCore.QT_VERSION_STR)'
+
+PLAYWRIGHT_BROWSERS_PATH="$browser_cache" \
+  "$conda_cmd" run --prefix "$env_prefix" python -c \
+  'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print("内置 Chromium:", p.chromium.executable_path); p.stop()'
 
 echo "UOS ARM64 构建环境已准备完成。"

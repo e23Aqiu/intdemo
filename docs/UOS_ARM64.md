@@ -16,10 +16,10 @@
   Python 3.10 ARM64 环境。
 - PyQt5 从 conda-forge 安装。PyPI 的 PyQt5 没有 Linux ARM64 wheel，直接
   `pip install -r requirements.txt` 会失败或进入本地源码编译。
-- UOS 使用系统已有的 Chromium/UOS 浏览器，或者通过
-  `INTDEMO_CHROMIUM_PATH` 指定浏览器。不要在这套 UOS 20 环境执行
-  `playwright install chromium`；当前 Playwright 自带浏览器面向更新的 Linux
-  发行版，不能假定兼容 glibc 2.28。
+- 环境准备脚本把与固定 Playwright 版本匹配的 ARM64 Chromium 下载到仓库下的
+  `.playwright-uos-arm64`。该浏览器已在本文目标真机上通过 Chromium 145 启动、
+  AArch64 架构、动态库和 Playwright 控制检查，构建时会自动装入最终软件包。
+  `INTDEMO_CHROMIUM_PATH` 仅作为故障排查时的显式覆盖入口。
 - Windows DPAPI 在 Linux 上替换为 Secret Service。应用只把随机主密钥放入
   当前用户的桌面密钥环，SQLite 中的在线令牌和离线授权仍然是 AES-GCM 密文。
 - UOS 包必须在这台 ARM64 真机上构建。PyInstaller 不是交叉编译器；同时在
@@ -43,28 +43,9 @@ sudo apt install -y \
 个别包名在当前仓库不存在，先保留终端输出，继续运行后面的诊断脚本，它会
 指出实际缺失项。
 
-确认机器上已有 Chromium 内核浏览器：
-
-```bash
-for cmd in chromium chromium-browser uos-browser uos-browser-stable \
-  deepin-browser deepin-browser-stable google-chrome-stable google-chrome; do
-  command -v "$cmd" 2>/dev/null && "$cmd" --version
-done
-```
-
-如果没有输出，可先在 UOS 应用商店安装“浏览器”或“Chromium”。如果浏览器
-可以从桌面启动、但命令不在 `PATH`，找到桌面文件中的真实命令：
-
-```bash
-grep -R '^Exec=' /usr/share/applications 2>/dev/null | \
-  grep -Ei 'chromium|chrome|uos.*browser|deepin.*browser' | head -n 20
-```
-
-记下可执行文件绝对路径，后续设置：
-
-```bash
-export INTDEMO_CHROMIUM_PATH=/实际/浏览器/可执行文件
-```
+最终用户无需安装 Chromium/UOS 浏览器。首次准备构建环境时需要联网下载约数百
+MB 的浏览器文件；网络较慢时可设置代理或增大
+`PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT`。
 
 ## 二、获取兼容分支
 
@@ -103,14 +84,16 @@ bash scripts/uos-arm64/prepare-env.sh
 ```
 
 脚本会在仓库下创建 `.conda-uos-arm64`，其中包含 Python 3.10、ARM64
-PyQt5、PyInstaller 和项目依赖。然后运行完整诊断：
+PyQt5、PyInstaller 和项目依赖，并把 Chromium 下载到被 Git 忽略的
+`.playwright-uos-arm64`。然后运行完整诊断：
 
 ```bash
 bash scripts/uos-arm64/diagnose.sh 2>&1 | tee uos-arm64-diagnose.log
 ```
 
-诊断会实际启动一次无头 Chromium，并对 Linux Secret Service 做一轮加解密。
-首次访问桌面密钥环时，UOS 可能弹出解锁提示，这是预期行为。
+诊断会自动使用项目缓存，检查 Chromium ELF 架构和缺失动态库，实际启动一次
+无头 Chromium，并对 Linux Secret Service 做一轮加解密。首次访问桌面密钥环
+时，UOS 可能弹出解锁提示，这是预期行为。
 
 若只想先验证源码界面：
 
@@ -152,8 +135,10 @@ conda run -p ./.conda-uos-arm64 python main.py
 bash scripts/uos-arm64/build.sh
 ```
 
-默认流程依次执行：环境更新、UOS/架构/glibc/依赖/浏览器/密钥环预检、客户端
-离线回归测试、PyInstaller 目录包构建、`tar.gz` 打包和 SHA-256 生成。
+默认流程依次执行：环境和浏览器缓存更新、UOS/架构/glibc/依赖/浏览器/密钥环
+预检、客户端离线回归测试、PyInstaller 目录包构建、内置 Chromium 复制与二次
+启动检查、`tar.gz` 打包和 SHA-256 生成。构建脚本拒绝打包项目缓存目录之外的
+浏览器，避免误带入开发机上的其他可执行文件。
 
 仅在定位问题时使用跳过参数：
 
@@ -168,6 +153,9 @@ bash scripts/uos-arm64/build.sh --skip-browser-check
 dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz
 dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz.sha256
 ```
+
+压缩包内的 `browser/` 是完整 Chromium 运行目录；启动器会自动设置
+`INTDEMO_CHROMIUM_PATH`，最终用户不需要执行 `playwright install`。
 
 ## 六、试运行与当前用户安装
 
@@ -206,7 +194,8 @@ cd IntDemo-UOS-arm64-*
 3. 在线登录成功；勾选“记住密码”，关闭并重开后资料可解密；断网时可用有效的
    本机离线授权登录。
 4. “系统设置”显示版本；UOS 暂不展示 Windows `.exe` 自动更新入口。
-5. “运行设置”中的 Chromium 健康检查通过，并显示系统浏览器真实路径/版本。
+5. “运行设置”中的 Chromium 健康检查通过，并显示软件包内
+   `browser/chrome` 的真实路径和版本。
 6. 用一份脱敏 `.xlsx` 分别跑运输证、营运企业回填、爱企查；检查人工验证码、
    浏览器重启恢复、暂停/继续、停止和原子保存。
 7. 导入公开腾讯文档；再测试需要登录的腾讯文档，确认独立浏览器资料目录可复用。
@@ -228,7 +217,8 @@ ldd dist/uos-arm64/pyinstaller/intdemo-client/intdemo-client | grep 'not found' 
 如果浏览器启动失败，再补充：
 
 ```bash
-"${INTDEMO_CHROMIUM_PATH:-$(command -v chromium)}" --version
+find . -path '*/browser/chrome' -type f -print -exec {} --version \;
+ldd ./browser/chrome | grep 'not found' || true
 echo "$XDG_SESSION_TYPE $DISPLAY $WAYLAND_DISPLAY $QT_QPA_PLATFORM"
 ```
 
@@ -236,7 +226,8 @@ echo "$XDG_SESSION_TYPE $DISPLAY $WAYLAND_DISPLAY $QT_QPA_PLATFORM"
 
 - UOS 自动更新暂时关闭，因为现有更新清单和发布器只生成 Windows `.exe`。
   UOS 测试包通过重新构建后执行 `install-user.sh` 覆盖升级。
-- Playwright 官方支持的是更新的 Debian/Ubuntu 版本；在 UOS 20 上控制系统
-  Chromium 属于兼容适配路线，必须以本节真机结果为准。
+- Playwright 官方支持的是更新的 Debian/Ubuntu 版本；本项目内置 Chromium
+  已在 UOS Desktop 20 1070 ARM64、glibc 2.28 上完成首次启动验证，但仍需通过
+  真实运输证、营运查询、爱企查和腾讯文档业务流程验收。
 - 当前默认走 XWayland，以降低旧 Qt 5/显卡驱动组合的不确定性；原生 Wayland
   作为后续真机验证项，不作为第一版阻塞条件。

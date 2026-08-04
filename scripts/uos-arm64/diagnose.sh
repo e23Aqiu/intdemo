@@ -4,6 +4,13 @@ set -Eeuo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 env_prefix="${INTDEMO_UOS_ENV_PREFIX:-$repo_root/.conda-uos-arm64}"
+browser_cache="${INTDEMO_UOS_BROWSER_CACHE:-$repo_root/.playwright-uos-arm64}"
+if [[ "$browser_cache" != /* ]]; then
+  browser_cache="$repo_root/$browser_cache"
+fi
+if [[ -d "$browser_cache" ]]; then
+  export PLAYWRIGHT_BROWSERS_PATH="${PLAYWRIGHT_BROWSERS_PATH:-$browser_cache}"
+fi
 cd "$repo_root"
 
 echo "=== 系统信息 ==="
@@ -19,6 +26,7 @@ printf 'DISPLAY=%s\n' "${DISPLAY:-}"
 printf 'WAYLAND_DISPLAY=%s\n' "${WAYLAND_DISPLAY:-}"
 printf 'QT_QPA_PLATFORM=%s\n' "${QT_QPA_PLATFORM:-}"
 printf 'INTDEMO_CHROMIUM_PATH=%s\n' "${INTDEMO_CHROMIUM_PATH:-}"
+printf 'PLAYWRIGHT_BROWSERS_PATH=%s\n' "${PLAYWRIGHT_BROWSERS_PATH:-}"
 
 echo
 echo "=== 浏览器候选 ==="

@@ -1148,3 +1148,20 @@
 - 新增真机搭建、诊断、构建、安装和验收文档；本地客户端完整回归 `160/160`、
   Python 编译检查、PyInstaller spec 编译检查及 Bash 脚本语法检查通过。
 - 状态：首轮代码兼容已完成，等待 UOS ARM64 真机构建和业务流程验证。
+
+### 步骤 118：将真机验证通过的 ARM64 Chromium 装入 UOS 包
+
+- 在 UOS Desktop 20 Professional 1070、aarch64、glibc 2.28、Wayland 真机上，
+  项目 Python 3.10 环境的全部原生依赖成功导入；Playwright Chromium 145、
+  Secret Service 加解密及无头浏览器实际启动检查均通过。
+- 环境准备脚本默认把固定 Playwright 版本对应的 Chromium 下载到项目专用
+  `.playwright-uos-arm64` 缓存；源码运行自动识别该缓存，并继续保留系统浏览器
+  和 `INTDEMO_CHROMIUM_PATH` 作为回退与故障排查入口。
+- 构建脚本只允许使用项目缓存内的 Chromium，预检 ELF AArch64 架构和缺失
+  动态库，只复制正式 Chromium 运行目录而不携带无用的浏览器缓存，并在压缩前
+  对复制后的浏览器再做一次实际启动检查。
+- UOS 软件包启动器优先使用随包携带的 `browser/chrome`，最终用户无需安装
+  系统浏览器；文档、包内说明、缓存忽略规则和静态回归同步更新。
+- UOS 专项回归 `12/12`、客户端完整回归 `163/163`、Python 编译、Bash 语法及
+  `git diff --check` 通过。
+- 状态：内置浏览器构建代码已完成，等待 UOS 真机生成软件包并验收业务流程。

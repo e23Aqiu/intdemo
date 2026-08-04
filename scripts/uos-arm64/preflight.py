@@ -53,6 +53,17 @@ def _package_version(module):
     )
 
 
+def _elf_machine(path):
+    try:
+        header = Path(path).read_bytes()[:20]
+    except OSError:
+        return None
+    if len(header) < 20 or header[:4] != b"\x7fELF":
+        return None
+    byte_order = "little" if header[5] == 1 else "big"
+    return int.from_bytes(header[18:20], byteorder=byte_order)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--require-uos", action="store_true")
@@ -119,6 +130,47 @@ def main():
 
         browser_path = get_builtin_chromium_path()
         print(f"\nChromium: {browser_path}")
+        elf_machine = _elf_machine(browser_path)
+        if elf_machine == 183:
+            print("Chromium ELF 架构: AArch64")
+        elif elf_machine is None:
+            warnings.append("Chromium 不是可直接识别的 ELF 文件，无法验证架构")
+        else:
+            errors.append(
+                f"Chromium ELF 架构错误：e_machine={elf_machine}，需要 AArch64"
+            )
+        if sys.platform.startswith("linux"):
+            dependency_check = subprocess.run(
+                ["ldd", browser_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            dependency_output = "\n".join(
+                value
+                for value in (
+                    dependency_check.stdout,
+                    dependency_check.stderr,
+                )
+                if value
+            )
+            missing_libraries = [
+                line.strip()
+                for line in dependency_output.splitlines()
+                if "not found" in line.casefold()
+            ]
+            if missing_libraries:
+                errors.append(
+                    "Chromium 缺少动态库：" + "; ".join(missing_libraries)
+                )
+            elif dependency_check.returncode == 0:
+                print("Chromium 动态库检查: 正常")
+            else:
+                warnings.append(
+                    "无法完成 Chromium ldd 检查："
+                    + (dependency_output.strip() or "未知错误")
+                )
         try:
             version = subprocess.run(
                 [browser_path, "--version"],

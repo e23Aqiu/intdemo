@@ -2,6 +2,11 @@
 set -Eeuo pipefail
 
 package_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+bundled_browser="$package_root/browser/chrome"
+
+if [[ -x "$bundled_browser" ]]; then
+  export INTDEMO_CHROMIUM_PATH="${INTDEMO_CHROMIUM_PATH:-$bundled_browser}"
+fi
 
 # UOS 20 Wayland normally provides XWayland.  Qt 5's XCB plugin and Chromium's
 # X11 path are more reliable on this older desktop stack.  Users can override

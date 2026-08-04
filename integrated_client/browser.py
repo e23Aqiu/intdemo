@@ -20,7 +20,7 @@ _LINUX_BROWSER_COMMANDS = (
 
 
 def configure_playwright_browser_path() -> None:
-    """Keep the historical bundled-browser layout on Windows packages."""
+    """Configure the platform-specific managed-browser location."""
     if os.environ.get("PLAYWRIGHT_BROWSERS_PATH"):
         return
     if getattr(sys, "frozen", False):
@@ -35,6 +35,20 @@ def configure_playwright_browser_path() -> None:
             os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browser_dir)
     elif os.name == "nt":
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = "0"
+    elif sys.platform.startswith("linux"):
+        configured_cache = os.environ.get(
+            "INTDEMO_UOS_BROWSER_CACHE", ""
+        ).strip()
+        browser_cache = (
+            Path(configured_cache).expanduser()
+            if configured_cache
+            else Path(__file__).resolve().parents[1]
+            / ".playwright-uos-arm64"
+        )
+        if browser_cache.is_dir():
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(
+                browser_cache.resolve()
+            )
 
 
 configure_playwright_browser_path()
@@ -81,36 +95,43 @@ def _playwright_browser(playwright):
         return None
 
 
+def _resolve_playwright_browser(playwright=None):
+    if playwright is not None:
+        return _playwright_browser(playwright)
+    try:
+        with sync_playwright() as runtime:
+            return _playwright_browser(runtime)
+    except Exception:
+        return None
+
+
 def get_builtin_chromium_path(playwright=None) -> str:
     """Resolve a compatible Chromium while retaining the public API name.
 
-    Windows continues to prefer Playwright's bundled browser.  Linux prefers a
-    configured or system Chromium because current Playwright browser builds do
-    not target UOS 20's older glibc baseline.
+    Windows continues to prefer Playwright's bundled browser.  Linux prefers
+    the project-managed browser after it has passed UOS compatibility checks,
+    then falls back to a system Chromium.
     """
     configured = _configured_browser()
     if configured is not None:
         return str(configured)
+
+    managed_browser = bool(
+        os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "").strip()
+    )
+    if sys.platform.startswith("linux") and managed_browser:
+        executable = _resolve_playwright_browser(playwright)
+        if executable is not None:
+            return str(executable)
 
     if sys.platform.startswith("linux"):
         system_browser = _system_browser()
         if system_browser is not None:
             return str(system_browser)
 
-    if playwright is not None:
-        executable = _playwright_browser(playwright)
-        if executable is not None:
-            return str(executable)
-    else:
-        try:
-            with sync_playwright() as runtime:
-                executable = _playwright_browser(runtime)
-                if executable is not None:
-                    return str(executable)
-        except Exception:
-            # DrissionPage can still use a system browser even when the
-            # Playwright driver itself cannot start on an older distribution.
-            pass
+    executable = _resolve_playwright_browser(playwright)
+    if executable is not None:
+        return str(executable)
 
     if not sys.platform.startswith("linux"):
         system_browser = _system_browser()
@@ -119,7 +140,9 @@ def get_builtin_chromium_path(playwright=None) -> str:
 
     if sys.platform.startswith("linux"):
         raise RuntimeError(
-            "未找到可用的 Chromium。请安装 UOS/Chromium 浏览器，或设置：\n"
+            "未找到项目内置 Chromium。请先运行：\n"
+            "bash scripts/uos-arm64/prepare-env.sh\n"
+            "也可以显式指定兼容浏览器：\n"
             "export INTDEMO_CHROMIUM_PATH=/浏览器/可执行文件/路径"
         )
     raise RuntimeError(

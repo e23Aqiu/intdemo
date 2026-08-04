@@ -1,5 +1,6 @@
 import base64
 import os
+import runpy
 import tempfile
 import unittest
 from pathlib import Path
@@ -53,6 +54,30 @@ class UosCompatibilityTests(unittest.TestCase):
                 self.assertEqual(
                     browser.get_builtin_chromium_path(playwright),
                     str(executable.resolve()),
+                )
+
+    def test_linux_prefers_verified_managed_chromium(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            managed = Path(temporary) / "managed" / "chrome"
+            managed.parent.mkdir()
+            managed.write_bytes(b"managed-browser")
+            system = Path(temporary) / "system-chromium"
+            system.write_bytes(b"system-browser")
+            playwright = Mock()
+            playwright.chromium.executable_path = str(managed)
+
+            with patch.dict(
+                os.environ,
+                {"PLAYWRIGHT_BROWSERS_PATH": temporary},
+                clear=True,
+            ), patch.object(
+                browser.sys, "platform", "linux"
+            ), patch.object(
+                browser.shutil, "which", return_value=str(system)
+            ):
+                self.assertEqual(
+                    browser.get_builtin_chromium_path(playwright),
+                    str(managed.resolve()),
                 )
 
     def test_wayland_uses_xwayland_defaults_when_display_is_available(self):
@@ -127,6 +152,37 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertNotIn("PyQt5==", requirements)
         self.assertIn("opencv-python-headless", requirements)
         self.assertNotIn("\nopencv-python==", requirements)
+
+    def test_uos_build_bundles_project_managed_chromium(self):
+        root = Path(__file__).resolve().parents[1]
+        prepare_script = (root / "scripts/uos-arm64/prepare-env.sh").read_text(
+            encoding="utf-8"
+        )
+        build_script = (root / "scripts/uos-arm64/build.sh").read_text(
+            encoding="utf-8"
+        )
+        launcher = (root / "packaging/uos-arm64/intdemo-client").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("python -m playwright install chromium", prepare_script)
+        self.assertIn('cp -a "$browser_source_dir/."', build_script)
+        self.assertIn('browser/chrome', build_script)
+        self.assertIn('bundled_browser="$package_root/browser/chrome"', launcher)
+        self.assertIn("INTDEMO_CHROMIUM_PATH", launcher)
+
+    def test_uos_preflight_recognizes_aarch64_elf(self):
+        root = Path(__file__).resolve().parents[1]
+        preflight = runpy.run_path(
+            str(root / "scripts/uos-arm64/preflight.py")
+        )
+        header = bytearray(20)
+        header[:4] = b"\x7fELF"
+        header[5] = 1
+        header[18:20] = (183).to_bytes(2, byteorder="little")
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = Path(temporary) / "chrome"
+            executable.write_bytes(header)
+            self.assertEqual(preflight["_elf_machine"](executable), 183)
 
     def test_linux_online_config_uses_xdg_config_home(self):
         with tempfile.TemporaryDirectory() as temporary:

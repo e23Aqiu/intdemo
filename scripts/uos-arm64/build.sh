@@ -4,6 +4,10 @@ set -Eeuo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 env_prefix="${INTDEMO_UOS_ENV_PREFIX:-$repo_root/.conda-uos-arm64}"
+browser_cache="${INTDEMO_UOS_BROWSER_CACHE:-$repo_root/.playwright-uos-arm64}"
+if [[ "$browser_cache" != /* ]]; then
+  browser_cache="$repo_root/$browser_cache"
+fi
 cd "$repo_root"
 skip_tests=0
 skip_env_update=0
@@ -63,12 +67,45 @@ if [[ ! -f "$env_prefix/conda-meta/history" ]]; then
   echo "错误：未找到 $env_prefix，请先运行 prepare-env.sh。" >&2
   exit 1
 fi
+if [[ ! -d "$browser_cache" ]]; then
+  echo "错误：未找到项目内置 Chromium 缓存：$browser_cache" >&2
+  echo "请先运行 scripts/uos-arm64/prepare-env.sh。" >&2
+  exit 1
+fi
+
+browser_output="$(
+  PLAYWRIGHT_BROWSERS_PATH="$browser_cache" \
+    "$conda_cmd" run --prefix "$env_prefix" python -c \
+    'from playwright.sync_api import sync_playwright; p = sync_playwright().start(); print("INTDEMO_BROWSER_PATH=" + p.chromium.executable_path); p.stop()'
+)"
+browser_path="$(
+  printf '%s\n' "$browser_output" | \
+    sed -n 's/^INTDEMO_BROWSER_PATH=//p' | tail -n 1
+)"
+if [[ -z "$browser_path" || ! -x "$browser_path" ]]; then
+  echo "错误：项目缓存中没有可执行的 Playwright Chromium。" >&2
+  echo "$browser_output" >&2
+  exit 1
+fi
+browser_cache_real="$(readlink -f "$browser_cache")"
+browser_path="$(readlink -f "$browser_path")"
+case "$browser_path" in
+  "$browser_cache_real"/*) ;;
+  *) echo "拒绝打包项目缓存之外的浏览器：$browser_path" >&2; exit 1 ;;
+esac
+if [[ "$(basename "$browser_path")" != "chrome" ]]; then
+  echo "错误：无法识别 Chromium 可执行文件名：$browser_path" >&2
+  exit 1
+fi
+browser_source_dir="$(dirname "$browser_path")"
+export PLAYWRIGHT_BROWSERS_PATH="$browser_cache_real"
 
 preflight_args=(--require-uos)
 if ((skip_browser_check)); then
   preflight_args+=(--skip-browser-launch)
 fi
-"$conda_cmd" run --prefix "$env_prefix" \
+INTDEMO_CHROMIUM_PATH="$browser_path" \
+  "$conda_cmd" run --prefix "$env_prefix" \
   python "$script_dir/preflight.py" "${preflight_args[@]}"
 
 if ((skip_tests == 0)); then
@@ -100,8 +137,9 @@ case "$package_root" in
 esac
 rm -rf -- "$package_root"
 rm -f -- "$artifact" "$artifact.sha256"
-mkdir -p "$package_root/app"
+mkdir -p "$package_root/app" "$package_root/browser"
 cp -a "$pyinstaller_dist/intdemo-client/." "$package_root/app/"
+cp -a "$browser_source_dir/." "$package_root/browser/"
 cp "$repo_root/packaging/uos-arm64/intdemo-client" "$package_root/"
 cp "$repo_root/packaging/uos-arm64/install-user.sh" "$package_root/"
 cp "$repo_root/packaging/uos-arm64/uninstall-user.sh" "$package_root/"
@@ -113,7 +151,15 @@ chmod +x \
   "$package_root/intdemo-client" \
   "$package_root/install-user.sh" \
   "$package_root/uninstall-user.sh" \
-  "$package_root/app/intdemo-client"
+  "$package_root/app/intdemo-client" \
+  "$package_root/browser/chrome"
+
+if ((skip_browser_check == 0)); then
+  echo "=== 检查打包后的内置 Chromium ==="
+  INTDEMO_CHROMIUM_PATH="$package_root/browser/chrome" \
+    "$conda_cmd" run --prefix "$env_prefix" python -c \
+    'from integrated_client.browser import check_builtin_chromium; path, version = check_builtin_chromium(); print("打包浏览器正常:", version, path)'
+fi
 
 {
   printf 'version=%s\n' "$version"
@@ -122,6 +168,7 @@ chmod +x \
   printf 'os=%s\n' "$(grep -m1 '^SystemName=' /etc/os-version 2>/dev/null || true)"
   printf 'architecture=%s\n' "$(uname -m)"
   printf 'glibc=%s\n' "$(ldd --version 2>&1 | head -n 1)"
+  printf 'chromium=%s\n' "$("$browser_path" --version 2>&1 | head -n 1)"
 } > "$package_root/build-info.txt"
 
 mkdir -p "$package_parent"
@@ -131,4 +178,5 @@ sha256sum "$artifact" > "$artifact.sha256"
 echo "=== 构建完成 ==="
 echo "$artifact"
 cat "$artifact.sha256"
+du -sh "$package_root/browser" "$artifact"
 echo "解压后先运行 ./intdemo-client；确认无误后可运行 ./install-user.sh。"

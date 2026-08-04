@@ -96,7 +96,7 @@ flowchart LR
 
 - Windows 10/11 x64，或 UOS Desktop 20 Professional ARM64（兼容分支）
 - Windows 使用 64 位 Python 3.9；UOS 使用隔离的 Miniforge Python 3.10，不修改系统 Python 3.7
-- 网络连接（Windows 使用项目内置 Chromium；UOS 自动发现或显式指定系统 Chromium）
+- 网络连接（Windows 与 UOS 构建均携带项目内置 Chromium）
 - Git（仅克隆和参与开发时需要）
 
 ## 安装方法
@@ -118,6 +118,9 @@ git clone --branch codex/uos-arm64-compat --single-branch \
 cd intdemo
 bash scripts/uos-arm64/prepare-env.sh
 ```
+
+环境准备脚本会把与固定 Playwright 版本匹配的 ARM64 Chromium 下载到项目缓存，
+构建产物会自动携带该浏览器，不要求最终用户安装系统浏览器。
 
 完整说明见 [`docs/UOS_ARM64.md`](docs/UOS_ARM64.md)。下面的虚拟环境与依赖
 安装命令仅适用于 Windows。
@@ -244,8 +247,9 @@ bash scripts/uos-arm64/diagnose.sh
 bash scripts/uos-arm64/build.sh
 ```
 
-产物位于 `dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz`。详细的系统依赖、
-浏览器指定、XWayland 策略与十项验收清单见
+产物位于 `dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz`，其中包含已在目标
+UOS 20 真机验证的 ARM64 Chromium。详细的系统依赖、浏览器覆盖、XWayland
+策略与十项验收清单见
 [`docs/UOS_ARM64.md`](docs/UOS_ARM64.md)。
 
 同时构建 Windows 免安装便携包和安装包（公网 IP 测试方案）：
