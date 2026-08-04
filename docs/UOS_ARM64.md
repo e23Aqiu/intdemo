@@ -169,10 +169,9 @@ bash scripts/uos-arm64/build-deb.sh
 DEB 使用包名 `com.e23aqiu.intdemo`、架构 `arm64`，应用文件位于
 `/opt/apps/com.e23aqiu.intdemo/`。包中不使用 `postinst` 修改系统，程序仍以
 普通桌面用户运行；用户数据库、Secret Service 密钥和在线配置不会装入 DEB。
-DEB 的桌面文件使用独立 ID `com.e23aqiu.intdemo.uos.desktop`，菜单名称为
-“逃费车辆智能查询平台（UOS）”。它与历史用户安装使用的
-`com.e23aqiu.intdemo.desktop` 分离，避免 UOS V20 的菜单缓存继续执行已经删除的
-`~/.local/opt/intdemo-client` 入口；旧版 DDE 下同时关闭启动通知。
+DEB 的桌面文件严格使用与 AppID 相同的 `com.e23aqiu.intdemo.desktop`，Qt 的
+DesktopFileName 也使用同一值，以便 UOS 应用注册与沙箱识别该入口。菜单名称为
+“逃费车辆智能查询平台（UOS）”，并在旧版 DDE 下关闭启动通知。
 
 压缩包内的 `browser/` 是完整 Chromium 运行目录；启动器会自动设置
 `INTDEMO_CHROMIUM_PATH`，最终用户不需要执行 `playwright install`。
@@ -216,9 +215,8 @@ cd IntDemo-UOS-arm64-*
 
 ## 七、DEB 安装、升级与卸载
 
-首次从用户级安装切换到 DEB 前，仍建议删除旧程序和旧桌面入口，避免菜单中出现
-两个名称相近的入口；DEB 专用桌面 ID 不再被旧入口的缓存遮盖。该脚本不会删除
-数据库、在线配置或浏览器账号资料：
+首次从用户级安装切换到 DEB 前，必须先删除旧程序和用户级同名桌面入口，避免它
+遮盖 UOS 注册的系统入口。该脚本不会删除数据库、在线配置或浏览器账号资料：
 
 ```bash
 if [[ -x "$HOME/.local/opt/intdemo-client/uninstall-user.sh" ]]; then
@@ -245,7 +243,7 @@ UOS 管理策略开启开发者模式，或使用已经获信任签名/企业应
 ```bash
 dpkg -s com.e23aqiu.intdemo | grep -E '^(Status|Version|Architecture):'
 grep -E '^(Name|Exec)=' \
-  /opt/apps/com.e23aqiu.intdemo/entries/applications/com.e23aqiu.intdemo.uos.desktop
+  /opt/apps/com.e23aqiu.intdemo/entries/applications/com.e23aqiu.intdemo.desktop
 QT_QPA_PLATFORM=offscreen \
   /opt/apps/com.e23aqiu.intdemo/files/intdemo-client --self-check
 ```
@@ -259,6 +257,13 @@ sudo apt remove com.e23aqiu.intdemo
 用户业务数据继续保留在
 `~/.local/share/intdemo-client-online-test/`，用户在线配置继续保留在
 `~/.config/intdemo-client/`。
+
+根启动器会把菜单入口路径、桌面会话和启动前标准错误追加到以下诊断日志，不记录
+账号、令牌或业务内容：
+
+```text
+~/.local/share/intdemo-client-online-test/logs/launcher.log
+```
 
 ## 八、首轮真机验收清单
 
@@ -287,6 +292,7 @@ sudo apt remove com.e23aqiu.intdemo
 bash scripts/uos-arm64/diagnose.sh 2>&1 | tee uos-arm64-diagnose.log
 tail -n 200 ~/.local/share/intdemo-client-online-test/logs/client.log
 tail -n 200 ~/.local/share/intdemo-client-online-test/logs/native-crash.log
+tail -n 200 ~/.local/share/intdemo-client-online-test/logs/launcher.log
 ldd dist/uos-arm64/pyinstaller/intdemo-client/intdemo-client | grep 'not found' || true
 grep -ao 'GLIBCXX_[0-9.]*' ./app/_internal/libstdc++.so.6 | sort -Vu | tail -n 1
 LD_LIBRARY_PATH="$PWD/app/_internal" ldd ./app/_internal/libQt5Core.so.5

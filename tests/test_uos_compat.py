@@ -183,6 +183,9 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn('browser/chrome', build_script)
         self.assertIn('bundled_browser="$package_root/browser/chrome"', launcher)
         self.assertIn("INTDEMO_CHROMIUM_PATH", launcher)
+        self.assertIn("launcher.log", launcher)
+        self.assertIn("GIO_LAUNCHED_DESKTOP_FILE", launcher)
+        self.assertIn('2>>"$launcher_log"', launcher)
 
     def test_uos_build_generates_native_arm64_deb(self):
         root = Path(__file__).resolve().parents[1]
@@ -200,11 +203,11 @@ class UosCompatibilityTests(unittest.TestCase):
             .replace("@UOS_VERSION@", "0.2.8.0")
         )
         desktop = (
-            packaging / "com.e23aqiu.intdemo.uos.desktop"
+            packaging / "com.e23aqiu.intdemo.desktop"
         ).read_text(encoding="utf-8")
 
         self.assertIn('app_id="com.e23aqiu.intdemo"', deb_builder)
-        self.assertIn('desktop_file_name="$app_id.uos.desktop"', deb_builder)
+        self.assertIn('desktop_file_name="$app_id.desktop"', deb_builder)
         self.assertIn('app_root="$deb_root/opt/apps/$app_id"', deb_builder)
         self.assertIn("dpkg-deb --root-owner-group", deb_builder)
         self.assertIn("fakeroot dpkg-deb --build", deb_builder)
@@ -232,7 +235,11 @@ class UosCompatibilityTests(unittest.TestCase):
         )
         self.assertIn("Name=逃费车辆智能查询平台（UOS）", desktop)
         self.assertIn("StartupNotify=false", desktop)
-        self.assertFalse((packaging / "com.e23aqiu.intdemo.desktop").exists())
+        self.assertFalse((packaging / "com.e23aqiu.intdemo.uos.desktop").exists())
+        self.assertEqual(
+            (packaging / "com.e23aqiu.intdemo.desktop").stem,
+            info["appid"],
+        )
         self.assertIn(
             "entries/applications/$desktop_file_name",
             deb_builder,

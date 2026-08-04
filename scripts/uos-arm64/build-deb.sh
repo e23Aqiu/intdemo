@@ -4,7 +4,7 @@ set -Eeuo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 app_id="com.e23aqiu.intdemo"
-desktop_file_name="$app_id.uos.desktop"
+desktop_file_name="$app_id.desktop"
 version=""
 package_root=""
 
@@ -207,7 +207,7 @@ fi
 if ! dpkg-deb --contents "$artifact" | \
   grep -F "./opt/apps/$app_id/entries/applications/$desktop_file_name" \
     >/dev/null; then
-  echo "错误：DEB 缺少 UOS 专用桌面入口。" >&2
+  echo "错误：DEB 缺少与 AppID 同名的 UOS 桌面入口。" >&2
   exit 1
 fi
 
