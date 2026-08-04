@@ -14,8 +14,10 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 from integrated_client.config import APP_NAME
 from release_publisher.connection_control import ConnectionControlClient
 from release_publisher.core import (
+    _current_git_branch,
     CommandStep,
     GitPushPlan,
+    PublisherError,
     PublisherSettings,
     ReleaseOptions,
     SettingsStore,
@@ -36,6 +38,32 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleasePublisherCoreTests(unittest.TestCase):
+    def test_current_git_branch_uses_legacy_compatible_rev_parse(self):
+        repo_root = Path("legacy-git-repo")
+        with patch(
+            "release_publisher.core._git_output",
+            return_value="codex/uos-arm64-compat",
+        ) as git_output:
+            self.assertEqual(
+                _current_git_branch(repo_root),
+                "codex/uos-arm64-compat",
+            )
+        git_output.assert_called_once_with(
+            repo_root,
+            "rev-parse",
+            "--abbrev-ref",
+            "HEAD",
+            action="读取当前 Git 分支",
+        )
+
+    def test_current_git_branch_rejects_detached_head(self):
+        with patch(
+            "release_publisher.core._git_output",
+            return_value="HEAD",
+        ):
+            with self.assertRaisesRegex(PublisherError, "detached HEAD"):
+                _current_git_branch(Path("detached-repo"))
+
     def test_current_project_product_name_fields_are_consistent(self):
         expected_name = "逃费车辆智能查询平台"
         installer = (REPO_ROOT / "installer" / "intdemo.iss").read_text(

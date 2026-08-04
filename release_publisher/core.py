@@ -413,20 +413,26 @@ def _git_output(
     return result.stdout.strip()
 
 
+def _current_git_branch(repo_root: Path) -> str:
+    branch = _git_output(
+        repo_root,
+        "rev-parse",
+        "--abbrev-ref",
+        "HEAD",
+        action="读取当前 Git 分支",
+    )
+    if not branch or branch == "HEAD":
+        raise PublisherError("当前处于 detached HEAD，无法安全推送")
+    return branch
+
+
 def build_git_push_plan(repo_root: str | Path) -> GitPushPlan:
     root = Path(repo_root).resolve()
     changes = git_status(root)
     if changes:
         raise PublisherError("推送前请先提交全部 Git 工作区变更")
 
-    branch = _git_output(
-        root,
-        "branch",
-        "--show-current",
-        action="读取当前 Git 分支",
-    )
-    if not branch:
-        raise PublisherError("当前处于 detached HEAD，无法安全推送")
+    branch = _current_git_branch(root)
     _git_output(
         root,
         "rev-parse",

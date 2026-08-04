@@ -19,6 +19,7 @@ class UosCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "uos-browser"
             executable.write_bytes(b"browser")
+            executable.chmod(0o755)
             with patch.dict(
                 os.environ,
                 {"INTDEMO_CHROMIUM_PATH": str(executable)},
@@ -42,6 +43,7 @@ class UosCompatibilityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "chromium"
             executable.write_bytes(b"browser")
+            executable.chmod(0o755)
             playwright = Mock()
             playwright.chromium.executable_path = "/missing/playwright/chromium"
 
@@ -61,8 +63,10 @@ class UosCompatibilityTests(unittest.TestCase):
             managed = Path(temporary) / "managed" / "chrome"
             managed.parent.mkdir()
             managed.write_bytes(b"managed-browser")
+            managed.chmod(0o755)
             system = Path(temporary) / "system-chromium"
             system.write_bytes(b"system-browser")
+            system.chmod(0o755)
             playwright = Mock()
             playwright.chromium.executable_path = str(managed)
 

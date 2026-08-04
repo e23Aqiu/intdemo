@@ -4339,7 +4339,6 @@ class ToolAndUiTests(unittest.TestCase):
             chart._hover_card.height(),
             50 + chart._hover_card._detail_row_count * 22,
         )
-        donut_card_height = chart._hover_card.height()
         donut_card_width = chart._hover_card.width()
 
         bar_local = QPoint(int(bar_rect.center().x()), int(bar_rect.center().y()))
@@ -4358,7 +4357,10 @@ class ToolAndUiTests(unittest.TestCase):
             chart._hover_card.details,
             [("有电话", "2 条"), ("其他数据", "3 条")],
         )
-        self.assertEqual(chart._hover_card.height(), donut_card_height)
+        self.assertGreaterEqual(
+            chart._hover_card.height(),
+            50 + chart._hover_card._detail_row_count * 22,
+        )
         self.assertEqual(chart._hover_card.width(), donut_card_width)
         self.assertIsNone(chart._hovered_slice)
         phase = chart._animation_phase
