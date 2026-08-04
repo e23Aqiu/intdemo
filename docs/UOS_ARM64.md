@@ -169,6 +169,10 @@ bash scripts/uos-arm64/build-deb.sh
 DEB 使用包名 `com.e23aqiu.intdemo`、架构 `arm64`，应用文件位于
 `/opt/apps/com.e23aqiu.intdemo/`。包中不使用 `postinst` 修改系统，程序仍以
 普通桌面用户运行；用户数据库、Secret Service 密钥和在线配置不会装入 DEB。
+DEB 的桌面文件使用独立 ID `com.e23aqiu.intdemo.uos.desktop`，菜单名称为
+“逃费车辆智能查询平台（UOS）”。它与历史用户安装使用的
+`com.e23aqiu.intdemo.desktop` 分离，避免 UOS V20 的菜单缓存继续执行已经删除的
+`~/.local/opt/intdemo-client` 入口；旧版 DDE 下同时关闭启动通知。
 
 压缩包内的 `browser/` 是完整 Chromium 运行目录；启动器会自动设置
 `INTDEMO_CHROMIUM_PATH`，最终用户不需要执行 `playwright install`。
@@ -212,8 +216,9 @@ cd IntDemo-UOS-arm64-*
 
 ## 七、DEB 安装、升级与卸载
 
-首次从用户级安装切换到 DEB 前，先删除旧程序和旧桌面入口，避免用户级入口遮盖
-系统级入口；该脚本不会删除数据库、在线配置或浏览器账号资料：
+首次从用户级安装切换到 DEB 前，仍建议删除旧程序和旧桌面入口，避免菜单中出现
+两个名称相近的入口；DEB 专用桌面 ID 不再被旧入口的缓存遮盖。该脚本不会删除
+数据库、在线配置或浏览器账号资料：
 
 ```bash
 if [[ -x "$HOME/.local/opt/intdemo-client/uninstall-user.sh" ]]; then
@@ -227,12 +232,20 @@ fi
 sudo apt install ./dist/uos-arm64/IntDemo-UOS-arm64-0.2.8.deb
 ```
 
+同一应用版本内重新构建并测试菜单兼容修复时，使用强制重装让 `dpkg` 刷新文件清单：
+
+```bash
+sudo apt install --reinstall ./dist/uos-arm64/IntDemo-UOS-arm64-0.2.8.deb
+```
+
 本次生成的是未投递应用商店的测试包；若图形软件包安装器提示签名问题，需要按
 UOS 管理策略开启开发者模式，或使用已经获信任签名/企业应用商店发布的包。安装后
-从应用菜单启动，并可检查包信息和成品入口：
+从应用菜单启动“逃费车辆智能查询平台（UOS）”，并可检查包信息和成品入口：
 
 ```bash
 dpkg -s com.e23aqiu.intdemo | grep -E '^(Status|Version|Architecture):'
+grep -E '^(Name|Exec)=' \
+  /opt/apps/com.e23aqiu.intdemo/entries/applications/com.e23aqiu.intdemo.uos.desktop
 QT_QPA_PLATFORM=offscreen \
   /opt/apps/com.e23aqiu.intdemo/files/intdemo-client --self-check
 ```

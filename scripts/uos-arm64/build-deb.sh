@@ -4,6 +4,7 @@ set -Eeuo pipefail
 script_dir="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(CDPATH= cd -- "$script_dir/../.." && pwd)"
 app_id="com.e23aqiu.intdemo"
+desktop_file_name="$app_id.uos.desktop"
 version=""
 package_root=""
 
@@ -143,7 +144,7 @@ cp "$repo_root/packaging/uos-arm64/deb/README.txt" "$files_root/"
 cp "$repo_root/docs/UOS_ARM64.md" "$files_root/"
 cp "$repo_root/integrated_client/ui/assets/app-icon.png" "$files_root/"
 cp "$package_root/build-info.txt" "$files_root/"
-cp "$repo_root/packaging/uos-arm64/deb/com.e23aqiu.intdemo.desktop" \
+cp "$repo_root/packaging/uos-arm64/deb/$desktop_file_name" \
   "$desktop_root/"
 
 sed "s/@UOS_VERSION@/$version.0/g" \
@@ -155,7 +156,7 @@ chmod 0755 \
   "$files_root/browser/chrome"
 chmod 0644 \
   "$app_root/info" \
-  "$desktop_root/com.e23aqiu.intdemo.desktop" \
+  "$desktop_root/$desktop_file_name" \
   "$files_root/client-online.json" \
   "$files_root/certs/intdemo-caddy-root.crt" \
   "$files_root/README.txt" \
@@ -201,6 +202,12 @@ fi
 if ! dpkg-deb --contents "$artifact" | \
   grep -F "./opt/apps/$app_id/files/intdemo-client" >/dev/null; then
   echo "错误：DEB 缺少应用入口。" >&2
+  exit 1
+fi
+if ! dpkg-deb --contents "$artifact" | \
+  grep -F "./opt/apps/$app_id/entries/applications/$desktop_file_name" \
+    >/dev/null; then
+  echo "错误：DEB 缺少 UOS 专用桌面入口。" >&2
   exit 1
 fi
 

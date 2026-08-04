@@ -1254,3 +1254,23 @@
   `git diff --check` 通过。
 - 状态：DEB 构建与静态/最小归档验证完成，等待 UOS ARM64 真机用现有完整成品
   生成约 400 MB 的实际包，并验收双击安装、应用菜单、覆盖升级和卸载保数。
+
+### 步骤 124：修复 UOS V20 的 DEB 菜单入口缓存冲突
+
+- UOS Desktop 20 Professional 1070 ARM64 真机确认 DEB 安装成功，直接执行
+  `/opt/apps/com.e23aqiu.intdemo/files/intdemo-client` 可以正常显示登录界面，但
+  复用历史用户安装桌面 ID 的原菜单项点击后没有反应。
+- 真机新建唯一桌面 ID 的诊断入口后，DDE 菜单可以正常执行同一 DEB 根启动器；
+  诊断日志确认 `HOME`、`PATH`、Wayland、X11 显示变量、内置浏览器、在线配置及
+  Qt XCB 设置均正常，因此问题限定为旧菜单 ID 缓存，而非权限或运行库失败。
+- DEB 桌面文件改为 `com.e23aqiu.intdemo.uos.desktop`，显示名增加“（UOS）”，并
+  在旧版 DDE 下关闭启动通知；历史用户安装继续使用原桌面 ID，两种分发入口不再
+  相互遮盖。构建后新增桌面入口归档校验，防止重封装时退回旧文件名。
+- 继续遵循 UOS 应用目录规范：全部应用文件仍位于 `/opt/apps/${appid}`，不写入
+  `/usr/share`、不增加 `postinst`、不修改任何用户目录。文档补充同版本测试包需
+  使用 `apt --reinstall` 刷新 `dpkg` 文件清单。
+- UOS 专项回归 `16/16`、客户端完整回归 `169/169`、Python 编译、Bash 语法和
+  `git diff --check` 通过；WSL 原生 Linux 文件系统中的最小 DEB 实际归档确认只
+  包含新的 UOS 桌面 ID，包名、版本与 ARM64 架构校验继续生效。
+- 状态：菜单缓存兼容修复已完成，等待真机重封装并验证新的“逃费车辆智能查询平台
+  （UOS）”菜单入口。

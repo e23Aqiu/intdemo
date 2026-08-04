@@ -254,8 +254,9 @@ bash scripts/uos-arm64/build.sh
 两者均包含已在目标 UOS 20 真机验证的 ARM64 Chromium，以及与 conda-forge Qt
 匹配的 ARM64 GNU C++ 运行库、在线测试服务配置和公开根证书。DEB 按 UOS 规范
 安装到 `/opt/apps/com.e23aqiu.intdemo/`，用户数据库与配置仍位于 XDG 用户目录，
-升级或卸载程序不会删除业务数据。构建会验证 Qt 所需的 GLIBCXX ABI、在线配置及
-成品运行库。详细的系统依赖、浏览器覆盖、XWayland 策略与验收清单见
+升级或卸载程序不会删除业务数据；DEB 使用独立的 UOS 桌面 ID，避免历史用户安装
+残留的菜单缓存阻止启动。构建会验证 Qt 所需的 GLIBCXX ABI、在线配置及成品运行库。
+详细的系统依赖、浏览器覆盖、XWayland 策略与验收清单见
 [`docs/UOS_ARM64.md`](docs/UOS_ARM64.md)。
 
 同时构建 Windows 免安装便携包和安装包（公网 IP 测试方案）：

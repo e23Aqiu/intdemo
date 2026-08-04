@@ -200,10 +200,11 @@ class UosCompatibilityTests(unittest.TestCase):
             .replace("@UOS_VERSION@", "0.2.8.0")
         )
         desktop = (
-            packaging / "com.e23aqiu.intdemo.desktop"
+            packaging / "com.e23aqiu.intdemo.uos.desktop"
         ).read_text(encoding="utf-8")
 
         self.assertIn('app_id="com.e23aqiu.intdemo"', deb_builder)
+        self.assertIn('desktop_file_name="$app_id.uos.desktop"', deb_builder)
         self.assertIn('app_root="$deb_root/opt/apps/$app_id"', deb_builder)
         self.assertIn("dpkg-deb --root-owner-group", deb_builder)
         self.assertIn("fakeroot dpkg-deb --build", deb_builder)
@@ -228,6 +229,13 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn(
             "Exec=/opt/apps/com.e23aqiu.intdemo/files/intdemo-client",
             desktop,
+        )
+        self.assertIn("Name=逃费车辆智能查询平台（UOS）", desktop)
+        self.assertIn("StartupNotify=false", desktop)
+        self.assertFalse((packaging / "com.e23aqiu.intdemo.desktop").exists())
+        self.assertIn(
+            "entries/applications/$desktop_file_name",
+            deb_builder,
         )
 
     def test_uos_build_bundles_compatible_cpp_runtime(self):
