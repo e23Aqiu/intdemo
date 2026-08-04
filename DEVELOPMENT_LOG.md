@@ -1294,3 +1294,23 @@
   启动日志行为及 `git diff --check` 通过；WSL 原生文件系统中的最小 ARM64 DEB
   实际归档确认只包含 AppID 同名桌面入口，独立 UOS 文件名不存在。
 - 状态：AppID 同名入口已恢复并通过回归，等待干净真机完整重建与首次安装。
+
+### 步骤 126：修复 UOS 菜单注入 Qt Wayland 平台导致的静默退出
+
+- 干净环境完整重建并首次安装后，AppID 同名菜单入口仍点击无界面；新增的
+  `launcher.log` 证明 UOS 已正确执行 `/usr/share/applications/com.e23aqiu.intdemo.desktop`，
+  包路径、用户和显示变量均正常。
+- 日志捕获到 UOS 菜单环境注入了 `QT_QPA_PLATFORM=wayland`，而随包 Qt 只包含
+  `eglfs`、`minimal`、`offscreen`、`vnc`、`webgl` 与 `xcb` 插件，因此 Qt 在创建
+  QApplication 前立即退出。终端启动能够成功，是因为终端环境没有该注入值，旧
+  启动器的 `${QT_QPA_PLATFORM:-xcb}` 才会选择 `xcb`。
+- 根启动器和 Python 平台兼容层现把 UOS Wayland 会话中继承的空值、`wayland` 或
+  `wayland-egl` 统一回退到 `xcb`，同时保留构建自检所需的 `offscreen` 等明确值。
+  新增 `INTDEMO_QT_QPA_PLATFORM` 作为有意验证原生 Wayland 的唯一显式覆盖入口。
+- 启动日志追加最终生效的 Qt 平台与 Chromium Ozone 平台，后续无需再从启动前环境
+  猜测实际选择。
+- UOS 专项回归增至 `19/19`、客户端完整回归增至 `172/172`，Python 编译、Bash
+  语法和 `git diff --check` 通过；真实 Bash 启动器测试确认系统注入 `wayland`
+  会得到 `xcb`，`offscreen` 保持不变，项目专用原生 Wayland 覆盖仍然生效。
+- 状态：根因与修复已落地；由于 ARM64 便携成品已经重新生成，只需快速重封装并
+  强制重装 DEB，无需再次运行 PyInstaller。

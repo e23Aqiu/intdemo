@@ -124,10 +124,14 @@ Chromium `--ozone-platform=x11`。如果真机已经安装完整 Qt Wayland 插�
 验证原生 Wayland，可显式覆盖：
 
 ```bash
-export QT_QPA_PLATFORM=wayland
+export INTDEMO_QT_QPA_PLATFORM=wayland
 export INTDEMO_CHROMIUM_OZONE_PLATFORM=wayland
 conda run -p ./.conda-uos-arm64 python main.py
 ```
+
+UOS 菜单启动器可能自动注入 `QT_QPA_PLATFORM=wayland`，但当前随包 Qt 不包含
+Wayland 平台插件；根启动器会把这个系统注入值改为 `xcb`。普通用户不要直接用
+`QT_QPA_PLATFORM=wayland` 覆盖，原生 Wayland 验证统一使用上述项目专用变量。
 
 ## 五、构建 ARM64 包
 

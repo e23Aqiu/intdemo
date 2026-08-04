@@ -34,14 +34,27 @@ if [[ -z "${INTDEMO_CONNECTION_CONFIG:-}" ]]; then
   fi
 fi
 
-# UOS 20 Wayland normally provides XWayland.  Qt 5's XCB plugin and Chromium's
-# X11 path are more reliable on this older desktop stack.  Users can override
-# either value before launching when native Wayland has been verified.
+# UOS 20 Wayland normally provides XWayland.  Its application launcher may
+# inject QT_QPA_PLATFORM=wayland even though the bundled Qt has no Wayland
+# plugin, so treat that inherited value as unsafe and force XCB.  A deliberate
+# native Wayland test must use the project-specific override below.
+if [[ -n "${INTDEMO_QT_QPA_PLATFORM:-}" ]]; then
+  export QT_QPA_PLATFORM="$INTDEMO_QT_QPA_PLATFORM"
+elif [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${DISPLAY:-}" ]]; then
+  case "${QT_QPA_PLATFORM:-}" in
+    ""|wayland|wayland-egl) export QT_QPA_PLATFORM=xcb ;;
+  esac
+fi
 if [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${DISPLAY:-}" ]]; then
-  export QT_QPA_PLATFORM="${QT_QPA_PLATFORM:-xcb}"
   export INTDEMO_CHROMIUM_OZONE_PLATFORM="${INTDEMO_CHROMIUM_OZONE_PLATFORM:-x11}"
 fi
 export QT_AUTO_SCREEN_SCALE_FACTOR="${QT_AUTO_SCREEN_SCALE_FACTOR:-1}"
+
+if [[ -n "$launcher_log" ]]; then
+  printf 'effective_qt_platform=%s chromium_ozone=%s\n' \
+    "${QT_QPA_PLATFORM:-}" "${INTDEMO_CHROMIUM_OZONE_PLATFORM:-}" \
+    >>"$launcher_log" 2>&1 || true
+fi
 
 if [[ -n "$launcher_log" ]]; then
   exec "$package_root/app/intdemo-client" "$@" 2>>"$launcher_log"

@@ -100,6 +100,43 @@ class UosCompatibilityTests(unittest.TestCase):
                 ["--disable-dev-shm-usage", "--ozone-platform=x11"],
             )
 
+    def test_uos_injected_wayland_qt_platform_falls_back_to_xcb(self):
+        environment = {
+            "XDG_SESSION_TYPE": "wayland",
+            "DISPLAY": ":1",
+            "QT_QPA_PLATFORM": "wayland",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            platform_support, "is_linux_arm64", return_value=True
+        ):
+            platform_support.configure_desktop_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "xcb")
+
+    def test_uos_qt_offscreen_platform_is_preserved(self):
+        environment = {
+            "XDG_SESSION_TYPE": "wayland",
+            "DISPLAY": ":1",
+            "QT_QPA_PLATFORM": "offscreen",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            platform_support, "is_linux_arm64", return_value=True
+        ):
+            platform_support.configure_desktop_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "offscreen")
+
+    def test_uos_explicit_native_wayland_override_wins(self):
+        environment = {
+            "XDG_SESSION_TYPE": "wayland",
+            "DISPLAY": ":1",
+            "QT_QPA_PLATFORM": "xcb",
+            "INTDEMO_QT_QPA_PLATFORM": "wayland",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            platform_support, "is_linux_arm64", return_value=True
+        ):
+            platform_support.configure_desktop_environment()
+            self.assertEqual(os.environ["QT_QPA_PLATFORM"], "wayland")
+
     def test_self_update_is_limited_to_windows_installer_platform(self):
         with patch.object(platform_support.os, "name", "posix"):
             self.assertFalse(platform_support.supports_self_update())
@@ -185,6 +222,8 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("INTDEMO_CHROMIUM_PATH", launcher)
         self.assertIn("launcher.log", launcher)
         self.assertIn("GIO_LAUNCHED_DESKTOP_FILE", launcher)
+        self.assertIn("INTDEMO_QT_QPA_PLATFORM", launcher)
+        self.assertIn("effective_qt_platform", launcher)
         self.assertIn('2>>"$launcher_log"', launcher)
 
     def test_uos_build_generates_native_arm64_deb(self):
