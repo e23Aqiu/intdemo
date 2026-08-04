@@ -12,6 +12,7 @@ cd "$repo_root"
 skip_tests=0
 skip_env_update=0
 skip_browser_check=0
+skip_deb=0
 
 usage() {
   cat <<'EOF'
@@ -19,6 +20,7 @@ usage() {
   --skip-tests          跳过离线自动测试
   --skip-env-update     不更新现有 conda 环境
   --skip-browser-check  只解析浏览器路径，不实际启动 Chromium
+  --skip-deb            只生成 tar.gz，不生成 UOS ARM64 DEB
 EOF
 }
 
@@ -27,6 +29,7 @@ while (($#)); do
     --skip-tests) skip_tests=1 ;;
     --skip-env-update) skip_env_update=1 ;;
     --skip-browser-check) skip_browser_check=1 ;;
+    --skip-deb) skip_deb=1 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
   esac
@@ -83,6 +86,7 @@ package_parent="$repo_root/dist/uos-arm64/package"
 package_name="IntDemo-UOS-arm64-$version"
 package_root="$package_parent/$package_name"
 artifact="$repo_root/dist/uos-arm64/$package_name.tar.gz"
+deb_artifact="$repo_root/dist/uos-arm64/$package_name.deb"
 
 case "$package_root" in
   "$repo_root"/dist/uos-arm64/package/*) ;;
@@ -92,9 +96,14 @@ case "$artifact" in
   "$repo_root"/dist/uos-arm64/IntDemo-UOS-arm64-*.tar.gz) ;;
   *) echo "拒绝清理非预期构建产物：$artifact" >&2; exit 1 ;;
 esac
+case "$deb_artifact" in
+  "$repo_root"/dist/uos-arm64/IntDemo-UOS-arm64-*.deb) ;;
+  *) echo "拒绝清理非预期 DEB 产物：$deb_artifact" >&2; exit 1 ;;
+esac
 echo "=== 清理同版本旧构建产物 ==="
 rm -rf -- "$package_root"
 rm -f -- "$artifact" "$artifact.sha256"
+rm -f -- "$deb_artifact" "$deb_artifact.sha256"
 
 browser_output="$(
   PLAYWRIGHT_BROWSERS_PATH="$browser_cache" \
@@ -266,8 +275,18 @@ mkdir -p "$package_parent"
 tar -C "$package_parent" -czf "$artifact" "$package_name"
 sha256sum "$artifact" > "$artifact.sha256"
 
+if ((skip_deb == 0)); then
+  bash "$script_dir/build-deb.sh" \
+    --package-root "$package_root" \
+    --version "$version"
+fi
+
 echo "=== 构建完成 ==="
 echo "$artifact"
 cat "$artifact.sha256"
-du -sh "$package_root/browser" "$artifact"
+size_targets=("$package_root/browser" "$artifact")
+if [[ -f "$deb_artifact" ]]; then
+  size_targets+=("$deb_artifact")
+fi
+du -sh "${size_targets[@]}"
 echo "解压后先运行 ./intdemo-client；确认无误后可运行 ./install-user.sh。"

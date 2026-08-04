@@ -1230,3 +1230,27 @@
   在线配置加载、服务端健康检查及 `git diff --check` 通过。
 - 状态：默认在线配置已完成，等待 UOS 真机验证账号登录、记住密码、重启解密和
   数据同步；客户端 `0.2.8` 与当前服务端 `0.2.7` 的最终兼容性以该轮结果为准。
+
+### 步骤 123：增加 UOS ARM64 原生 DEB 分发包
+
+- 在已经通过真机验证的便携包基础上新增独立 `build-deb.sh`，无需重新运行
+  PyInstaller 即可快速重封装；完整 `build.sh` 默认同时生成 `tar.gz` 和同版本
+  `.deb`，并继续提供 `--skip-deb` 故障排查入口。
+- DEB 包名和 AppID 统一为 `com.e23aqiu.intdemo`，架构固定为 `arm64`；应用按
+  UOS 规范放入 `/opt/apps/com.e23aqiu.intdemo/` 下的 `files`、`entries` 与
+  `info` 结构，桌面入口直接启动包内根启动器。
+- DEB 复用当前仓库中的启动器、在线配置与公开根证书，因此即使基于此前生成的
+  ARM64 便携成品重封装，也会带上最新连接配置；已有用户配置仍然优先。
+- 控制信息声明 UOS 桌面运行依赖和 ARM64 架构，生成 `md5sums`、包级 SHA-256，
+  使用 `--root-owner-group` 或 `fakeroot` 固定所有权，并在打包后复查包名、版本、
+  架构和入口清单。包中没有 `postinst`，不会修改用户目录或删除业务数据。
+- 首次从 `~/.local/opt/intdemo-client` 切换到 DEB 时，文档要求先运行原用户卸载
+  脚本清理旧程序和桌面入口；数据库、浏览器资料、Secret Service 密钥及在线配置
+  均继续保留在 XDG 用户目录。后续可由软件包安装器完成升级和卸载。
+- 在 WSL 原生 Linux 文件系统中实际生成最小测试 DEB，`dpkg-deb` 成功读取
+  `Package=com.e23aqiu.intdemo`、`Version=9.9.9`、`Architecture=arm64`，应用入口、
+  在线配置、根证书、UOS `info` 和桌面文件的归档路径及权限检查通过。
+- UOS 专项回归 `16/16`、客户端完整回归 `169/169`、Python 编译、Bash 语法和
+  `git diff --check` 通过。
+- 状态：DEB 构建与静态/最小归档验证完成，等待 UOS ARM64 真机用现有完整成品
+  生成约 400 MB 的实际包，并验收双击安装、应用菜单、覆盖升级和卸载保数。

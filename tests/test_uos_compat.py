@@ -184,6 +184,52 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn('bundled_browser="$package_root/browser/chrome"', launcher)
         self.assertIn("INTDEMO_CHROMIUM_PATH", launcher)
 
+    def test_uos_build_generates_native_arm64_deb(self):
+        root = Path(__file__).resolve().parents[1]
+        packaging = root / "packaging/uos-arm64/deb"
+        deb_builder = (root / "scripts/uos-arm64/build-deb.sh").read_text(
+            encoding="utf-8"
+        )
+        build_script = (root / "scripts/uos-arm64/build.sh").read_text(
+            encoding="utf-8"
+        )
+        control = (packaging / "control.in").read_text(encoding="utf-8")
+        info = json.loads(
+            (packaging / "info.json.in")
+            .read_text(encoding="utf-8")
+            .replace("@UOS_VERSION@", "0.2.8.0")
+        )
+        desktop = (
+            packaging / "com.e23aqiu.intdemo.desktop"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('app_id="com.e23aqiu.intdemo"', deb_builder)
+        self.assertIn('app_root="$deb_root/opt/apps/$app_id"', deb_builder)
+        self.assertIn("dpkg-deb --root-owner-group", deb_builder)
+        self.assertIn("fakeroot dpkg-deb --build", deb_builder)
+        self.assertIn("DEBIAN/md5sums", deb_builder)
+        self.assertIn("trap cleanup_deb_build EXIT", deb_builder)
+        self.assertIn(
+            'cp "$repo_root/packaging/uos-arm64/intdemo-client"',
+            deb_builder,
+        )
+        self.assertIn('packaging/uos-arm64/deb/README.txt', deb_builder)
+        self.assertNotIn("$HOME/.local", deb_builder)
+        self.assertNotIn("postinst", deb_builder.lower())
+        self.assertIn('bash "$script_dir/build-deb.sh"', build_script)
+        self.assertIn("--skip-deb", build_script)
+        self.assertIn("Package: com.e23aqiu.intdemo", control)
+        self.assertIn("Architecture: arm64", control)
+        self.assertIn("libsecret-tools", control)
+        self.assertEqual(info["appid"], "com.e23aqiu.intdemo")
+        self.assertEqual(info["version"], "0.2.8.0")
+        self.assertEqual(info["arch"], ["arm64"])
+        self.assertTrue(info["permissions"]["clipboard"])
+        self.assertIn(
+            "Exec=/opt/apps/com.e23aqiu.intdemo/files/intdemo-client",
+            desktop,
+        )
+
     def test_uos_build_bundles_compatible_cpp_runtime(self):
         root = Path(__file__).resolve().parents[1]
         environment = (root / "environment-uos-arm64.yml").read_text(

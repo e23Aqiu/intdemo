@@ -35,7 +35,7 @@
 ```bash
 sudo apt update
 sudo apt install -y \
-  wget ca-certificates git binutils lsof libsecret-tools \
+  wget ca-certificates git binutils fakeroot lsof libsecret-tools \
   libglib2.0-0 libdbus-1-3 libfontconfig1 libfreetype6 \
   libx11-6 libx11-xcb1 libxcb1 libxcb-xinerama0 libxkbcommon-x11-0 \
   libxrender1 libxi6 libxrandr2 libxfixes3 libxcursor1 \
@@ -138,15 +138,17 @@ bash scripts/uos-arm64/build.sh
 默认流程依次执行：环境和浏览器缓存更新、UOS/架构/glibc/依赖/浏览器/密钥环
 预检、客户端离线回归测试、PyInstaller 目录包构建、conda ARM64 GNU 运行库
 固定、Qt 所需 `GLIBCXX_3.4.26` 与动态库检查、成品入口自检、内置 Chromium
-复制与二次启动检查、`tar.gz` 打包和 SHA-256 生成。构建脚本拒绝打包项目缓存
-目录之外的浏览器，避免误带入开发机上的其他可执行文件。正式构建开始前会删除
-同版本旧压缩包和旧组装目录；任何后续检查失败时都不会留下可被误认为新包的产物。
+复制与二次启动检查、`tar.gz` 打包、UOS ARM64 DEB 组装和 SHA-256 生成。构建
+脚本拒绝打包项目缓存目录之外的浏览器，避免误带入开发机上的其他可执行文件。
+正式构建开始前会删除同版本旧压缩包、旧 DEB 和旧组装目录；任何后续检查失败时
+都不会留下可被误认为新包的同格式产物。
 
 仅在定位问题时使用跳过参数：
 
 ```bash
 bash scripts/uos-arm64/build.sh --skip-env-update --skip-tests
 bash scripts/uos-arm64/build.sh --skip-browser-check
+bash scripts/uos-arm64/build.sh --skip-deb
 ```
 
 成功后得到：
@@ -154,7 +156,19 @@ bash scripts/uos-arm64/build.sh --skip-browser-check
 ```text
 dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz
 dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz.sha256
+dist/uos-arm64/IntDemo-UOS-arm64-<版本>.deb
+dist/uos-arm64/IntDemo-UOS-arm64-<版本>.deb.sha256
 ```
+
+如果 ARM64 便携包已经成功生成，只想快速补做 DEB，无需重新运行 PyInstaller：
+
+```bash
+bash scripts/uos-arm64/build-deb.sh
+```
+
+DEB 使用包名 `com.e23aqiu.intdemo`、架构 `arm64`，应用文件位于
+`/opt/apps/com.e23aqiu.intdemo/`。包中不使用 `postinst` 修改系统，程序仍以
+普通桌面用户运行；用户数据库、Secret Service 密钥和在线配置不会装入 DEB。
 
 压缩包内的 `browser/` 是完整 Chromium 运行目录；启动器会自动设置
 `INTDEMO_CHROMIUM_PATH`，最终用户不需要执行 `playwright install`。
@@ -165,7 +179,7 @@ PyInstaller 误收集 UOS 系统旧库后无法加载 conda-forge Qt。
 根启动器按“`INTDEMO_CONNECTION_CONFIG` 显式指定、用户配置、随包配置”的顺序
 选择连接配置，所以直接解压试运行即可连接在线测试服务，同时不会覆盖已有环境。
 
-## 六、试运行与当前用户安装
+## 六、便携试运行与当前用户安装
 
 ```bash
 cd /tmp
@@ -196,7 +210,44 @@ cd IntDemo-UOS-arm64-*
 ~/.local/opt/intdemo-client/uninstall-user.sh
 ```
 
-## 七、首轮真机验收清单
+## 七、DEB 安装、升级与卸载
+
+首次从用户级安装切换到 DEB 前，先删除旧程序和旧桌面入口，避免用户级入口遮盖
+系统级入口；该脚本不会删除数据库、在线配置或浏览器账号资料：
+
+```bash
+if [[ -x "$HOME/.local/opt/intdemo-client/uninstall-user.sh" ]]; then
+  "$HOME/.local/opt/intdemo-client/uninstall-user.sh"
+fi
+```
+
+随后可在文件管理器中双击当前版本的 `.deb`，或在仓库根目录通过终端安装：
+
+```bash
+sudo apt install ./dist/uos-arm64/IntDemo-UOS-arm64-0.2.8.deb
+```
+
+本次生成的是未投递应用商店的测试包；若图形软件包安装器提示签名问题，需要按
+UOS 管理策略开启开发者模式，或使用已经获信任签名/企业应用商店发布的包。安装后
+从应用菜单启动，并可检查包信息和成品入口：
+
+```bash
+dpkg -s com.e23aqiu.intdemo | grep -E '^(Status|Version|Architecture):'
+QT_QPA_PLATFORM=offscreen \
+  /opt/apps/com.e23aqiu.intdemo/files/intdemo-client --self-check
+```
+
+升级时直接安装更高版本 DEB；卸载只删除程序文件和系统桌面入口：
+
+```bash
+sudo apt remove com.e23aqiu.intdemo
+```
+
+用户业务数据继续保留在
+`~/.local/share/intdemo-client-online-test/`，用户在线配置继续保留在
+`~/.config/intdemo-client/`。
+
+## 八、首轮真机验收清单
 
 请按顺序验收，并在某一步失败时停止，保留该步终端与日志：
 
@@ -212,9 +263,10 @@ cd IntDemo-UOS-arm64-*
 7. 导入公开腾讯文档；再测试需要登录的腾讯文档，确认独立浏览器资料目录可复用。
 8. 用 WPS 打开测试表格时，应用能提示文件占用；关闭 WPS 后可以继续写入。
 9. 关闭应用后检查日志与数据库均位于 XDG 数据目录，重新启动数据仍在。
-10. 解压包、用户安装、应用菜单启动和卸载各执行一次；确认卸载不删除业务数据。
+10. 解压包、用户安装、DEB 安装/升级、应用菜单启动和两种卸载方式各执行一次；
+    确认卸载不删除业务数据或在线配置。
 
-## 八、失败时回传的信息
+## 九、失败时回传的信息
 
 请提供以下文件/输出，注意先检查其中是否含有业务文件名或服务器地址：
 
@@ -239,7 +291,8 @@ echo "$XDG_SESSION_TYPE $DISPLAY $WAYLAND_DISPLAY $QT_QPA_PLATFORM"
 ## 当前限制
 
 - UOS 自动更新暂时关闭，因为现有更新清单和发布器只生成 Windows `.exe`。
-  UOS 测试包通过重新构建后执行 `install-user.sh` 覆盖升级。
+  UOS 测试包可执行 `install-user.sh` 覆盖用户安装，或安装更高版本 DEB；客户端
+  目前还不会在应用内自动下载并调用软件包安装器。
 - Playwright 官方支持的是更新的 Debian/Ubuntu 版本；本项目内置 Chromium
   已在 UOS Desktop 20 1070 ARM64、glibc 2.28 上完成启动验证；游客模式的实际
   业务处理已经通过，在线账号登录、凭据重启解密与同步链路仍需真机验收。

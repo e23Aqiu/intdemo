@@ -53,7 +53,8 @@ flowchart LR
   新版本会通过弹窗及侧边栏红点提示。更新提示等待处理时只锁定业务内容，
   最小化、最大化和关闭按钮始终可用；普通更新可选择稍后更新、后台更新或
   立即更新，下载在后台进行，开始安装时才暂停其他业务。
-  当前自动更新安装器仅适用于 Windows；UOS 使用用户安装脚本手动覆盖升级。
+  当前应用内自动更新仅适用于 Windows；UOS 使用用户安装脚本或更高版本 DEB
+  手动升级。
 - 窗口顶部提供公告喇叭和 7 秒轮播入口；管理员可发布富文本公告、上传图片或
   文件、选择开屏展示及指定普通用户，普通用户可在公告详情中发送纯文字消息，
   管理员在“公告发布”页面集中查看并标记已读。
@@ -242,17 +243,19 @@ python -m pytest
 WebSocket、私有 CA、备份和全新数据库恢复。真实运输证、营运查询及爱企查
 流程仍需在授权环境人工验收。
 
-UOS ARM64 真机构建与测试：
+UOS ARM64 真机构建与测试（默认同时生成便携包和原生 DEB）：
 
 ```bash
 bash scripts/uos-arm64/diagnose.sh
 bash scripts/uos-arm64/build.sh
 ```
 
-产物位于 `dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz`，其中包含已在目标
-UOS 20 真机验证的 ARM64 Chromium，以及与 conda-forge Qt 匹配的 ARM64 GNU
-C++ 运行库、在线测试服务配置和公开根证书。构建会验证 Qt 所需的 GLIBCXX ABI、
-在线配置及成品运行库。详细的系统依赖、浏览器覆盖、XWayland 策略与十项验收清单见
+产物位于 `dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz` 和同名 `.deb`。
+两者均包含已在目标 UOS 20 真机验证的 ARM64 Chromium，以及与 conda-forge Qt
+匹配的 ARM64 GNU C++ 运行库、在线测试服务配置和公开根证书。DEB 按 UOS 规范
+安装到 `/opt/apps/com.e23aqiu.intdemo/`，用户数据库与配置仍位于 XDG 用户目录，
+升级或卸载程序不会删除业务数据。构建会验证 Qt 所需的 GLIBCXX ABI、在线配置及
+成品运行库。详细的系统依赖、浏览器覆盖、XWayland 策略与验收清单见
 [`docs/UOS_ARM64.md`](docs/UOS_ARM64.md)。
 
 同时构建 Windows 免安装便携包和安装包（公网 IP 测试方案）：
