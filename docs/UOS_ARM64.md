@@ -22,6 +22,9 @@
   `INTDEMO_CHROMIUM_PATH` 仅作为故障排查时的显式覆盖入口。
 - Windows DPAPI 在 Linux 上替换为 Secret Service。应用只把随机主密钥放入
   当前用户的桌面密钥环，SQLite 中的在线令牌和离线授权仍然是 AES-GCM 密文。
+- 成品包预置在线测试服务 `https://43.138.177.65` 和用于校验该服务证书的公开
+  Caddy 根证书。启动器优先使用用户配置，未配置时才使用随包默认值；账号密码、
+  令牌和私钥均不进入软件包。
 - UOS 包必须在这台 ARM64 真机上构建。PyInstaller 不是交叉编译器；同时在
   glibc 2.28 上构建可以避免产物误依赖更新的 glibc。
 
@@ -59,7 +62,7 @@ cd intdemo
 
 ```bash
 git fetch origin
-git switch codex/uos-arm64-compat
+git checkout codex/uos-arm64-compat
 git pull --ff-only
 ```
 
@@ -101,23 +104,20 @@ bash scripts/uos-arm64/diagnose.sh 2>&1 | tee uos-arm64-diagnose.log
 conda run -p ./.conda-uos-arm64 python main.py
 ```
 
-在线模式把连接配置放在用户配置目录，安装或升级不会覆盖：
+从源码启动时，可把仓库中经过验证的在线测试配置复制到用户配置目录：
 
 ```bash
-mkdir -p "${XDG_CONFIG_HOME:-$HOME/.config}/intdemo-client"
-cat > "${XDG_CONFIG_HOME:-$HOME/.config}/intdemo-client/client-online.json" <<'JSON'
-{
-  "base_url": "https://api.example.com",
-  "ca_bundle": null,
-  "channel": "test",
-  "connect_timeout": 5,
-  "read_timeout": 20
-}
-JSON
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/intdemo-client"
+mkdir -p "$config_dir/certs"
+cp packaging/uos-arm64/client-online.json "$config_dir/"
+cp packaging/uos-arm64/certs/intdemo-caddy-root.crt "$config_dir/certs/"
+chmod 0600 "$config_dir/client-online.json"
+chmod 0644 "$config_dir/certs/intdemo-caddy-root.crt"
 ```
 
-如果使用公网 IP 和自建 Caddy CA，必须把 `ca_bundle` 改成该根证书的绝对
-路径；客户端不会允许 `http://` 或 `verify=False` 式绕过。
+该配置指向 `https://43.138.177.65`，`ca_bundle` 使用相对于配置文件的证书路径，
+因此复制整个配置目录后仍然有效。若需要改用其他服务，可以编辑用户配置；
+客户端不会允许 `http://`、缺少受信 CA 的公网 IP 或 `verify=False` 式绕过。
 
 Wayland 会话且存在 XWayland 时，程序默认使用 `QT_QPA_PLATFORM=xcb` 和
 Chromium `--ozone-platform=x11`。如果真机已经安装完整 Qt Wayland 插件并想
@@ -161,6 +161,10 @@ dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz.sha256
 `app/_internal/libstdc++.so.6` 和 `libgcc_s.so.1` 来自项目 conda 环境，避免
 PyInstaller 误收集 UOS 系统旧库后无法加载 conda-forge Qt。
 
+压缩包根目录还包含 `client-online.json` 和 `certs/intdemo-caddy-root.crt`。
+根启动器按“`INTDEMO_CONNECTION_CONFIG` 显式指定、用户配置、随包配置”的顺序
+选择连接配置，所以直接解压试运行即可连接在线测试服务，同时不会覆盖已有环境。
+
 ## 六、试运行与当前用户安装
 
 ```bash
@@ -182,6 +186,9 @@ cd IntDemo-UOS-arm64-*
 ```text
 ~/.local/share/intdemo-client-online-test/
 ```
+
+首次安装且用户配置不存在时，安装脚本会把随包连接配置和公开根证书复制到
+`~/.config/intdemo-client/`；升级时若该配置已经存在则原样保留。
 
 卸载只删除程序，不删除业务数据库：
 
@@ -234,7 +241,7 @@ echo "$XDG_SESSION_TYPE $DISPLAY $WAYLAND_DISPLAY $QT_QPA_PLATFORM"
 - UOS 自动更新暂时关闭，因为现有更新清单和发布器只生成 Windows `.exe`。
   UOS 测试包通过重新构建后执行 `install-user.sh` 覆盖升级。
 - Playwright 官方支持的是更新的 Debian/Ubuntu 版本；本项目内置 Chromium
-  已在 UOS Desktop 20 1070 ARM64、glibc 2.28 上完成首次启动验证，但仍需通过
-  真实运输证、营运查询、爱企查和腾讯文档业务流程验收。
+  已在 UOS Desktop 20 1070 ARM64、glibc 2.28 上完成启动验证；游客模式的实际
+  业务处理已经通过，在线账号登录、凭据重启解密与同步链路仍需真机验收。
 - 当前默认走 XWayland，以降低旧 Qt 5/显卡驱动组合的不确定性；原生 Wayland
   作为后续真机验证项，不作为第一版阻塞条件。

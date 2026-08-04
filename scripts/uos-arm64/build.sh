@@ -216,9 +216,12 @@ fi
 echo "Qt Core C++ 运行库: $qt_libstdcxx_real"
 echo "Qt Core 动态库检查: 正常"
 
-mkdir -p "$package_root/app" "$package_root/browser"
+mkdir -p "$package_root/app" "$package_root/browser" "$package_root/certs"
 cp -a "$pyinstaller_dist/intdemo-client/." "$package_root/app/"
 cp -a "$browser_source_dir/." "$package_root/browser/"
+cp "$repo_root/packaging/uos-arm64/client-online.json" "$package_root/"
+cp "$repo_root/packaging/uos-arm64/certs/intdemo-caddy-root.crt" \
+  "$package_root/certs/"
 cp "$repo_root/packaging/uos-arm64/intdemo-client" "$package_root/"
 cp "$repo_root/packaging/uos-arm64/install-user.sh" "$package_root/"
 cp "$repo_root/packaging/uos-arm64/uninstall-user.sh" "$package_root/"
@@ -232,6 +235,11 @@ chmod +x \
   "$package_root/uninstall-user.sh" \
   "$package_root/app/intdemo-client" \
   "$package_root/browser/chrome"
+
+echo "=== 检查打包后的在线配置 ==="
+INTDEMO_CONNECTION_CONFIG="$package_root/client-online.json" \
+  "$conda_cmd" run --prefix "$env_prefix" python -c \
+  'from integrated_client.online.config import OnlineConfig; config = OnlineConfig.load(); print("在线配置正常:", config.base_url, config.ca_bundle)'
 
 echo "=== 检查打包后的客户端运行库 ==="
 QT_QPA_PLATFORM=offscreen "$package_root/intdemo-client" --self-check

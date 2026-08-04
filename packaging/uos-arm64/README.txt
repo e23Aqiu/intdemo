@@ -3,7 +3,8 @@
 
 快速试运行：
   1. 确认系统已安装 secret-tool；Chromium 和 Qt 所需 GNU C++ 运行库已包含在本软件包中。
-  2. 按 UOS_ARM64.md 创建 ~/.config/intdemo-client/client-online.json。
+  2. 在线测试服务 https://43.138.177.65 及其公开根证书已随包配置。
+     若 ~/.config/intdemo-client/client-online.json 已存在，则优先保留并使用用户配置。
   3. 在当前目录执行：./intdemo-client
   4. 仅在排查内置浏览器问题时才覆盖浏览器路径：
        export INTDEMO_CHROMIUM_PATH=/实际/浏览器/可执行文件

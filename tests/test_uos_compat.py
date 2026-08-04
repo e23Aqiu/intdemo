@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import json
 import os
 import runpy
 import tempfile
@@ -157,6 +159,13 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("opencv-python-headless", requirements)
         self.assertNotIn("\nopencv-python==", requirements)
 
+    def test_uos_guide_uses_legacy_compatible_git_checkout(self):
+        guide = (
+            Path(__file__).resolve().parents[1] / "docs/UOS_ARM64.md"
+        ).read_text(encoding="utf-8")
+        self.assertIn("git checkout codex/uos-arm64-compat", guide)
+        self.assertNotIn("git switch", guide)
+
     def test_uos_build_bundles_project_managed_chromium(self):
         root = Path(__file__).resolve().parents[1]
         prepare_script = (root / "scripts/uos-arm64/prepare-env.sh").read_text(
@@ -194,6 +203,40 @@ class UosCompatibilityTests(unittest.TestCase):
         )
         self.assertIn('"$package_root/intdemo-client" --self-check', build_script)
         self.assertIn('runtime_self_check = "--self-check" in sys.argv', entrypoint)
+
+    def test_uos_package_contains_verified_online_service_config(self):
+        root = Path(__file__).resolve().parents[1]
+        packaging = root / "packaging/uos-arm64"
+        config = json.loads(
+            (packaging / "client-online.json").read_text(encoding="utf-8")
+        )
+        certificate = (
+            packaging / "certs/intdemo-caddy-root.crt"
+        ).read_bytes()
+        build_script = (root / "scripts/uos-arm64/build.sh").read_text(
+            encoding="utf-8"
+        )
+        launcher = (packaging / "intdemo-client").read_text(encoding="utf-8")
+        installer = (packaging / "install-user.sh").read_text(encoding="utf-8")
+
+        self.assertEqual(config["base_url"], "https://43.138.177.65")
+        self.assertEqual(
+            config["ca_bundle"],
+            "certs/intdemo-caddy-root.crt",
+        )
+        self.assertEqual(
+            hashlib.sha256(certificate).hexdigest(),
+            "713f2799f66f4fb510d1ad5a056020e32f11d375f51f3e15cf925f95732a4e41",
+        )
+        self.assertIn("INTDEMO_CONNECTION_CONFIG", launcher)
+        self.assertLess(
+            launcher.index('if [[ -f "$user_connection_config" ]]'),
+            launcher.index('elif [[ -f "$bundled_connection_config" ]]'),
+        )
+        self.assertIn("检查打包后的在线配置", build_script)
+        self.assertIn('cp "$repo_root/packaging/uos-arm64/client-online.json"', build_script)
+        self.assertIn('if [[ ! -f "$user_config"', installer)
+        self.assertIn("保留现有在线配置", installer)
 
     def test_uos_preflight_recognizes_aarch64_elf(self):
         root = Path(__file__).resolve().parents[1]
