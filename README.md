@@ -248,8 +248,9 @@ bash scripts/uos-arm64/build.sh
 ```
 
 产物位于 `dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz`，其中包含已在目标
-UOS 20 真机验证的 ARM64 Chromium。详细的系统依赖、浏览器覆盖、XWayland
-策略与十项验收清单见
+UOS 20 真机验证的 ARM64 Chromium，以及与 conda-forge Qt 匹配的 ARM64 GNU
+C++ 运行库。构建会验证 Qt 所需的 GLIBCXX ABI 并执行成品运行库自检。详细的
+系统依赖、浏览器覆盖、XWayland 策略与十项验收清单见
 [`docs/UOS_ARM64.md`](docs/UOS_ARM64.md)。
 
 同时构建 Windows 免安装便携包和安装包（公网 IP 测试方案）：

@@ -124,6 +124,62 @@ mkdir -p "$pyinstaller_dist" "$pyinstaller_work"
   --workpath "$pyinstaller_work" \
   "$repo_root/integrated_client_uos_arm64.spec"
 
+echo "=== 固定打包 ARM64 GNU 运行库 ==="
+pyinstaller_app="$pyinstaller_dist/intdemo-client"
+pyinstaller_internal="$pyinstaller_app/_internal"
+case "$pyinstaller_internal" in
+  "$repo_root"/dist/uos-arm64/pyinstaller/intdemo-client/_internal) ;;
+  *) echo "拒绝修改非预期 PyInstaller 目录：$pyinstaller_internal" >&2; exit 1 ;;
+esac
+if [[ ! -d "$pyinstaller_internal" ]]; then
+  echo "错误：未找到 PyInstaller 运行库目录：$pyinstaller_internal" >&2
+  exit 1
+fi
+
+for runtime_library in libstdc++.so.6 libgcc_s.so.1; do
+  runtime_source="$env_prefix/lib/$runtime_library"
+  if [[ ! -f "$runtime_source" ]]; then
+    echo "错误：conda 环境缺少 $runtime_library，请重新运行 prepare-env.sh。" >&2
+    exit 1
+  fi
+  rm -f -- "$pyinstaller_internal/$runtime_library"
+  cp -L -- "$runtime_source" "$pyinstaller_internal/$runtime_library"
+  chmod 0644 "$pyinstaller_internal/$runtime_library"
+done
+
+required_glibcxx="GLIBCXX_3.4.26"
+bundled_libstdcxx="$pyinstaller_internal/libstdc++.so.6"
+if ! LC_ALL=C grep -aFq "$required_glibcxx" "$bundled_libstdcxx"; then
+  echo "错误：包内 libstdc++.so.6 不提供 Qt 所需的 $required_glibcxx。" >&2
+  exit 1
+fi
+bundled_glibcxx_max="$(
+  LC_ALL=C grep -ao 'GLIBCXX_[0-9][0-9.]*' "$bundled_libstdcxx" | \
+    sort -Vu | tail -n 1
+)"
+echo "包内 C++ ABI: $bundled_glibcxx_max（最低要求 $required_glibcxx）"
+
+qt_core="$pyinstaller_internal/libQt5Core.so.5"
+if [[ ! -f "$qt_core" ]]; then
+  echo "错误：未找到包内 Qt Core：$qt_core" >&2
+  exit 1
+fi
+qt_ldd_output="$(
+  LD_LIBRARY_PATH="$pyinstaller_internal${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    ldd "$qt_core" 2>&1 || true
+)"
+if grep -Fqi "not found" <<<"$qt_ldd_output"; then
+  echo "错误：包内 Qt Core 存在缺失动态库：" >&2
+  echo "$qt_ldd_output" >&2
+  exit 1
+fi
+if ! grep -Fq "$pyinstaller_internal/libstdc++.so.6" <<<"$qt_ldd_output"; then
+  echo "错误：Qt Core 未解析到包内 libstdc++.so.6：" >&2
+  echo "$qt_ldd_output" >&2
+  exit 1
+fi
+echo "Qt Core 动态库检查: 正常"
+
 version="$("$conda_cmd" run --prefix "$env_prefix" python -c 'from integrated_client.config import APP_VERSION; print(APP_VERSION)')"
 version="$(printf '%s' "$version" | tr -d '\r' | tail -n 1)"
 package_parent="$repo_root/dist/uos-arm64/package"
@@ -154,6 +210,9 @@ chmod +x \
   "$package_root/app/intdemo-client" \
   "$package_root/browser/chrome"
 
+echo "=== 检查打包后的客户端运行库 ==="
+QT_QPA_PLATFORM=offscreen "$package_root/intdemo-client" --self-check
+
 if ((skip_browser_check == 0)); then
   echo "=== 检查打包后的内置 Chromium ==="
   INTDEMO_CHROMIUM_PATH="$package_root/browser/chrome" \
@@ -168,6 +227,7 @@ fi
   printf 'os=%s\n' "$(grep -m1 '^SystemName=' /etc/os-version 2>/dev/null || true)"
   printf 'architecture=%s\n' "$(uname -m)"
   printf 'glibc=%s\n' "$(ldd --version 2>&1 | head -n 1)"
+  printf 'libstdcxx=%s\n' "$bundled_glibcxx_max"
   printf 'chromium=%s\n' "$("$browser_path" --version 2>&1 | head -n 1)"
 } > "$package_root/build-info.txt"
 

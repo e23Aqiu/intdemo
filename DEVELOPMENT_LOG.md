@@ -1180,3 +1180,19 @@
   改为验证内容对应的最低高度和固定宽度，保留实际布局与可见性检查。
 - 针对失败点的专项回归 `7/7`、客户端完整回归 `165/165` 通过。
 - 状态：真机构建前阻断已修复，等待 UOS ARM64 重新构建并生成软件包。
+
+### 步骤 120：修复 UOS 成品 Qt 的 GLIBCXX 运行库冲突
+
+- UOS 真机成功生成首个 `0.2.8` ARM64 压缩包，但从压缩包全新解压启动时，
+  PyInstaller 收集到的系统旧版 `libstdc++.so.6` 缺少 conda-forge Qt 5.15
+  所需的 `GLIBCXX_3.4.26`，应用在导入 `PyQt5.QtCore` 时立即退出。
+- UOS conda 环境显式加入 ARM64 `libgcc-ng` 与 `libstdcxx-ng`；PyInstaller 完成后，
+  构建脚本强制用该环境中已经在 glibc 2.28 真机成功加载 Qt 的 `libstdc++.so.6`
+  和 `libgcc_s.so.1` 替换误收集的系统版本。
+- 出包前新增 `GLIBCXX_3.4.26` 符号检查、最高 GLIBCXX ABI 记录、Qt Core `ldd`
+  缺失库及实际解析路径检查，确保 Qt 使用包内 C++ 运行库。
+- 客户端增加不会进入登录和数据库流程的 `--self-check`，构建脚本会通过最终包
+  启动器以 Qt offscreen 模式执行它；导入或 Qt 插件加载失败将直接中止构建。
+- UOS 专项回归 `13/13`、客户端完整回归 `166/166`、Python 编译、Bash 语法、
+  本地 Qt 自检及 `git diff --check` 通过。
+- 状态：C++ ABI 修复和成品级防回归已完成，等待 UOS ARM64 真机重新出包启动。

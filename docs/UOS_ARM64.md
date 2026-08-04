@@ -136,9 +136,10 @@ bash scripts/uos-arm64/build.sh
 ```
 
 默认流程依次执行：环境和浏览器缓存更新、UOS/架构/glibc/依赖/浏览器/密钥环
-预检、客户端离线回归测试、PyInstaller 目录包构建、内置 Chromium 复制与二次
-启动检查、`tar.gz` 打包和 SHA-256 生成。构建脚本拒绝打包项目缓存目录之外的
-浏览器，避免误带入开发机上的其他可执行文件。
+预检、客户端离线回归测试、PyInstaller 目录包构建、conda ARM64 GNU 运行库
+固定、Qt 所需 `GLIBCXX_3.4.26` 与动态库检查、成品入口自检、内置 Chromium
+复制与二次启动检查、`tar.gz` 打包和 SHA-256 生成。构建脚本拒绝打包项目缓存
+目录之外的浏览器，避免误带入开发机上的其他可执行文件。
 
 仅在定位问题时使用跳过参数：
 
@@ -156,6 +157,8 @@ dist/uos-arm64/IntDemo-UOS-arm64-<版本>.tar.gz.sha256
 
 压缩包内的 `browser/` 是完整 Chromium 运行目录；启动器会自动设置
 `INTDEMO_CHROMIUM_PATH`，最终用户不需要执行 `playwright install`。
+`app/_internal/libstdc++.so.6` 和 `libgcc_s.so.1` 来自项目 conda 环境，避免
+PyInstaller 误收集 UOS 系统旧库后无法加载 conda-forge Qt。
 
 ## 六、试运行与当前用户安装
 
@@ -212,6 +215,9 @@ bash scripts/uos-arm64/diagnose.sh 2>&1 | tee uos-arm64-diagnose.log
 tail -n 200 ~/.local/share/intdemo-client-online-test/logs/client.log
 tail -n 200 ~/.local/share/intdemo-client-online-test/logs/native-crash.log
 ldd dist/uos-arm64/pyinstaller/intdemo-client/intdemo-client | grep 'not found' || true
+grep -ao 'GLIBCXX_[0-9.]*' ./app/_internal/libstdc++.so.6 | sort -Vu | tail -n 1
+LD_LIBRARY_PATH="$PWD/app/_internal" ldd ./app/_internal/libQt5Core.so.5
+QT_QPA_PLATFORM=offscreen ./intdemo-client --self-check
 ```
 
 如果浏览器启动失败，再补充：

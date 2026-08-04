@@ -8,5 +8,9 @@ dependencies:
   - pip
   - pyqt=5.15.11
   - pyinstaller>=6,<7
+  # PyInstaller can otherwise pick UOS 20's older system C++ runtime while
+  # collecting conda-forge Qt.  Bundle the matching ARM64 GNU runtimes.
+  - libgcc-ng>=12
+  - libstdcxx-ng>=12
   - setuptools
   - wheel

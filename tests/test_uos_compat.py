@@ -174,6 +174,22 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn('bundled_browser="$package_root/browser/chrome"', launcher)
         self.assertIn("INTDEMO_CHROMIUM_PATH", launcher)
 
+    def test_uos_build_bundles_compatible_cpp_runtime(self):
+        root = Path(__file__).resolve().parents[1]
+        environment = (root / "environment-uos-arm64.yml").read_text(
+            encoding="utf-8"
+        )
+        build_script = (root / "scripts/uos-arm64/build.sh").read_text(
+            encoding="utf-8"
+        )
+        entrypoint = (root / "main.py").read_text(encoding="utf-8")
+        self.assertIn("libgcc-ng>=12", environment)
+        self.assertIn("libstdcxx-ng>=12", environment)
+        self.assertIn("libstdc++.so.6 libgcc_s.so.1", build_script)
+        self.assertIn("GLIBCXX_3.4.26", build_script)
+        self.assertIn('"$package_root/intdemo-client" --self-check', build_script)
+        self.assertIn('runtime_self_check = "--self-check" in sys.argv', entrypoint)
+
     def test_uos_preflight_recognizes_aarch64_elf(self):
         root = Path(__file__).resolve().parents[1]
         preflight = runpy.run_path(
