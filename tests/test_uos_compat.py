@@ -187,6 +187,11 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("libstdcxx-ng>=12", environment)
         self.assertIn("libstdc++.so.6 libgcc_s.so.1", build_script)
         self.assertIn("GLIBCXX_3.4.26", build_script)
+        self.assertIn('qt_libstdcxx_real="$(readlink -f', build_script)
+        self.assertLess(
+            build_script.index('rm -f -- "$artifact" "$artifact.sha256"'),
+            build_script.index("pyinstaller --noconfirm --clean"),
+        )
         self.assertIn('"$package_root/intdemo-client" --self-check', build_script)
         self.assertIn('runtime_self_check = "--self-check" in sys.argv', entrypoint)
 

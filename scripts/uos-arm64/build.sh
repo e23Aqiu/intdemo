@@ -73,6 +73,29 @@ if [[ ! -d "$browser_cache" ]]; then
   exit 1
 fi
 
+version="$("$conda_cmd" run --prefix "$env_prefix" python -c 'from integrated_client.config import APP_VERSION; print(APP_VERSION)')"
+version="$(printf '%s' "$version" | tr -d '\r' | tail -n 1)"
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "错误：无法识别客户端版本：$version" >&2
+  exit 1
+fi
+package_parent="$repo_root/dist/uos-arm64/package"
+package_name="IntDemo-UOS-arm64-$version"
+package_root="$package_parent/$package_name"
+artifact="$repo_root/dist/uos-arm64/$package_name.tar.gz"
+
+case "$package_root" in
+  "$repo_root"/dist/uos-arm64/package/*) ;;
+  *) echo "拒绝清理非预期打包目录：$package_root" >&2; exit 1 ;;
+esac
+case "$artifact" in
+  "$repo_root"/dist/uos-arm64/IntDemo-UOS-arm64-*.tar.gz) ;;
+  *) echo "拒绝清理非预期构建产物：$artifact" >&2; exit 1 ;;
+esac
+echo "=== 清理同版本旧构建产物 ==="
+rm -rf -- "$package_root"
+rm -f -- "$artifact" "$artifact.sha256"
+
 browser_output="$(
   PLAYWRIGHT_BROWSERS_PATH="$browser_cache" \
     "$conda_cmd" run --prefix "$env_prefix" python -c \
@@ -173,26 +196,26 @@ if grep -Fqi "not found" <<<"$qt_ldd_output"; then
   echo "$qt_ldd_output" >&2
   exit 1
 fi
-if ! grep -Fq "$pyinstaller_internal/libstdc++.so.6" <<<"$qt_ldd_output"; then
+qt_libstdcxx_path="$(
+  sed -n \
+    's/^[[:space:]]*libstdc++\.so\.6 => \([^[:space:]]*\).*/\1/p' \
+    <<<"$qt_ldd_output" | head -n 1
+)"
+if [[ -z "$qt_libstdcxx_path" || ! -e "$qt_libstdcxx_path" ]]; then
   echo "错误：Qt Core 未解析到包内 libstdc++.so.6：" >&2
   echo "$qt_ldd_output" >&2
   exit 1
 fi
+qt_libstdcxx_real="$(readlink -f "$qt_libstdcxx_path")"
+bundled_libstdcxx_real="$(readlink -f "$bundled_libstdcxx")"
+if [[ "$qt_libstdcxx_real" != "$bundled_libstdcxx_real" ]]; then
+  echo "错误：Qt Core 使用了包外 libstdc++.so.6：$qt_libstdcxx_real" >&2
+  echo "$qt_ldd_output" >&2
+  exit 1
+fi
+echo "Qt Core C++ 运行库: $qt_libstdcxx_real"
 echo "Qt Core 动态库检查: 正常"
 
-version="$("$conda_cmd" run --prefix "$env_prefix" python -c 'from integrated_client.config import APP_VERSION; print(APP_VERSION)')"
-version="$(printf '%s' "$version" | tr -d '\r' | tail -n 1)"
-package_parent="$repo_root/dist/uos-arm64/package"
-package_name="IntDemo-UOS-arm64-$version"
-package_root="$package_parent/$package_name"
-artifact="$repo_root/dist/uos-arm64/$package_name.tar.gz"
-
-case "$package_root" in
-  "$repo_root"/dist/uos-arm64/package/*) ;;
-  *) echo "拒绝清理非预期打包目录：$package_root" >&2; exit 1 ;;
-esac
-rm -rf -- "$package_root"
-rm -f -- "$artifact" "$artifact.sha256"
 mkdir -p "$package_root/app" "$package_root/browser"
 cp -a "$pyinstaller_dist/intdemo-client/." "$package_root/app/"
 cp -a "$browser_source_dir/." "$package_root/browser/"
