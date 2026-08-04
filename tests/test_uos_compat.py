@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import runpy
+import ssl
 import tempfile
 import unittest
 from pathlib import Path
@@ -210,9 +211,10 @@ class UosCompatibilityTests(unittest.TestCase):
         config = json.loads(
             (packaging / "client-online.json").read_text(encoding="utf-8")
         )
-        certificate = (
+        certificate_pem = (
             packaging / "certs/intdemo-caddy-root.crt"
-        ).read_bytes()
+        ).read_text(encoding="ascii")
+        certificate_der = ssl.PEM_cert_to_DER_cert(certificate_pem)
         build_script = (root / "scripts/uos-arm64/build.sh").read_text(
             encoding="utf-8"
         )
@@ -225,8 +227,8 @@ class UosCompatibilityTests(unittest.TestCase):
             "certs/intdemo-caddy-root.crt",
         )
         self.assertEqual(
-            hashlib.sha256(certificate).hexdigest(),
-            "713f2799f66f4fb510d1ad5a056020e32f11d375f51f3e15cf925f95732a4e41",
+            hashlib.sha256(certificate_der).hexdigest(),
+            "1ba425e2184fe9bab3e90620773ec9bc89aaf292f84c00cf54b5a0901c4bf69f",
         )
         self.assertIn("INTDEMO_CONNECTION_CONFIG", launcher)
         self.assertLess(
