@@ -1,8 +1,8 @@
-# 逃费车辆智能查询平台
+# 逃费车辆信息智能查询平台
 
-逃费车辆智能查询平台（内部项目代号 `IntDemo`）是一个面向运输业务处理场景的 PyQt5 桌面客户端，支持 Windows x64，并在兼容分支支持统信 UOS 20 ARM64。项目将“运输证查询回填”和“爱企查批量查询”整合为一条可暂停、继续和停止的处理流水线，完成运输证号查询、营运企业回填以及企业法人、地址、电话补齐。
+逃费车辆信息智能查询平台（内部项目代号 `IntDemo`）是一个面向运输业务处理场景的 PyQt5 桌面客户端，支持 Windows x64 和统信 UOS 20 ARM64。项目将“运输证查询回填”和“爱企查批量查询”整合为一条可暂停、继续和停止的处理流水线，完成运输证号查询、营运企业回填以及企业法人、地址、电话补齐。
 
-当前版本：`0.2.8` 在线同步测试版。`v0.1` 的本地数据库和发布包保持不变，
+当前版本：`0.2.9` 双端兼容更新版。`v0.1` 的本地数据库和发布包保持不变，
 `v0.2` 使用独立应用名称及独立数据目录，不迁移测试数据。
 
 ## v0.2 在线架构
@@ -53,8 +53,8 @@ flowchart LR
   新版本会通过弹窗及侧边栏红点提示。更新提示等待处理时只锁定业务内容，
   最小化、最大化和关闭按钮始终可用；普通更新可选择稍后更新、后台更新或
   立即更新，下载在后台进行，开始安装时才暂停其他业务。
-  当前应用内自动更新仅适用于 Windows；UOS 使用用户安装脚本或更高版本 DEB
-  手动升级。
+  Windows x64 与 UOS ARM64 共用同一更新通道；服务端按平台分别下发 `.exe`
+  或 `.deb`，下载后均校验大小和 SHA-256，再调用对应系统安装器。
 - 窗口顶部提供公告喇叭和 7 秒轮播入口；管理员可发布富文本公告、上传图片或
   文件、选择开屏展示及指定普通用户，普通用户可在公告详情中发送纯文字消息，
   管理员在“公告发布”页面集中查看并标记已读。
@@ -95,7 +95,7 @@ flowchart LR
 
 ## 环境要求
 
-- Windows 10/11 x64，或 UOS Desktop 20 Professional ARM64（兼容分支）
+- Windows 10/11 x64，或 UOS Desktop 20 Professional ARM64
 - Windows 使用 64 位 Python 3.9；UOS 使用隔离的 Miniforge Python 3.10，不修改系统 Python 3.7
 - 网络连接（Windows 与 UOS 构建均携带项目内置 Chromium）
 - Git（仅克隆和参与开发时需要）
@@ -286,7 +286,8 @@ winget install --id JRSoftware.InnoSetup --exact
 
 ```powershell
 .\scripts\publish-update.ps1 `
-  -Installer .\dist\installer\IntDemoOnline-Setup-0.2.5.exe `
+  -WindowsInstaller .\dist\installer\IntDemoOnline-Setup-0.2.5.exe `
+  -UosInstaller .\dist\uos-arm64\IntDemo-UOS-arm64-0.2.5.deb `
   -DeltaInstaller .\dist\installer\IntDemoOnline-Patch-0.2.4-to-0.2.5.exe `
   -DeltaFromVersion 0.2.4 `
   -Version 0.2.5 `
@@ -295,9 +296,11 @@ winget install --id JRSoftware.InnoSetup --exact
   -RemotePath /opt/intdemo/deploy/updates
 ```
 
-发布脚本始终把完整安装包保留在 `test.json` 顶层，并把可选差异包写入
-`deltas.from_version`。更新清单接口会读取客户端发送的当前版本：只有精确匹配
-差异包来源版本时才返回增量包，旧版本、未知版本或请求头缺失时一律返回完整包。
+发布脚本在同一个 `test.json` 的 `platforms` 中原子写入 Windows x64 和 UOS
+ARM64 完整包；同时把 Windows 完整包保留在顶层以兼容旧客户端，并把可选 Windows
+差异包写入 `deltas.from_version`。更新清单接口读取客户端平台与当前版本：只有
+Windows 当前版本精确匹配差异包来源版本时才返回增量包，其他情况返回对应平台
+完整包。
 客户端后台检查同一 HTTPS 服务器的 `/updates/test.json`，下载后同时核对文件大小与 SHA-256，
 不会绕过私有 CA。版本号、更新内容、检查按钮和下载进度统一位于“系统设置”；
 检测到新版本时会弹窗提示，侧边栏显示新版本标记。安装版和便携版都可以
@@ -307,17 +310,20 @@ winget install --id JRSoftware.InnoSetup --exact
 旧版客户端虽然不识别 `deltas`，但会在 `User-Agent` 中携带当前程序版本；
 服务器会为它生成兼容的顶层字段。例如 0.2.4 获取 0.2.4→0.2.5 增量包，
 0.2.3 及更早版本获取完整 0.2.5 安装包。新版客户端还会额外发送
-`X-IntDemo-Version`，并在本机再次校验 `from_version`。
+`X-IntDemo-Version` 和 `X-IntDemo-Platform`，并在本机再次校验平台、包扩展名与
+`from_version`。
 
 ### 开发者专用打包发布器
 
 开发者电脑可以双击 `run-release-publisher.bat` 启动独立 GUI 发布器。该工具
-统一完成版本字段同步、环境检查、客户端与服务端测试、便携包/完整包/增量包
-构建、发布确认、SSH 上传和发布快照归档，并可临时断开全部或指定业务客户端
+统一完成版本字段同步、环境检查、Windows 本机构建、UOS ARM64 SSH 真机构建、
+双端发布确认、SSH 上传和发布快照归档，并可临时断开全部或指定业务客户端
 的 API、同步及 WebSocket 连接以验证离线行为；还可暂停所选远程更新通道，
 完整归档活动清单并保留安装包。构建与发布权限不会进入业务客户端。
 
-远程发布要求 Git 工作区无未提交变更，已经保存发布快照的版本不能原地覆盖。
+“推送”会依次使用普通 `git push` 同步 `origin`（GitHub）和 `gitee` 两个远程，
+不会强制推送。远程构建/发布要求 Git 工作区无未提交变更，UOS 构建机仓库还必须
+处于同一提交；已经保存发布快照的版本不能原地覆盖。
 暂停期间新的客户端检查按“暂无更新”处理，发布更高版本后自动恢复分发。
 SSH 主机留空时只生成本地 `dist/update-release`。完整操作说明见
 [`docs/RELEASE_PUBLISHER.md`](docs/RELEASE_PUBLISHER.md)。
@@ -369,7 +375,7 @@ intdemo/
 ## v0.2 明确不包含
 
 本测试版不建设 Web 管理后台、文件云盘、静默强制更新、Redis、多 API
-实例或多节点高可用。目标规模为 20 个以内 Windows 终端。
+实例或多节点高可用。目标规模为 20 个以内 Windows/UOS 终端。
 
 ## 维护说明
 

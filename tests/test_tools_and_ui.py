@@ -1326,11 +1326,11 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIn("workflow", window._nav_buttons)
         self.assertIn("personal", window._nav_buttons)
         self.assertEqual(window.sidebar.width(), 230)
-        self.assertEqual(window.sidebar_brand_badge.text(), "逃")
+        self.assertEqual(window.sidebar_brand_badge.text(), "查")
         self.assertEqual(window.sidebar_brand_badge.objectName(), "BrandBadge")
         self.assertEqual(
             window.sidebar.findChild(QLabel, "BrandTitle").text(),
-            "逃费车辆智能\n查询平台",
+            "逃费车辆信息\n智能查询平台",
         )
         self.assertEqual(window.sidebar_role.text(), "管理员  ·  admin")
         self.assertEqual(window.sidebar_avatar.text(), "系")
@@ -1968,6 +1968,28 @@ class ToolAndUiTests(unittest.TestCase):
         )
         dialog.deleteLater()
 
+    def test_login_enter_submits_credentials_instead_of_guest_mode(self):
+        self.db.change_password(
+            self.admin.id,
+            DEFAULT_ADMIN_PASSWORD,
+            must_change=False,
+        )
+        store = Mock(is_available=True)
+        store.load.return_value = None
+        dialog = LoginDialog(self.db, credential_store=store)
+        dialog.show()
+        dialog.username_edit.setText(DEFAULT_ADMIN_USERNAME)
+        dialog.password_edit.setText(DEFAULT_ADMIN_PASSWORD)
+
+        QTest.keyClick(dialog.password_edit, Qt.Key_Return)
+        self.app.processEvents()
+
+        self.assertEqual(dialog.result(), dialog.Accepted)
+        self.assertEqual(dialog.account.username, DEFAULT_ADMIN_USERNAME)
+        self.assertFalse(dialog.offline_business_mode)
+        store.clear.assert_called_once_with()
+        dialog.deleteLater()
+
     def test_offline_login_enters_guest_without_credentials_or_account_access(self):
         store = Mock()
         store.is_available = True
@@ -2133,6 +2155,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(window._window_hit_test(control_point), HTCLIENT)
         self.assertEqual(window._window_hit_test(QPoint(0, 0)), HTTOPLEFT)
         self.assertEqual(
+            window._resize_edges(QPoint(0, 0)),
+            Qt.LeftEdge | Qt.TopEdge,
+        )
+        self.assertEqual(
             window._window_hit_test(QPoint(window.width() - 1, window.height() - 1)),
             HTBOTTOMRIGHT,
         )
@@ -2154,6 +2180,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(login.minimumSize(), login.maximumSize())
         self.assertEqual(login._window_hit_test(QPoint(60, 20)), HTCAPTION)
         self.assertEqual(login.username_edit.text(), "")
+        self.assertTrue(login.login_btn.isDefault())
+        self.assertTrue(login.login_btn.autoDefault())
+        self.assertFalse(login.offline_login_btn.isDefault())
+        self.assertFalse(login.offline_login_btn.autoDefault())
         self.assertEqual(login.remember_password_checkbox.text(), "记住密码")
         self.assertEqual(login.auto_login_checkbox.text(), "自动登录")
         self.assertFalse(

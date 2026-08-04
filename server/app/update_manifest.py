@@ -19,6 +19,9 @@ _UPDATER_USER_AGENT = re.compile(
     re.IGNORECASE,
 )
 _PACKAGE_FIELDS = ("installer_path", "sha256", "size")
+_PACKAGE_KEYS = (*_PACKAGE_FIELDS, "full", "delta", "deltas")
+_PLATFORMS = {"windows-x86_64", "linux-aarch64"}
+_LEGACY_PLATFORM = "windows-x86_64"
 
 
 def request_client_version(request: Request) -> str | None:
@@ -27,6 +30,29 @@ def request_client_version(request: Request) -> str | None:
         return explicit
     match = _UPDATER_USER_AGENT.match(request.headers.get("user-agent", "").strip())
     return match.group("version") if match else None
+
+
+def request_client_platform(request: Request) -> str:
+    explicit = request.headers.get("x-intdemo-platform", "").strip().casefold()
+    return explicit if explicit in _PLATFORMS else _LEGACY_PLATFORM
+
+
+def select_platform_manifest(
+    payload: dict[str, Any],
+    platform_key: str,
+) -> dict[str, Any] | None:
+    platforms = payload.get("platforms")
+    if not isinstance(platforms, dict):
+        return dict(payload) if platform_key == _LEGACY_PLATFORM else None
+    platform_payload = platforms.get(platform_key)
+    if not isinstance(platform_payload, dict):
+        return None
+    selected = dict(payload)
+    for key in (*_PACKAGE_KEYS, "primary_kind", "primary_from_version"):
+        selected.pop(key, None)
+    selected.update(platform_payload)
+    selected["selected_platform"] = platform_key
+    return selected
 
 
 def matching_delta(payload: dict[str, Any], current_version: str | None) -> dict | None:
@@ -92,11 +118,13 @@ def update_manifest(channel: str, request: Request) -> Response:
     settings = get_settings()
     payload = _load_manifest(settings.updates_dir / f"{channel}.json")
     current_version = request_client_version(request)
+    platform_key = request_client_platform(request)
     if payload.get("paused") is True:
         headers = {
             "Cache-Control": "no-store",
             "X-IntDemo-Update-Package": "paused",
             "X-IntDemo-Update-Distribution": "paused",
+            "X-IntDemo-Platform": platform_key,
         }
         if current_version is None:
             return Response(status_code=204, headers=headers)
@@ -108,13 +136,28 @@ def update_manifest(channel: str, request: Request) -> Response:
                 "version": current_version,
                 "paused": True,
                 "paused_version": str(payload.get("paused_version") or ""),
+                "selected_platform": platform_key,
             },
             headers=headers,
         )
-    selected, package_kind = select_manifest_package(payload, current_version)
+    platform_manifest = select_platform_manifest(payload, platform_key)
+    if platform_manifest is None:
+        return Response(
+            status_code=204,
+            headers={
+                "Cache-Control": "no-store",
+                "X-IntDemo-Update-Package": "unavailable",
+                "X-IntDemo-Platform": platform_key,
+            },
+        )
+    selected, package_kind = select_manifest_package(
+        platform_manifest,
+        current_version,
+    )
     headers = {
         "Cache-Control": "no-store",
         "X-IntDemo-Update-Package": package_kind,
+        "X-IntDemo-Platform": platform_key,
     }
     if current_version is not None:
         headers["X-IntDemo-Client-Version"] = current_version

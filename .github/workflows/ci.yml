@@ -20,6 +20,27 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: python -m unittest discover -s tests
 
+  client-linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: conda-incubator/setup-miniconda@v4
+        with:
+          miniforge-version: latest
+          environment-file: environment-uos-arm64.yml
+          activate-environment: intdemo-uos-arm64
+          auto-activate: false
+      - name: Install ARM64 test tools
+        shell: bash -el {0}
+        run: python -m pip install -r requirements-uos-arm64.txt
+      - name: Run Linux ARM64 client tests
+        shell: bash -el {0}
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -c "import platform; assert platform.machine().lower() in {'aarch64', 'arm64'}"
+          python -m unittest discover -s tests
+
   server-linux:
     runs-on: ubuntu-24.04
     steps:

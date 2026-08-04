@@ -33,6 +33,36 @@ def update_manifest_file():
             }
         ],
         "notes": "版本识别测试",
+        "platforms": {
+            "windows-x86_64": {
+                "full": {
+                    "installer_path": (
+                        "/updates/files/IntDemoOnline-Setup-0.2.5.exe"
+                    ),
+                    "sha256": "a" * 64,
+                    "size": 500_000_000,
+                },
+                "deltas": [
+                    {
+                        "from_version": "0.2.4",
+                        "installer_path": (
+                            "/updates/files/IntDemoOnline-Patch-0.2.4-to-0.2.5.exe"
+                        ),
+                        "sha256": "b" * 64,
+                        "size": 14_000_000,
+                    }
+                ],
+            },
+            "linux-aarch64": {
+                "full": {
+                    "installer_path": (
+                        "/updates/files/IntDemo-UOS-arm64-0.2.5.deb"
+                    ),
+                    "sha256": "c" * 64,
+                    "size": 620_000_000,
+                }
+            },
+        },
     }
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     try:
@@ -62,6 +92,24 @@ def test_nonmatching_versions_receive_full_installer(
     assert "primary_from_version" not in payload
     assert response.headers["x-intdemo-update-package"] == "full"
     assert response.headers["x-intdemo-client-version"] == version
+    assert response.headers["x-intdemo-platform"] == "windows-x86_64"
+
+
+def test_uos_arm64_client_receives_deb_package(client, update_manifest_file):
+    response = client.get(
+        "/updates/test.json",
+        headers={
+            "X-IntDemo-Version": "0.2.4",
+            "X-IntDemo-Platform": "linux-aarch64",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["selected_platform"] == "linux-aarch64"
+    assert payload["installer_path"].endswith(".deb")
+    assert payload["primary_kind"] == "full"
+    assert response.headers["x-intdemo-platform"] == "linux-aarch64"
 
 
 def test_exact_version_receives_legacy_compatible_delta(client, update_manifest_file):
@@ -154,6 +202,7 @@ def test_paused_manifest_suppresses_updates_for_old_and_headerless_clients(
         "version": "0.2.4",
         "paused": True,
         "paused_version": "0.2.5",
+        "selected_platform": "windows-x86_64",
     }
     assert versioned.headers["x-intdemo-update-package"] == "paused"
     assert versioned.headers["x-intdemo-update-distribution"] == "paused"

@@ -1,13 +1,15 @@
-# IntDemo 专用打包发布器
+# 逃费车辆信息智能查询平台双端打包发布器
 
-专用打包发布器只在开发者 Windows 电脑上运行，用于统一执行版本准备、环境
-检查、客户端与服务端测试、便携包和安装包构建、增量包构建、远程发布以及发布
-快照归档，并可在版本异常时暂停远程通道分发。它不会被打进业务客户端，也
-不会向服务器开放安装包上传或远程命令执行接口。
+发布器通常在开发者 Windows 电脑上运行：Windows x64 包在本机生成，UOS ARM64
+包通过 SSH 在真实 UOS ARM64 构建机生成并回传。它统一执行版本准备、测试、
+双端构建、双端更新发布和快照归档，并可在版本异常时暂停远程通道分发。它不会
+被打进业务客户端，也不会向业务服务器开放构建命令执行接口。
 
 ## 1. 启动
 
-先准备项目原有的两个虚拟环境，并安装 Inno Setup 6：
+先准备项目原有的两个虚拟环境、Inno Setup 6，以及可通过 SSH 登录的 UOS ARM64
+构建机。构建机仓库必须是专用且干净的工作树；脚本会从其 `origin` 获取本机提交，
+以 detached HEAD 构建，未推送的提交会被拒绝：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -20,6 +22,14 @@ winget install --id JRSoftware.InnoSetup --exact
 
 ```powershell
 .\run-release-publisher.bat
+```
+
+发布器的“推送”要求远程名称固定为 `origin` 和 `gitee`。当前仓库已经配置完成；
+其他克隆如缺少 Gitee 远程，可先执行：
+
+```powershell
+git remote -v
+git remote add gitee https://gitee.com/e23aqiu/intdemo.git
 ```
 
 发布器配置保存在当前 Windows 用户的：
@@ -38,12 +48,13 @@ winget install --id JRSoftware.InnoSetup --exact
 3. 检查发布器修改的客户端、服务端、安装器和构建脚本版本字段。
 4. 完成新版本代码和文档并运行测试，点击“提交变更”检查待提交文件、填写
    提交说明并创建本地 Git 提交。
-5. 正式发布前点击“推送”，检查待推送提交并将当前分支推送到 GitHub。
+5. 正式发布前点击“推送”，检查待推送提交并将当前分支依次推送到
+   `origin`（GitHub）和 `gitee`（Gitee）。
 6. 如果需要增量包，填写一个已经存在发布快照的精确来源版本。
-7. 填写服务地址、CA、发布通道和本次更新说明。
+7. 填写服务地址、CA、UOS SSH 构建主机/仓库目录、发布通道和更新说明。
 8. 点击“环境检查”。
-9. 本地验证时可分别点击“运行全部测试”和“构建安装包”。
-10. 正式发布时点击“测试 → 构建 → 发布”，核对确认窗口后执行。
+9. 本地验证时可分别点击“运行全部测试”和“构建双端安装包”。
+10. 正式发布时点击“测试 → 双端构建 → 双端发布”，核对后执行。
 
 远程发布要求 Git 工作区无未提交变更。这样服务器上的安装包可以追溯到明确
 的提交。仅生成本地 `dist/update-release` 时可以不填写 SSH 主机。
@@ -61,6 +72,7 @@ winget install --id JRSoftware.InnoSetup --exact
 - 项目内各处版本号是否一致；
 - HTTPS 服务地址和 IP 私有 CA；
 - Inno Setup 编译器；
+- UOS ARM64 SSH 构建主机、构建仓库路径以及本机 `ssh`/`scp`；
 - 增量来源版本及其发布快照；
 - SSH 主机、私钥和远程目录格式；
 - 发布产物及已发布版本不可覆盖规则。
@@ -81,14 +93,13 @@ winget install --id JRSoftware.InnoSetup --exact
 
 先读取并展示当前 Git 工作区变更，填写提交说明并再次确认后，依次执行
 `git add --all` 和 `git commit`。因此修改、删除和未跟踪文件都会进入本次
-本地提交；操作不会自动推送到 GitHub。
+本地提交；操作不会自动推送到 GitHub 或 Gitee。
 
 ### 推送
 
-要求 Git 工作区已经提交且当前分支没有落后上游。操作前会显示本地分支、
-远程目标和待推送提交，并再次确认。已有上游时只推送当前分支；首次推送时
-使用 `origin`（或唯一远程仓库）并设置上游。发布器只执行普通 `git push`，
-不会使用强制推送。
+要求 Git 工作区已经提交且当前分支没有落后已知远程跟踪分支。操作前分别显示
+`origin/<分支>` 与 `gitee/<分支>` 的待推送提交，再依次执行普通 `git push`；
+首次推送只把 `origin` 设置为上游，Gitee 保持镜像远程。不会使用强制推送。
 
 ### 客户端断连测试
 
@@ -111,16 +122,19 @@ winget install --id JRSoftware.InnoSetup --exact
 
 ### 构建安装包
 
-默认复用 `scripts/build-releases.ps1`，生成便携包和完整安装包。填写增量来源
-版本时，还会通过该版本的发布快照生成精确版本增量包。不需要便携包时，可取消
-“同时构建便携包”，此时只调用 `scripts/build-installer.ps1`。
+Windows 默认复用 `scripts/build-releases.ps1` 生成便携包和完整安装包；填写
+增量来源时还生成 Windows 精确版本增量包。UOS ARM64 通过
+`scripts/build-uos-remote.ps1` 在指定构建机调用 `scripts/uos-arm64/build.sh`，
+获取并校验指定提交、ARM64 架构、UOS/glibc、系统 Fcitx Qt5 插件与 SHA-256
+后回传 DEB。PyInstaller
+不能跨架构编译，因此 Windows 电脑不能直接生成 UOS ARM64 二进制。
 
 ### 发布
 
 复用 `scripts/publish-update.ps1`：
 
-- SSH 主机为空：只生成 `dist/update-release`；
-- SSH 主机不为空：先上传安装包，再原子替换服务器清单；
+- SSH 主机为空：只生成含 Windows/UOS 两个平台的 `dist/update-release`；
+- SSH 主机不为空：先上传 `.exe`、可选 Windows 增量包和 `.deb`，再原子替换清单；
 - 成功后调用 `scripts/save-release-snapshot.ps1` 保存本次版本快照。
 
 已经存在 `dist/release-snapshots/<版本>.json` 的版本视为已发布版本，发布器
@@ -145,7 +159,7 @@ winget install --id JRSoftware.InnoSetup --exact
 
 ## 4. 增量包规则
 
-增量来源版本必须满足：
+增量包目前只用于 Windows；UOS 每次发布完整 DEB。Windows 增量来源版本必须满足：
 
 - 使用 `x.y.z` 格式；
 - 低于目标版本；

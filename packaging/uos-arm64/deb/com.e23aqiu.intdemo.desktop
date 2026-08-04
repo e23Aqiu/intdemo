@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=逃费车辆智能查询平台（UOS）
+Name=逃费车辆信息智能查询平台（UOS）
 Comment=逃费车辆查询、回填与数据同步客户端
 Exec=/opt/apps/com.e23aqiu.intdemo/files/intdemo-client
 Icon=/opt/apps/com.e23aqiu.intdemo/files/app-icon.png

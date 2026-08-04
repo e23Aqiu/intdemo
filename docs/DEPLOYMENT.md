@@ -205,7 +205,8 @@ CA 证书也是 HTTPS 校验的一部分。安装包位于
 
 ```powershell
 .\scripts\publish-update.ps1 `
-  -Installer .\dist\installer\IntDemoOnline-Setup-0.2.5.exe `
+  -WindowsInstaller .\dist\installer\IntDemoOnline-Setup-0.2.5.exe `
+  -UosInstaller .\dist\uos-arm64\IntDemo-UOS-arm64-0.2.5.deb `
   -DeltaInstaller .\dist\installer\IntDemoOnline-Patch-0.2.4-to-0.2.5.exe `
   -DeltaFromVersion 0.2.4 `
   -Version 0.2.5 `
@@ -216,7 +217,8 @@ CA 证书也是 HTTPS 校验的一部分。安装包位于
 
 Compose 将服务器的 `deploy/updates/` 同时只读挂载给 API 和 Caddy。
 `/updates/test.json`、`/updates/stable.json` 由 API 根据
-`X-IntDemo-Version` 或 `IntDemoUpdater/<版本>` User-Agent 动态选择包；
+`X-IntDemo-Platform`、`X-IntDemo-Version` 或 `IntDemoUpdater/<版本>` User-Agent
+动态选择 Windows x64/UOS ARM64 包；
 其余 `/updates/files/*` 仍由 Caddy 直接下载。只有当前版本精确匹配
 `deltas.from_version` 才返回增量包，其余情况返回完整包。
 
@@ -224,8 +226,8 @@ Compose 将服务器的 `deploy/updates/` 同时只读挂载给 API 和 Caddy。
 写入公共清单顶层，新的发布命令无需使用。
 
 1. 本地完整构建并执行安装、启动、卸载冒烟测试。
-2. 生成 SHA-256 和 `test.json`。
-3. 把安装包上传到服务器 `.incoming` 并核对大小及 SHA-256。
+2. 同时生成 Windows `.exe`、UOS ARM64 `.deb` 的 SHA-256 和 `test.json`。
+3. 把双端安装包上传到服务器 `.incoming` 并核对大小及 SHA-256。
 4. 安装包就位后原子替换 `test.json`，客户端才会看到新版本。
 
 需要紧急停止向新检查分发当前版本时，可在专用打包发布器点击“暂停分发”，
@@ -245,7 +247,8 @@ Compose 将服务器的 `deploy/updates/` 同时只读挂载给 API 和 Caddy。
 检查仍以暂停前版本为准。
 
 客户端只接受与 API 相同主机、相同 HTTPS 信任链下的更新地址，并在运行
-安装包前核对清单声明的大小及 SHA-256。未购买 Windows 代码签名证书前，
+安装包前核对清单声明的大小及 SHA-256。UOS 使用 `.deb` 并调用系统提权安装，
+Windows 使用 Inno Setup `.exe`。未购买 Windows 代码签名证书前，
 其他电脑首次运行安装包可能显示“未知发布者”；这不应通过关闭
 SmartScreen 或禁用 TLS 校验来规避，正式发布建议购买组织代码签名证书。
 

@@ -22,6 +22,7 @@ from release_publisher.core import (
     ReleaseOptions,
     SettingsStore,
     build_git_commit_steps,
+    build_git_mirror_push_plans,
     build_git_push_plan,
     build_pause_distribution_steps,
     build_release_plan,
@@ -65,7 +66,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
                 _current_git_branch(Path("detached-repo"))
 
     def test_current_project_product_name_fields_are_consistent(self):
-        expected_name = "逃费车辆智能查询平台"
+        expected_name = "逃费车辆信息智能查询平台"
         installer = (REPO_ROOT / "installer" / "intdemo.iss").read_text(
             encoding="utf-8"
         )
@@ -76,6 +77,10 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         self.assertEqual(APP_NAME, expected_name)
         self.assertIn(f'#define MyAppName "{expected_name}"', installer)
         self.assertIn(f'#define MyAppExeName "{expected_name}.exe"', installer)
+        self.assertIn(
+            'Type: files; Name: "{app}\\逃费车辆智能查询平台.exe"',
+            installer,
+        )
         self.assertIn(
             f"StringStruct(u'FileDescription', u'{expected_name}')",
             version_info,
@@ -125,14 +130,21 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             mandatory=True,
             remote_host="intdemo-test",
             identity_file="C:/keys/release",
+            build_uos=True,
+            uos_builder_host="uos-builder",
+            uos_builder_path="/opt/intdemo",
         )
 
-        steps = build_release_plan(
-            options,
-            include_tests=True,
-            include_build=True,
-            include_publish=True,
-        )
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=False,
+        ):
+            steps = build_release_plan(
+                options,
+                include_tests=True,
+                include_build=True,
+                include_publish=True,
+            )
 
         self.assertEqual(
             [step.key for step in steps],
@@ -140,7 +152,8 @@ class ReleasePublisherCoreTests(unittest.TestCase):
                 "compile_client",
                 "test_client",
                 "test_server",
-                "build_packages",
+                "build_windows_packages",
+                "build_uos_package",
                 "publish",
                 "snapshot",
             ],
@@ -153,7 +166,13 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             )
         )
         self.assertIn("-DeltaFromVersion", build_step.arguments)
-        publish_step = steps[4]
+        self.assertTrue(
+            any(
+                Path(argument).name == "build-uos-remote.ps1"
+                for argument in steps[4].arguments
+            )
+        )
+        publish_step = steps[5]
         self.assertTrue(
             any(
                 Path(argument).name == "publish-update.ps1"
@@ -162,6 +181,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         )
         self.assertIn("-Mandatory", publish_step.arguments)
         self.assertIn("-RemoteHost", publish_step.arguments)
+        self.assertIn("-UosInstaller", publish_step.arguments)
 
     def test_pause_distribution_plan_only_targets_the_selected_remote_channel(self):
         options = ReleaseOptions(
@@ -219,6 +239,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         scripts = [
             REPO_ROOT / "scripts" / "pause-update.ps1",
             REPO_ROOT / "scripts" / "publish-update.ps1",
+            REPO_ROOT / "scripts" / "build-uos-remote.ps1",
         ]
         for script in scripts:
             with self.subTest(script=script.name):
@@ -427,6 +448,103 @@ function global:scp {
             self.assertIn("already publishes version 1.2.3", output)
             self.assertNotIn("scp must not run", output)
 
+    @unittest.skipUnless(shutil.which("powershell.exe"), "requires Windows PowerShell")
+    def test_publish_script_generates_atomic_dual_platform_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            scripts = root / "scripts"
+            scripts.mkdir()
+            publish_script = scripts / "publish-update.ps1"
+            publish_script.write_bytes(
+                (REPO_ROOT / "scripts" / "publish-update.ps1").read_bytes()
+            )
+            windows_installer = root / "windows.exe"
+            windows_installer.write_bytes(b"windows-package")
+            uos_installer = root / "uos.deb"
+            uos_installer.write_bytes(b"uos-arm64-package")
+            delta_installer = root / "delta.exe"
+            delta_installer.write_bytes(b"windows-delta-package")
+            environment = {
+                name: value
+                for name, value in os.environ.items()
+                if name.casefold() != "psmodulepath"
+            }
+            environment.update(
+                {
+                    "INTDEMO_PUBLISH_SCRIPT": str(publish_script),
+                    "INTDEMO_WINDOWS_INSTALLER": str(windows_installer),
+                    "INTDEMO_UOS_INSTALLER": str(uos_installer),
+                    "INTDEMO_DELTA_INSTALLER": str(delta_installer),
+                }
+            )
+            harness = """
+function global:git {
+    $global:LASTEXITCODE = 0
+    if ($args -contains "rev-parse") {
+        Write-Output (("a" * 40) -join "")
+        return
+    }
+    if ($args -contains "status") { return }
+    throw "Unexpected fake git command"
+}
+& $env:INTDEMO_PUBLISH_SCRIPT `
+    -WindowsInstaller $env:INTDEMO_WINDOWS_INSTALLER `
+    -UosInstaller $env:INTDEMO_UOS_INSTALLER `
+    -DeltaInstaller $env:INTDEMO_DELTA_INSTALLER `
+    -DeltaFromVersion 1.2.2 `
+    -Version 1.2.3 `
+    -Notes dual-platform `
+    -Channel test
+""".strip()
+
+            result = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-Command",
+                    harness,
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=environment,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+            manifest = json.loads(
+                (root / "dist/update-release/test.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertTrue(manifest["installer_path"].endswith(".exe"))
+            self.assertEqual(
+                set(manifest["platforms"]),
+                {"windows-x86_64", "linux-aarch64"},
+            )
+            self.assertTrue(
+                manifest["platforms"]["windows-x86_64"]["full"][
+                    "installer_path"
+                ].endswith(".exe")
+            )
+            self.assertTrue(
+                manifest["platforms"]["linux-aarch64"]["full"][
+                    "installer_path"
+                ].endswith(".deb")
+            )
+            self.assertEqual(
+                manifest["platforms"]["windows-x86_64"]["deltas"][0][
+                    "from_version"
+                ],
+                "1.2.2",
+            )
+            self.assertNotIn(
+                "deltas",
+                manifest["platforms"]["linux-aarch64"],
+            )
+
     def test_git_commit_steps_stage_all_changes_and_create_local_commit(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -566,6 +684,71 @@ function global:scp {
                 errors="replace",
             )
             self.assertEqual(build_git_push_plan(local).ahead_count, 0)
+
+    def test_git_mirror_push_plans_target_github_and_gitee_without_force(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            local.mkdir()
+            remotes = {
+                "origin": root / "github.git",
+                "gitee": root / "gitee.git",
+            }
+            for remote in remotes.values():
+                subprocess.run(
+                    ["git", "init", "--bare", "-q", str(remote)],
+                    check=True,
+                )
+            subprocess.run(["git", "init", "-q"], cwd=local, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "IntDemo Test"],
+                cwd=local,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "intdemo@example.invalid"],
+                cwd=local,
+                check=True,
+            )
+            (local / "tracked.txt").write_text("dual\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--all"], cwd=local, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "dual remote"],
+                cwd=local,
+                check=True,
+            )
+            for name, remote in remotes.items():
+                subprocess.run(
+                    ["git", "remote", "add", name, str(remote)],
+                    cwd=local,
+                    check=True,
+                )
+
+            plans = build_git_mirror_push_plans(local)
+
+            self.assertEqual([plan.remote for plan in plans], ["origin", "gitee"])
+            self.assertTrue(plans[0].sets_upstream)
+            self.assertFalse(plans[1].sets_upstream)
+            for plan in plans:
+                self.assertNotIn("--force", plan.step.arguments)
+                subprocess.run(
+                    [plan.step.program, *plan.step.arguments],
+                    cwd=plan.step.working_directory,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            for remote in remotes.values():
+                result = subprocess.run(
+                    ["git", "--git-dir", str(remote), "show-ref", "--heads"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                )
+                self.assertIn(plans[0].branch, result.stdout)
 
     def test_version_sync_updates_all_authoritative_fields(self):
         current = project_version(REPO_ROOT)
@@ -769,7 +952,10 @@ class ReleasePublisherUiTests(unittest.TestCase):
     def test_window_exposes_safe_release_workflow(self):
         window = ReleasePublisherWindow(REPO_ROOT)
 
-        self.assertEqual(window.windowTitle(), "IntDemo 专用打包发布器")
+        self.assertEqual(
+            window.windowTitle(),
+            "逃费车辆信息智能查询平台 · 双端打包发布器",
+        )
         self.assertEqual(window.current_version_value.text(), f"v{project_version(REPO_ROOT)}")
         self.assertEqual(window.channel_combo.currentData(), "test")
         self.assertFalse(window.mandatory_check.isChecked())
@@ -783,6 +969,9 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertIn("不会推送", window.commit_changes_button.toolTip())
         self.assertEqual(window.push_button.text(), "推送")
         self.assertIn("不会强制推送", window.push_button.toolTip())
+        self.assertIn("GitHub", window.push_button.toolTip())
+        self.assertTrue(window.windows_check.isChecked())
+        self.assertTrue(window.uos_check.isChecked())
         self.assertEqual(window.control_username_edit.text(), "admin")
         self.assertEqual(window.control_password_edit.text(), "")
         self.assertIn("断开全部", window.disconnect_all_button.text())
@@ -887,7 +1076,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
 
     def test_push_button_previews_and_runs_non_force_push(self):
         window = ReleasePublisherWindow(REPO_ROOT)
-        plan = GitPushPlan(
+        origin_plan = GitPushPlan(
             branch="codex/test",
             remote="origin",
             remote_branch="codex/test",
@@ -895,7 +1084,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
             ahead_count=1,
             commits=("abc1234 测试提交",),
             step=CommandStep(
-                key="git_push",
+                key="git_push_origin",
                 title="推送 Git 分支 codex/test",
                 program="git",
                 arguments=(
@@ -907,11 +1096,31 @@ class ReleasePublisherUiTests(unittest.TestCase):
                 working_directory=REPO_ROOT,
             ),
         )
+        gitee_plan = GitPushPlan(
+            branch="codex/test",
+            remote="gitee",
+            remote_branch="codex/test",
+            upstream="gitee/codex/test",
+            ahead_count=1,
+            commits=("abc1234 测试提交",),
+            step=CommandStep(
+                key="git_push_gitee",
+                title="推送 Git 分支到 gitee",
+                program="git",
+                arguments=(
+                    "push",
+                    "--porcelain",
+                    "gitee",
+                    "HEAD:refs/heads/codex/test",
+                ),
+                working_directory=REPO_ROOT,
+            ),
+        )
 
         with (
             patch(
-                "release_publisher.ui.build_git_push_plan",
-                return_value=plan,
+                "release_publisher.ui.build_git_mirror_push_plans",
+                return_value=[origin_plan, gitee_plan],
             ),
             patch(
                 "release_publisher.ui.QMessageBox.warning",
@@ -922,11 +1131,17 @@ class ReleasePublisherUiTests(unittest.TestCase):
             window._push_changes()
 
         self.assertIn("不会强制推送", warning.call_args.args[2])
-        self.assertNotIn("--force", plan.step.arguments)
-        self.assertEqual(run_steps.call_args.args[0], [plan.step])
+        self.assertIn("origin/codex/test", warning.call_args.args[2])
+        self.assertIn("gitee/codex/test", warning.call_args.args[2])
+        self.assertNotIn("--force", origin_plan.step.arguments)
+        self.assertNotIn("--force", gitee_plan.step.arguments)
+        self.assertEqual(
+            run_steps.call_args.args[0],
+            [origin_plan.step, gitee_plan.step],
+        )
         self.assertEqual(
             run_steps.call_args.kwargs["completion_message"],
-            "当前分支已推送到 origin/codex/test",
+            "当前分支已同步推送到 GitHub 与 Gitee",
         )
         window.deleteLater()
 

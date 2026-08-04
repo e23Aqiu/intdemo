@@ -1,8 +1,8 @@
 import os
 from pathlib import Path
 
-APP_NAME = "逃费车辆智能查询平台"
-APP_VERSION = "0.2.8"
+APP_NAME = "逃费车辆信息智能查询平台"
+APP_VERSION = "0.2.9"
 ORGANIZATION_NAME = "IntDemo"
 
 DEFAULT_ADMIN_USERNAME = "admin"

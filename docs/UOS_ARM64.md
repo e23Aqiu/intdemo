@@ -39,7 +39,8 @@ sudo apt install -y \
   libglib2.0-0 libdbus-1-3 libfontconfig1 libfreetype6 \
   libx11-6 libx11-xcb1 libxcb1 libxcb-xinerama0 libxkbcommon-x11-0 \
   libxrender1 libxi6 libxrandr2 libxfixes3 libxcursor1 \
-  libgl1 libegl1 libgbm1 libnss3 libasound2 fonts-noto-cjk
+  libgl1 libegl1 libgbm1 libnss3 libasound2 fonts-noto-cjk \
+  fcitx-frontend-qt5 policykit-1 xdg-utils
 ```
 
 不同 UOS 补丁级别可能已预装其中一部分；`apt` 会跳过已安装的软件包。如果
@@ -132,12 +133,19 @@ conda run -p ./.conda-uos-arm64 python main.py
 UOS 菜单启动器可能自动注入 `QT_QPA_PLATFORM=wayland`，但当前随包 Qt 不包含
 Wayland 平台插件；根启动器会把这个系统注入值改为 `xcb`。普通用户不要直接用
 `QT_QPA_PLATFORM=wayland` 覆盖，原生 Wayland 验证统一使用上述项目专用变量。
+构建脚本会校验 UOS 的 `fcitx-frontend-qt5` 平台输入上下文及依赖；程序在
+PyInstaller 自带 Qt 插件路径之后追加受信任的系统 Qt 插件目录。启动器会尊重
+已有的 IBus/Fcitx 配置，并在 UOS 默认场景设置 `QT_IM_MODULE=fcitx`，从而支持
+公告标题、轮播文字和富文本正文的中文组合输入。
 
 ## 五、构建 ARM64 包
 
 ```bash
 bash scripts/uos-arm64/build.sh
 ```
+
+发布器远程构建时会额外传入 `--base-url`、`--channel` 以及 `--ca-bundle`（或
+`--no-ca-bundle`），保证 Windows 与 UOS 包使用同一在线服务和证书配置。
 
 默认流程依次执行：环境和浏览器缓存更新、UOS/架构/glibc/依赖/浏览器/密钥环
 预检、客户端离线回归测试、PyInstaller 目录包构建、conda ARM64 GNU 运行库
@@ -175,7 +183,7 @@ DEB 使用包名 `com.e23aqiu.intdemo`、架构 `arm64`，应用文件位于
 普通桌面用户运行；用户数据库、Secret Service 密钥和在线配置不会装入 DEB。
 DEB 的桌面文件严格使用与 AppID 相同的 `com.e23aqiu.intdemo.desktop`，Qt 的
 DesktopFileName 也使用同一值，以便 UOS 应用注册与沙箱识别该入口。菜单名称为
-“逃费车辆智能查询平台（UOS）”，并在旧版 DDE 下关闭启动通知。
+“逃费车辆信息智能查询平台（UOS）”，并在旧版 DDE 下关闭启动通知。
 
 压缩包内的 `browser/` 是完整 Chromium 运行目录；启动器会自动设置
 `INTDEMO_CHROMIUM_PATH`，最终用户不需要执行 `playwright install`。
@@ -231,18 +239,18 @@ fi
 随后可在文件管理器中双击当前版本的 `.deb`，或在仓库根目录通过终端安装：
 
 ```bash
-sudo apt install ./dist/uos-arm64/IntDemo-UOS-arm64-0.2.8.deb
+sudo apt install ./dist/uos-arm64/IntDemo-UOS-arm64-0.2.9.deb
 ```
 
 同一应用版本内重新构建并测试菜单兼容修复时，使用强制重装让 `dpkg` 刷新文件清单：
 
 ```bash
-sudo apt install --reinstall ./dist/uos-arm64/IntDemo-UOS-arm64-0.2.8.deb
+sudo apt install --reinstall ./dist/uos-arm64/IntDemo-UOS-arm64-0.2.9.deb
 ```
 
 本次生成的是未投递应用商店的测试包；若图形软件包安装器提示签名问题，需要按
 UOS 管理策略开启开发者模式，或使用已经获信任签名/企业应用商店发布的包。安装后
-从应用菜单启动“逃费车辆智能查询平台（UOS）”，并可检查包信息和成品入口：
+从应用菜单启动“逃费车辆信息智能查询平台（UOS）”，并可检查包信息和成品入口：
 
 ```bash
 dpkg -s com.e23aqiu.intdemo | grep -E '^(Status|Version|Architecture):'
@@ -277,7 +285,8 @@ sudo apt remove com.e23aqiu.intdemo
 2. 源码启动后登录页中文字体正常，窗口可拖动、最大化、缩放，无黑边或透明块。
 3. 在线登录成功；勾选“记住密码”，关闭并重开后资料可解密；断网时可用有效的
    本机离线授权登录。
-4. “系统设置”显示版本；UOS 暂不展示 Windows `.exe` 自动更新入口。
+4. “系统设置”显示版本并可检查更新；UOS 只接受 `linux-aarch64` 的 `.deb`，
+   下载和 SHA-256 校验完成后通过 `pkexec + dpkg`（或系统软件包界面）安装。
 5. “运行设置”中的 Chromium 健康检查通过，并显示软件包内
    `browser/chrome` 的真实路径和版本。
 6. 用一份脱敏 `.xlsx` 分别跑运输证、营运企业回填、爱企查；检查人工验证码、
@@ -285,7 +294,7 @@ sudo apt remove com.e23aqiu.intdemo
 7. 导入公开腾讯文档；再测试需要登录的腾讯文档，确认独立浏览器资料目录可复用。
 8. 用 WPS 打开测试表格时，应用能提示文件占用；关闭 WPS 后可以继续写入。
 9. 关闭应用后检查日志与数据库均位于 XDG 数据目录，重新启动数据仍在。
-10. 解压包、用户安装、DEB 安装/升级、应用菜单启动和两种卸载方式各执行一次；
+10. 解压包、用户安装、DEB 安装/应用内升级、应用菜单启动和两种卸载方式各执行一次；
     确认卸载不删除业务数据或在线配置。
 
 ## 九、失败时回传的信息
@@ -313,9 +322,8 @@ echo "$XDG_SESSION_TYPE $DISPLAY $WAYLAND_DISPLAY $QT_QPA_PLATFORM"
 
 ## 当前限制
 
-- UOS 自动更新暂时关闭，因为现有更新清单和发布器只生成 Windows `.exe`。
-  UOS 测试包可执行 `install-user.sh` 覆盖用户安装，或安装更高版本 DEB；客户端
-  目前还不会在应用内自动下载并调用软件包安装器。
+- UOS 应用内更新需要系统存在 `pkexec + dpkg` 或可处理 `.deb` 的 `xdg-open`；
+  企业策略禁用提权时仍需管理员手动安装已经校验的 DEB。
 - Playwright 官方支持的是更新的 Debian/Ubuntu 版本；本项目内置 Chromium
   已在 UOS Desktop 20 1070 ARM64、glibc 2.28 上完成启动验证；游客模式的实际
   业务处理已经通过，在线账号登录、凭据重启解密与同步链路仍需真机验收。

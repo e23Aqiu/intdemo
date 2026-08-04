@@ -99,6 +99,12 @@ class FramelessWindowMixin:
         self._frameless_drag_regions = []
         self._frameless_drag_height = 0
         self.setWindowFlag(Qt.FramelessWindowHint, True)
+        application = QApplication.instance()
+        if application is not None:
+            # Linux/XCB does not provide the Windows WM_NCHITTEST path.  An
+            # application-level filter lets the top-level window see pointer
+            # presses delivered to any of its child widgets.
+            application.installEventFilter(self)
 
     def register_window_drag_region(self, widget):
         """Use an existing widget as a caption without changing its layout."""
@@ -171,6 +177,90 @@ class FramelessWindowMixin:
             return HTCAPTION
         return HTCLIENT
 
+    def _resize_edges(self, local_point):
+        if not self._frameless_resizable or self.isMaximized():
+            return Qt.Edges()
+        margin = self.resize_border_width
+        edges = Qt.Edges()
+        if local_point.x() < margin:
+            edges |= Qt.LeftEdge
+        elif local_point.x() >= self.width() - margin:
+            edges |= Qt.RightEdge
+        if local_point.y() < margin:
+            edges |= Qt.TopEdge
+        elif local_point.y() >= self.height() - margin:
+            edges |= Qt.BottomEdge
+        return edges
+
+    @staticmethod
+    def _resize_cursor(edges):
+        if edges in (
+            Qt.LeftEdge | Qt.TopEdge,
+            Qt.RightEdge | Qt.BottomEdge,
+        ):
+            return Qt.SizeFDiagCursor
+        if edges in (
+            Qt.RightEdge | Qt.TopEdge,
+            Qt.LeftEdge | Qt.BottomEdge,
+        ):
+            return Qt.SizeBDiagCursor
+        if edges & (Qt.LeftEdge | Qt.RightEdge):
+            return Qt.SizeHorCursor
+        if edges & (Qt.TopEdge | Qt.BottomEdge):
+            return Qt.SizeVerCursor
+        return None
+
+    def _non_windows_pointer_event(self, watched, event):
+        if not self._uses_linux_qpa() or not isinstance(watched, QWidget):
+            return False
+        try:
+            if watched.window() is not self:
+                return False
+        except RuntimeError:
+            return False
+        event_type = event.type()
+        if event_type not in {
+            QEvent.MouseMove,
+            QEvent.MouseButtonPress,
+            QEvent.MouseButtonDblClick,
+        }:
+            return False
+        global_position = (
+            event.globalPos() if hasattr(event, "globalPos") else QCursor.pos()
+        )
+        local_point = self.mapFromGlobal(global_position)
+        edges = self._resize_edges(local_point)
+        if event_type == QEvent.MouseMove and not event.buttons():
+            cursor = self._resize_cursor(edges)
+            if cursor is None:
+                if watched.property("framelessResizeCursor"):
+                    watched.unsetCursor()
+                    watched.setProperty("framelessResizeCursor", False)
+            else:
+                watched.setCursor(cursor)
+                watched.setProperty("framelessResizeCursor", True)
+            return False
+        if event.button() != Qt.LeftButton:
+            return False
+        handle = self.windowHandle()
+        if handle is None:
+            return False
+        if event_type == QEvent.MouseButtonPress and edges:
+            if hasattr(handle, "startSystemResize"):
+                handle.startSystemResize(edges)
+                return True
+        if not self._point_in_drag_region(local_point):
+            return False
+        if event_type == QEvent.MouseButtonDblClick and self._frameless_resizable:
+            self.showNormal() if self.isMaximized() else self.showMaximized()
+            return True
+        if event_type == QEvent.MouseButtonPress and hasattr(
+            handle, "startSystemMove"
+        ):
+            handle.startSystemMove()
+            return True
+        return False
+
     @staticmethod
     def _uses_windows_qpa():
         application = QApplication.instance()
@@ -178,6 +268,15 @@ class FramelessWindowMixin:
             sys.platform == "win32"
             and application is not None
             and application.platformName().lower() == "windows"
+        )
+
+    @staticmethod
+    def _uses_linux_qpa():
+        application = QApplication.instance()
+        return (
+            sys.platform.startswith("linux")
+            and application is not None
+            and application.platformName().lower() in {"xcb", "wayland"}
         )
 
     @staticmethod
@@ -335,8 +434,14 @@ class FramelessWindowMixin:
     def showEvent(self, event):
         super().showEvent(event)
         self._apply_windows_resize_style()
+        if self._uses_linux_qpa():
+            self.setMouseTracking(True)
+            for child in self.findChildren(QWidget):
+                child.setMouseTracking(True)
 
     def eventFilter(self, watched, event):
+        if self._non_windows_pointer_event(watched, event):
+            return True
         current = watched if isinstance(watched, QWidget) else None
         in_drag_region = False
         while current is not None:
@@ -355,7 +460,7 @@ class FramelessWindowMixin:
                 if (
                     event.type() == QEvent.MouseButtonPress
                     and event.button() == Qt.LeftButton
-                    and not self._uses_windows_qpa()
+                    and self._uses_linux_qpa()
                 ):
                     handle = self.windowHandle()
                     if handle is not None and hasattr(handle, "startSystemMove"):

@@ -137,11 +137,62 @@ class UosCompatibilityTests(unittest.TestCase):
             platform_support.configure_desktop_environment()
             self.assertEqual(os.environ["QT_QPA_PLATFORM"], "wayland")
 
-    def test_self_update_is_limited_to_windows_installer_platform(self):
-        with patch.object(platform_support.os, "name", "posix"):
-            self.assertFalse(platform_support.supports_self_update())
-        with patch.object(platform_support.os, "name", "nt"):
+    def test_self_update_supports_windows_and_uos_arm64(self):
+        with patch.object(
+            platform_support,
+            "update_platform_key",
+            return_value=platform_support.WINDOWS_UPDATE_PLATFORM,
+        ):
             self.assertTrue(platform_support.supports_self_update())
+        with patch.object(
+            platform_support,
+            "update_platform_key",
+            return_value=platform_support.UOS_UPDATE_PLATFORM,
+        ), patch.object(platform_support, "is_uos", return_value=True):
+            self.assertTrue(platform_support.supports_self_update())
+        with patch.object(
+            platform_support,
+            "update_platform_key",
+            return_value=platform_support.UOS_UPDATE_PLATFORM,
+        ), patch.object(platform_support, "is_uos", return_value=False):
+            self.assertFalse(platform_support.supports_self_update())
+
+    def test_update_platform_and_uos_deb_install_command(self):
+        self.assertEqual(
+            platform_support.update_platform_key("linux", "arm64"),
+            platform_support.UOS_UPDATE_PLATFORM,
+        )
+        with patch.object(
+            platform_support,
+            "update_platform_key",
+            return_value=platform_support.UOS_UPDATE_PLATFORM,
+        ), patch.object(
+            platform_support.shutil,
+            "which",
+            side_effect=lambda name: f"/usr/bin/{name}",
+        ):
+            program, arguments = platform_support.update_install_command(
+                "/tmp/IntDemo-UOS-arm64-1.2.3.deb"
+            )
+        self.assertEqual(program, "/usr/bin/pkexec")
+        self.assertEqual(arguments[:2], ["/usr/bin/dpkg", "--install"])
+        self.assertTrue(arguments[-1].endswith(".deb"))
+
+    def test_uos_environment_selects_fcitx_for_chinese_input(self):
+        environment = {
+            "XDG_SESSION_TYPE": "x11",
+            "DISPLAY": ":0",
+            "INTDEMO_QT_SYSTEM_PLUGIN_PATH": "/usr/lib/qt5/plugins",
+        }
+        with patch.dict(os.environ, environment, clear=True), patch.object(
+            platform_support, "is_linux_arm64", return_value=True
+        ):
+            platform_support.configure_desktop_environment()
+            self.assertEqual(os.environ["QT_IM_MODULE"], "fcitx")
+            self.assertIn(
+                "/usr/lib/qt5/plugins",
+                os.environ["QT_PLUGIN_PATH"].split(os.pathsep),
+            )
 
     def test_secret_service_protector_round_trip(self):
         encoded_key = base64.b64encode(b"k" * 32).decode("ascii")
@@ -224,6 +275,8 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("GIO_LAUNCHED_DESKTOP_FILE", launcher)
         self.assertIn("INTDEMO_QT_QPA_PLATFORM", launcher)
         self.assertIn("effective_qt_platform", launcher)
+        self.assertIn("qt_im_module", launcher)
+        self.assertIn("QT_IM_MODULE=fcitx", launcher)
         self.assertIn('2>>"$launcher_log"', launcher)
 
     def test_uos_build_generates_native_arm64_deb(self):
@@ -264,6 +317,8 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("Package: com.e23aqiu.intdemo", control)
         self.assertIn("Architecture: arm64", control)
         self.assertIn("libsecret-tools", control)
+        self.assertIn("fcitx-frontend-qt5", control)
+        self.assertIn("policykit-1", control)
         self.assertEqual(info["appid"], "com.e23aqiu.intdemo")
         self.assertEqual(info["version"], "0.2.8.0")
         self.assertEqual(info["arch"], ["arm64"])
@@ -272,7 +327,7 @@ class UosCompatibilityTests(unittest.TestCase):
             "Exec=/opt/apps/com.e23aqiu.intdemo/files/intdemo-client",
             desktop,
         )
-        self.assertIn("Name=逃费车辆智能查询平台（UOS）", desktop)
+        self.assertIn("Name=逃费车辆信息智能查询平台（UOS）", desktop)
         self.assertIn("StartupNotify=false", desktop)
         self.assertFalse((packaging / "com.e23aqiu.intdemo.uos.desktop").exists())
         self.assertEqual(
@@ -295,6 +350,12 @@ class UosCompatibilityTests(unittest.TestCase):
         entrypoint = (root / "main.py").read_text(encoding="utf-8")
         self.assertIn("libgcc-ng>=12", environment)
         self.assertIn("libstdcxx-ng>=12", environment)
+        platform_code = (root / "integrated_client/platform_support.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("QT_PLUGIN_PATH", platform_code)
+        self.assertIn("libfcitx*inputcontextplugin", platform_code)
+        self.assertIn("Qt Fcitx 输入法插件", build_script)
         self.assertIn("libstdc++.so.6 libgcc_s.so.1", build_script)
         self.assertIn("GLIBCXX_3.4.26", build_script)
         self.assertIn('qt_libstdcxx_real="$(readlink -f', build_script)

@@ -187,7 +187,7 @@ class SecretServiceProtector(Protector):
         stored = self._run(
             [
                 "store",
-                "--label=逃费车辆智能查询平台",
+                "--label=逃费车辆信息智能查询平台",
                 *self._ATTRIBUTES,
             ],
             input_text=encoded + "\n",

@@ -26,6 +26,7 @@ from integrated_client.online.update import (
     UpdateInfo,
     version_key,
 )
+from integrated_client.platform_support import WINDOWS_UPDATE_PLATFORM
 from integrated_client.preferences import ClientPreferences, LoginCredentialStore
 
 
@@ -297,7 +298,11 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         )
 
-        update = UpdateClient(config, session=session).check()
+        update = UpdateClient(
+            config,
+            session=session,
+            platform_key=WINDOWS_UPDATE_PLATFORM,
+        ).check()
 
         self.assertEqual(update.version, target_version)
         self.assertEqual(
@@ -306,11 +311,81 @@ class OnlineClientTests(unittest.TestCase):
         )
         self.assertGreater(version_key(update.version), version_key(APP_VERSION))
         self.assertTrue(update.mandatory)
+        self.assertEqual(
+            session.headers["X-IntDemo-Platform"],
+            "windows-x86_64",
+        )
         session.get.assert_called_once()
 
         response.json.return_value["installer_path"] = "https://evil.example/x.exe"
         with self.assertRaisesRegex(UpdateError, "路径无效"):
-            UpdateClient(config, session=session).check()
+            UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).check()
+
+    def test_update_manifest_selects_uos_arm64_deb(self):
+        target_version = _next_patch_version(APP_VERSION)
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "schema_version": 1,
+            "channel": "test",
+            "version": target_version,
+            "notes": "双端更新测试",
+            "platforms": {
+                "windows-x86_64": {
+                    "full": {
+                        "installer_path": (
+                            f"/updates/files/IntDemoOnline-Setup-{target_version}.exe"
+                        ),
+                        "sha256": "a" * 64,
+                        "size": 123,
+                    }
+                },
+                "linux-aarch64": {
+                    "full": {
+                        "installer_path": (
+                            f"/updates/files/IntDemo-UOS-arm64-{target_version}.deb"
+                        ),
+                        "sha256": "b" * 64,
+                        "size": 456,
+                    }
+                },
+            },
+        }
+        session = Mock()
+        session.headers = {}
+        session.get.return_value = response
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+
+        update = UpdateClient(
+            config,
+            session=session,
+            platform_key="linux-aarch64",
+        ).check()
+
+        self.assertEqual(update.platform_key, "linux-aarch64")
+        self.assertTrue(update.installer_name.endswith(".deb"))
+        self.assertEqual(update.size, 456)
+        self.assertEqual(
+            session.headers["X-IntDemo-Platform"],
+            "linux-aarch64",
+        )
+
+        response.json.return_value["platforms"]["linux-aarch64"]["full"][
+            "installer_path"
+        ] = f"/updates/files/IntDemoOnline-Setup-{target_version}.exe"
+        with self.assertRaisesRegex(UpdateError, "当前平台不匹配"):
+            UpdateClient(
+                config,
+                session=session,
+                platform_key="linux-aarch64",
+            ).check()
 
     def test_update_manifest_prefers_matching_delta(self):
         full = b"full"
@@ -354,7 +429,11 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         )
 
-        update = UpdateClient(config, session=session).check()
+        update = UpdateClient(
+            config,
+            session=session,
+            platform_key=WINDOWS_UPDATE_PLATFORM,
+        ).check()
 
         self.assertTrue(update.is_delta)
         self.assertEqual(update.from_version, APP_VERSION)
@@ -376,13 +455,25 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         )
 
-        self.assertIsNone(UpdateClient(config, session=session).check())
+        self.assertIsNone(
+            UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).check()
+        )
 
         no_content = Mock(status_code=204)
         no_content.raise_for_status.return_value = None
         session.get.return_value = no_content
 
-        self.assertIsNone(UpdateClient(config, session=session).check())
+        self.assertIsNone(
+            UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).check()
+        )
         no_content.json.assert_not_called()
 
     def test_update_manifest_uses_delta_only_for_exact_current_version(self):
@@ -433,6 +524,7 @@ class OnlineClientTests(unittest.TestCase):
                     config,
                     session=session,
                     current_version=current_version,
+                    platform_key=WINDOWS_UPDATE_PLATFORM,
                 ).check()
 
                 self.assertEqual(update.package_kind, expected_kind)
@@ -487,7 +579,11 @@ class OnlineClientTests(unittest.TestCase):
         os.environ["INTDEMO_DATA_DIR"] = self.temp_dir.name
         progress = []
         try:
-            path = UpdateClient(config, session=session).download(
+            path = UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).download(
                 update,
                 progress_callback=lambda received, total: progress.append(
                     (received, total)
@@ -541,7 +637,11 @@ class OnlineClientTests(unittest.TestCase):
         cancelled = [False]
         try:
             with self.assertRaises(UpdateCancelled):
-                UpdateClient(config, session=session).download(
+                UpdateClient(
+                    config,
+                    session=session,
+                    platform_key=WINDOWS_UPDATE_PLATFORM,
+                ).download(
                     update,
                     progress_callback=lambda received, _total: (
                         cancelled.__setitem__(0, True)

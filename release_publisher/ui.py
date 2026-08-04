@@ -40,7 +40,7 @@ from .core import (
     ReleaseOptions,
     SettingsStore,
     build_git_commit_steps,
-    build_git_push_plan,
+    build_git_mirror_push_plans,
     build_pause_distribution_steps,
     build_release_plan,
     find_inno_compiler,
@@ -69,7 +69,7 @@ class ReleasePublisherWindow(QMainWindow):
         self._connection_client: ConnectionControlClient | None = None
         self._connection_client_key: tuple[str, ...] | None = None
 
-        self.setWindowTitle("IntDemo 专用打包发布器")
+        self.setWindowTitle("逃费车辆信息智能查询平台 · 双端打包发布器")
         self.setMinimumSize(1120, 720)
         self.resize(1320, 820)
         icon_path = (
@@ -90,10 +90,10 @@ class ReleasePublisherWindow(QMainWindow):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("IntDemo 专用打包发布器")
+        title = QLabel("双端打包发布器")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "开发者本地工具 · 测试、构建、校验、发布、暂停分发和快照归档"
+            "Windows x64 + 统信 UOS ARM64 · 测试、构建、双端更新发布和快照归档"
         )
         subtitle.setObjectName("Muted")
         title_box.addWidget(title)
@@ -157,6 +157,17 @@ class ReleasePublisherWindow(QMainWindow):
             "现有服务端尚未拒绝旧版本；客户端在线检查到更新后不能忽略提示。"
         )
         version_form.addRow("", self.mandatory_check)
+        platform_row = QWidget()
+        platform_layout = QHBoxLayout(platform_row)
+        platform_layout.setContentsMargins(0, 0, 0, 0)
+        self.windows_check = QCheckBox("Windows x64")
+        self.windows_check.setChecked(True)
+        self.uos_check = QCheckBox("统信 UOS ARM64")
+        self.uos_check.setChecked(True)
+        platform_layout.addWidget(self.windows_check)
+        platform_layout.addWidget(self.uos_check)
+        platform_layout.addStretch()
+        version_form.addRow("构建平台", platform_row)
         self.portable_check = QCheckBox("同时构建便携包")
         self.portable_check.setChecked(True)
         version_form.addRow("", self.portable_check)
@@ -176,6 +187,16 @@ class ReleasePublisherWindow(QMainWindow):
             "程序文件 (ISCC.exe);;所有文件 (*)",
         )
         connection_form.addRow("Inno Setup", inno_row)
+        self.uos_builder_host_edit = QLineEdit()
+        self.uos_builder_host_edit.setPlaceholderText(
+            "Windows 上填写 UOS ARM64 构建机，例如 uos-builder"
+        )
+        connection_form.addRow("UOS 构建主机", self.uos_builder_host_edit)
+        self.uos_builder_path_edit = QLineEdit("/opt/intdemo")
+        self.uos_builder_path_edit.setPlaceholderText(
+            "构建机上已克隆且与本机提交一致的仓库绝对路径"
+        )
+        connection_form.addRow("UOS 仓库目录", self.uos_builder_path_edit)
         layout.addWidget(connection_card)
 
         control_card, control_form = self._card("客户端断连测试")
@@ -245,7 +266,7 @@ class ReleasePublisherWindow(QMainWindow):
         control_form.addRow("当前状态", self.connection_test_status)
         layout.addWidget(control_card)
 
-        remote_card, remote_form = self._card("远程发布")
+        remote_card, remote_form = self._card("更新服务器发布")
         self.remote_host_edit = QLineEdit()
         self.remote_host_edit.setPlaceholderText(
             "留空仅生成 dist/update-release，例如 intdemo-test"
@@ -308,7 +329,7 @@ class ReleasePublisherWindow(QMainWindow):
         self.test_button = QPushButton("运行全部测试")
         self.test_button.clicked.connect(self._run_tests)
         actions.addWidget(self.test_button)
-        self.build_button = QPushButton("构建安装包")
+        self.build_button = QPushButton("构建双端安装包")
         self.build_button.clicked.connect(self._run_build)
         actions.addWidget(self.build_button)
         self.commit_changes_button = QPushButton("提交变更")
@@ -319,7 +340,7 @@ class ReleasePublisherWindow(QMainWindow):
         actions.addWidget(self.commit_changes_button)
         self.push_button = QPushButton("推送")
         self.push_button.setToolTip(
-            "预览待推送提交并将当前分支推送到上游；不会强制推送"
+            "预览待推送提交并将当前分支同时推送到 GitHub(origin) 与 Gitee(gitee)；不会强制推送"
         )
         self.push_button.clicked.connect(self._push_changes)
         actions.addWidget(self.push_button)
@@ -333,10 +354,10 @@ class ReleasePublisherWindow(QMainWindow):
             self._run_pause_distribution
         )
         actions.addWidget(self.pause_distribution_button)
-        self.publish_button = QPushButton("发布")
+        self.publish_button = QPushButton("发布双端更新")
         self.publish_button.clicked.connect(self._run_publish)
         actions.addWidget(self.publish_button)
-        self.pipeline_button = QPushButton("测试 → 构建 → 发布")
+        self.pipeline_button = QPushButton("测试 → 双端构建 → 双端发布")
         self.pipeline_button.setObjectName("PrimaryButton")
         self.pipeline_button.clicked.connect(self._run_full_pipeline)
         actions.addWidget(self.pipeline_button)
@@ -404,6 +425,10 @@ class ReleasePublisherWindow(QMainWindow):
         self.ca_edit.setText(settings.ca_bundle)
         self.control_username_edit.setText(settings.control_username)
         self.inno_edit.setText(settings.inno_compiler)
+        self.windows_check.setChecked(settings.build_windows)
+        self.uos_check.setChecked(settings.build_uos)
+        self.uos_builder_host_edit.setText(settings.uos_builder_host)
+        self.uos_builder_path_edit.setText(settings.uos_builder_path)
         self.remote_host_edit.setText(settings.remote_host)
         self.remote_path_edit.setText(settings.remote_path)
         self.identity_edit.setText(settings.identity_file)
@@ -652,6 +677,10 @@ class ReleasePublisherWindow(QMainWindow):
             identity_file=self.identity_edit.text().strip(),
             channel=str(self.channel_combo.currentData()),
             build_portable=self.portable_check.isChecked(),
+            build_windows=self.windows_check.isChecked(),
+            build_uos=self.uos_check.isChecked(),
+            uos_builder_host=self.uos_builder_host_edit.text().strip(),
+            uos_builder_path=self.uos_builder_path_edit.text().strip(),
         )
         self.settings_store.save(settings)
 
@@ -681,6 +710,10 @@ class ReleasePublisherWindow(QMainWindow):
             remote_host=self.remote_host_edit.text().strip(),
             remote_path=self.remote_path_edit.text().strip(),
             identity_file=self.identity_edit.text().strip(),
+            build_windows=self.windows_check.isChecked(),
+            build_uos=self.uos_check.isChecked(),
+            uos_builder_host=self.uos_builder_host_edit.text().strip(),
+            uos_builder_path=self.uos_builder_path_edit.text().strip(),
         )
 
     def _validate(
@@ -711,6 +744,7 @@ class ReleasePublisherWindow(QMainWindow):
         self._save_settings()
         message = (
             f"环境检查通过。\n\n目标版本：{options.version}\n"
+            f"构建平台：{'Windows x64 + UOS ARM64' if options.build_windows and options.build_uos else ('Windows x64' if options.build_windows else 'UOS ARM64')}\n"
             f"通道：{options.channel}\n"
             f"增量来源：{options.delta_from_version or '无'}\n"
             f"远程主机：{options.remote_host or '仅本地'}"
@@ -753,9 +787,9 @@ class ReleasePublisherWindow(QMainWindow):
     def _confirm_publish(self, options: ReleaseOptions) -> bool:
         destination = options.remote_host or "本地 dist/update-release"
         package = (
-            f"完整包 + {options.delta_from_version} 增量包"
+            f"Windows 完整包 + {options.delta_from_version} 增量包 + UOS ARM64 DEB"
             if options.delta_from_version
-            else "完整包"
+            else "Windows x64 完整包 + UOS ARM64 DEB"
         )
         warning = "是（在线检查到后不可忽略）" if options.mandatory else "否"
         reply = QMessageBox.warning(
@@ -933,48 +967,49 @@ class ReleasePublisherWindow(QMainWindow):
 
     def _push_changes(self) -> None:
         try:
-            plan = build_git_push_plan(self.repo_root)
+            plans = build_git_mirror_push_plans(self.repo_root)
         except PublisherError as exc:
             QMessageBox.warning(self, "无法推送", str(exc))
             self._append_log(f"准备 Git 推送失败：{exc}")
             return
-        if plan.upstream is not None and plan.ahead_count == 0:
+        pending = [plan for plan in plans if plan.ahead_count > 0]
+        if not pending:
+            targets = "、".join(plan.target for plan in plans)
             self._append_log(
-                f"Git 分支 {plan.branch} 没有需要推送到 {plan.target} 的提交。"
+                f"Git 分支 {plans[0].branch} 已与 {targets} 同步。"
             )
             QMessageBox.information(
                 self,
                 "无需推送",
-                f"当前分支 {plan.branch} 已与 {plan.target} 同步。",
+                f"当前分支 {plans[0].branch} 已与 GitHub 和 Gitee 同步。",
             )
             return
 
-        preview = "\n".join(f"  {commit}" for commit in plan.commits)
-        remaining = plan.ahead_count - len(plan.commits)
-        if remaining > 0:
-            preview += f"\n  ……另有 {remaining} 个较早提交"
-        mode = (
-            "首次推送，并设置为当前分支的上游"
-            if plan.sets_upstream
-            else "推送到现有上游"
-        )
+        previews = []
+        for plan in plans:
+            commits = "\n".join(f"    {commit}" for commit in plan.commits)
+            remaining = plan.ahead_count - len(plan.commits)
+            if remaining > 0:
+                commits += f"\n    ……另有 {remaining} 个较早提交"
+            previews.append(
+                f"{plan.target}：{plan.ahead_count} 个待推送提交"
+                + (f"\n{commits}" if commits else "")
+            )
         reply = QMessageBox.warning(
             self,
-            "确认推送当前分支",
-            f"本地分支：{plan.branch}\n"
-            f"远程目标：{plan.target}\n"
-            f"推送方式：{mode}\n"
-            f"待推送提交：{plan.ahead_count} 个\n\n"
-            f"{preview}\n\n"
-            "将执行普通 Git push，不会强制推送。是否继续？",
+            "确认双仓库推送",
+            f"本地分支：{plans[0].branch}\n\n"
+            + "\n\n".join(previews)
+            + "\n\n将依次执行普通 Git push 到 GitHub 与 Gitee，"
+            "不会强制推送。任一远程拒绝时会停止并保留清晰日志。是否继续？",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Cancel,
         )
         if reply != QMessageBox.Yes:
             return
         self._run_steps(
-            [plan.step],
-            completion_message=f"当前分支已推送到 {plan.target}",
+            [plan.step for plan in pending],
+            completion_message="当前分支已同步推送到 GitHub 与 Gitee",
         )
 
     def _run_steps(

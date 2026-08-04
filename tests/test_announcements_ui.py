@@ -279,6 +279,9 @@ class AnnouncementUiTests(unittest.TestCase):
             }
         ]
         dialog = AnnouncementEditorDialog(accounts)
+        self.assertTrue(dialog.title_edit.testAttribute(Qt.WA_InputMethodEnabled))
+        self.assertTrue(dialog.ticker_edit.testAttribute(Qt.WA_InputMethodEnabled))
+        self.assertTrue(dialog.body_edit.testAttribute(Qt.WA_InputMethodEnabled))
         dialog.title_edit.setText("格式化公告")
         dialog.ticker_edit.setText("请查看格式化公告")
         dialog.body_edit.setPlainText("重点内容")

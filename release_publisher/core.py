@@ -3,9 +3,11 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -46,6 +48,10 @@ class PublisherSettings:
     identity_file: str = ""
     channel: str = "test"
     build_portable: bool = True
+    build_windows: bool = True
+    build_uos: bool = True
+    uos_builder_host: str = ""
+    uos_builder_path: str = "/opt/intdemo"
 
 
 class SettingsStore:
@@ -120,6 +126,10 @@ class ReleaseOptions:
     remote_host: str = ""
     remote_path: str = "/opt/intdemo/deploy/updates"
     identity_file: str = ""
+    build_windows: bool = True
+    build_uos: bool = False
+    uos_builder_host: str = ""
+    uos_builder_path: str = "/opt/intdemo"
 
     @property
     def full_installer(self) -> Path:
@@ -142,6 +152,15 @@ class ReleaseOptions:
                 f"IntDemoOnline-Patch-{self.delta_from_version}"
                 f"-to-{self.version}.exe"
             )
+        )
+
+    @property
+    def uos_installer(self) -> Path:
+        return (
+            self.repo_root
+            / "dist"
+            / "uos-arm64"
+            / f"IntDemo-UOS-arm64-{self.version}.deb"
         )
 
     @property
@@ -570,6 +589,124 @@ def build_git_push_plan(repo_root: str | Path) -> GitPushPlan:
     )
 
 
+def build_git_mirror_push_plans(
+    repo_root: str | Path,
+    remote_names: tuple[str, ...] = ("origin", "gitee"),
+) -> list[GitPushPlan]:
+    """Prepare ordinary, non-force pushes of the branch to GitHub and Gitee."""
+    root = Path(repo_root).resolve()
+    if git_status(root):
+        raise PublisherError("推送前请先提交全部 Git 工作区变更")
+    branch = _current_git_branch(root)
+    _git_output(root, "rev-parse", "--verify", "HEAD", action="读取当前 Git 提交")
+    configured = set(
+        _git_output(root, "remote", action="读取 Git 远程仓库").splitlines()
+    )
+    missing = [name for name in remote_names if name not in configured]
+    if missing:
+        raise PublisherError(
+            "缺少双仓库远程配置：" + "、".join(missing)
+        )
+    upstream_result = _run_git_capture(
+        root,
+        "rev-parse",
+        "--abbrev-ref",
+        "--symbolic-full-name",
+        "@{upstream}",
+    )
+    current_upstream = (
+        upstream_result.stdout.strip()
+        if upstream_result.returncode == 0
+        else None
+    )
+    git_program = shutil.which("git")
+    if not git_program:
+        raise PublisherError("未找到 Git，请先安装 Git 并将其加入 PATH")
+
+    plans: list[GitPushPlan] = []
+    for index, remote in enumerate(remote_names):
+        _git_output(
+            root,
+            "remote",
+            "get-url",
+            "--push",
+            remote,
+            action=f"读取 Git 远程 {remote}",
+        )
+        tracking = f"{remote}/{branch}"
+        tracking_result = _run_git_capture(
+            root,
+            "rev-parse",
+            "--verify",
+            f"refs/remotes/{tracking}",
+        )
+        tracking_exists = tracking_result.returncode == 0
+        if tracking_exists:
+            counts = _git_output(
+                root,
+                "rev-list",
+                "--left-right",
+                "--count",
+                f"{tracking}...HEAD",
+                action=f"比较本地与 {tracking} 提交",
+            ).split()
+            if len(counts) != 2:
+                raise PublisherError(f"无法解析本地与 {tracking} 的提交差异")
+            behind_count, ahead_count = (int(value) for value in counts)
+            if behind_count:
+                raise PublisherError(
+                    f"当前分支落后 {tracking} {behind_count} 个提交，"
+                    "请先拉取并处理差异后再双仓库推送"
+                )
+            commit_range = f"{tracking}..HEAD"
+        else:
+            ahead_count = int(
+                _git_output(
+                    root,
+                    "rev-list",
+                    "--count",
+                    "HEAD",
+                    action=f"统计待推送到 {remote} 的提交",
+                )
+            )
+            commit_range = "HEAD"
+        commits = tuple(
+            line
+            for line in _git_output(
+                root,
+                "log",
+                "--format=%h %s",
+                "--max-count=20",
+                commit_range,
+                action=f"读取待推送到 {remote} 的提交",
+            ).splitlines()
+            if line.strip()
+        )
+        set_upstream = current_upstream is None and index == 0
+        arguments = ["push", "--porcelain"]
+        if set_upstream:
+            arguments.append("--set-upstream")
+        arguments.extend((remote, f"HEAD:refs/heads/{branch}"))
+        plans.append(
+            GitPushPlan(
+                branch=branch,
+                remote=remote,
+                remote_branch=branch,
+                upstream=(None if set_upstream else tracking),
+                ahead_count=ahead_count,
+                commits=commits,
+                step=CommandStep(
+                    key=f"git_push_{remote}",
+                    title=f"推送 Git 分支到 {remote}",
+                    program=git_program,
+                    arguments=tuple(arguments),
+                    working_directory=root,
+                ),
+            )
+        )
+    return plans
+
+
 def _replace_exact(
     content: str,
     pattern: str,
@@ -736,6 +873,11 @@ def find_inno_compiler(configured: str = "") -> Path | None:
     return next((path.resolve() for path in candidates if path.is_file()), None)
 
 
+def is_native_uos_arm64_builder() -> bool:
+    machine = platform.machine().strip().casefold()
+    return sys.platform.startswith("linux") and machine in {"aarch64", "arm64"}
+
+
 def validate_test_environment(repo_root: str | Path) -> list[str]:
     root = Path(repo_root).resolve()
     errors: list[str] = []
@@ -745,9 +887,10 @@ def validate_test_environment(repo_root: str | Path) -> list[str]:
         errors.append(str(exc))
     else:
         errors.extend(project_version_mismatches(root, current))
+    executable = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
     for label, path in (
-        ("客户端开发环境", root / ".venv" / "Scripts" / "python.exe"),
-        ("服务端测试环境", root / "server" / ".venv" / "Scripts" / "python.exe"),
+        ("客户端开发环境", root / ".venv" / executable),
+        ("服务端测试环境", root / "server" / ".venv" / executable),
     ):
         if not path.is_file():
             errors.append(f"{label}不存在：{path}")
@@ -787,7 +930,16 @@ def validate_release_options(
     if (for_publish or for_pipeline) and not str(options.notes or "").strip():
         errors.append("更新说明不能为空")
 
+    if not options.build_windows and not options.build_uos:
+        errors.append("请至少选择一个构建平台")
+    if (for_publish or for_pipeline) and not (
+        options.build_windows and options.build_uos
+    ):
+        errors.append("双端发布必须同时选择 Windows x64 和 UOS ARM64")
+
     if options.delta_from_version:
+        if not options.build_windows:
+            errors.append("增量更新仅适用于 Windows，必须选择 Windows x64")
         try:
             delta_key = _version_key(options.delta_from_version)
             if target_key is not None and delta_key >= target_key:
@@ -805,8 +957,29 @@ def validate_release_options(
 
     if options.inno_compiler and not Path(options.inno_compiler).expanduser().is_file():
         errors.append(f"Inno Setup 编译器不存在：{options.inno_compiler}")
-    if for_build and find_inno_compiler(options.inno_compiler) is None:
+    if (
+        for_build
+        and options.build_windows
+        and find_inno_compiler(options.inno_compiler) is None
+    ):
         errors.append("未找到 Inno Setup 6 编译器")
+    if for_build and options.build_windows and os.name != "nt":
+        errors.append("Windows 安装包必须在 Windows x64 主机上构建")
+
+    if options.build_uos:
+        if options.uos_builder_path and not _safe_remote_path(
+            options.uos_builder_path
+        ):
+            errors.append("UOS 构建仓库目录必须是安全的绝对 Linux 路径")
+        if for_build and not is_native_uos_arm64_builder():
+            if not options.uos_builder_host:
+                errors.append("非 UOS ARM64 主机必须填写 UOS SSH 构建主机")
+            elif not REMOTE_HOST_PATTERN.fullmatch(options.uos_builder_host):
+                errors.append("UOS SSH 构建主机格式无效")
+            if not _safe_remote_path(options.uos_builder_path):
+                errors.append("UOS 构建仓库目录必须是安全的绝对 Linux 路径")
+            if shutil.which("ssh") is None or shutil.which("scp") is None:
+                errors.append("远程构建 UOS ARM64 包需要系统提供 ssh 和 scp")
 
     try:
         current = project_version(root)
@@ -818,10 +991,12 @@ def validate_release_options(
         errors.extend(project_version_mismatches(root, options.version))
 
     if for_publish:
-        if not options.full_installer.is_file():
+        if options.build_windows and not options.full_installer.is_file():
             errors.append(f"完整安装包不存在：{options.full_installer}")
         if options.delta_installer is not None and not options.delta_installer.is_file():
             errors.append(f"增量安装包不存在：{options.delta_installer}")
+        if options.build_uos and not options.uos_installer.is_file():
+            errors.append(f"UOS ARM64 安装包不存在：{options.uos_installer}")
     if for_publish or for_pipeline:
         if options.snapshot_path.exists():
             errors.append(
@@ -839,6 +1014,14 @@ def validate_release_options(
             else:
                 if changes:
                     errors.append("远程发布要求 Git 工作区无未提交变更")
+    if for_build and options.build_uos and not is_native_uos_arm64_builder():
+        try:
+            changes = git_status(root)
+        except PublisherError as exc:
+            errors.append(str(exc))
+        else:
+            if changes:
+                errors.append("UOS 远程构建要求 Git 工作区无未提交变更")
 
     if not _safe_remote_path(options.remote_path):
         errors.append("远程更新目录必须是安全的绝对 Linux 路径")
@@ -916,11 +1099,12 @@ def build_pause_distribution_steps(options: ReleaseOptions) -> list[CommandStep]
 
 def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
     root = options.repo_root
+    executable = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
     return [
         CommandStep(
             key="compile_client",
             title="检查客户端 Python 语法",
-            program=str(root / ".venv" / "Scripts" / "python.exe"),
+            program=str(root / ".venv" / executable),
             arguments=(
                 "-m",
                 "compileall",
@@ -934,14 +1118,14 @@ def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
         CommandStep(
             key="test_client",
             title="运行客户端自动化测试",
-            program=str(root / ".venv" / "Scripts" / "python.exe"),
+            program=str(root / ".venv" / executable),
             arguments=("-m", "pytest", "tests", "-q"),
             working_directory=root,
         ),
         CommandStep(
             key="test_server",
             title="运行服务端自动化测试",
-            program=str(root / "server" / ".venv" / "Scripts" / "python.exe"),
+            program=str(root / "server" / ".venv" / executable),
             arguments=("-m", "pytest", "-q"),
             working_directory=root / "server",
         ),
@@ -949,40 +1133,95 @@ def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
 
 
 def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
-    arguments = [
-        "-BaseUrl",
-        options.base_url,
-        "-Version",
-        options.version,
-    ]
-    if options.ca_bundle:
-        arguments.extend(["-CaBundle", options.ca_bundle])
-    if options.delta_from_version:
-        arguments.extend(["-DeltaFromVersion", options.delta_from_version])
-    if options.inno_compiler:
-        arguments.extend(["-InnoCompiler", options.inno_compiler])
-    script_name = (
-        "build-releases.ps1" if options.build_portable else "build-installer.ps1"
-    )
-    return [
-        _powershell_step(
-            options,
-            key="build_packages",
-            title=(
-                "构建便携包、完整安装包和增量包"
-                if options.build_portable
-                else "构建完整安装包和增量包"
-            ),
-            script_name=script_name,
-            script_arguments=arguments,
+    steps: list[CommandStep] = []
+    if options.build_windows:
+        arguments = [
+            "-BaseUrl",
+            options.base_url,
+            "-Version",
+            options.version,
+        ]
+        if options.ca_bundle:
+            arguments.extend(["-CaBundle", options.ca_bundle])
+        if options.delta_from_version:
+            arguments.extend(["-DeltaFromVersion", options.delta_from_version])
+        if options.inno_compiler:
+            arguments.extend(["-InnoCompiler", options.inno_compiler])
+        script_name = (
+            "build-releases.ps1"
+            if options.build_portable
+            else "build-installer.ps1"
         )
-    ]
+        steps.append(
+            _powershell_step(
+                options,
+                key="build_windows_packages",
+                title=(
+                    "构建 Windows 便携包、完整安装包和增量包"
+                    if options.build_portable
+                    else "构建 Windows 完整安装包和增量包"
+                ),
+                script_name=script_name,
+                script_arguments=arguments,
+            )
+        )
+    if options.build_uos:
+        if is_native_uos_arm64_builder():
+            uos_arguments = [
+                str(options.repo_root / "scripts/uos-arm64/build.sh"),
+                "--base-url",
+                options.base_url,
+                "--channel",
+                options.channel,
+            ]
+            if options.ca_bundle:
+                uos_arguments.extend(["--ca-bundle", options.ca_bundle])
+            else:
+                uos_arguments.append("--no-ca-bundle")
+            steps.append(
+                CommandStep(
+                    key="build_uos_package",
+                    title="构建 UOS ARM64 DEB 安装包",
+                    program=shutil.which("bash") or "bash",
+                    arguments=tuple(uos_arguments),
+                    working_directory=options.repo_root,
+                )
+            )
+        else:
+            remote_arguments = [
+                "-BuilderHost",
+                options.uos_builder_host,
+                "-BuilderRepoPath",
+                options.uos_builder_path,
+                "-Version",
+                options.version,
+                "-BaseUrl",
+                options.base_url,
+                "-Channel",
+                options.channel,
+            ]
+            if options.identity_file:
+                remote_arguments.extend(["-IdentityFile", options.identity_file])
+            if options.ca_bundle:
+                remote_arguments.extend(["-CaBundle", options.ca_bundle])
+            steps.append(
+                _powershell_step(
+                    options,
+                    key="build_uos_package",
+                    title=f"在 {options.uos_builder_host} 构建 UOS ARM64 DEB",
+                    script_name="build-uos-remote.ps1",
+                    script_arguments=remote_arguments,
+                )
+            )
+    return steps
 
 
 def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
     arguments = [
-        "-Installer",
+        "-WindowsInstaller",
         str(options.full_installer),
+        "-UosInstaller",
+        str(options.uos_installer),
         "-Version",
         options.version,
         "-Notes",

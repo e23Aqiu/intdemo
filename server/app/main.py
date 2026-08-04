@@ -45,7 +45,7 @@ def create_app() -> FastAPI:
     settings = get_settings()
     app = FastAPI(
         title="IntDemo Sync API",
-        version="0.2.8",
+        version="0.2.9",
         docs_url="/api/v1/docs" if not settings.is_production else None,
         redoc_url=None,
         openapi_url="/api/v1/openapi.json" if not settings.is_production else None,
@@ -110,7 +110,7 @@ def create_app() -> FastAPI:
 
     @api.get("/health/live")
     def live() -> dict:
-        return {"status": "live", "version": "0.2.8"}
+        return {"status": "live", "version": "0.2.9"}
 
     @api.get("/health/ready")
     def ready() -> dict:

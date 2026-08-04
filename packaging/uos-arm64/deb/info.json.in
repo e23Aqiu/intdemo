@@ -1,6 +1,6 @@
 {
   "appid": "com.e23aqiu.intdemo",
-  "name": "逃费车辆智能查询平台",
+  "name": "逃费车辆信息智能查询平台",
   "version": "@UOS_VERSION@",
   "arch": ["arm64"],
   "permissions": {

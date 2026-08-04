@@ -13,6 +13,10 @@ skip_tests=0
 skip_env_update=0
 skip_browser_check=0
 skip_deb=0
+base_url=""
+channel="test"
+ca_bundle=""
+ca_bundle_mode="default"
 
 usage() {
   cat <<'EOF'
@@ -21,6 +25,10 @@ usage() {
   --skip-env-update     不更新现有 conda 环境
   --skip-browser-check  只解析浏览器路径，不实际启动 Chromium
   --skip-deb            只生成 tar.gz，不生成 UOS ARM64 DEB
+  --base-url URL        写入安装包的 HTTPS 在线服务地址
+  --ca-bundle PATH      写入安装包的私有 CA 根证书
+  --no-ca-bundle        使用系统公共 CA，不附带私有根证书
+  --channel NAME        更新通道：test 或 stable（默认 test）
 EOF
 }
 
@@ -30,11 +38,49 @@ while (($#)); do
     --skip-env-update) skip_env_update=1 ;;
     --skip-browser-check) skip_browser_check=1 ;;
     --skip-deb) skip_deb=1 ;;
+    --base-url)
+      (($# >= 2)) || { echo "错误：--base-url 缺少参数。" >&2; exit 2; }
+      base_url="$2"
+      shift
+      ;;
+    --ca-bundle)
+      (($# >= 2)) || { echo "错误：--ca-bundle 缺少参数。" >&2; exit 2; }
+      ca_bundle="$2"
+      ca_bundle_mode="file"
+      shift
+      ;;
+    --no-ca-bundle)
+      ca_bundle=""
+      ca_bundle_mode="none"
+      ;;
+    --channel)
+      (($# >= 2)) || { echo "错误：--channel 缺少参数。" >&2; exit 2; }
+      channel="$2"
+      shift
+      ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数：$1" >&2; usage >&2; exit 2 ;;
   esac
   shift
 done
+
+if [[ -n "$base_url" && ! "$base_url" =~ ^https://[^[:space:]]+$ ]]; then
+  echo "错误：--base-url 必须是 HTTPS URL。" >&2
+  exit 2
+fi
+if [[ "$channel" != "test" && "$channel" != "stable" ]]; then
+  echo "错误：--channel 只能是 test 或 stable。" >&2
+  exit 2
+fi
+if [[ "$ca_bundle_mode" == "file" ]]; then
+  if [[ "$ca_bundle" != /* ]]; then
+    ca_bundle="$repo_root/$ca_bundle"
+  fi
+  if [[ ! -f "$ca_bundle" ]]; then
+    echo "错误：找不到 --ca-bundle 指定的证书：$ca_bundle" >&2
+    exit 2
+  fi
+fi
 
 case "$(uname -m)" in
   aarch64|arm64) ;;
@@ -225,12 +271,35 @@ fi
 echo "Qt Core C++ 运行库: $qt_libstdcxx_real"
 echo "Qt Core 动态库检查: 正常"
 
+fcitx_input_plugin="$(
+  find /usr/lib -path '*/qt5/plugins/platforminputcontexts/*' \
+    -name 'libfcitx*inputcontextplugin.so*' -print -quit 2>/dev/null || true
+)"
+if [[ -z "$fcitx_input_plugin" ]]; then
+  echo "错误：UOS 系统缺少 Qt Fcitx 输入法插件。" >&2
+  echo "请确认系统已安装 fcitx-frontend-qt5。" >&2
+  exit 1
+fi
+input_plugin_ldd="$(ldd "$fcitx_input_plugin" 2>&1 || true)"
+if grep -Fqi "not found" <<<"$input_plugin_ldd"; then
+  echo "错误：Qt Fcitx 输入法插件存在缺失动态库：" >&2
+  echo "$input_plugin_ldd" >&2
+  exit 1
+fi
+echo "Qt 中文输入法系统插件: $fcitx_input_plugin"
+
 mkdir -p "$package_root/app" "$package_root/browser" "$package_root/certs"
 cp -a "$pyinstaller_dist/intdemo-client/." "$package_root/app/"
 cp -a "$browser_source_dir/." "$package_root/browser/"
 cp "$repo_root/packaging/uos-arm64/client-online.json" "$package_root/"
-cp "$repo_root/packaging/uos-arm64/certs/intdemo-caddy-root.crt" \
-  "$package_root/certs/"
+package_ca_bundle=""
+if [[ "$ca_bundle_mode" == "default" ]]; then
+  ca_bundle="$repo_root/packaging/uos-arm64/certs/intdemo-caddy-root.crt"
+fi
+if [[ "$ca_bundle_mode" != "none" ]]; then
+  cp "$ca_bundle" "$package_root/certs/intdemo-caddy-root.crt"
+  package_ca_bundle="certs/intdemo-caddy-root.crt"
+fi
 cp "$repo_root/packaging/uos-arm64/intdemo-client" "$package_root/"
 cp "$repo_root/packaging/uos-arm64/install-user.sh" "$package_root/"
 cp "$repo_root/packaging/uos-arm64/uninstall-user.sh" "$package_root/"
@@ -238,6 +307,11 @@ cp "$repo_root/packaging/uos-arm64/com.e23aqiu.intdemo.desktop" "$package_root/"
 cp "$repo_root/packaging/uos-arm64/README.txt" "$package_root/"
 cp "$repo_root/docs/UOS_ARM64.md" "$package_root/"
 cp "$repo_root/integrated_client/ui/assets/app-icon.png" "$package_root/"
+INTDEMO_PACKAGE_BASE_URL="$base_url" \
+INTDEMO_PACKAGE_CHANNEL="$channel" \
+INTDEMO_PACKAGE_CA_BUNDLE="$package_ca_bundle" \
+  "$conda_cmd" run --prefix "$env_prefix" python -c \
+  'import json, os, pathlib; p=pathlib.Path("'"$package_root"'/client-online.json"); data=json.loads(p.read_text(encoding="utf-8")); url=os.environ["INTDEMO_PACKAGE_BASE_URL"].strip(); data["base_url"]=(url.rstrip("/") if url else data["base_url"]); data["channel"]=os.environ["INTDEMO_PACKAGE_CHANNEL"]; data["ca_bundle"]=os.environ["INTDEMO_PACKAGE_CA_BUNDLE"] or None; p.write_text(json.dumps(data, ensure_ascii=False, indent=2)+"\n", encoding="utf-8")'
 chmod +x \
   "$package_root/intdemo-client" \
   "$package_root/install-user.sh" \

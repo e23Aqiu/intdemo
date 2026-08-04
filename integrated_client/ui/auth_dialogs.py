@@ -192,6 +192,7 @@ class LoginDialog(FramelessDialog):
         self.password_edit = QLineEdit()
         self.password_edit.setPlaceholderText("请输入密码")
         self.password_edit.setEchoMode(QLineEdit.Password)
+        self.username_edit.returnPressed.connect(self._login)
         self.password_edit.returnPressed.connect(self._login)
         card_layout.addRow("账号", self.username_edit)
         card_layout.addRow("密码", self.password_edit)
@@ -213,9 +214,13 @@ class LoginDialog(FramelessDialog):
         self.login_btn = QPushButton("登录")
         self.login_btn.setObjectName("PrimaryButton")
         self.login_btn.setMinimumHeight(42)
+        self.login_btn.setDefault(True)
+        self.login_btn.setAutoDefault(True)
         self.login_btn.clicked.connect(self._login)
         self.offline_login_btn = QPushButton("离线登录（游客）")
         self.offline_login_btn.setMinimumHeight(42)
+        self.offline_login_btn.setDefault(False)
+        self.offline_login_btn.setAutoDefault(False)
         self.offline_login_btn.setToolTip(
             "无需账号和密码，仅可处理业务；本次不记录统计、计时或同步数据。"
         )

@@ -34,7 +34,7 @@ if command -v update-desktop-database >/dev/null 2>&1; then
 fi
 
 echo "安装完成：$install_root"
-echo "可从应用菜单启动“逃费车辆智能查询平台”，或执行：intdemo-client"
+echo "可从应用菜单启动“逃费车辆信息智能查询平台”，或执行：intdemo-client"
 echo "业务数据未写入安装目录，升级/卸载不会删除本地数据库。"
 if [[ ! -f "$user_config" && -f "$install_root/client-online.json" ]]; then
   mkdir -p "$user_cert_dir"

@@ -50,9 +50,25 @@ if [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${DISPLAY:-}" ]]; then
 fi
 export QT_AUTO_SCREEN_SCALE_FACTOR="${QT_AUTO_SCREEN_SCALE_FACTOR:-1}"
 
+# Qt 5's XCB backend does not infer the UOS Fcitx service reliably from every
+# desktop launcher.  Respect an explicit module, mirror IBus when configured,
+# and otherwise use the bundled Fcitx/Fcitx5 platform input context.
+if [[ -z "${QT_IM_MODULE:-}" ]]; then
+  input_method_hint="${GTK_IM_MODULE:-} ${XMODIFIERS:-} ${INPUT_METHOD:-}"
+  if [[ "${input_method_hint,,}" == *ibus* ]]; then
+    export QT_IM_MODULE=ibus
+  else
+    export QT_IM_MODULE=fcitx
+  fi
+fi
+if [[ "$QT_IM_MODULE" == fcitx && -z "${XMODIFIERS:-}" ]]; then
+  export XMODIFIERS=@im=fcitx
+fi
+
 if [[ -n "$launcher_log" ]]; then
-  printf 'effective_qt_platform=%s chromium_ozone=%s\n' \
-    "${QT_QPA_PLATFORM:-}" "${INTDEMO_CHROMIUM_OZONE_PLATFORM:-}" \
+  printf 'effective_qt_platform=%s qt_im_module=%s chromium_ozone=%s\n' \
+    "${QT_QPA_PLATFORM:-}" "${QT_IM_MODULE:-}" \
+    "${INTDEMO_CHROMIUM_OZONE_PLATFORM:-}" \
     >>"$launcher_log" 2>&1 || true
 fi
 
