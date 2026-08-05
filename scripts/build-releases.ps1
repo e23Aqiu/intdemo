@@ -5,6 +5,9 @@ param(
 
     [string]$CaBundle = "",
 
+    [ValidateSet("test", "stable")]
+    [string]$Channel = "test",
+
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version = "0.2.9",
     [ValidatePattern('^$|^\d+\.\d+\.\d+$')]
@@ -18,6 +21,7 @@ $ErrorActionPreference = "Stop"
 $portableArguments = @{
     BaseUrl = $BaseUrl
     CaBundle = $CaBundle
+    Channel = $Channel
     Version = $Version
 }
 & (Join-Path $PSScriptRoot "build-portable.ps1") @portableArguments
@@ -28,6 +32,7 @@ if (-not $?) {
 $installerArguments = @{
     BaseUrl = $BaseUrl
     CaBundle = $CaBundle
+    Channel = $Channel
     Version = $Version
     DeltaFromVersion = $DeltaFromVersion
 }

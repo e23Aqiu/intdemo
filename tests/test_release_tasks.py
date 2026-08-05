@@ -1,0 +1,511 @@
+from __future__ import annotations
+
+import json
+import os
+import stat
+import subprocess
+import sys
+import tempfile
+import unittest
+import zipfile
+from hashlib import sha256 as bytes_sha256
+from pathlib import Path
+from unittest.mock import patch
+
+from release_publisher import release_tasks as tasks
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+COMMIT = "a" * 40
+OTHER_COMMIT = "b" * 40
+
+
+def snapshot_payload(version: str) -> dict:
+    content = b"installed application"
+    return {
+        "schema_version": 1,
+        "version": version,
+        "generated_at": "2026-08-05T00:00:00Z",
+        "files": [
+            {
+                "path": "IntDemo.exe",
+                "size": len(content),
+                "sha256": bytes_sha256(content).hexdigest(),
+            }
+        ],
+    }
+
+
+def write_snapshot(path: Path, version: str) -> None:
+    tasks.write_json(path, snapshot_payload(version))
+
+
+def create_result_archive(
+    root: Path,
+    *,
+    version: str = "1.2.3",
+    commit: str = COMMIT,
+    base_url: str = "https://api.example.com",
+    channel: str = "test",
+    tamper_installer: bool = False,
+) -> Path:
+    staging = root / "result-source"
+    artifacts_root = staging / "artifacts"
+    artifacts_root.mkdir(parents=True)
+    request = tasks.validate_request(
+        {
+            "schema_version": 1,
+            "request_id": "20260805000000-abcdef1234",
+            "version": version,
+            "source_commit": commit,
+            "source_branch": "codex/release-test",
+            "repository_url": "https://github.com/e23Aqiu/intdemo.git",
+            "base_url": base_url,
+            "channel": channel,
+            "build_portable": False,
+            "delta_from_version": "",
+            "created_at": "2026-08-05T00:00:00Z",
+            "inputs": {"ca_bundle": None, "baseline_snapshot": None},
+        }
+    )
+    request_path = staging / tasks.REQUEST_FILE
+    tasks.write_json(request_path, request)
+
+    installer = artifacts_root / f"IntDemoOnline-Setup-{version}.exe"
+    installer.write_bytes(b"windows installer")
+    snapshot = artifacts_root / f"IntDemoOnline-Snapshot-{version}.json"
+    write_snapshot(snapshot, version)
+    artifacts = {
+        "windows_installer": tasks.artifact_descriptor(
+            installer,
+            f"artifacts/{installer.name}",
+        ),
+        "windows_snapshot": tasks.artifact_descriptor(
+            snapshot,
+            f"artifacts/{snapshot.name}",
+        ),
+    }
+    result = {
+        "schema_version": 1,
+        "request_id": request["request_id"],
+        "request_sha256": tasks.sha256(request_path),
+        "version": version,
+        "source_commit": commit,
+        "base_url": base_url,
+        "channel": channel,
+        "delta_from_version": "",
+        "build_portable": False,
+        "tests_passed": True,
+        "built_at": "2026-08-05T00:01:00Z",
+        "builder": {"kind": "windows-manual"},
+        "artifacts": artifacts,
+    }
+    tasks.write_json(staging / tasks.RESULT_FILE, result)
+    if tamper_installer:
+        installer.write_bytes(b"changed after hashing")
+    archive = root / "windows-build-result.zip"
+    tasks.make_zip(staging, archive)
+    return archive
+
+
+class ReleaseTasksTests(unittest.TestCase):
+    def test_windows_builder_accepts_exact_detached_commit(self):
+        with patch.object(
+            tasks,
+            "git",
+            side_effect=["HEAD", COMMIT, ""],
+        ):
+            self.assertEqual(
+                tasks.source_state(Path("windows-checkout"), allow_detached=True),
+                ("HEAD", COMMIT),
+            )
+
+        with (
+            patch.object(tasks, "git", return_value="HEAD"),
+            self.assertRaisesRegex(tasks.ReleaseTaskError, "具名 Git 分支"),
+        ):
+            tasks.source_state(Path("uos-publisher"))
+
+    def test_external_targets_cannot_be_parsed_as_command_options(self):
+        self.assertIsNone(tasks.REMOTE_HOST_PATTERN.fullmatch("-V"))
+        with self.assertRaisesRegex(tasks.ReleaseTaskError, "远程名称"):
+            tasks.create_windows_request(
+                Path("unused"),
+                version="1.2.3",
+                base_url="https://api.example.com",
+                channel="test",
+                ca_bundle="",
+                delta_from_version="",
+                build_portable=False,
+                github_remote="--upload-pack",
+            )
+
+    def test_request_export_binds_source_config_ca_and_real_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ca = root / "root.crt"
+            ca.write_bytes(b"public root certificate")
+            baseline = root / "dist" / "release-snapshots" / "1.2.2.json"
+            write_snapshot(baseline, "1.2.2")
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                patch.object(
+                    tasks,
+                    "git",
+                    return_value="https://github.com/e23Aqiu/intdemo.git",
+                ),
+            ):
+                archive = tasks.create_windows_request(
+                    root,
+                    version="1.2.3",
+                    base_url="https://121.1.2.3",
+                    channel="stable",
+                    ca_bundle=str(ca),
+                    delta_from_version="1.2.2",
+                    build_portable=True,
+                    github_remote="origin",
+                )
+
+            with tempfile.TemporaryDirectory() as extracted_directory:
+                extracted = Path(extracted_directory)
+                tasks.extract_zip_safely(archive, extracted)
+                request, _path, _digest = tasks.load_request_from_directory(extracted)
+            self.assertEqual(request["source_commit"], COMMIT)
+            self.assertEqual(request["source_branch"], "release/v1")
+            self.assertEqual(request["base_url"], "https://121.1.2.3")
+            self.assertEqual(request["channel"], "stable")
+            self.assertTrue(request["build_portable"])
+            self.assertEqual(request["delta_from_version"], "1.2.2")
+            self.assertEqual(
+                request["inputs"]["ca_bundle"]["sha256"],
+                tasks.sha256(ca),
+            )
+            self.assertEqual(
+                request["inputs"]["baseline_snapshot"]["sha256"],
+                tasks.sha256(baseline),
+            )
+
+    def test_request_rejects_missing_delta_snapshot_without_empty_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                patch.object(
+                    tasks,
+                    "git",
+                    return_value="https://github.com/e23Aqiu/intdemo.git",
+                ),
+                self.assertRaisesRegex(tasks.ReleaseTaskError, "基线快照"),
+            ):
+                tasks.create_windows_request(
+                    root,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                    delta_from_version="1.2.2",
+                    build_portable=False,
+                    github_remote="origin",
+                )
+            self.assertFalse((root / "dist" / "windows-build-requests").exists())
+
+    def test_zip_extraction_rejects_traversal_and_symlink_entries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            unsafe_archives = []
+            traversal = root / "traversal.zip"
+            with zipfile.ZipFile(traversal, "w") as archive:
+                archive.writestr("../outside.txt", b"unsafe")
+            unsafe_archives.append(traversal)
+            symlink = root / "symlink.zip"
+            with zipfile.ZipFile(symlink, "w") as archive:
+                info = zipfile.ZipInfo("link")
+                info.create_system = 3
+                info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                archive.writestr(info, "target")
+            unsafe_archives.append(symlink)
+
+            for archive in unsafe_archives:
+                with self.subTest(archive=archive.name), self.assertRaisesRegex(
+                    tasks.ReleaseTaskError,
+                    "不安全路径",
+                ):
+                    tasks.extract_zip_safely(archive, root / archive.stem)
+            self.assertFalse((root.parent / "outside.txt").exists())
+
+    def test_result_import_verifies_request_snapshot_and_artifact_hashes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = create_result_archive(root)
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+            ):
+                receipt_path = tasks.import_windows_result(
+                    root,
+                    result_archive=archive,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                    delta_from_version="",
+                    build_portable=False,
+                )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["source_commit"], COMMIT)
+            self.assertEqual(
+                set(receipt["artifacts"]),
+                {"windows_installer", "windows_snapshot"},
+            )
+            for descriptor in receipt["artifacts"].values():
+                path = root / descriptor["path"]
+                self.assertEqual(tasks.sha256(path), descriptor["sha256"])
+
+            tampered_root = root / "tampered"
+            tampered_root.mkdir()
+            tampered_archive = create_result_archive(
+                tampered_root,
+                tamper_installer=True,
+            )
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                self.assertRaisesRegex(tasks.ReleaseTaskError, "大小|SHA-256"),
+            ):
+                tasks.import_windows_result(
+                    tampered_root,
+                    result_archive=tampered_archive,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                    delta_from_version="",
+                    build_portable=False,
+                )
+
+    def test_result_request_must_match_current_release_configuration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = create_result_archive(root)
+            ca = root / "different.crt"
+            ca.write_bytes(b"different certificate")
+            cases = (
+                (COMMIT, "https://other.example.com", "test", "", "base_url"),
+                (COMMIT, "https://api.example.com", "stable", "", "channel"),
+                (COMMIT, "https://api.example.com", "test", str(ca), "CA"),
+                (OTHER_COMMIT, "https://api.example.com", "test", "", "source_commit"),
+            )
+            for commit, base_url, channel, ca_bundle, expected in cases:
+                with (
+                    self.subTest(expected=expected),
+                    patch.object(
+                        tasks,
+                        "source_state",
+                        return_value=("release/v1", commit),
+                    ),
+                    patch.object(tasks, "current_version", return_value="1.2.3"),
+                    self.assertRaisesRegex(tasks.ReleaseTaskError, expected),
+                ):
+                    tasks.import_windows_result(
+                        root,
+                        result_archive=archive,
+                        version="1.2.3",
+                        base_url=base_url,
+                        channel=channel,
+                        ca_bundle=ca_bundle,
+                        delta_from_version="",
+                        build_portable=False,
+                    )
+
+    def test_uos_receipt_checks_build_info_package_config_and_ca(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = (
+                root
+                / "dist"
+                / "uos-arm64"
+                / "package"
+                / "IntDemo-UOS-arm64-1.2.3"
+            )
+            certificate = package / "certs" / "root.crt"
+            certificate.parent.mkdir(parents=True)
+            certificate.write_bytes(b"public root certificate")
+            source_ca = root / "root.crt"
+            source_ca.write_bytes(certificate.read_bytes())
+            (package / "build-info.txt").write_text(
+                f"version=1.2.3\ngit_commit={COMMIT}\n",
+                encoding="utf-8",
+            )
+            tasks.write_json(
+                package / "client-online.json",
+                {
+                    "base_url": "https://121.1.2.3",
+                    "channel": "stable",
+                    "ca_bundle": "certs/root.crt",
+                },
+            )
+            deb = root / "dist" / "uos-arm64" / "IntDemo-UOS-arm64-1.2.3.deb"
+            deb.write_bytes(b"deb package")
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                patch.object(tasks, "validate_uos_deb_payload") as validate_deb,
+            ):
+                receipt_path = tasks.record_uos_result(
+                    root,
+                    version="1.2.3",
+                    base_url="https://121.1.2.3",
+                    channel="stable",
+                    ca_bundle=str(source_ca),
+                )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["platform"], "linux-aarch64")
+            self.assertEqual(receipt["ca_sha256"], tasks.sha256(source_ca))
+            validate_deb.assert_called_once()
+
+            config = json.loads(
+                (package / "client-online.json").read_text(encoding="utf-8")
+            )
+            config["channel"] = "test"
+            tasks.write_json(package / "client-online.json", config)
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                patch.object(tasks, "validate_uos_deb_payload"),
+                self.assertRaisesRegex(tasks.ReleaseTaskError, "通道"),
+            ):
+                tasks.record_uos_result(
+                    root,
+                    version="1.2.3",
+                    base_url="https://121.1.2.3",
+                    channel="stable",
+                    ca_bundle=str(source_ca),
+                )
+
+    def test_dual_manifest_keeps_legacy_windows_fields(self):
+        windows = {"name": "setup.exe", "size": 10, "sha256": "1" * 64}
+        uos = {"name": "client.deb", "size": 20, "sha256": "2" * 64}
+        delta = {"name": "patch.exe", "size": 5, "sha256": "3" * 64}
+        manifest = tasks.prepare_update_manifest(
+            version="1.2.3",
+            channel="stable",
+            source_commit=COMMIT,
+            notes="release",
+            mandatory=True,
+            windows=windows,
+            uos=uos,
+            delta=delta,
+            delta_from_version="1.2.2",
+        )
+        self.assertEqual(manifest["installer_path"], "/updates/files/setup.exe")
+        self.assertEqual(manifest["sha256"], windows["sha256"])
+        self.assertEqual(
+            set(manifest["platforms"]),
+            {"windows-x86_64", "linux-aarch64"},
+        )
+        self.assertEqual(
+            manifest["platforms"]["windows-x86_64"]["deltas"],
+            manifest["deltas"],
+        )
+        self.assertNotIn("deltas", manifest["platforms"]["linux-aarch64"])
+
+    def test_remote_guards_refuse_equal_or_higher_versions(self):
+        for current in ("1.2.3", "1.2.4"):
+            with self.subTest(current=current), self.assertRaisesRegex(
+                tasks.ReleaseTaskError,
+                "不能覆盖或降级",
+            ):
+                tasks.remote_manifest_guard({"version": current}, "1.2.3")
+        self.assertTrue(
+            tasks.remote_manifest_guard(
+                {"paused": True, "paused_version": "1.2.2"},
+                "1.2.3",
+            )
+        )
+
+    def test_remote_publish_refuses_same_name_with_different_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"new installer")
+            manifest_path = root / "stable.json"
+            tasks.write_json(manifest_path, {"version": "1.2.3"})
+            descriptor = {
+                "name": artifact.name,
+                "path": artifact,
+                "size": artifact.stat().st_size,
+                "sha256": tasks.sha256(artifact),
+            }
+            with (
+                patch.object(tasks, "run_command") as run_command,
+                patch.object(tasks, "ssh_capture", return_value=""),
+                patch.object(
+                    tasks,
+                    "remote_hash",
+                    side_effect=["", "", "f" * 64],
+                ),
+                self.assertRaisesRegex(tasks.ReleaseTaskError, "拒绝覆盖"),
+            ):
+                tasks.publish_remote(
+                    root,
+                    version="1.2.3",
+                    source_commit=COMMIT,
+                    channel="stable",
+                    manifest_path=manifest_path,
+                    manifest={"version": "1.2.3"},
+                    artifacts={"windows_installer": descriptor},
+                    host="release-server",
+                    remote_path="/opt/intdemo/updates",
+                    identity_file=None,
+                )
+            self.assertEqual(run_command.call_count, 1)
+
+    def test_github_run_can_be_identified_by_tag_display_title(self):
+        tag = "intdemo-windows/v1.2.3-request"
+        run = {
+            "id": 123,
+            "name": tasks.WINDOWS_WORKFLOW_NAME,
+            "event": "push",
+            "head_branch": None,
+            "display_title": f"Windows release · {tag}",
+        }
+        with patch.object(tasks, "workflow_runs", return_value=[run]):
+            self.assertEqual(
+                tasks.wait_for_windows_run(REPO_ROOT, "owner/repo", tag, COMMIT, 1),
+                run,
+            )
+
+    def test_github_fallback_exit_and_build_scripts_do_not_call_app_server(self):
+        self.assertEqual(tasks.GITHUB_UNAVAILABLE_EXIT, 20)
+        workflow = (REPO_ROOT / ".github/workflows/windows-release.yml").read_text(
+            encoding="utf-8"
+        )
+        helper = (REPO_ROOT / "scripts/build-windows-request.ps1").read_text(
+            encoding="utf-8"
+        )
+        combined = (workflow + helper).casefold()
+        for marker in ("invoke-restmethod", "invoke-webrequest", "/api/v1/"):
+            self.assertNotIn(marker, combined)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-S",
+                str(REPO_ROOT / "release_publisher/release_tasks.py"),
+                "--help",
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env={**os.environ, "PYTHONUTF8": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("windows-github", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()

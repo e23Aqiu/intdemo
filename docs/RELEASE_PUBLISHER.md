@@ -1,15 +1,25 @@
 # 逃费车辆信息智能查询平台双端打包发布器
 
-发布器通常在开发者 Windows 电脑上运行：Windows x64 包在本机生成，UOS ARM64
-包通过 SSH 在真实 UOS ARM64 构建机生成并回传。它统一执行版本准备、测试、
-双端构建、双端更新发布和快照归档，并可在版本异常时暂停远程通道分发。它不会
-被打进业务客户端，也不会向业务服务器开放构建命令执行接口。
+发布器现在以 UOS ARM64 真机作为推荐主控：DEB 在本机生成，Windows EXE 优先由
+GitHub Actions 生成；GitHub 不可用时可把带哈希的任务 ZIP 交给个人或站点
+Windows x64 真机构建，再回到 UOS 校验并统一发布。原有 Windows 主控流程继续
+保留。完整的 UOS 操作手册见
+[`UOS_RELEASE_CONTROL.md`](UOS_RELEASE_CONTROL.md)。发布器不会被打进业务客户端，
+也不会向业务服务器开放构建命令执行接口。
 
 ## 1. 启动
 
-先准备项目原有的两个虚拟环境、Inno Setup 6，以及可通过 SSH 登录的 UOS ARM64
-构建机。构建机仓库必须是专用且干净的工作树；脚本会从其 `origin` 获取本机提交，
-以 detached HEAD 构建，未推送的提交会被拒绝：
+UOS 主控先准备 ARM64 环境，然后从图形桌面的终端启动：
+
+```bash
+bash scripts/uos-arm64/prepare-env.sh
+bash scripts/uos-arm64/run-release-publisher.sh
+```
+
+GitHub 自动构建还需要 ARM64 版 `gh` 并执行 `gh auth login`。UOS 本机只打包和
+发布时不需要 Docker；执行完整测试流程时需要项目的 `server/.venv`。
+
+Windows 主控或 Windows 真机构建任务需要项目虚拟环境与 Inno Setup 6：
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
@@ -18,7 +28,8 @@
 winget install --id JRSoftware.InnoSetup --exact
 ```
 
-双击仓库根目录的 `run-release-publisher.bat`，或在 PowerShell 中运行：
+Windows 主控可双击仓库根目录的 `run-release-publisher.bat`，或在 PowerShell 中
+运行：
 
 ```powershell
 .\run-release-publisher.bat
@@ -32,10 +43,11 @@ git remote -v
 git remote add gitee https://gitee.com/e23aqiu/intdemo.git
 ```
 
-发布器配置保存在当前 Windows 用户的：
+发布器配置分别保存在：
 
 ```text
-%LOCALAPPDATA%\IntDemoReleasePublisher\settings.json
+Windows: %LOCALAPPDATA%\IntDemoReleasePublisher\settings.json
+UOS:     ~/.config/intdemo-release-publisher/settings.json
 ```
 
 这里只保存服务地址、文件路径、SSH 主机和发布目录等开发配置。更新说明、
@@ -43,21 +55,19 @@ git remote add gitee https://gitee.com/e23aqiu/intdemo.git
 
 ## 2. 推荐的新版本流程
 
-1. 确认 Git 工作区干净。
-2. 在“目标版本”填写新版本，例如 `0.2.6`，点击“同步项目版本号”。
-3. 检查发布器修改的客户端、服务端、安装器和构建脚本版本字段。
-4. 完成新版本代码和文档并运行测试，点击“提交变更”检查待提交文件、填写
-   提交说明并创建本地 Git 提交。
-5. 正式发布前点击“推送”，检查待推送提交并将当前分支依次推送到
-   `origin`（GitHub）和 `gitee`（Gitee）。
-6. 如果需要增量包，填写一个已经存在发布快照的精确来源版本。
-7. 填写服务地址、CA、UOS SSH 构建主机/仓库目录、发布通道和更新说明。
-8. 点击“环境检查”。
-9. 本地验证时可分别点击“运行全部测试”和“构建双端安装包”。
-10. 正式发布时点击“测试 → 双端构建 → 双端发布”，核对后执行。
+1. 确认 Git 工作区干净，填写目标版本并点击“同步项目版本号”。
+2. 检查修改，运行测试，点击“提交变更”创建本地提交。
+3. 点击“推送”，把当前分支普通推送到 `origin`（GitHub）和 `gitee`（Gitee）。
+4. 填写服务地址、公开 CA 根证书、发布通道、更新说明和发布服务器 SSH 配置。
+5. 选择 Windows x64、UOS ARM64 或两者；UOS 主控的 Windows 构建默认选择“自动”。
+6. 如果需要增量包，填写本机已有真实发布快照的精确来源版本。
+7. 点击“环境检查”，再按需运行测试或“构建所选安装包”。
+8. GitHub 不可用时，把保留的任务 ZIP 带到 Windows x64 运行
+   `scripts/build-windows-request.ps1`，然后回 UOS 点击“导入 Windows 结果”。
+9. 两个平台收据都校验通过后，点击“双端发布”；GitHub 可用时也可使用一键流程。
 
-远程发布要求 Git 工作区无未提交变更。这样服务器上的安装包可以追溯到明确
-的提交。仅生成本地 `dist/update-release` 时可以不填写 SSH 主机。
+单平台构建允许用于验证，但正式发布必须同时选择同版本 EXE 与 DEB。UOS 正式发布
+要求 Git 工作区干净并填写 SSH 主机；服务器上的安装包都可追溯到明确提交。
 
 当前业务客户端只检查 `test` 通道。发布器中的 `stable` 是为后续正式通道
 预留的选项，现有客户端不会自动读取该通道。
@@ -71,8 +81,8 @@ git remote add gitee https://gitee.com/e23aqiu/intdemo.git
 - 客户端与服务端虚拟环境；
 - 项目内各处版本号是否一致；
 - HTTPS 服务地址和 IP 私有 CA；
-- Inno Setup 编译器；
-- UOS ARM64 SSH 构建主机、构建仓库路径以及本机 `ssh`/`scp`；
+- Windows 本地主控所需的 Inno Setup，或 UOS 主控的 GitHub/真机构建配置；
+- 非 UOS 主控使用的 ARM64 SSH 构建机，或 UOS 本机构建环境；
 - 增量来源版本及其发布快照；
 - SSH 主机、私钥和远程目录格式；
 - 发布产物及已发布版本不可覆盖规则。
@@ -122,20 +132,26 @@ git remote add gitee https://gitee.com/e23aqiu/intdemo.git
 
 ### 构建安装包
 
-Windows 默认复用 `scripts/build-releases.ps1` 生成便携包和完整安装包；填写
-增量来源时还生成 Windows 精确版本增量包。UOS ARM64 通过
-`scripts/build-uos-remote.ps1` 在指定构建机调用 `scripts/uos-arm64/build.sh`，
-获取并校验指定提交、ARM64 架构、UOS/glibc、系统 Fcitx Qt5 插件与 SHA-256
-后回传 DEB。PyInstaller
-不能跨架构编译，因此 Windows 电脑不能直接生成 UOS ARM64 二进制。
+UOS 主控可以单选或全选 Windows x64 与 UOS ARM64。DEB 由
+`scripts/uos-arm64/build.sh` 在本机生成并写入带提交、在线配置和哈希的收据。
+Windows 默认先导出不可变任务，再由 GitHub Actions 构建并自动导入；GitHub
+不可用返回专用提示码，任务 ZIP 保留给 Windows 真机使用。Windows 真机只需访问
+代码和依赖来源，构建过程不连接 IntDemo 程序服务器。
+
+Windows 主控继续复用 `scripts/build-releases.ps1`；非 UOS 主控仍可通过
+`scripts/build-uos-remote.ps1` 连接 ARM64 构建机。PyInstaller 不能跨架构编译，
+所以任何 DEB 都必须在 ARM64 Linux 真机生成。
 
 ### 发布
 
-复用 `scripts/publish-update.ps1`：
+UOS 主控先重新校验两个平台收据及其中每个文件，再检查更新 API 已启用平台选择，
+通过 SSH 上传 `.exe`、可选 Windows 增量包和 `.deb`，最后原子替换双端清单。远程
+同名文件只有 SHA-256 完全一致时才复用，否则拒绝覆盖；清单替换带并发保护，并在
+远程完整哈希验证成功后才保存本次 Windows 发布快照。UOS 正式发布不能省略 SSH
+主机。
 
-- SSH 主机为空：只生成含 Windows/UOS 两个平台的 `dist/update-release`；
-- SSH 主机不为空：先上传 `.exe`、可选 Windows 增量包和 `.deb`，再原子替换清单；
-- 成功后调用 `scripts/save-release-snapshot.ps1` 保存本次版本快照。
+Windows 主控继续复用 `scripts/publish-update.ps1`，并保留 SSH 主机为空时仅生成
+本地 `dist/update-release` 的兼容行为。
 
 已经存在 `dist/release-snapshots/<版本>.json` 的版本视为已发布版本，发布器
 不会覆盖。发现已发布版本有问题时，应暂停服务器上的该版本并发布更高版本的
@@ -145,7 +161,7 @@ Windows 默认复用 `scripts/build-releases.ps1` 生成便携包和完整安装
 
 “暂停分发”只作用于所选 SSH 远程通道，不要求重新构建安装包，也不受本地
 待发布版本和 Git 工作区状态影响。确认后，发布器调用
-`scripts/pause-update.ps1`：
+对应平台的暂停任务：
 
 1. 读取并校验当前活动清单，前后两次核对 SHA-256，避免与并发发布互相覆盖；
 2. 把原清单完整复制到更新目录同级的 `<更新目录>-paused/`，该目录不由
@@ -163,17 +179,19 @@ Windows 默认复用 `scripts/build-releases.ps1` 生成便携包和完整安装
 
 - 使用 `x.y.z` 格式；
 - 低于目标版本；
-- `dist/release-snapshots/<来源版本>.json` 存在；
+- `dist/release-snapshots/<来源版本>.json` 存在且来自当时真实成功发布的候选包；
 - 安装端注册表版本与来源版本精确一致。
 
-发布器不会读取或比较用户数据库、Excel 或其他业务文件。差异比较只发生在
-构建机上的两个正式程序版本之间。
+任务导出会把真实来源快照及其 SHA-256 一并交给 Windows 构建机。不能通过切换到
+旧提交重新构建旧版本来替代发布快照。发布器不会读取或比较用户数据库、Excel
+或其他业务文件；差异比较只发生在正式程序文件清单之间。
 
 ## 5. 发布安全
 
 - 远程发布前必须再次人工确认版本、通道、包类型和强更标记。
 - 发布清单记录源代码 Git 提交；远程发布时脚本会再次拒绝未提交工作区。
-- PowerShell 参数通过独立进程参数传递，不拼接成可执行命令字符串。
+- Windows 请求与结果绑定源提交、版本、配置和哈希，导入时逐项重新校验。
+- 任务包只可包含公开 CA 根证书，不包含 CA 私钥、SSH 私钥或访问令牌。
 - 发布脚本校验文件 SHA-256，并在安装包到位后才替换版本清单。
 - 远程通道已经发布相同或更高版本时，脚本拒绝覆盖或降级。
 - 暂停分发会归档原清单并用 SHA-256 条件更新，安装包和归档清单均不会删除。

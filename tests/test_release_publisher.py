@@ -14,13 +14,13 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 from integrated_client.config import APP_NAME
 from release_publisher.connection_control import ConnectionControlClient
 from release_publisher.core import (
-    _current_git_branch,
     CommandStep,
     GitPushPlan,
     PublisherError,
     PublisherSettings,
     ReleaseOptions,
     SettingsStore,
+    _current_git_branch,
     build_git_commit_steps,
     build_git_mirror_push_plans,
     build_git_push_plan,
@@ -61,9 +61,8 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         with patch(
             "release_publisher.core._git_output",
             return_value="HEAD",
-        ):
-            with self.assertRaisesRegex(PublisherError, "detached HEAD"):
-                _current_git_branch(Path("detached-repo"))
+        ), self.assertRaisesRegex(PublisherError, "detached HEAD"):
+            _current_git_branch(Path("detached-repo"))
 
     def test_current_project_product_name_fields_are_consistent(self):
         expected_name = "逃费车辆信息智能查询平台"
@@ -113,6 +112,9 @@ class ReleasePublisherCoreTests(unittest.TestCase):
                 identity_file="C:/keys/release",
                 channel="stable",
                 build_portable=False,
+                windows_build_mode="manual",
+                github_remote="github",
+                github_repo="e23Aqiu/intdemo",
             )
 
             store.save(settings)
@@ -182,6 +184,78 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         self.assertIn("-Mandatory", publish_step.arguments)
         self.assertIn("-RemoteHost", publish_step.arguments)
         self.assertIn("-UosInstaller", publish_step.arguments)
+
+    def test_native_uos_plan_supports_selected_platforms_and_unified_publish(self):
+        both = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="dual release",
+            build_windows=True,
+            build_uos=True,
+            windows_build_mode="auto",
+            remote_host="release-server",
+        )
+        uos_only = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="uos build",
+            build_windows=False,
+            build_uos=True,
+        )
+        windows_only = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="windows build",
+            build_windows=True,
+            build_uos=False,
+        )
+
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=True,
+        ):
+            both_build = build_release_plan(
+                both,
+                include_tests=False,
+                include_build=True,
+                include_publish=False,
+            )
+            uos_build = build_release_plan(
+                uos_only,
+                include_tests=False,
+                include_build=True,
+                include_publish=False,
+            )
+            windows_build = build_release_plan(
+                windows_only,
+                include_tests=False,
+                include_build=True,
+                include_publish=False,
+            )
+            publish = build_release_plan(
+                both,
+                include_tests=False,
+                include_build=False,
+                include_publish=True,
+            )
+
+        self.assertEqual(
+            [step.key for step in both_build],
+            ["build_uos_package", "record_uos_result", "build_windows_github"],
+        )
+        self.assertIn("--fallback-on-unavailable", both_build[-1].arguments)
+        self.assertEqual(
+            [step.key for step in uos_build],
+            ["build_uos_package", "record_uos_result"],
+        )
+        self.assertEqual(
+            [step.key for step in windows_build],
+            ["build_windows_github"],
+        )
+        self.assertEqual([step.key for step in publish], ["publish"])
 
     def test_pause_distribution_plan_only_targets_the_selected_remote_channel(self):
         options = ReleaseOptions(
@@ -884,11 +958,12 @@ function global:git {
 param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
     [string]$CaBundle = "",
+    [string]$Channel = "test",
     [string]$Version = ""
 )
 [IO.File]::WriteAllText(
     (Join-Path $PSScriptRoot "portable-result.txt"),
-    "$BaseUrl|$Version"
+    "$BaseUrl|$Channel|$Version"
 )
 """.strip(),
                 encoding="utf-8",
@@ -898,13 +973,14 @@ param(
 param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
     [string]$CaBundle = "",
+    [string]$Channel = "test",
     [string]$Version = "",
     [string]$DeltaFromVersion = "",
     [string]$InnoCompiler = ""
 )
 [IO.File]::WriteAllText(
     (Join-Path $PSScriptRoot "installer-result.txt"),
-    "$BaseUrl|$Version|$DeltaFromVersion"
+    "$BaseUrl|$Channel|$Version|$DeltaFromVersion"
 )
 """.strip(),
                 encoding="utf-8",
@@ -921,6 +997,8 @@ param(
                     str(root / "build-releases.ps1"),
                     "-BaseUrl",
                     "https://api.example.com",
+                    "-Channel",
+                    "stable",
                     "-Version",
                     "1.2.3",
                     "-DeltaFromVersion",
@@ -936,11 +1014,11 @@ param(
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
             self.assertEqual(
                 (root / "portable-result.txt").read_text(encoding="utf-8"),
-                "https://api.example.com|1.2.3",
+                "https://api.example.com|stable|1.2.3",
             )
             self.assertEqual(
                 (root / "installer-result.txt").read_text(encoding="utf-8"),
-                "https://api.example.com|1.2.3|1.2.2",
+                "https://api.example.com|stable|1.2.3|1.2.2",
             )
 
 
@@ -972,6 +1050,9 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertIn("GitHub", window.push_button.toolTip())
         self.assertTrue(window.windows_check.isChecked())
         self.assertTrue(window.uos_check.isChecked())
+        self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")
+        self.assertFalse(window.export_windows_request_button.isEnabled())
+        self.assertFalse(window.import_windows_result_button.isEnabled())
         self.assertEqual(window.control_username_edit.text(), "admin")
         self.assertEqual(window.control_password_edit.text(), "")
         self.assertIn("断开全部", window.disconnect_all_button.text())
@@ -1005,6 +1086,57 @@ class ReleasePublisherUiTests(unittest.TestCase):
             "中文日志",
         )
 
+        window.deleteLater()
+
+    def test_native_uos_enables_windows_transfer_and_updates_build_text(self):
+        with (
+            patch(
+                "release_publisher.ui.SettingsStore.load",
+                return_value=PublisherSettings(),
+            ),
+            patch(
+                "release_publisher.ui.is_native_uos_arm64_builder",
+                return_value=True,
+            ),
+        ):
+            window = ReleasePublisherWindow(REPO_ROOT)
+
+            self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")
+            self.assertTrue(window.export_windows_request_button.isEnabled())
+            self.assertTrue(window.import_windows_result_button.isEnabled())
+            self.assertIn("EXE + DEB", window.build_button.text())
+            window.uos_check.setChecked(False)
+            self.assertIn("EXE", window.build_button.text())
+            self.assertNotIn("DEB", window.build_button.text())
+            window.windows_check.setChecked(False)
+            window.uos_check.setChecked(True)
+            self.assertIn("DEB", window.build_button.text())
+
+        window.deleteLater()
+
+    def test_github_unavailable_exit_prompts_for_windows_transfer(self):
+        window = ReleasePublisherWindow(REPO_ROOT)
+        process = Mock()
+        window.process = process
+        window._current_step = CommandStep(
+            key="build_windows_github",
+            title="GitHub Windows 构建",
+            program="python",
+            arguments=(),
+            working_directory=REPO_ROOT,
+        )
+
+        with (
+            patch.object(window, "sender", return_value=process),
+            patch.object(window, "_read_process_output"),
+            patch.object(window, "_finish_pipeline") as finish_pipeline,
+        ):
+            window._process_finished(20, Mock())
+
+        finish_pipeline.assert_called_once()
+        self.assertFalse(finish_pipeline.call_args.args[0])
+        self.assertIn("Windows 真机", finish_pipeline.call_args.args[1])
+        self.assertTrue(finish_pipeline.call_args.kwargs["warning"])
         window.deleteLater()
 
     def test_pause_distribution_button_confirms_and_runs_remote_pause(self):

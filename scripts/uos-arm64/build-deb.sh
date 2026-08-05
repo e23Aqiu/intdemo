@@ -72,6 +72,7 @@ required_paths=(
   "$package_root/app/_internal/libstdc++.so.6"
   "$package_root/browser/chrome"
   "$package_root/build-info.txt"
+  "$package_root/client-online.json"
 )
 for required_path in "${required_paths[@]}"; do
   if [[ ! -e "$required_path" ]]; then
@@ -136,9 +137,10 @@ mkdir -p "$deb_root/DEBIAN" "$files_root" "$desktop_root"
 cp -a "$package_root/app" "$files_root/"
 cp -a "$package_root/browser" "$files_root/"
 mkdir -p "$files_root/certs"
-cp "$repo_root/packaging/uos-arm64/client-online.json" "$files_root/"
-cp "$repo_root/packaging/uos-arm64/certs/intdemo-caddy-root.crt" \
-  "$files_root/certs/"
+cp "$package_root/client-online.json" "$files_root/"
+if [[ -d "$package_root/certs" ]]; then
+  cp -a "$package_root/certs/." "$files_root/certs/"
+fi
 cp "$repo_root/packaging/uos-arm64/intdemo-client" "$files_root/"
 cp "$repo_root/packaging/uos-arm64/deb/README.txt" "$files_root/"
 cp "$repo_root/docs/UOS_ARM64.md" "$files_root/"
@@ -158,11 +160,11 @@ chmod 0644 \
   "$app_root/info" \
   "$desktop_root/$desktop_file_name" \
   "$files_root/client-online.json" \
-  "$files_root/certs/intdemo-caddy-root.crt" \
   "$files_root/README.txt" \
   "$files_root/UOS_ARM64.md" \
   "$files_root/app-icon.png" \
   "$files_root/build-info.txt"
+find "$files_root/certs" -type f -exec chmod 0644 {} +
 find "$deb_root" -type d -exec chmod 0755 {} +
 
 installed_size="$(du -sk "$app_root" | awk '{print $1}')"

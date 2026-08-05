@@ -13,8 +13,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
-REMOTE_HOST_PATTERN = re.compile(r"^[A-Za-z0-9._@:-]+$")
+REMOTE_HOST_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9._@:-]+$")
 REMOTE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._/-]+$")
+GIT_REMOTE_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9._-]+$")
 
 
 def _safe_remote_path(value: str) -> bool:
@@ -50,6 +51,9 @@ class PublisherSettings:
     build_portable: bool = True
     build_windows: bool = True
     build_uos: bool = True
+    windows_build_mode: str = "auto"
+    github_remote: str = "origin"
+    github_repo: str = ""
     uos_builder_host: str = ""
     uos_builder_path: str = "/opt/intdemo"
 
@@ -128,6 +132,9 @@ class ReleaseOptions:
     identity_file: str = ""
     build_windows: bool = True
     build_uos: bool = False
+    windows_build_mode: str = "auto"
+    github_remote: str = "origin"
+    github_repo: str = ""
     uos_builder_host: str = ""
     uos_builder_path: str = "/opt/intdemo"
 
@@ -170,6 +177,26 @@ class ReleaseOptions:
             / "dist"
             / "release-snapshots"
             / f"{self.version}.json"
+        )
+
+    @property
+    def windows_result_receipt(self) -> Path:
+        return (
+            self.repo_root
+            / "dist"
+            / "windows-build-results"
+            / self.version
+            / "validated-result.json"
+        )
+
+    @property
+    def uos_result_receipt(self) -> Path:
+        return (
+            self.repo_root
+            / "dist"
+            / "uos-build-results"
+            / self.version
+            / "validated-result.json"
         )
 
 
@@ -878,6 +905,19 @@ def is_native_uos_arm64_builder() -> bool:
     return sys.platform.startswith("linux") and machine in {"aarch64", "arm64"}
 
 
+def client_python_path(repo_root: str | Path) -> Path:
+    root = Path(repo_root).resolve()
+    if is_native_uos_arm64_builder():
+        conda_python = root / ".conda-uos-arm64" / "bin" / "python"
+        if conda_python.is_file():
+            return conda_python
+        current = Path(sys.executable).resolve()
+        if current.is_file():
+            return current
+    executable = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
+    return root / ".venv" / executable
+
+
 def validate_test_environment(repo_root: str | Path) -> list[str]:
     root = Path(repo_root).resolve()
     errors: list[str] = []
@@ -889,7 +929,7 @@ def validate_test_environment(repo_root: str | Path) -> list[str]:
         errors.extend(project_version_mismatches(root, current))
     executable = Path("Scripts/python.exe") if os.name == "nt" else Path("bin/python")
     for label, path in (
-        ("客户端开发环境", root / ".venv" / executable),
+        ("客户端开发环境", client_python_path(root)),
         ("服务端测试环境", root / "server" / ".venv" / executable),
     ):
         if not path.is_file():
@@ -927,6 +967,8 @@ def validate_release_options(
         errors.append(f"CA 根证书不存在：{options.ca_bundle}")
     if options.channel not in {"test", "stable"}:
         errors.append("发布通道只能是 test 或 stable")
+    if options.windows_build_mode not in {"auto", "github", "manual"}:
+        errors.append("Windows 构建方式无效")
     if (for_publish or for_pipeline) and not str(options.notes or "").strip():
         errors.append("更新说明不能为空")
 
@@ -955,16 +997,33 @@ def validate_release_options(
         if (for_build or for_publish or for_pipeline) and not snapshot.is_file():
             errors.append(f"缺少增量来源快照：{snapshot}")
 
-    if options.inno_compiler and not Path(options.inno_compiler).expanduser().is_file():
+    if (
+        os.name == "nt"
+        and options.inno_compiler
+        and not Path(options.inno_compiler).expanduser().is_file()
+    ):
         errors.append(f"Inno Setup 编译器不存在：{options.inno_compiler}")
     if (
         for_build
         and options.build_windows
+        and os.name == "nt"
         and find_inno_compiler(options.inno_compiler) is None
     ):
         errors.append("未找到 Inno Setup 6 编译器")
     if for_build and options.build_windows and os.name != "nt":
-        errors.append("Windows 安装包必须在 Windows x64 主机上构建")
+        if not is_native_uos_arm64_builder():
+            errors.append("Windows 远程构建主控仅支持 UOS ARM64 真机")
+        elif options.windows_build_mode == "github" and shutil.which("gh") is None:
+            errors.append("仅 GitHub 模式需要安装 GitHub CLI（gh）")
+        if not GIT_REMOTE_PATTERN.fullmatch(str(options.github_remote or "")):
+            errors.append("Windows GitHub 构建的 Git 远程名称格式无效")
+    if (
+        for_pipeline
+        and options.build_windows
+        and is_native_uos_arm64_builder()
+        and options.windows_build_mode == "manual"
+    ):
+        errors.append("Windows 真机模式不能直接执行一键发布；请先导入结果再发布")
 
     if options.build_uos:
         if options.uos_builder_path and not _safe_remote_path(
@@ -997,6 +1056,17 @@ def validate_release_options(
             errors.append(f"增量安装包不存在：{options.delta_installer}")
         if options.build_uos and not options.uos_installer.is_file():
             errors.append(f"UOS ARM64 安装包不存在：{options.uos_installer}")
+        if is_native_uos_arm64_builder():
+            if not options.windows_result_receipt.is_file():
+                errors.append(
+                    f"缺少已校验的 Windows 构建收据：{options.windows_result_receipt}"
+                )
+            if not options.uos_result_receipt.is_file():
+                errors.append(
+                    f"缺少已校验的 UOS 构建收据：{options.uos_result_receipt}"
+                )
+            if not options.remote_host:
+                errors.append("统信正式发布必须填写更新服务器 SSH 主机")
     if for_publish or for_pipeline:
         if options.snapshot_path.exists():
             errors.append(
@@ -1028,7 +1098,8 @@ def validate_release_options(
     if options.identity_file and not Path(options.identity_file).expanduser().is_file():
         errors.append(f"SSH 私钥不存在：{options.identity_file}")
 
-    errors.extend(validate_test_environment(root))
+    if for_pipeline or (for_build and os.name == "nt"):
+        errors.extend(validate_test_environment(root))
     return list(dict.fromkeys(errors))
 
 
@@ -1075,6 +1146,27 @@ def _powershell_step(
     )
 
 
+def _release_task_step(
+    options: ReleaseOptions,
+    *,
+    key: str,
+    title: str,
+    command: str,
+    arguments: list[str],
+) -> CommandStep:
+    return CommandStep(
+        key=key,
+        title=title,
+        program=sys.executable,
+        arguments=(
+            str(options.repo_root / "release_publisher" / "release_tasks.py"),
+            command,
+            *arguments,
+        ),
+        working_directory=options.repo_root,
+    )
+
+
 def build_pause_distribution_steps(options: ReleaseOptions) -> list[CommandStep]:
     arguments = [
         "-Channel",
@@ -1086,6 +1178,26 @@ def build_pause_distribution_steps(options: ReleaseOptions) -> list[CommandStep]
     ]
     if options.identity_file:
         arguments.extend(["-IdentityFile", options.identity_file])
+    if is_native_uos_arm64_builder():
+        linux_arguments = [
+            "--channel",
+            options.channel,
+            "--remote-host",
+            options.remote_host,
+            "--remote-path",
+            options.remote_path,
+        ]
+        if options.identity_file:
+            linux_arguments.extend(["--identity-file", options.identity_file])
+        return [
+            _release_task_step(
+                options,
+                key="pause_distribution",
+                title=f"暂停 {options.channel} 通道分发",
+                command="pause",
+                arguments=linux_arguments,
+            )
+        ]
     return [
         _powershell_step(
             options,
@@ -1104,7 +1216,7 @@ def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
         CommandStep(
             key="compile_client",
             title="检查客户端 Python 语法",
-            program=str(root / ".venv" / executable),
+            program=str(client_python_path(root)),
             arguments=(
                 "-m",
                 "compileall",
@@ -1118,7 +1230,7 @@ def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
         CommandStep(
             key="test_client",
             title="运行客户端自动化测试",
-            program=str(root / ".venv" / executable),
+            program=str(client_python_path(root)),
             arguments=("-m", "pytest", "tests", "-q"),
             working_directory=root,
         ),
@@ -1133,38 +1245,85 @@ def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
 
 
 def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
-    steps: list[CommandStep] = []
+    windows_steps: list[CommandStep] = []
+    uos_steps: list[CommandStep] = []
     if options.build_windows:
-        arguments = [
-            "-BaseUrl",
-            options.base_url,
-            "-Version",
-            options.version,
-        ]
-        if options.ca_bundle:
-            arguments.extend(["-CaBundle", options.ca_bundle])
-        if options.delta_from_version:
-            arguments.extend(["-DeltaFromVersion", options.delta_from_version])
-        if options.inno_compiler:
-            arguments.extend(["-InnoCompiler", options.inno_compiler])
-        script_name = (
-            "build-releases.ps1"
-            if options.build_portable
-            else "build-installer.ps1"
-        )
-        steps.append(
-            _powershell_step(
-                options,
-                key="build_windows_packages",
-                title=(
-                    "构建 Windows 便携包、完整安装包和增量包"
-                    if options.build_portable
-                    else "构建 Windows 完整安装包和增量包"
-                ),
-                script_name=script_name,
-                script_arguments=arguments,
+        if is_native_uos_arm64_builder():
+            arguments = [
+                "--version",
+                options.version,
+                "--base-url",
+                options.base_url,
+                "--channel",
+                options.channel,
+                "--github-remote",
+                options.github_remote,
+            ]
+            if options.ca_bundle:
+                arguments.extend(["--ca-bundle", options.ca_bundle])
+            if options.delta_from_version:
+                arguments.extend(
+                    ["--delta-from-version", options.delta_from_version]
+                )
+            if options.build_portable:
+                arguments.append("--build-portable")
+            if options.windows_build_mode == "manual":
+                windows_steps.append(
+                    _release_task_step(
+                        options,
+                        key="export_windows_request",
+                        title="导出 Windows 真机构建任务包",
+                        command="export-windows-request",
+                        arguments=arguments,
+                    )
+                )
+            else:
+                if options.github_repo:
+                    arguments.extend(["--github-repo", options.github_repo])
+                if options.windows_build_mode == "auto":
+                    arguments.append("--fallback-on-unavailable")
+                windows_steps.append(
+                    _release_task_step(
+                        options,
+                        key="build_windows_github",
+                        title="通过 GitHub 构建并校验 Windows 安装包",
+                        command="windows-github",
+                        arguments=arguments,
+                    )
+                )
+        else:
+            arguments = [
+                "-BaseUrl",
+                options.base_url,
+                "-Channel",
+                options.channel,
+                "-Version",
+                options.version,
+            ]
+            if options.ca_bundle:
+                arguments.extend(["-CaBundle", options.ca_bundle])
+            if options.delta_from_version:
+                arguments.extend(["-DeltaFromVersion", options.delta_from_version])
+            if options.inno_compiler:
+                arguments.extend(["-InnoCompiler", options.inno_compiler])
+            script_name = (
+                "build-releases.ps1"
+                if options.build_portable
+                else "build-installer.ps1"
             )
-        )
+            windows_steps.append(
+                _powershell_step(
+                    options,
+                    key="build_windows_packages",
+                    title=(
+                        "构建 Windows 便携包、完整安装包和增量包"
+                        if options.build_portable
+                        else "构建 Windows 完整安装包和增量包"
+                    ),
+                    script_name=script_name,
+                    script_arguments=arguments,
+                )
+            )
     if options.build_uos:
         if is_native_uos_arm64_builder():
             uos_arguments = [
@@ -1178,13 +1337,32 @@ def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
                 uos_arguments.extend(["--ca-bundle", options.ca_bundle])
             else:
                 uos_arguments.append("--no-ca-bundle")
-            steps.append(
+            uos_steps.append(
                 CommandStep(
                     key="build_uos_package",
                     title="构建 UOS ARM64 DEB 安装包",
                     program=shutil.which("bash") or "bash",
                     arguments=tuple(uos_arguments),
                     working_directory=options.repo_root,
+                )
+            )
+            record_arguments = [
+                "--version",
+                options.version,
+                "--base-url",
+                options.base_url,
+                "--channel",
+                options.channel,
+            ]
+            if options.ca_bundle:
+                record_arguments.extend(["--ca-bundle", options.ca_bundle])
+            uos_steps.append(
+                _release_task_step(
+                    options,
+                    key="record_uos_result",
+                    title="校验 UOS DEB 并生成构建收据",
+                    command="record-uos-result",
+                    arguments=record_arguments,
                 )
             )
         else:
@@ -1204,7 +1382,7 @@ def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
                 remote_arguments.extend(["-IdentityFile", options.identity_file])
             if options.ca_bundle:
                 remote_arguments.extend(["-CaBundle", options.ca_bundle])
-            steps.append(
+            uos_steps.append(
                 _powershell_step(
                     options,
                     key="build_uos_package",
@@ -1213,10 +1391,105 @@ def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
                     script_arguments=remote_arguments,
                 )
             )
-    return steps
+    if is_native_uos_arm64_builder():
+        return [*uos_steps, *windows_steps]
+    return [*windows_steps, *uos_steps]
+
+
+def _windows_task_arguments(options: ReleaseOptions) -> list[str]:
+    arguments = [
+        "--version",
+        options.version,
+        "--base-url",
+        options.base_url,
+        "--channel",
+        options.channel,
+    ]
+    if options.ca_bundle:
+        arguments.extend(["--ca-bundle", options.ca_bundle])
+    if options.delta_from_version:
+        arguments.extend(["--delta-from-version", options.delta_from_version])
+    if options.build_portable:
+        arguments.append("--build-portable")
+    return arguments
+
+
+def build_windows_request_export_steps(options: ReleaseOptions) -> list[CommandStep]:
+    arguments = [
+        *_windows_task_arguments(options),
+        "--github-remote",
+        options.github_remote,
+    ]
+    return [
+        _release_task_step(
+            options,
+            key="export_windows_request",
+            title="导出 Windows 真机构建任务包",
+            command="export-windows-request",
+            arguments=arguments,
+        )
+    ]
+
+
+def build_windows_result_import_steps(
+    options: ReleaseOptions,
+    result_archive: str | Path,
+) -> list[CommandStep]:
+    arguments = [
+        *_windows_task_arguments(options),
+        "--result-archive",
+        str(Path(result_archive).expanduser().resolve()),
+    ]
+    return [
+        _release_task_step(
+            options,
+            key="import_windows_result",
+            title="导入并校验 Windows 真机构建结果",
+            command="import-windows-result",
+            arguments=arguments,
+        )
+    ]
 
 
 def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
+    if is_native_uos_arm64_builder():
+        arguments = [
+            "--version",
+            options.version,
+            "--base-url",
+            options.base_url,
+            "--channel",
+            options.channel,
+            "--notes",
+            options.notes.strip(),
+            "--remote-host",
+            options.remote_host,
+            "--remote-path",
+            options.remote_path,
+            "--confirm-version",
+            options.version,
+        ]
+        if options.ca_bundle:
+            arguments.extend(["--ca-bundle", options.ca_bundle])
+        if options.delta_from_version:
+            arguments.extend(
+                ["--delta-from-version", options.delta_from_version]
+            )
+        if options.build_portable:
+            arguments.append("--build-portable")
+        if options.mandatory:
+            arguments.append("--mandatory")
+        if options.identity_file:
+            arguments.extend(["--identity-file", options.identity_file])
+        return [
+            _release_task_step(
+                options,
+                key="publish",
+                title=f"从统信发布双端版本 {options.version}",
+                command="publish",
+                arguments=arguments,
+            )
+        ]
     arguments = [
         "-WindowsInstaller",
         str(options.full_installer),

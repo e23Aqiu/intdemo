@@ -315,17 +315,28 @@ Windows 当前版本精确匹配差异包来源版本时才返回增量包，其
 
 ### 开发者专用打包发布器
 
-开发者电脑可以双击 `run-release-publisher.bat` 启动独立 GUI 发布器。该工具
-统一完成版本字段同步、环境检查、Windows 本机构建、UOS ARM64 SSH 真机构建、
-双端发布确认、SSH 上传和发布快照归档，并可临时断开全部或指定业务客户端
-的 API、同步及 WebSocket 连接以验证离线行为；还可暂停所选远程更新通道，
-完整归档活动清单并保留安装包。构建与发布权限不会进入业务客户端。
+推荐在 UOS ARM64 真机启动独立 GUI 发布器：
+
+```bash
+bash scripts/uos-arm64/run-release-publisher.sh
+```
+
+发布器可单选或全选构建 Windows EXE 与 UOS DEB。DEB 在 UOS 本机生成；EXE 优先
+交给 GitHub Actions，GitHub 不可用时会保留可验证任务 ZIP，供个人或站点 Windows
+x64 真机完成后再导回 UOS。Windows 构建只把服务地址和公开 CA 写入安装包，不访问
+IntDemo 程序服务器，因此 Windows 所在网络即使无法进入公司 `121.x` 网段也能构建。
+UOS 打包与 SSH 发布本身不需要 Docker。
+
+Windows 开发机仍可双击 `run-release-publisher.bat` 使用原有主控方式。两种主控都
+支持版本字段同步、环境检查、双端发布确认、SSH 上传、发布快照归档、客户端断连
+测试和暂停远程更新通道；构建与发布权限不会进入业务客户端。
 
 “推送”会依次使用普通 `git push` 同步 `origin`（GitHub）和 `gitee` 两个远程，
-不会强制推送。远程构建/发布要求 Git 工作区无未提交变更，UOS 构建机仓库还必须
-处于同一提交；已经保存发布快照的版本不能原地覆盖。
-暂停期间新的客户端检查按“暂无更新”处理，发布更高版本后自动恢复分发。
-SSH 主机留空时只生成本地 `dist/update-release`。完整操作说明见
+不会强制推送。正式发布要求同版本、同提交、同在线配置的 EXE 与 DEB 校验收据，
+已保存发布快照的版本不能原地覆盖；Windows 增量必须使用真实已发布快照，不能
+重建旧提交代替。暂停期间新的客户端检查按“暂无更新”处理，发布更高版本后自动
+恢复分发。完整说明见
+[`docs/UOS_RELEASE_CONTROL.md`](docs/UOS_RELEASE_CONTROL.md) 和
 [`docs/RELEASE_PUBLISHER.md`](docs/RELEASE_PUBLISHER.md)。
 
 ## 项目目录结构

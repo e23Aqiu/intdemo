@@ -146,8 +146,10 @@ Wayland 平台插件；根启动器会把这个系统注入值改为 `xcb`。普
 bash scripts/uos-arm64/build.sh
 ```
 
-发布器远程构建时会额外传入 `--base-url`、`--channel` 以及 `--ca-bundle`（或
-`--no-ca-bundle`），保证 Windows 与 UOS 包使用同一在线服务和证书配置。
+统信主控发布器在本机构建时会额外传入 `--base-url`、`--channel` 以及
+`--ca-bundle`（或 `--no-ca-bundle`），保证 Windows 与 UOS 包使用同一在线服务和
+证书配置。双端任务、GitHub/Windows 真机回退和发布操作见
+[`UOS_RELEASE_CONTROL.md`](UOS_RELEASE_CONTROL.md)。
 
 默认流程依次执行：环境和浏览器缓存更新、UOS/架构/glibc/依赖/浏览器/密钥环
 预检、客户端离线回归测试、PyInstaller 目录包构建、conda ARM64 GNU 运行库

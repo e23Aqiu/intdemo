@@ -38,9 +38,8 @@ class UosCompatibilityTests(unittest.TestCase):
             os.environ,
             {"INTDEMO_CHROMIUM_PATH": "/missing/uos-browser"},
             clear=False,
-        ):
-            with self.assertRaisesRegex(RuntimeError, "INTDEMO_CHROMIUM_PATH"):
-                browser.get_builtin_chromium_path()
+        ), self.assertRaisesRegex(RuntimeError, "INTDEMO_CHROMIUM_PATH"):
+            browser.get_builtin_chromium_path()
 
     def test_linux_prefers_system_chromium_over_playwright_cache(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -333,6 +332,12 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("trap cleanup_deb_build EXIT", deb_builder)
         self.assertIn(
             'cp "$repo_root/packaging/uos-arm64/intdemo-client"',
+            deb_builder,
+        )
+        self.assertIn('cp "$package_root/client-online.json"', deb_builder)
+        self.assertIn('cp -a "$package_root/certs/."', deb_builder)
+        self.assertNotIn(
+            'cp "$repo_root/packaging/uos-arm64/client-online.json"',
             deb_builder,
         )
         self.assertIn('packaging/uos-arm64/deb/README.txt', deb_builder)
