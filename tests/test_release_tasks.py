@@ -46,6 +46,7 @@ def create_result_archive(
     commit: str = COMMIT,
     base_url: str = "https://api.example.com",
     channel: str = "test",
+    build_portable: bool = False,
     tamper_installer: bool = False,
 ) -> Path:
     staging = root / "result-source"
@@ -61,7 +62,7 @@ def create_result_archive(
             "repository_url": "https://github.com/e23Aqiu/intdemo.git",
             "base_url": base_url,
             "channel": channel,
-            "build_portable": False,
+            "build_portable": build_portable,
             "delta_from_version": "",
             "created_at": "2026-08-05T00:00:00Z",
             "inputs": {"ca_bundle": None, "baseline_snapshot": None},
@@ -84,6 +85,13 @@ def create_result_archive(
             f"artifacts/{snapshot.name}",
         ),
     }
+    if build_portable:
+        portable = artifacts_root / f"IntDemoOnline-Portable-{version}.zip"
+        portable.write_bytes(b"windows portable package")
+        artifacts["windows_portable"] = tasks.artifact_descriptor(
+            portable,
+            f"artifacts/{portable.name}",
+        )
     result = {
         "schema_version": 1,
         "request_id": request["request_id"],
@@ -93,7 +101,7 @@ def create_result_archive(
         "base_url": base_url,
         "channel": channel,
         "delta_from_version": "",
-        "build_portable": False,
+        "build_portable": build_portable,
         "tests_passed": True,
         "built_at": "2026-08-05T00:01:00Z",
         "builder": {"kind": "windows-manual"},
@@ -233,6 +241,37 @@ class ReleaseTasksTests(unittest.TestCase):
                 ):
                     tasks.extract_zip_safely(archive, root / archive.stem)
             self.assertFalse((root.parent / "outside.txt").exists())
+
+    def test_windows_result_portable_mode_is_detected_from_archive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer_only = create_result_archive(root / "installer-only")
+            with_portable = create_result_archive(
+                root / "with-portable",
+                build_portable=True,
+            )
+
+            self.assertFalse(
+                tasks.detect_windows_result_portable(installer_only)
+            )
+            self.assertTrue(tasks.detect_windows_result_portable(with_portable))
+
+    def test_windows_result_portable_detection_rejects_missing_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = create_result_archive(root / "source", build_portable=True)
+            invalid = root / "missing-portable.zip"
+            with (
+                zipfile.ZipFile(source) as source_archive,
+                zipfile.ZipFile(invalid, "w") as target_archive,
+            ):
+                for info in source_archive.infolist():
+                    if info.filename.endswith("Portable-1.2.3.zip"):
+                        continue
+                    target_archive.writestr(info, source_archive.read(info))
+
+            with self.assertRaisesRegex(tasks.ReleaseTaskError, "缺少构建产物"):
+                tasks.detect_windows_result_portable(invalid)
 
     def test_result_import_verifies_request_snapshot_and_artifact_hashes(self):
         with tempfile.TemporaryDirectory() as directory:

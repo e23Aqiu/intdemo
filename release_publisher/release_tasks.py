@@ -275,26 +275,33 @@ def verify_file(root: Path, descriptor: Any, label: str) -> Path:
 def extract_zip_safely(archive: Path, destination: Path) -> None:
     try:
         with zipfile.ZipFile(archive) as source:
-            seen: set[str] = set()
-            for info in source.infolist():
-                name = info.filename
-                pure = PurePosixPath(name)
-                mode = (info.external_attr >> 16) & 0o170000
-                if (
-                    not name
-                    or name in seen
-                    or pure.is_absolute()
-                    or ".." in pure.parts
-                    or "\\" in name
-                    or ":" in name
-                    or pure.as_posix() != name.rstrip("/")
-                    or mode == 0o120000
-                ):
-                    raise ReleaseTaskError(f"ZIP 包含不安全路径：{name}")
-                seen.add(name)
+            _validated_zip_members(source)
             source.extractall(destination)
     except (OSError, zipfile.BadZipFile) as exc:
         raise ReleaseTaskError(f"无法读取 ZIP：{archive}") from exc
+
+
+def _validated_zip_members(
+    archive: zipfile.ZipFile,
+) -> dict[str, zipfile.ZipInfo]:
+    members: dict[str, zipfile.ZipInfo] = {}
+    for info in archive.infolist():
+        name = info.filename
+        pure = PurePosixPath(name)
+        mode = (info.external_attr >> 16) & 0o170000
+        if (
+            not name
+            or name in members
+            or pure.is_absolute()
+            or ".." in pure.parts
+            or "\\" in name
+            or ":" in name
+            or pure.as_posix() != name.rstrip("/")
+            or mode == 0o120000
+        ):
+            raise ReleaseTaskError(f"ZIP 包含不安全路径：{name}")
+        members[name] = info
+    return members
 
 
 def make_zip(source_root: Path, target: Path) -> None:
@@ -712,6 +719,17 @@ def build_windows_result(
         result_root = Path(temporary) / "result"
         result_root.mkdir()
         shutil.copy2(request_path, result_root / REQUEST_FILE)
+        for key, label in (
+            ("ca_bundle", "CA 根证书"),
+            ("baseline_snapshot", "Windows 增量基线快照"),
+        ):
+            descriptor = request["inputs"].get(key)
+            if descriptor is None:
+                continue
+            source = verify_file(extracted, descriptor, label)
+            target = result_root / PurePosixPath(descriptor["file"])
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
         artifacts: dict[str, dict[str, Any]] = {}
         for key, source in artifact_sources.items():
             target = result_root / "artifacts" / result_names[key]
@@ -782,6 +800,109 @@ def validate_result_payload(payload: Any) -> dict[str, Any]:
         "source_commit": source_commit,
         "artifacts": artifacts,
     }
+
+
+def detect_windows_result_portable(result_archive: str | Path) -> bool:
+    """Read a result ZIP safely and return whether it contains a portable build."""
+    archive_path = Path(result_archive).expanduser().resolve()
+    if not archive_path.is_file():
+        raise ReleaseTaskError(f"Windows 构建结果包不存在：{archive_path}")
+
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = _validated_zip_members(archive)
+
+            def read_metadata(name: str, label: str) -> tuple[Any, bytes]:
+                info = members.get(name)
+                if info is None or info.is_dir():
+                    raise ReleaseTaskError(f"Windows 构建结果缺少{label}：{name}")
+                if info.file_size > 2 * 1024 * 1024:
+                    raise ReleaseTaskError(f"Windows 构建结果的{label}过大")
+                payload = archive.read(info)
+                return json.loads(payload.decode("utf-8")), payload
+
+            result_payload, _result_bytes = read_metadata(
+                RESULT_FILE,
+                "结果元数据",
+            )
+            request_payload, request_bytes = read_metadata(
+                REQUEST_FILE,
+                "任务元数据",
+            )
+            result = validate_result_payload(result_payload)
+            request = validate_request(request_payload)
+
+            if result["request_sha256"] != hashlib.sha256(request_bytes).hexdigest():
+                raise ReleaseTaskError("Windows 结果绑定的构建任务 SHA-256 不匹配")
+            if result["request_id"] != request["request_id"]:
+                raise ReleaseTaskError("Windows 结果与内含构建任务 ID 不一致")
+            for key in (
+                "version",
+                "source_commit",
+                "base_url",
+                "channel",
+                "delta_from_version",
+                "build_portable",
+            ):
+                if result.get(key) != request.get(key):
+                    raise ReleaseTaskError(
+                        f"Windows 结果元数据 {key} 与构建任务不一致"
+                    )
+
+            for key, label in (
+                ("ca_bundle", "CA 根证书"),
+                ("baseline_snapshot", "Windows 增量基线快照"),
+            ):
+                descriptor = request["inputs"].get(key)
+                if descriptor is None:
+                    continue
+                normalized = validate_descriptor(descriptor, label)
+                member = members.get(normalized["file"])
+                if member is None or member.is_dir():
+                    raise ReleaseTaskError(f"Windows 结果缺少{label}")
+                if member.file_size != normalized["size"]:
+                    raise ReleaseTaskError(f"Windows 结果中的{label}大小不匹配")
+
+            version = request["version"]
+            expected_names = {
+                "windows_installer": f"IntDemoOnline-Setup-{version}.exe",
+                "windows_snapshot": f"IntDemoOnline-Snapshot-{version}.json",
+            }
+            if request["delta_from_version"]:
+                expected_names["windows_delta"] = (
+                    f"IntDemoOnline-Patch-{request['delta_from_version']}"
+                    f"-to-{version}.exe"
+                )
+            if request["build_portable"]:
+                expected_names["windows_portable"] = (
+                    f"IntDemoOnline-Portable-{version}.zip"
+                )
+            if set(result["artifacts"]) != set(expected_names):
+                raise ReleaseTaskError("Windows 结果产物集合与便携包标记不一致")
+            for key, expected_name in expected_names.items():
+                descriptor = validate_descriptor(result["artifacts"][key], key)
+                expected_file = f"artifacts/{expected_name}"
+                if descriptor["file"] != expected_file:
+                    raise ReleaseTaskError(
+                        f"Windows 结果文件名不符合约定：{descriptor['file']}"
+                    )
+                member = members.get(expected_file)
+                if member is None or member.is_dir():
+                    raise ReleaseTaskError(f"Windows 结果缺少构建产物：{expected_file}")
+                if member.file_size != descriptor["size"]:
+                    raise ReleaseTaskError(f"Windows 构建产物大小不匹配：{expected_file}")
+    except ReleaseTaskError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        RuntimeError,
+    ) as exc:
+        raise ReleaseTaskError(f"无法读取 Windows 构建结果：{archive_path}") from exc
+
+    return bool(request["build_portable"])
 
 
 def compare_request_to_expected(

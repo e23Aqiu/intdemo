@@ -73,8 +73,10 @@ Windows 构建方式有三种：
 - `仅使用 GitHub Actions`：缺少 `gh` 或 GitHub 不可用会直接作为环境/步骤错误。
 - `Windows 真机任务包`：只导出任务 ZIP，不尝试 GitHub。
 
-勾选“同时生成 Windows 便携包”时，Windows 结果还会包含便携 ZIP。Windows 增量包
-只在填写精确来源版本时生成；UOS 始终发布完整 DEB。
+“同时生成 Windows 便携包”默认关闭；偶尔需要便携版时再勾选，Windows 结果会额外
+包含便携 ZIP。导入 Windows 结果时，发布器会校验结果元数据和文件清单，自动识别
+是否含便携包并同步界面选项。Windows 增量包只在填写精确来源版本时生成；UOS
+始终发布完整 DEB。
 
 ## 4. 推荐的 GitHub 双端流程
 
@@ -138,9 +140,9 @@ dist\windows-manual-results\windows-build-result-<时间>.zip
 ```
 
 已经准备好正确依赖的离线 Windows 环境可加 `-SkipDependencyInstall`，但不能跳过
-脚本内的完整测试。把结果 ZIP 带回 UOS，在保持服务地址、通道、CA、增量来源和
-便携包选项与导出时完全一致的情况下，点击“导入 Windows 结果”。任何配置或文件
-变化都会拒绝导入，不能通过重命名 ZIP 绕过。
+脚本内的完整测试。把结果 ZIP 带回 UOS，在保持服务地址、通道、CA 和增量来源与
+导出时完全一致的情况下，点击“导入 Windows 结果”。便携包选项会从结果中自动
+识别并同步；其他配置或文件发生变化仍会拒绝导入，不能通过重命名 ZIP 绕过。
 
 ## 6. 从 UOS 正式发布
 

@@ -231,6 +231,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             notes="发布器测试",
             delta_from_version="0.2.4",
             mandatory=True,
+            build_portable=True,
             remote_host="intdemo-test",
             identity_file="C:/keys/release",
             build_uos=True,
@@ -1220,6 +1221,8 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertIn("v", window.release_readiness_label.text())
         self.assertTrue(window.windows_check.isChecked())
         self.assertTrue(window.uos_check.isChecked())
+        self.assertFalse(window.portable_check.isChecked())
+        self.assertIn("自动识别", window.portable_check.toolTip())
         self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")
         self.assertFalse(window.export_windows_request_button.isEnabled())
         self.assertFalse(window.import_windows_result_button.isEnabled())
@@ -1277,6 +1280,46 @@ class ReleasePublisherUiTests(unittest.TestCase):
             self.assertIn("DEB", window.build_button.text())
 
         window.deleteLater()
+
+    def test_import_windows_result_auto_detects_portable_package(self):
+        selected = str(REPO_ROOT / "windows-build-result.zip")
+        for detected in (False, True):
+            with (
+                self.subTest(detected=detected),
+                patch(
+                    "release_publisher.ui.is_native_uos_arm64_builder",
+                    return_value=True,
+                ),
+                patch(
+                    "release_publisher.ui.QFileDialog.getOpenFileName",
+                    return_value=(selected, "ZIP 文件 (*.zip)"),
+                ),
+                patch(
+                    "release_publisher.ui.detect_windows_result_portable",
+                    return_value=detected,
+                ) as detect_result,
+            ):
+                window = ReleasePublisherWindow(REPO_ROOT)
+                window.portable_check.setChecked(not detected)
+                with (
+                    patch.object(
+                        window,
+                        "_validate",
+                        side_effect=lambda: window._options(),
+                    ),
+                    patch.object(window, "_save_settings"),
+                    patch.object(window, "_run_steps") as run_steps,
+                ):
+                    window._import_windows_result()
+
+                self.assertEqual(window.portable_check.isChecked(), detected)
+                detect_result.assert_called_once_with(selected)
+                step = run_steps.call_args.args[0][0]
+                self.assertEqual(
+                    "--build-portable" in step.arguments,
+                    detected,
+                )
+                window.deleteLater()
 
     def test_github_unavailable_exit_prompts_for_windows_transfer(self):
         window = ReleasePublisherWindow(REPO_ROOT)

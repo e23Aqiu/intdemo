@@ -50,7 +50,7 @@ class PublisherSettings:
     remote_path: str = "/opt/intdemo/deploy/updates"
     identity_file: str = ""
     channel: str = "test"
-    build_portable: bool = True
+    build_portable: bool = False
     build_windows: bool = True
     build_uos: bool = True
     windows_build_mode: str = "auto"
@@ -128,7 +128,7 @@ class ReleaseOptions:
     delta_from_version: str = ""
     channel: str = "test"
     mandatory: bool = False
-    build_portable: bool = True
+    build_portable: bool = False
     inno_compiler: str = ""
     remote_host: str = ""
     remote_path: str = "/opt/intdemo/deploy/updates"

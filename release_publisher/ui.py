@@ -34,6 +34,7 @@ from .connection_control import (
     ConnectionControlClient,
     ConnectionControlError,
 )
+from .release_tasks import ReleaseTaskError, detect_windows_result_portable
 from .core import (
     CommandStep,
     PublisherError,
@@ -183,7 +184,10 @@ class ReleasePublisherWindow(QMainWindow):
         platform_layout.addStretch()
         version_form.addRow("构建平台", platform_row)
         self.portable_check = QCheckBox("同时构建便携包")
-        self.portable_check.setChecked(True)
+        self.portable_check.setChecked(False)
+        self.portable_check.setToolTip(
+            "默认不构建；导入 Windows 结果时会根据结果包自动识别并同步此选项"
+        )
         version_form.addRow("", self.portable_check)
         layout.addWidget(version_card)
 
@@ -956,6 +960,16 @@ class ReleasePublisherWindow(QMainWindow):
         )
         if not selected:
             return
+        try:
+            build_portable = detect_windows_result_portable(selected)
+        except ReleaseTaskError as exc:
+            QMessageBox.warning(self, "无法识别 Windows 结果", str(exc))
+            return
+        self.portable_check.setChecked(build_portable)
+        portable_status = "包含便携包" if build_portable else "不含便携包"
+        self._append_log(
+            f"已自动识别 Windows 结果：{portable_status}，界面选项已同步。"
+        )
         options = self._validate()
         if options is None:
             return

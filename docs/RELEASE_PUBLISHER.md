@@ -62,7 +62,8 @@ UOS:     ~/.config/intdemo-release-publisher/settings.json
    `origin`（GitHub）和 `gitee`（Gitee）。
 4. 填写服务地址、公开 CA 根证书、发布通道、更新说明和发布服务器 SSH 配置。
 5. 选择 Windows x64、UOS ARM64 或两者；UOS 主控的 Windows 构建默认选择“自动”。
-6. 如果需要增量包，填写本机已有真实发布快照的精确来源版本。
+6. 便携包默认不构建，偶尔需要时再勾选；如果需要增量包，填写本机已有真实发布
+   快照的精确来源版本。导入 Windows 结果时会自动识别是否含便携包。
 7. 点击“环境检查”，再按需运行测试或“构建所选安装包”。
 8. GitHub 不可用时，把保留的任务 ZIP 带到 Windows x64 运行
    `scripts/build-windows-request.ps1`，然后回 UOS 点击“导入 Windows 结果”。
