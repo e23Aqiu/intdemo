@@ -269,7 +269,11 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             identity_file="C:/keys/release",
         )
 
-        steps = build_pause_distribution_steps(options)
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=False,
+        ):
+            steps = build_pause_distribution_steps(options)
 
         self.assertEqual([step.key for step in steps], ["pause_distribution"])
         step = steps[0]
@@ -1027,6 +1031,20 @@ class ReleasePublisherUiTests(unittest.TestCase):
     def setUpClass(cls):
         cls.application = QApplication.instance() or QApplication([])
 
+    def setUp(self):
+        settings_patcher = patch(
+            "release_publisher.ui.SettingsStore.load",
+            return_value=PublisherSettings(),
+        )
+        platform_patcher = patch(
+            "release_publisher.ui.is_native_uos_arm64_builder",
+            return_value=False,
+        )
+        settings_patcher.start()
+        platform_patcher.start()
+        self.addCleanup(platform_patcher.stop)
+        self.addCleanup(settings_patcher.stop)
+
     def test_window_exposes_safe_release_workflow(self):
         window = ReleasePublisherWindow(REPO_ROOT)
 
@@ -1089,15 +1107,9 @@ class ReleasePublisherUiTests(unittest.TestCase):
         window.deleteLater()
 
     def test_native_uos_enables_windows_transfer_and_updates_build_text(self):
-        with (
-            patch(
-                "release_publisher.ui.SettingsStore.load",
-                return_value=PublisherSettings(),
-            ),
-            patch(
-                "release_publisher.ui.is_native_uos_arm64_builder",
-                return_value=True,
-            ),
+        with patch(
+            "release_publisher.ui.is_native_uos_arm64_builder",
+            return_value=True,
         ):
             window = ReleasePublisherWindow(REPO_ROOT)
 

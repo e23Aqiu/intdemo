@@ -1356,3 +1356,11 @@
 - 新增 UOS GUI 启动器、Windows 真机辅助脚本、GitHub Windows workflow、统信主控
   操作手册和任务安全回归。UOS 打包/SSH 发布不依赖 Docker，服务端容器部署保持
   独立。
+
+### 步骤 129：隔离 UOS 打包前测试与发布器用户配置
+
+- 发布器 UI 测试不再读取开发者真实的 `settings.json`，统一使用独立默认配置，
+  避免用户已选择 `stable` 通道时测试仍固定断言 `test` 而中止 UOS 构建。
+- Windows 暂停分发计划测试显式模拟 Windows 主控，不再在 UOS ARM64 上错误要求
+  PowerShell `pause-update.ps1`；UOS 原生 Python 暂停流程继续由专项计划覆盖。
+- 发布器专项回归 `26/26`、客户端完整回归 `195/195` 和静态检查通过。
