@@ -4,11 +4,57 @@ import os
 import platform
 import shutil
 import sys
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 WINDOWS_UPDATE_PLATFORM = "windows-x86_64"
 UOS_UPDATE_PLATFORM = "linux-aarch64"
+
+
+def _is_system_qt_plugin_path(value):
+    """Return whether *value* exposes a distro Qt 5 plugin directory.
+
+    The UOS desktop plugins are built against the distro Qt 5.11 runtime.  The
+    client bundles Qt 5.15, so allowing either runtime to discover the other
+    runtime's plugins can crash inside QApplication before Python can report an
+    exception.  App-owned plugin roots remain supported; only conventional
+    system library trees are rejected.
+    """
+    normalized = str(PurePosixPath(str(value).strip()))
+    if not normalized.startswith("/"):
+        return False
+    system_library_roots = (
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/usr/local/lib",
+    )
+    if not any(
+        normalized == root or normalized.startswith(f"{root}/")
+        for root in system_library_roots
+    ):
+        return False
+    parts = tuple(part.casefold() for part in PurePosixPath(normalized).parts)
+    return any(
+        parts[index] == "qt5" and parts[index + 1] == "plugins"
+        for index in range(len(parts) - 1)
+    )
+
+
+def _isolate_bundled_qt_plugins():
+    """Remove inherited paths that would mix UOS Qt plugins into bundled Qt."""
+    for variable in ("QT_PLUGIN_PATH", "QT_QPA_PLATFORM_PLUGIN_PATH"):
+        configured_paths = [
+            item for item in os.environ.get(variable, "").split(os.pathsep) if item
+        ]
+        safe_paths = [
+            item for item in configured_paths if not _is_system_qt_plugin_path(item)
+        ]
+        if safe_paths:
+            os.environ[variable] = os.pathsep.join(safe_paths)
+        else:
+            os.environ.pop(variable, None)
 
 
 def normalized_machine(value=None):
@@ -45,6 +91,7 @@ def configure_desktop_environment():
     """
     if not is_linux_arm64():
         return
+    _isolate_bundled_qt_plugins()
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     if not os.environ.get("QT_IM_MODULE", "").strip():
         input_method_hint = " ".join(
@@ -59,34 +106,6 @@ def configure_desktop_environment():
         os.environ["QT_IM_MODULE"] = (
             "ibus" if "ibus" in input_method_hint else "fcitx"
         )
-    plugin_roots = []
-    explicit_plugin_root = os.environ.get(
-        "INTDEMO_QT_SYSTEM_PLUGIN_PATH", ""
-    ).strip()
-    if explicit_plugin_root:
-        plugin_roots.append(explicit_plugin_root)
-    for input_context_root in (
-        *Path("/usr/lib").glob("*/qt5/plugins/platforminputcontexts"),
-        Path("/usr/lib/qt5/plugins/platforminputcontexts"),
-    ):
-        try:
-            has_fcitx = any(
-                input_context_root.glob("libfcitx*inputcontextplugin.so*")
-            )
-        except OSError:
-            has_fcitx = False
-        if has_fcitx:
-            plugin_roots.append(str(input_context_root.parent))
-    existing_plugin_roots = [
-        item
-        for item in os.environ.get("QT_PLUGIN_PATH", "").split(os.pathsep)
-        if item
-    ]
-    combined_plugin_roots = list(
-        dict.fromkeys([*existing_plugin_roots, *plugin_roots])
-    )
-    if combined_plugin_roots:
-        os.environ["QT_PLUGIN_PATH"] = os.pathsep.join(combined_plugin_roots)
     explicit_platform = os.environ.get(
         "INTDEMO_QT_QPA_PLATFORM", ""
     ).strip()

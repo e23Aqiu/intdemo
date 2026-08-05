@@ -178,10 +178,20 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertEqual(arguments[:2], ["/usr/bin/dpkg", "--install"])
         self.assertTrue(arguments[-1].endswith(".deb"))
 
-    def test_uos_environment_selects_fcitx_for_chinese_input(self):
+    def test_uos_environment_selects_fcitx_and_isolates_system_qt_plugins(self):
+        app_plugin_root = "/opt/intdemo/qt5/plugins"
         environment = {
             "XDG_SESSION_TYPE": "x11",
             "DISPLAY": ":0",
+            "QT_PLUGIN_PATH": os.pathsep.join(
+                (
+                    "/usr/lib/aarch64-linux-gnu/qt5/plugins",
+                    app_plugin_root,
+                )
+            ),
+            "QT_QPA_PLATFORM_PLUGIN_PATH": (
+                "/usr/lib/aarch64-linux-gnu/qt5/plugins/platforms"
+            ),
             "INTDEMO_QT_SYSTEM_PLUGIN_PATH": "/usr/lib/qt5/plugins",
         }
         with patch.dict(os.environ, environment, clear=True), patch.object(
@@ -189,10 +199,26 @@ class UosCompatibilityTests(unittest.TestCase):
         ):
             platform_support.configure_desktop_environment()
             self.assertEqual(os.environ["QT_IM_MODULE"], "fcitx")
-            self.assertIn(
-                "/usr/lib/qt5/plugins",
-                os.environ["QT_PLUGIN_PATH"].split(os.pathsep),
+            self.assertEqual(os.environ["QT_PLUGIN_PATH"], app_plugin_root)
+            self.assertNotIn("QT_QPA_PLATFORM_PLUGIN_PATH", os.environ)
+
+    def test_uos_system_qt_plugin_path_detection_preserves_app_paths(self):
+        self.assertTrue(
+            platform_support._is_system_qt_plugin_path(
+                "/usr/lib/aarch64-linux-gnu/qt5/plugins/imageformats"
             )
+        )
+        self.assertTrue(
+            platform_support._is_system_qt_plugin_path(
+                "/usr/local/lib/qt5/plugins"
+            )
+        )
+        self.assertFalse(
+            platform_support._is_system_qt_plugin_path(
+                "/opt/apps/com.e23aqiu.intdemo/files/app/_internal/"
+                "PyQt5/Qt5/plugins"
+            )
+        )
 
     def test_secret_service_protector_round_trip(self):
         encoded_key = base64.b64encode(b"k" * 32).decode("ascii")
@@ -354,8 +380,15 @@ class UosCompatibilityTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("QT_PLUGIN_PATH", platform_code)
-        self.assertIn("libfcitx*inputcontextplugin", platform_code)
+        self.assertIn("QT_QPA_PLATFORM_PLUGIN_PATH", platform_code)
+        self.assertNotIn('Path("/usr/lib").glob', platform_code)
+        self.assertNotIn("INTDEMO_QT_SYSTEM_PLUGIN_PATH", platform_code)
         self.assertIn("Qt Fcitx 输入法插件", build_script)
+        self.assertIn("platforminputcontexts", build_script)
+        self.assertIn('cp -L -- "$fcitx_input_plugin"', build_script)
+        self.assertIn("QT_DEBUG_PLUGINS=1", build_script)
+        self.assertIn("Qt 插件隔离检查", build_script)
+        self.assertIn("QT_IM_MODULE=compose", build_script)
         self.assertIn("libstdc++.so.6 libgcc_s.so.1", build_script)
         self.assertIn("GLIBCXX_3.4.26", build_script)
         self.assertIn('qt_libstdcxx_real="$(readlink -f', build_script)
@@ -365,6 +398,7 @@ class UosCompatibilityTests(unittest.TestCase):
         )
         self.assertIn('"$package_root/intdemo-client" --self-check', build_script)
         self.assertIn('runtime_self_check = "--self-check" in sys.argv', entrypoint)
+        self.assertIn("app.inputMethod().locale()", entrypoint)
 
     def test_uos_package_contains_verified_online_service_config(self):
         root = Path(__file__).resolve().parents[1]

@@ -1314,3 +1314,25 @@
   会得到 `xcb`，`offscreen` 保持不变，项目专用原生 Wayland 覆盖仍然生效。
 - 状态：根因与修复已落地；由于 ARM64 便携成品已经重新生成，只需快速重封装并
   强制重装 DEB，无需再次运行 PyInstaller。
+
+### 步骤 127：隔离 UOS Qt 5.11 插件与随包 Qt 5.15
+
+- UOS 真机继续出现菜单启动退出和直接运行返回 `139`。对照自检确认
+  `offscreen+compose` 正常，而 `xcb+compose`、`xcb+fcitx` 均发生段错误，因此
+  排除了 Wayland 注入和 Fcitx 输入法本身是必要触发条件。
+- `QT_DEBUG_PLUGINS=1` 进一步确认随包 Qt 5.15.15 实际加载了
+  `/usr/lib/aarch64-linux-gnu/qt5/plugins/imageformats/kimg_*.so`；这些插件元数据版本
+  `330499` 对应 UOS Qt 5.11.3，崩溃位置同时落在 `QApplication` 初始化和窗口图标
+  加载路径。根因是为发现系统 Fcitx 插件而把整个系统 Qt 插件根目录加入了
+  `QT_PLUGIN_PATH`。
+- ARM64 构建现只把系统 Fcitx 平台输入上下文复制到 PyInstaller 私有
+  `PyQt5/Qt5/plugins/platforminputcontexts` 目录，并用包内运行库执行 `ldd`，拒绝
+  缺失依赖或解析到包外 Qt。运行时会过滤继承到的系统 `QT_PLUGIN_PATH` 与
+  `QT_QPA_PLATFORM_PLUGIN_PATH`，保留应用自有插件路径。
+- 成品自检会显式创建输入法上下文，使用 `QT_DEBUG_PLUGINS` 确认私有 Fcitx 插件
+  已加载且没有发现任何系统 Qt 插件；构建会话存在 `DISPLAY` 时，再分别执行
+  `xcb+compose` 与 `xcb+fcitx` 两次真实图形初始化，防止仅靠 `offscreen` 漏检。
+- UOS 专项回归 `22/22`、客户端完整回归 `179/179`、Python 编译、本机 Qt
+  `offscreen` 自检、Bash 语法和 `git diff --check` 均通过。
+- 状态：代码和静态/本机回归完成，等待 UOS ARM64 真机重新完整构建，以私有插件
+  加载日志及两次 XCB 自检结果作为出包条件；当前有问题的 UOS 0.2.9 不应发布。

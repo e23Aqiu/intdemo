@@ -288,6 +288,56 @@ if grep -Fqi "not found" <<<"$input_plugin_ldd"; then
 fi
 echo "Qt 中文输入法系统插件: $fcitx_input_plugin"
 
+# Never add the distro Qt plugin root to QT_PLUGIN_PATH.  UOS ships Qt 5.11,
+# while the conda runtime bundles Qt 5.15; exposing the whole distro tree lets
+# image format, platform theme and style plugins cross that ABI boundary and
+# can segfault inside QApplication.  Copy only the required input context into
+# the already-isolated PyInstaller Qt plugin tree.
+qt_plugin_root="$pyinstaller_internal/PyQt5/Qt5/plugins"
+if [[ ! -d "$qt_plugin_root" ]]; then
+  echo "错误：未找到包内 Qt 插件目录：$qt_plugin_root" >&2
+  exit 1
+fi
+bundled_input_context_dir="$qt_plugin_root/platforminputcontexts"
+mkdir -p "$bundled_input_context_dir"
+bundled_fcitx_input_plugin="$bundled_input_context_dir/$(basename "$fcitx_input_plugin")"
+cp -L -- "$fcitx_input_plugin" "$bundled_fcitx_input_plugin"
+chmod 0644 "$bundled_fcitx_input_plugin"
+
+bundled_input_plugin_ldd="$(
+  LD_LIBRARY_PATH="$pyinstaller_internal${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
+    ldd "$bundled_fcitx_input_plugin" 2>&1 || true
+)"
+if grep -Fqi "not found" <<<"$bundled_input_plugin_ldd"; then
+  echo "错误：私有 Qt Fcitx 输入法插件存在缺失动态库：" >&2
+  echo "$bundled_input_plugin_ldd" >&2
+  exit 1
+fi
+bundled_qt_dependency_count=0
+while IFS= read -r resolved_qt_path; do
+  [[ -n "$resolved_qt_path" ]] || continue
+  resolved_qt_path="$(readlink -f "$resolved_qt_path")"
+  case "$resolved_qt_path" in
+    "$pyinstaller_internal"/*) ;;
+    *)
+      echo "错误：Fcitx 输入法插件解析到了包外 Qt：$resolved_qt_path" >&2
+      echo "$bundled_input_plugin_ldd" >&2
+      exit 1
+      ;;
+  esac
+  ((bundled_qt_dependency_count += 1))
+done < <(
+  sed -n \
+    's/^[[:space:]]*libQt5[^[:space:]]* => \([^[:space:]]*\).*/\1/p' \
+    <<<"$bundled_input_plugin_ldd"
+)
+if ((bundled_qt_dependency_count == 0)); then
+  echo "错误：无法确认 Fcitx 输入法插件使用包内 Qt。" >&2
+  echo "$bundled_input_plugin_ldd" >&2
+  exit 1
+fi
+echo "Qt 中文输入法私有插件: $bundled_fcitx_input_plugin"
+
 mkdir -p "$package_root/app" "$package_root/browser" "$package_root/certs"
 cp -a "$pyinstaller_dist/intdemo-client/." "$package_root/app/"
 cp -a "$browser_source_dir/." "$package_root/browser/"
@@ -324,8 +374,44 @@ INTDEMO_CONNECTION_CONFIG="$package_root/client-online.json" \
   "$conda_cmd" run --prefix "$env_prefix" python -c \
   'from integrated_client.online.config import OnlineConfig; config = OnlineConfig.load(); print("在线配置正常:", config.base_url, config.ca_bundle)'
 
-echo "=== 检查打包后的客户端运行库 ==="
-QT_QPA_PLATFORM=offscreen "$package_root/intdemo-client" --self-check
+echo "=== 检查打包后的客户端运行库与 Qt 插件隔离 ==="
+qt_plugin_debug_log="$pyinstaller_work/qt-plugin-self-check.log"
+rm -f -- "$qt_plugin_debug_log"
+QT_QPA_PLATFORM=offscreen \
+QT_IM_MODULE=fcitx \
+QT_DEBUG_PLUGINS=1 \
+  "$package_root/app/intdemo-client" --self-check \
+  2>"$qt_plugin_debug_log"
+package_fcitx_input_plugin="$package_root/app/_internal/PyQt5/Qt5/plugins/platforminputcontexts/$(basename "$fcitx_input_plugin")"
+if grep -Eq \
+  '"/(usr/(local/)?lib(64)?|lib(64)?)/[^" ]*qt5/plugins/' \
+  "$qt_plugin_debug_log"; then
+  echo "错误：打包客户端仍在发现 UOS 系统 Qt 插件：" >&2
+  grep -E \
+    '"/(usr/(local/)?lib(64)?|lib(64)?)/[^" ]*qt5/plugins/' \
+    "$qt_plugin_debug_log" | tail -n 30 >&2
+  exit 1
+fi
+if ! grep -Fq \
+  "loaded library \"$package_fcitx_input_plugin\"" \
+  "$qt_plugin_debug_log"; then
+  echo "错误：打包客户端未加载私有 Fcitx 输入法插件。" >&2
+  tail -n 100 "$qt_plugin_debug_log" >&2
+  exit 1
+fi
+echo "Qt 插件隔离检查: 正常"
+
+if [[ -n "${DISPLAY:-}" ]]; then
+  echo "=== 检查打包客户端的 XCB 图形初始化 ==="
+  INTDEMO_QT_QPA_PLATFORM=xcb \
+    QT_IM_MODULE=compose \
+    "$package_root/intdemo-client" --self-check
+  INTDEMO_QT_QPA_PLATFORM=xcb \
+    QT_IM_MODULE=fcitx \
+    "$package_root/intdemo-client" --self-check
+else
+  echo "提示：当前构建会话没有 DISPLAY，已跳过 XCB 真机启动检查。"
+fi
 
 if ((skip_browser_check == 0)); then
   echo "=== 检查打包后的内置 Chromium ==="

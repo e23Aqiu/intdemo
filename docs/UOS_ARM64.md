@@ -133,10 +133,12 @@ conda run -p ./.conda-uos-arm64 python main.py
 UOS 菜单启动器可能自动注入 `QT_QPA_PLATFORM=wayland`，但当前随包 Qt 不包含
 Wayland 平台插件；根启动器会把这个系统注入值改为 `xcb`。普通用户不要直接用
 `QT_QPA_PLATFORM=wayland` 覆盖，原生 Wayland 验证统一使用上述项目专用变量。
-构建脚本会校验 UOS 的 `fcitx-frontend-qt5` 平台输入上下文及依赖；程序在
-PyInstaller 自带 Qt 插件路径之后追加受信任的系统 Qt 插件目录。启动器会尊重
-已有的 IBus/Fcitx 配置，并在 UOS 默认场景设置 `QT_IM_MODULE=fcitx`，从而支持
-公告标题、轮播文字和富文本正文的中文组合输入。
+构建脚本会校验 UOS 的 `fcitx-frontend-qt5` 平台输入上下文及依赖，并只把该输入
+上下文插件复制到 PyInstaller 的私有 `platforminputcontexts` 目录。程序不会把
+`/usr/lib/.../qt5/plugins` 加入随包 Qt 5.15 的搜索路径，避免混入 UOS Qt 5.11 的
+图像、主题、样式和平台插件。启动器会尊重已有的 IBus/Fcitx 配置，并在 UOS 默认
+场景设置 `QT_IM_MODULE=fcitx`，从而支持公告标题、轮播文字和富文本正文的中文组合
+输入。
 
 ## 五、构建 ARM64 包
 
@@ -149,9 +151,11 @@ bash scripts/uos-arm64/build.sh
 
 默认流程依次执行：环境和浏览器缓存更新、UOS/架构/glibc/依赖/浏览器/密钥环
 预检、客户端离线回归测试、PyInstaller 目录包构建、conda ARM64 GNU 运行库
-固定、Qt 所需 `GLIBCXX_3.4.26` 与动态库检查、成品入口自检、内置 Chromium
-复制与二次启动检查、`tar.gz` 打包、UOS ARM64 DEB 组装和 SHA-256 生成。构建
-脚本拒绝打包项目缓存目录之外的浏览器，避免误带入开发机上的其他可执行文件。
+固定、Qt 所需 `GLIBCXX_3.4.26` 与动态库检查、Fcitx 私有插件复制及隔离检查、
+成品入口自检、内置 Chromium 复制与二次启动检查、`tar.gz` 打包、UOS ARM64 DEB
+组装和 SHA-256 生成。构建会话存在 `DISPLAY` 时还会自动执行 `xcb+compose` 和
+`xcb+fcitx` 两次真实图形初始化。构建脚本拒绝打包项目缓存目录之外的浏览器，避免
+误带入开发机上的其他可执行文件。
 正式构建开始前会删除同版本旧压缩包、旧 DEB 和旧组装目录；任何后续检查失败时
 都不会留下可被误认为新包的同格式产物。
 
@@ -258,6 +262,12 @@ grep -E '^(Name|Exec)=' \
   /opt/apps/com.e23aqiu.intdemo/entries/applications/com.e23aqiu.intdemo.desktop
 QT_QPA_PLATFORM=offscreen \
   /opt/apps/com.e23aqiu.intdemo/files/intdemo-client --self-check
+find /opt/apps/com.e23aqiu.intdemo/files/app/_internal/PyQt5/Qt5/plugins/\
+platforminputcontexts -maxdepth 1 -type f -name 'libfcitx*.so*' -print
+env INTDEMO_QT_QPA_PLATFORM=xcb QT_IM_MODULE=compose \
+  /opt/apps/com.e23aqiu.intdemo/files/intdemo-client --self-check
+env INTDEMO_QT_QPA_PLATFORM=xcb QT_IM_MODULE=fcitx \
+  /opt/apps/com.e23aqiu.intdemo/files/intdemo-client --self-check
 ```
 
 升级时直接安装更高版本 DEB；卸载只删除程序文件和系统桌面入口：
@@ -306,6 +316,7 @@ bash scripts/uos-arm64/diagnose.sh 2>&1 | tee uos-arm64-diagnose.log
 tail -n 200 ~/.local/share/intdemo-client-online-test/logs/client.log
 tail -n 200 ~/.local/share/intdemo-client-online-test/logs/native-crash.log
 tail -n 200 ~/.local/share/intdemo-client-online-test/logs/launcher.log
+tail -n 200 build/uos-arm64/qt-plugin-self-check.log
 ldd dist/uos-arm64/pyinstaller/intdemo-client/intdemo-client | grep 'not found' || true
 grep -ao 'GLIBCXX_[0-9.]*' ./app/_internal/libstdc++.so.6 | sort -Vu | tail -n 1
 LD_LIBRARY_PATH="$PWD/app/_internal" ldd ./app/_internal/libQt5Core.so.5

@@ -41,6 +41,9 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     if runtime_self_check:
+        # Force creation of the selected platform input context so UOS builds
+        # verify the bundled Fcitx plugin instead of merely discovering it.
+        app.inputMethod().locale()
         print(f"客户端运行库自检通过：Qt {qVersion()}", flush=True)
         return 0
 
