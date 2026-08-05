@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import replace
+from datetime import date, datetime, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,7 +13,7 @@ import app.main as main_module
 from app.config import get_settings
 from app.connection_test import connection_test_gate
 from app.database import SessionLocal
-from app.models import Account
+from app.models import Account, ActivityEvent
 
 from .conftest import auth_header, changed_admin, device_uid, login
 
@@ -573,6 +575,20 @@ def test_archived_account_can_be_permanently_deleted(client):
         f"/api/v1/admin/accounts/{account_id}/archive",
         headers=headers,
     ).status_code == 200
+    with SessionLocal() as db:
+        db.add(
+            ActivityEvent(
+                account_id=uuid.UUID(account_id),
+                event_uid=uuid.uuid4(),
+                metric_key="workflow_detail_total",
+                amount=7,
+                business_date=date.today(),
+                source="test",
+                summary={},
+                occurred_at=datetime.now(timezone.utc),
+            )
+        )
+        db.commit()
     deleted = client.delete(
         f"/api/v1/admin/accounts/{account_id}",
         headers=headers,
@@ -580,6 +596,13 @@ def test_archived_account_can_be_permanently_deleted(client):
     assert deleted.status_code == 204
     accounts = client.get("/api/v1/admin/accounts", headers=headers).json()
     assert account_id not in {str(account["id"]) for account in accounts}
+    with SessionLocal() as db:
+        assert db.get(Account, uuid.UUID(account_id)) is None
+        assert db.scalar(
+            select(ActivityEvent.id).where(
+                ActivityEvent.account_id == uuid.UUID(account_id)
+            )
+        ) is None
     audit_rows = client.get("/api/v1/admin/audit", headers=headers).json()["items"]
     assert any(
         row["action"] == "account.delete" and row["target_id"] == account_id

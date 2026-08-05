@@ -15,9 +15,53 @@ from integrated_client.online.secure import (
     SecretServiceProtector,
     SecureStorageUnavailable,
 )
+from integrated_client.ui import file_dialogs
 
 
 class UosCompatibilityTests(unittest.TestCase):
+    def test_uos_file_selection_prefers_desktop_portal_chooser(self):
+        runner = Mock(
+            return_value=Mock(
+                returncode=0,
+                stdout="/tmp/一.xlsx\n/tmp/二.xlsx\n",
+                stderr="",
+            )
+        )
+        with patch.object(file_dialogs, "is_uos", return_value=True), patch.object(
+            file_dialogs.shutil,
+            "which",
+            return_value="/usr/bin/zenity",
+        ), patch.object(file_dialogs.subprocess, "run", runner):
+            paths, selected_filter = file_dialogs.SystemFileDialog.getOpenFileNames(
+                None,
+                "选择表格",
+                "/tmp",
+                "Excel (*.xlsx);;所有文件 (*)",
+            )
+
+        self.assertEqual(paths, ["/tmp/一.xlsx", "/tmp/二.xlsx"])
+        self.assertEqual(selected_filter, "")
+        arguments = runner.call_args.args[0]
+        self.assertIn("--multiple", arguments)
+        self.assertIn("--file-filter=Excel | *.xlsx", arguments)
+        self.assertEqual(runner.call_args.kwargs["env"]["GTK_USE_PORTAL"], "1")
+
+    def test_non_uos_file_selection_keeps_qt_native_dialog(self):
+        with patch.object(file_dialogs, "is_uos", return_value=False), patch.object(
+            file_dialogs.QtFileDialog,
+            "getOpenFileName",
+            return_value=("C:/result.zip", "ZIP (*.zip)"),
+        ) as qt_dialog:
+            selected = file_dialogs.SystemFileDialog.getOpenFileName(
+                None,
+                "选择结果",
+                "C:/",
+                "ZIP (*.zip)",
+            )
+
+        self.assertEqual(selected[0], "C:/result.zip")
+        qt_dialog.assert_called_once()
+
     def test_explicit_chromium_path_has_priority(self):
         with tempfile.TemporaryDirectory() as temporary:
             executable = Path(temporary) / "uos-browser"

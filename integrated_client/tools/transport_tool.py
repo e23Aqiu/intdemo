@@ -26,6 +26,7 @@ from PyQt5.QtGui import QFont
 USING_PYQT6 = False
 from ..browser import get_builtin_chromium_path
 from ..platform_support import chromium_launch_args
+from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 from playwright.sync_api import sync_playwright, Page, Browser
 try:
     from ddddocr import DdddOcr

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
@@ -10,6 +11,7 @@ import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Mapping
 from urllib.parse import urlparse
 
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
@@ -54,6 +56,7 @@ class PublisherSettings:
     windows_build_mode: str = "auto"
     github_remote: str = "origin"
     github_repo: str = ""
+    gitee_url: str = ""
     uos_builder_host: str = ""
     uos_builder_path: str = "/opt/intdemo"
 
@@ -221,6 +224,7 @@ class GitPushPlan:
     ahead_count: int
     commits: tuple[str, ...]
     step: CommandStep
+    setup_step: CommandStep | None = None
 
     @property
     def target(self) -> str:
@@ -229,6 +233,159 @@ class GitPushPlan:
     @property
     def sets_upstream(self) -> bool:
         return self.upstream is None
+
+
+@dataclass(frozen=True)
+class ReleaseReadiness:
+    state: str
+    message: str
+    windows_ready: bool = False
+    uos_ready: bool = False
+    published: bool = False
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _candidate_receipt_matches(
+    path: Path,
+    *,
+    options: ReleaseOptions,
+    platform_key: str,
+    source_commit: str,
+    ca_digest: str,
+) -> bool:
+    try:
+        receipt = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    expected = {
+        "schema_version": 1,
+        "platform": platform_key,
+        "version": options.version,
+        "source_commit": source_commit,
+        "base_url": options.base_url.strip().rstrip("/"),
+        "channel": options.channel,
+        "ca_sha256": ca_digest,
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        return False
+    if platform_key == "windows-x86_64" and (
+        receipt.get("delta_from_version") != options.delta_from_version
+        or receipt.get("build_portable") is not bool(options.build_portable)
+    ):
+        return False
+    artifacts = receipt.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        return False
+    root = options.repo_root.resolve()
+    for descriptor in artifacts.values():
+        if not isinstance(descriptor, dict):
+            return False
+        relative = str(descriptor.get("path") or "")
+        try:
+            candidate = (root / relative).resolve()
+            candidate.relative_to(root)
+            expected_size = int(descriptor.get("size"))
+        except (OSError, TypeError, ValueError):
+            return False
+        if not candidate.is_file() or candidate.stat().st_size != expected_size:
+            return False
+    return True
+
+
+def release_readiness(options: ReleaseOptions) -> ReleaseReadiness:
+    """Summarize whether validated artifacts are waiting for a dual release."""
+    version = str(options.version or "").strip() or "-"
+    publish_receipt = (
+        options.repo_root
+        / "dist"
+        / "release-results"
+        / version
+        / "publish-receipt.json"
+    )
+    if publish_receipt.is_file() or options.snapshot_path.is_file():
+        return ReleaseReadiness(
+            "published",
+            f"v{version} 已发布，不可覆盖",
+            published=True,
+        )
+
+    receipts_exist = (
+        options.windows_result_receipt.is_file()
+        or options.uos_result_receipt.is_file()
+    )
+    commit_result = _run_git_capture(
+        options.repo_root.resolve(),
+        "rev-parse",
+        "HEAD",
+    )
+    source_commit = (
+        commit_result.stdout.strip().casefold()
+        if commit_result.returncode == 0
+        else ""
+    )
+    status_result = _run_git_capture(
+        options.repo_root.resolve(),
+        "status",
+        "--porcelain=v1",
+    )
+    if status_result.returncode != 0 or status_result.stdout.strip():
+        source_commit = ""
+    ca_digest = ""
+    if options.ca_bundle:
+        ca_path = Path(options.ca_bundle).expanduser()
+        if ca_path.is_file():
+            try:
+                ca_digest = _file_sha256(ca_path)
+            except OSError:
+                ca_digest = ""
+    windows_ready = _candidate_receipt_matches(
+        options.windows_result_receipt,
+        options=options,
+        platform_key="windows-x86_64",
+        source_commit=source_commit,
+        ca_digest=ca_digest,
+    )
+    uos_ready = _candidate_receipt_matches(
+        options.uos_result_receipt,
+        options=options,
+        platform_key="linux-aarch64",
+        source_commit=source_commit,
+        ca_digest=ca_digest,
+    )
+    if windows_ready and uos_ready:
+        return ReleaseReadiness(
+            "ready",
+            f"待发布：v{version} 的 EXE 和 DEB 均已就绪",
+            windows_ready=True,
+            uos_ready=True,
+        )
+    if windows_ready:
+        return ReleaseReadiness(
+            "partial",
+            f"待发布：v{version} 的 EXE 已就绪，等待 DEB",
+            windows_ready=True,
+        )
+    if uos_ready:
+        return ReleaseReadiness(
+            "partial",
+            f"待发布：v{version} 的 DEB 已就绪，等待 EXE",
+            uos_ready=True,
+        )
+    if receipts_exist:
+        return ReleaseReadiness(
+            "mismatch",
+            f"v{version} 存在与当前服务地址、CA、通道或提交不一致的构建结果",
+        )
+    return ReleaseReadiness("empty", f"v{version} 暂无待发布构建结果")
 
 
 def project_version(repo_root: str | Path) -> str:
@@ -472,6 +629,31 @@ def _current_git_branch(repo_root: Path) -> str:
     return branch
 
 
+def git_remote_url(repo_root: str | Path, remote: str) -> str:
+    root = Path(repo_root).resolve()
+    normalized = str(remote or "").strip()
+    if not GIT_REMOTE_PATTERN.fullmatch(normalized):
+        return ""
+    result = _run_git_capture(root, "remote", "get-url", "--push", normalized)
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _safe_git_remote_url(value: str) -> str:
+    normalized = str(value or "").strip()
+    if (
+        not normalized
+        or normalized.startswith("-")
+        or any(ord(character) < 32 for character in normalized)
+    ):
+        raise PublisherError("Gitee 仓库链接无效")
+    parsed = urlparse(normalized)
+    if parsed.scheme in {"http", "https"} and (
+        parsed.username is not None or parsed.password is not None
+    ):
+        raise PublisherError("Gitee 仓库链接不能包含账号、密码或访问令牌")
+    return normalized
+
+
 def build_git_push_plan(repo_root: str | Path) -> GitPushPlan:
     root = Path(repo_root).resolve()
     changes = git_status(root)
@@ -619,6 +801,7 @@ def build_git_push_plan(repo_root: str | Path) -> GitPushPlan:
 def build_git_mirror_push_plans(
     repo_root: str | Path,
     remote_names: tuple[str, ...] = ("origin", "gitee"),
+    remote_urls: Mapping[str, str] | None = None,
 ) -> list[GitPushPlan]:
     """Prepare ordinary, non-force pushes of the branch to GitHub and Gitee."""
     root = Path(repo_root).resolve()
@@ -629,7 +812,16 @@ def build_git_mirror_push_plans(
     configured = set(
         _git_output(root, "remote", action="读取 Git 远程仓库").splitlines()
     )
-    missing = [name for name in remote_names if name not in configured]
+    desired_urls = {
+        str(name): _safe_git_remote_url(url)
+        for name, url in dict(remote_urls or {}).items()
+        if str(url or "").strip()
+    }
+    missing = [
+        name
+        for name in remote_names
+        if name not in configured and name not in desired_urls
+    ]
     if missing:
         raise PublisherError(
             "缺少双仓库远程配置：" + "、".join(missing)
@@ -652,14 +844,31 @@ def build_git_mirror_push_plans(
 
     plans: list[GitPushPlan] = []
     for index, remote in enumerate(remote_names):
-        _git_output(
-            root,
-            "remote",
-            "get-url",
-            "--push",
-            remote,
-            action=f"读取 Git 远程 {remote}",
-        )
+        setup_step = None
+        current_url = ""
+        if remote in configured:
+            current_url = _git_output(
+                root,
+                "remote",
+                "get-url",
+                "--push",
+                remote,
+                action=f"读取 Git 远程 {remote}",
+            )
+        desired_url = desired_urls.get(remote, "")
+        remote_changed = bool(desired_url and desired_url != current_url)
+        if remote_changed:
+            setup_step = CommandStep(
+                key=f"git_configure_{remote}",
+                title=f"配置 Git 远程 {remote}",
+                program=git_program,
+                arguments=(
+                    ("remote", "set-url", remote, desired_url)
+                    if remote in configured
+                    else ("remote", "add", remote, desired_url)
+                ),
+                working_directory=root,
+            )
         tracking = f"{remote}/{branch}"
         tracking_result = _run_git_capture(
             root,
@@ -667,7 +876,7 @@ def build_git_mirror_push_plans(
             "--verify",
             f"refs/remotes/{tracking}",
         )
-        tracking_exists = tracking_result.returncode == 0
+        tracking_exists = tracking_result.returncode == 0 and not remote_changed
         if tracking_exists:
             counts = _git_output(
                 root,
@@ -729,6 +938,7 @@ def build_git_mirror_push_plans(
                     arguments=tuple(arguments),
                     working_directory=root,
                 ),
+                setup_step=setup_step,
             )
         )
     return plans

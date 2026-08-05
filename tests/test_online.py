@@ -1031,6 +1031,134 @@ class OnlineClientTests(unittest.TestCase):
         )
         self.assertEqual(own.id, self.session.state.account.id)
 
+    def test_remote_account_delete_change_purges_station_and_statistics(self):
+        self.session.login("station", "Online!234")
+        other_id = str(uuid.uuid4())
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        self.database.apply_sync_snapshot(
+            {
+                "revision": 10,
+                "accounts": [
+                    {
+                        "id": self.api.account_id,
+                        "username": "station",
+                        "display_name": "本站",
+                        "role": "user",
+                        "stats_scope": "all",
+                        "is_active": True,
+                        "is_archived": False,
+                        "entitlement_revision": 1,
+                    },
+                    {
+                        "id": other_id,
+                        "username": "deleted_station",
+                        "display_name": "待删除站点",
+                        "role": "user",
+                        "stats_scope": "own",
+                        "is_active": False,
+                        "is_archived": True,
+                        "entitlement_revision": 2,
+                    },
+                ],
+                "metrics": [],
+                "activity_events": [
+                    {
+                        "account_id": other_id,
+                        "event_uid": str(uuid.uuid4()),
+                        "metric_key": "workflow_detail_total",
+                        "amount": 5,
+                        "business_date": "2026-08-05",
+                        "source": "unified_workflow",
+                        "task_id": None,
+                        "summary": {},
+                        "occurred_at": occurred_at,
+                    }
+                ],
+                "workflow_batches": [],
+                "workflow_runs": [],
+                "entitlement_revision": 1,
+                "stats_scope": "all",
+            }
+        )
+        self.assertIn(
+            "deleted_station",
+            {account.username for account in self.database.list_accounts()},
+        )
+
+        self.database.apply_sync_changes(
+            {
+                "changes": [
+                    {
+                        "revision": 11,
+                        "account_id": None,
+                        "kind": "account",
+                        "entity_id": other_id,
+                        "entity_revision": 3,
+                        "operation": "delete",
+                        "payload": {"username": "deleted_station"},
+                        "occurred_at": occurred_at,
+                    }
+                ],
+                "latest_revision": 11,
+                "has_more": False,
+                "entitlement_revision": 1,
+                "stats_scope": "all",
+            }
+        )
+
+        self.assertNotIn(
+            "deleted_station",
+            {account.username for account in self.database.list_accounts()},
+        )
+        self.assertNotIn(
+            "deleted_station",
+            {row["username"] for row in self.database.get_all_account_totals()},
+        )
+
+    def test_full_snapshot_removes_remote_accounts_missing_from_server(self):
+        self.session.login("station", "Online!234")
+        stale_id = str(uuid.uuid4())
+        base_snapshot = {
+            "revision": 20,
+            "accounts": [
+                {
+                    "id": self.api.account_id,
+                    "username": "station",
+                    "display_name": "本站",
+                    "role": "user",
+                    "stats_scope": "all",
+                    "is_active": True,
+                    "is_archived": False,
+                    "entitlement_revision": 1,
+                },
+                {
+                    "id": stale_id,
+                    "username": "stale_station",
+                    "display_name": "已不存在站点",
+                    "role": "user",
+                    "stats_scope": "own",
+                    "is_active": False,
+                    "is_archived": True,
+                    "entitlement_revision": 2,
+                },
+            ],
+            "metrics": [],
+            "activity_events": [],
+            "workflow_batches": [],
+            "workflow_runs": [],
+            "entitlement_revision": 1,
+            "stats_scope": "all",
+        }
+        self.database.apply_sync_snapshot(base_snapshot)
+        base_snapshot["revision"] = 21
+        base_snapshot["accounts"] = base_snapshot["accounts"][:1]
+        self.database.apply_sync_snapshot(base_snapshot)
+
+        self.assertNotIn(
+            "stale_station",
+            {account.username for account in self.database.list_accounts()},
+        )
+
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
     def test_dpapi_round_trip_and_ciphertext(self):
         protector = DpapiProtector()

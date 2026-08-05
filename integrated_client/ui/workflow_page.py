@@ -20,7 +20,6 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
-    QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -41,6 +40,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..browser import check_builtin_chromium, get_builtin_chromium_path
+from .file_dialogs import SystemFileDialog as QFileDialog
 from ..database import (
     WORKFLOW_EMPTY_METRIC,
     WORKFLOW_HAS_PHONE_METRIC,

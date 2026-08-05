@@ -10,9 +10,9 @@ from PyQt5.QtGui import QDesktopServices, QIcon
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from integrated_client.ui.file_dialogs import SystemFileDialog as QFileDialog
 from integrated_client.ui.loading_dialog import run_with_loading
 
 from .connection_control import (
@@ -46,9 +47,11 @@ from .core import (
     build_windows_request_export_steps,
     build_windows_result_import_steps,
     find_inno_compiler,
+    git_remote_url,
     git_status,
     is_native_uos_arm64_builder,
     project_version,
+    release_readiness,
     set_project_version,
     validate_pause_distribution_options,
     validate_release_options,
@@ -115,8 +118,9 @@ class ReleasePublisherWindow(QMainWindow):
         splitter.addWidget(self._build_log_panel())
         splitter.setSizes([500, 780])
 
-        root_layout.addLayout(self._build_action_bar())
+        root_layout.addWidget(self._build_action_bar())
         self._load_settings()
+        self._connect_release_readiness_signals()
         self._platform_selection_changed()
         self._refresh_project_version()
         self._set_busy(False)
@@ -136,6 +140,10 @@ class ReleasePublisherWindow(QMainWindow):
         self.current_version_value = QLabel("-")
         self.current_version_value.setObjectName("VersionValue")
         version_form.addRow("项目当前版本", self.current_version_value)
+        self.release_readiness_label = QLabel("正在检查待发布产物…")
+        self.release_readiness_label.setObjectName("ReleaseReadiness")
+        self.release_readiness_label.setWordWrap(True)
+        version_form.addRow("发布状态", self.release_readiness_label)
         version_row = QHBoxLayout()
         self.version_edit = QLineEdit()
         self.version_edit.setPlaceholderText("例如 0.2.6")
@@ -205,6 +213,11 @@ class ReleasePublisherWindow(QMainWindow):
         self.github_repo_edit = QLineEdit()
         self.github_repo_edit.setPlaceholderText("可留空自动识别，例如 e23Aqiu/intdemo")
         connection_form.addRow("GitHub 仓库", self.github_repo_edit)
+        self.gitee_url_edit = QLineEdit()
+        self.gitee_url_edit.setPlaceholderText(
+            "例如 https://gitee.com/e23aqiu/intdemo.git"
+        )
+        connection_form.addRow("Gitee 仓库", self.gitee_url_edit)
         self.inno_edit, inno_row = self._path_input(
             "选择 ISCC.exe",
             "程序文件 (ISCC.exe);;所有文件 (*)",
@@ -343,18 +356,30 @@ class ReleasePublisherWindow(QMainWindow):
         layout.addWidget(self.log_edit, 1)
         return panel
 
-    def _build_action_bar(self) -> QHBoxLayout:
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
+    def _build_action_bar(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("ActionCard")
+        actions = QGridLayout(panel)
+        actions.setContentsMargins(14, 10, 14, 10)
+        actions.setHorizontalSpacing(8)
+        actions.setVerticalSpacing(8)
+
+        build_label = QLabel("检查与构建")
+        build_label.setObjectName("ActionGroupTitle")
+        actions.addWidget(build_label, 0, 0)
         self.preflight_button = QPushButton("环境检查")
         self.preflight_button.clicked.connect(self._preflight)
-        actions.addWidget(self.preflight_button)
+        actions.addWidget(self.preflight_button, 0, 1)
         self.test_button = QPushButton("运行全部测试")
         self.test_button.clicked.connect(self._run_tests)
-        actions.addWidget(self.test_button)
+        actions.addWidget(self.test_button, 0, 2)
         self.build_button = QPushButton("构建所选安装包")
         self.build_button.clicked.connect(self._run_build)
-        actions.addWidget(self.build_button)
+        actions.addWidget(self.build_button, 0, 3)
+
+        result_label = QLabel("结果与代码")
+        result_label.setObjectName("ActionGroupTitle")
+        actions.addWidget(result_label, 1, 0)
         self.export_windows_request_button = QPushButton("导出 Windows 任务")
         self.export_windows_request_button.setToolTip(
             "生成不含部署密钥的任务包，可带到无法访问程序服务器的 Windows 真机构建"
@@ -362,7 +387,7 @@ class ReleasePublisherWindow(QMainWindow):
         self.export_windows_request_button.clicked.connect(
             self._export_windows_request
         )
-        actions.addWidget(self.export_windows_request_button)
+        actions.addWidget(self.export_windows_request_button, 1, 1)
         self.import_windows_result_button = QPushButton("导入 Windows 结果")
         self.import_windows_result_button.setToolTip(
             "校验 Windows 真机结果的版本、源提交、配置与 SHA-256 后纳入本次发布"
@@ -370,20 +395,23 @@ class ReleasePublisherWindow(QMainWindow):
         self.import_windows_result_button.clicked.connect(
             self._import_windows_result
         )
-        actions.addWidget(self.import_windows_result_button)
-        self.commit_changes_button = QPushButton("提交变更")
+        actions.addWidget(self.import_windows_result_button, 1, 2)
+        self.commit_changes_button = QPushButton("提交到本地")
         self.commit_changes_button.setToolTip(
             "预览并暂存当前仓库的全部变更，创建本地 Git 提交；不会推送到远程"
         )
         self.commit_changes_button.clicked.connect(self._commit_changes)
-        actions.addWidget(self.commit_changes_button)
-        self.push_button = QPushButton("推送")
+        actions.addWidget(self.commit_changes_button, 1, 3)
+        self.push_button = QPushButton("推送 GitHub + Gitee")
         self.push_button.setToolTip(
             "预览待推送提交并将当前分支同时推送到 GitHub(origin) 与 Gitee(gitee)；不会强制推送"
         )
         self.push_button.clicked.connect(self._push_changes)
-        actions.addWidget(self.push_button)
-        actions.addStretch()
+        actions.addWidget(self.push_button, 1, 4)
+
+        publish_label = QLabel("发布控制")
+        publish_label.setObjectName("ActionGroupTitle")
+        actions.addWidget(publish_label, 2, 0)
         self.pause_distribution_button = QPushButton("暂停分发")
         self.pause_distribution_button.setObjectName("DangerButton")
         self.pause_distribution_button.setToolTip(
@@ -392,19 +420,20 @@ class ReleasePublisherWindow(QMainWindow):
         self.pause_distribution_button.clicked.connect(
             self._run_pause_distribution
         )
-        actions.addWidget(self.pause_distribution_button)
+        actions.addWidget(self.pause_distribution_button, 2, 1)
         self.publish_button = QPushButton("发布双端更新")
         self.publish_button.clicked.connect(self._run_publish)
-        actions.addWidget(self.publish_button)
+        actions.addWidget(self.publish_button, 2, 2)
         self.pipeline_button = QPushButton("测试 → 双端构建 → 双端发布")
         self.pipeline_button.setObjectName("PrimaryButton")
         self.pipeline_button.clicked.connect(self._run_full_pipeline)
-        actions.addWidget(self.pipeline_button)
+        actions.addWidget(self.pipeline_button, 2, 3, 1, 2)
         self.cancel_button = QPushButton("停止")
         self.cancel_button.setObjectName("DangerButton")
         self.cancel_button.clicked.connect(self._cancel)
-        actions.addWidget(self.cancel_button)
-        return actions
+        actions.addWidget(self.cancel_button, 2, 5)
+        actions.setColumnStretch(6, 1)
+        return panel
 
     @staticmethod
     def _card(title: str) -> tuple[QFrame, QFormLayout]:
@@ -472,6 +501,9 @@ class ReleasePublisherWindow(QMainWindow):
         self.windows_build_mode_combo.setCurrentIndex(max(0, mode_index))
         self.github_remote_edit.setText(settings.github_remote)
         self.github_repo_edit.setText(settings.github_repo)
+        self.gitee_url_edit.setText(
+            settings.gitee_url or git_remote_url(self.repo_root, "gitee")
+        )
         self.uos_builder_host_edit.setText(settings.uos_builder_host)
         self.uos_builder_path_edit.setText(settings.uos_builder_path)
         self.remote_host_edit.setText(settings.remote_host)
@@ -506,6 +538,19 @@ class ReleasePublisherWindow(QMainWindow):
             candidate = (path.parent / ca_bundle).resolve()
             if candidate.is_file():
                 self.ca_edit.setText(str(candidate))
+
+    def _connect_release_readiness_signals(self) -> None:
+        for edit in (
+            self.version_edit,
+            self.delta_edit,
+            self.base_url_edit,
+            self.ca_edit,
+        ):
+            edit.editingFinished.connect(self._refresh_release_readiness)
+        self.channel_combo.currentIndexChanged.connect(
+            self._refresh_release_readiness
+        )
+        self.portable_check.toggled.connect(self._refresh_release_readiness)
 
     def _connection_parameters(self) -> tuple[str, str, str, str, str]:
         return (
@@ -753,6 +798,7 @@ class ReleasePublisherWindow(QMainWindow):
             windows_build_mode=str(self.windows_build_mode_combo.currentData()),
             github_remote=self.github_remote_edit.text().strip() or "origin",
             github_repo=self.github_repo_edit.text().strip(),
+            gitee_url=self.gitee_url_edit.text().strip(),
             uos_builder_host=self.uos_builder_host_edit.text().strip(),
             uos_builder_path=self.uos_builder_path_edit.text().strip(),
         )
@@ -768,6 +814,16 @@ class ReleasePublisherWindow(QMainWindow):
         self.current_version_value.setText(f"v{version}")
         if not self.version_edit.text().strip():
             self.version_edit.setText(version)
+        self._refresh_release_readiness()
+
+    def _refresh_release_readiness(self, *_args) -> None:
+        readiness = release_readiness(self._options())
+        self.release_readiness_label.setText(readiness.message)
+        self.release_readiness_label.setProperty("state", readiness.state)
+        self.release_readiness_label.style().unpolish(
+            self.release_readiness_label
+        )
+        self.release_readiness_label.style().polish(self.release_readiness_label)
 
     def _options(self) -> ReleaseOptions:
         return ReleaseOptions(
@@ -1091,13 +1147,28 @@ class ReleasePublisherWindow(QMainWindow):
         )
 
     def _push_changes(self) -> None:
+        gitee_url = self.gitee_url_edit.text().strip()
+        if not gitee_url:
+            QMessageBox.warning(
+                self,
+                "缺少 Gitee 仓库",
+                "请先填写 Gitee 仓库链接。",
+            )
+            return
         try:
-            plans = build_git_mirror_push_plans(self.repo_root)
+            plans = build_git_mirror_push_plans(
+                self.repo_root,
+                remote_urls={"gitee": gitee_url},
+            )
         except PublisherError as exc:
             QMessageBox.warning(self, "无法推送", str(exc))
             self._append_log(f"准备 Git 推送失败：{exc}")
             return
-        pending = [plan for plan in plans if plan.ahead_count > 0]
+        pending = [
+            plan
+            for plan in plans
+            if plan.ahead_count > 0 or plan.setup_step is not None
+        ]
         if not pending:
             targets = "、".join(plan.target for plan in plans)
             self._append_log(
@@ -1120,11 +1191,18 @@ class ReleasePublisherWindow(QMainWindow):
                 f"{plan.target}：{plan.ahead_count} 个待推送提交"
                 + (f"\n{commits}" if commits else "")
             )
+        setup_notice = (
+            "\n点击继续后会新增或更新本仓库的 gitee 远程地址。"
+            if any(plan.setup_step is not None for plan in plans)
+            else ""
+        )
         reply = QMessageBox.warning(
             self,
             "确认双仓库推送",
             f"本地分支：{plans[0].branch}\n\n"
             + "\n\n".join(previews)
+            + f"\n\nGitee：{gitee_url}"
+            + setup_notice
             + "\n\n将依次执行普通 Git push 到 GitHub 与 Gitee，"
             "不会强制推送。任一远程拒绝时会停止并保留清晰日志。是否继续？",
             QMessageBox.Yes | QMessageBox.Cancel,
@@ -1132,8 +1210,15 @@ class ReleasePublisherWindow(QMainWindow):
         )
         if reply != QMessageBox.Yes:
             return
+        steps = []
+        for plan in pending:
+            if plan.setup_step is not None:
+                steps.append(plan.setup_step)
+            if plan.ahead_count > 0 or plan.setup_step is not None:
+                steps.append(plan.step)
+        self._save_settings()
         self._run_steps(
-            [plan.step for plan in pending],
+            steps,
             completion_message="当前分支已同步推送到 GitHub 与 Gitee",
         )
 
@@ -1316,6 +1401,7 @@ class ReleasePublisherWindow(QMainWindow):
         self._current_step = None
         self._completion_message = "全部步骤执行成功"
         self._set_busy(False)
+        self._refresh_release_readiness()
         self.status_label.setText(message)
         self._append_log(
             f"\n{'成功' if success else '失败'}：{message}\n" + "=" * 72
@@ -1418,7 +1504,32 @@ class ReleasePublisherWindow(QMainWindow):
                 padding: 8px 10px;
                 color: #245b8a;
             }
-            QFrame#Card, QFrame#LogCard {
+            QLabel#ReleaseReadiness {
+                background: #eef4fb;
+                border-radius: 6px;
+                padding: 8px 10px;
+                color: #486581;
+            }
+            QLabel#ReleaseReadiness[state="ready"] {
+                background: #e8f7ef;
+                color: #176b45;
+                font-weight: 700;
+            }
+            QLabel#ReleaseReadiness[state="partial"],
+            QLabel#ReleaseReadiness[state="mismatch"] {
+                background: #fff5df;
+                color: #8a5a00;
+            }
+            QLabel#ReleaseReadiness[state="published"] {
+                background: #edf2f7;
+                color: #52606d;
+            }
+            QLabel#ActionGroupTitle {
+                color: #52606d;
+                font-weight: 700;
+                min-width: 72px;
+            }
+            QFrame#Card, QFrame#LogCard, QFrame#ActionCard {
                 background: white;
                 border: 1px solid #d9e2ec;
                 border-radius: 9px;

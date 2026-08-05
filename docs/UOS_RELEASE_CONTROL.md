@@ -25,10 +25,11 @@ Gitee、U 盘或单位批准的传输介质带回 UOS。
 
 ## 2. UOS 发布机准备
 
-先完成 ARM64 环境准备，确认仓库具有 `origin`（GitHub）和 `gitee` 两个远程：
+先完成 ARM64 环境准备，并建议安装 UOS 系统文件选择组件：
 
 ```bash
 bash scripts/uos-arm64/prepare-env.sh
+sudo apt install zenity
 git remote -v
 ```
 
@@ -56,7 +57,8 @@ UOS 配置保存在：
 ~/.config/intdemo-release-publisher/settings.json
 ```
 
-配置只保存地址和文件路径，不保存更新说明、强更选择、密码、令牌或私钥内容。
+配置只保存地址和文件路径（包括 Gitee 仓库链接），不保存更新说明、强更选择、
+密码、令牌或私钥内容。
 
 ## 3. 构建方式
 
@@ -77,7 +79,8 @@ Windows 构建方式有三种：
 ## 4. 推荐的 GitHub 双端流程
 
 1. 在 UOS 发布器中同步目标版本，检查改动并提交。
-2. 点击“推送”，把同一分支普通推送到 `origin` 和 `gitee`。不要强制推送。
+2. 填写 Gitee 仓库链接，点击“推送 GitHub + Gitee”，把同一分支普通推送到
+   `origin` 和 `gitee`。发布器会在缺少或地址变化时配置 `gitee` 远程，不会强制推送。
 3. 填写 HTTPS 服务地址、公开 CA 根证书、通道、更新说明、SSH 主机和更新目录。
 4. 选择 Windows x64 与 UOS ARM64，Windows 构建方式选择“自动”。
 5. 需要增量包时填写已经真实发布过、且本机有发布快照的来源版本。

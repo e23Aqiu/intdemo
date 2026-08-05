@@ -29,6 +29,7 @@ from release_publisher.core import (
     git_status,
     project_version,
     project_version_mismatches,
+    release_readiness,
     set_project_version,
     validate_pause_distribution_options,
     validate_release_options,
@@ -115,12 +116,112 @@ class ReleasePublisherCoreTests(unittest.TestCase):
                 windows_build_mode="manual",
                 github_remote="github",
                 github_repo="e23Aqiu/intdemo",
+                gitee_url="https://gitee.com/e23aqiu/intdemo.git",
             )
 
             store.save(settings)
 
             self.assertEqual(SettingsStore(path).load(), settings)
             self.assertNotIn("mandatory", path.read_text(encoding="utf-8"))
+
+    def test_release_readiness_reports_validated_dual_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "IntDemo Test"],
+                cwd=root,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "intdemo@example.invalid"],
+                cwd=root,
+                check=True,
+            )
+            (root / ".gitignore").write_text("dist/\n", encoding="utf-8")
+            (root / "tracked.txt").write_text("release\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--all"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "release"],
+                cwd=root,
+                check=True,
+            )
+            commit = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            ).stdout.strip()
+            options = ReleaseOptions(
+                repo_root=root,
+                version="1.2.3",
+                base_url="https://api.example.com",
+                notes="test",
+                channel="test",
+                build_portable=False,
+                build_windows=True,
+                build_uos=True,
+            )
+            artifacts = {
+                "windows": root / "dist" / "installer" / "setup.exe",
+                "uos": root / "dist" / "uos-arm64" / "setup.deb",
+            }
+            for artifact in artifacts.values():
+                artifact.parent.mkdir(parents=True, exist_ok=True)
+                artifact.write_bytes(b"candidate")
+
+            common = {
+                "schema_version": 1,
+                "version": "1.2.3",
+                "source_commit": commit,
+                "base_url": "https://api.example.com",
+                "channel": "test",
+                "ca_sha256": "",
+            }
+            receipts = (
+                (
+                    options.windows_result_receipt,
+                    {
+                        **common,
+                        "platform": "windows-x86_64",
+                        "delta_from_version": "",
+                        "build_portable": False,
+                        "artifacts": {
+                            "windows_installer": {
+                                "path": str(artifacts["windows"].relative_to(root)),
+                                "size": artifacts["windows"].stat().st_size,
+                                "sha256": "0" * 64,
+                            }
+                        },
+                    },
+                ),
+                (
+                    options.uos_result_receipt,
+                    {
+                        **common,
+                        "platform": "linux-aarch64",
+                        "artifacts": {
+                            "uos_installer": {
+                                "path": str(artifacts["uos"].relative_to(root)),
+                                "size": artifacts["uos"].stat().st_size,
+                                "sha256": "0" * 64,
+                            }
+                        },
+                    },
+                ),
+            )
+            for path, payload in receipts:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload), encoding="utf-8")
+
+            readiness = release_readiness(options)
+
+            self.assertEqual(readiness.state, "ready")
+            self.assertTrue(readiness.windows_ready)
+            self.assertTrue(readiness.uos_ready)
+            self.assertIn("待发布", readiness.message)
 
     def test_release_plan_reuses_existing_powershell_scripts(self):
         options = ReleaseOptions(
@@ -828,6 +929,55 @@ function global:git {
                 )
                 self.assertIn(plans[0].branch, result.stdout)
 
+    def test_git_mirror_push_plan_can_add_gitee_from_entered_url(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            local = root / "local"
+            github = root / "github.git"
+            gitee = root / "gitee.git"
+            local.mkdir()
+            for remote in (github, gitee):
+                subprocess.run(
+                    ["git", "init", "--bare", "-q", str(remote)],
+                    check=True,
+                )
+            subprocess.run(["git", "init", "-q"], cwd=local, check=True)
+            subprocess.run(
+                ["git", "config", "user.name", "IntDemo Test"],
+                cwd=local,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "config", "user.email", "intdemo@example.invalid"],
+                cwd=local,
+                check=True,
+            )
+            (local / "tracked.txt").write_text("dual\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--all"], cwd=local, check=True)
+            subprocess.run(
+                ["git", "commit", "-q", "-m", "dual remote"],
+                cwd=local,
+                check=True,
+            )
+            subprocess.run(
+                ["git", "remote", "add", "origin", str(github)],
+                cwd=local,
+                check=True,
+            )
+
+            plans = build_git_mirror_push_plans(
+                local,
+                remote_urls={"gitee": str(gitee)},
+            )
+            gitee_plan = next(plan for plan in plans if plan.remote == "gitee")
+
+            self.assertIsNotNone(gitee_plan.setup_step)
+            self.assertEqual(
+                gitee_plan.setup_step.arguments[:3],
+                ("remote", "add", "gitee"),
+            )
+            self.assertNotIn("--force", gitee_plan.step.arguments)
+
     def test_version_sync_updates_all_authoritative_fields(self):
         current = project_version(REPO_ROOT)
         major, minor, patch = (int(part) for part in current.split("."))
@@ -1061,11 +1211,13 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertTrue(window.pause_distribution_button.isEnabled())
         self.assertIn("测试", window.pipeline_button.text())
         self.assertIn("发布", window.pipeline_button.text())
-        self.assertEqual(window.commit_changes_button.text(), "提交变更")
+        self.assertEqual(window.commit_changes_button.text(), "提交到本地")
         self.assertIn("不会推送", window.commit_changes_button.toolTip())
-        self.assertEqual(window.push_button.text(), "推送")
+        self.assertEqual(window.push_button.text(), "推送 GitHub + Gitee")
         self.assertIn("不会强制推送", window.push_button.toolTip())
         self.assertIn("GitHub", window.push_button.toolTip())
+        self.assertTrue(window.gitee_url_edit.text())
+        self.assertIn("v", window.release_readiness_label.text())
         self.assertTrue(window.windows_check.isChecked())
         self.assertTrue(window.uos_check.isChecked())
         self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")

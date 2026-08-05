@@ -40,7 +40,7 @@ sudo apt install -y \
   libx11-6 libx11-xcb1 libxcb1 libxcb-xinerama0 libxkbcommon-x11-0 \
   libxrender1 libxi6 libxrandr2 libxfixes3 libxcursor1 \
   libgl1 libegl1 libgbm1 libnss3 libasound2 fonts-noto-cjk \
-  fcitx-frontend-qt5 policykit-1 xdg-utils
+  fcitx-frontend-qt5 policykit-1 xdg-utils zenity
 ```
 
 不同 UOS 补丁级别可能已预装其中一部分；`apt` 会跳过已安装的软件包。如果
@@ -50,6 +50,10 @@ sudo apt install -y \
 最终用户无需安装 Chromium/UOS 浏览器。首次准备构建环境时需要联网下载约数百
 MB 的浏览器文件；网络较慢时可设置代理或增大
 `PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT`。
+
+业务客户端和打包发布器在 UOS 上优先通过 `zenity` 与桌面门户打开系统文件选择
+窗口；Windows 继续使用系统原生窗口。缺少 `zenity` 时会安全回退到 Qt 文件窗口，
+不会加载 UOS 系统 Qt 插件。
 
 ## 二、获取兼容分支
 

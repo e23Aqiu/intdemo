@@ -19,7 +19,6 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
-    QFileDialog,
     QFrame,
     QGridLayout,
     QHeaderView,
@@ -46,6 +45,7 @@ from ..database import (
 )
 from ..models import Account
 from .date_range import DateRangeSelector
+from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
 
 

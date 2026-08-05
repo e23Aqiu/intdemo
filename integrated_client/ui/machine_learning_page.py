@@ -9,7 +9,6 @@ from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QComboBox,
-    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -28,6 +27,7 @@ from ..captcha_models import (
     train_candidate,
 )
 from .announcement_page import start_api_task
+from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
 
 MAX_IMPORT_BYTES = 100 * 1024 * 1024

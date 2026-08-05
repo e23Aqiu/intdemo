@@ -35,12 +35,13 @@ Windows 主控可双击仓库根目录的 `run-release-publisher.bat`，或在 P
 .\run-release-publisher.bat
 ```
 
-发布器的“推送”要求远程名称固定为 `origin` 和 `gitee`。当前仓库已经配置完成；
-其他克隆如缺少 Gitee 远程，可先执行：
+发布器使用 `origin` 作为 GitHub 远程，并提供“Gitee 仓库”输入框。输入链接后点击
+“推送 GitHub + Gitee”，发布器会安全地新增或更新本仓库的 `gitee` 远程；也可以
+先手动检查：
 
 ```powershell
 git remote -v
-git remote add gitee https://gitee.com/e23aqiu/intdemo.git
+git remote -v
 ```
 
 发布器配置分别保存在：
@@ -56,8 +57,9 @@ UOS:     ~/.config/intdemo-release-publisher/settings.json
 ## 2. 推荐的新版本流程
 
 1. 确认 Git 工作区干净，填写目标版本并点击“同步项目版本号”。
-2. 检查修改，运行测试，点击“提交变更”创建本地提交。
-3. 点击“推送”，把当前分支普通推送到 `origin`（GitHub）和 `gitee`（Gitee）。
+2. 检查修改，运行测试，点击“提交到本地”创建本地提交。
+3. 填写 Gitee 仓库链接，点击“推送 GitHub + Gitee”，把当前分支普通推送到
+   `origin`（GitHub）和 `gitee`（Gitee）。
 4. 填写服务地址、公开 CA 根证书、发布通道、更新说明和发布服务器 SSH 配置。
 5. 选择 Windows x64、UOS ARM64 或两者；UOS 主控的 Windows 构建默认选择“自动”。
 6. 如果需要增量包，填写本机已有真实发布快照的精确来源版本。
@@ -65,6 +67,10 @@ UOS:     ~/.config/intdemo-release-publisher/settings.json
 8. GitHub 不可用时，把保留的任务 ZIP 带到 Windows x64 运行
    `scripts/build-windows-request.ps1`，然后回 UOS 点击“导入 Windows 结果”。
 9. 两个平台收据都校验通过后，点击“双端发布”；GitHub 可用时也可使用一键流程。
+
+版本区会持续显示“暂无结果”“仅 EXE/仅 DEB 就绪”“双端均已就绪”或“已发布”，
+避免构建结果留在 `dist` 中而忘记发布。单平台构建仍可独立执行；正式发布继续要求
+同版本双端结果，防止其中一端收到新版本号却下载旧安装包。
 
 单平台构建允许用于验证，但正式发布必须同时选择同版本 EXE 与 DEB。UOS 正式发布
 要求 Git 工作区干净并填写 SSH 主机；服务器上的安装包都可追溯到明确提交。

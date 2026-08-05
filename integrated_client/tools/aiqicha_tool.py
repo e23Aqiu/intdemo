@@ -21,7 +21,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
-    QProgressBar, QFileDialog, QMessageBox, QGroupBox, QTextEdit,
+    QProgressBar, QMessageBox, QGroupBox, QTextEdit,
     QSplitter, QFrame, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -32,6 +32,7 @@ from DrissionPage import ChromiumPage, ChromiumOptions
 
 from ..browser import get_builtin_chromium_path
 from ..platform_support import chromium_launch_args
+from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 
 
 # ==================== 配置 ====================

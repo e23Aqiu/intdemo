@@ -19,7 +19,6 @@ from PyQt5.QtWidgets import (
     QCheckBox,
     QColorDialog,
     QComboBox,
-    QFileDialog,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -43,6 +42,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..online.api import ApiResponseError, NetworkUnavailable
+from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessDialog
 from .frameless import FramelessMessageBox as QMessageBox
 from .loading_dialog import run_with_loading
