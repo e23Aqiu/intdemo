@@ -1379,6 +1379,14 @@ class ReleasePublisherUiTests(unittest.TestCase):
                 window.output_mode_combo.findData("result")
             )
             self.assertIn("仅构建包", window.build_button.text())
+            window.windows_build_mode_combo.setCurrentIndex(
+                window.windows_build_mode_combo.findData("manual")
+            )
+            self.assertIn("Windows 构建请求包", window.build_button.text())
+            self.assertIn("不会在统信主机上生成最终 EXE", window.build_button.toolTip())
+            window.windows_build_mode_combo.setCurrentIndex(
+                window.windows_build_mode_combo.findData("auto")
+            )
             window.uos_check.setChecked(False)
             self.assertIn("EXE", window.build_button.text())
             self.assertNotIn("DEB", window.build_button.text())

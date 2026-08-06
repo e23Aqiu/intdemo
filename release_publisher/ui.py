@@ -390,7 +390,7 @@ class ReleasePublisherWindow(QMainWindow):
         self.test_button = QPushButton("运行全部测试")
         self.test_button.clicked.connect(self._run_tests)
         actions.addWidget(self.test_button, 0, 2)
-        self.build_button = QPushButton("构建所选安装包")
+        self.build_button = QPushButton("导出所选产物")
         self.build_button.setToolTip("按当前平台和输出类型生成产物")
         self.build_button.clicked.connect(self._run_build)
         actions.addWidget(self.build_button, 0, 3)
@@ -804,7 +804,18 @@ class ReleasePublisherWindow(QMainWindow):
             "result": "仅构建包",
             "both": "安装包 + 构建包",
         }.get(output_mode, "构建")
-        self.build_button.setText(f"导出 {platforms}（{mode_label}）")
+        manual_windows_request = (
+            native_uos and windows and windows_mode == "manual"
+        )
+        if manual_windows_request:
+            if uos:
+                self.build_button.setText(
+                    f"导出 DEB + Windows 构建请求包（{mode_label}）"
+                )
+            else:
+                self.build_button.setText("导出 Windows 构建请求包")
+        else:
+            self.build_button.setText(f"导出 {platforms}（{mode_label}）")
         tooltip = {
             "native": "只导出可直接安装的 EXE/DEB，不生成发布器结果 ZIP",
             "result": (
@@ -813,6 +824,11 @@ class ReleasePublisherWindow(QMainWindow):
             ),
             "both": "同时导出可直接安装的 EXE/DEB 和发布器结果 ZIP",
         }.get(output_mode, "按当前平台和输出类型生成产物")
+        if manual_windows_request:
+            tooltip = (
+                "Windows 真机模式只生成构建请求包，不会在统信主机上生成最终 EXE；"
+                "请把请求包交给 Windows 真机执行。"
+            )
         self.build_button.setToolTip(tooltip)
         self.portable_check.setEnabled(windows)
         self.windows_build_mode_combo.setEnabled(native_uos and windows)
