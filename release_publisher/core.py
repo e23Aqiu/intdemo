@@ -1185,6 +1185,17 @@ def validate_release_options(
         errors.append("构建输出类型无效")
     if for_pipeline and options.build_output_mode != "both":
         errors.append("一键双端发布必须选择安装包 + 构建包")
+    if (
+        for_build
+        and options.build_output_mode == "result"
+        and options.build_uos
+        and is_native_uos_arm64_builder()
+        and not options.uos_installer.is_file()
+    ):
+        errors.append(
+            "统信仅构建包模式需要先生成同版本 DEB："
+            f"{options.uos_installer}"
+        )
     if (for_publish or for_pipeline) and not str(options.notes or "").strip():
         errors.append("更新说明不能为空")
 

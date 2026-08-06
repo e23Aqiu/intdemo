@@ -416,6 +416,23 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         self.assertEqual([step.key for step in windows_result_steps], ["build_windows_github"])
         self.assertIn("--result-output", windows_result_steps[0].arguments)
 
+    def test_uos_result_mode_requires_an_existing_native_deb(self):
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="uos result",
+            build_windows=False,
+            build_uos=True,
+            build_output_mode="result",
+        )
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=True,
+        ), patch.object(Path, "is_file", return_value=False):
+            errors = validate_release_options(options, for_build=True)
+        self.assertTrue(any("需要先生成同版本 DEB" in error for error in errors))
+
     def test_pause_distribution_plan_only_targets_the_selected_remote_channel(self):
         options = ReleaseOptions(
             repo_root=REPO_ROOT,
