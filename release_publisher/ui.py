@@ -184,6 +184,18 @@ class ReleasePublisherWindow(QMainWindow):
         platform_layout.addWidget(self.uos_check)
         platform_layout.addStretch()
         version_form.addRow("构建平台", platform_row)
+        self.output_mode_combo = QComboBox()
+        self.output_mode_combo.addItem("仅安装包（EXE / DEB）", "native")
+        self.output_mode_combo.addItem("仅构建包（发布器结果 ZIP）", "result")
+        self.output_mode_combo.addItem("安装包 + 构建包", "both")
+        self.output_mode_combo.setToolTip(
+            "仅安装包用于直接安装；仅构建包用于带到另一台打包器导入。"
+            "构建包内仍包含用于校验的安装包。"
+        )
+        self.output_mode_combo.currentIndexChanged.connect(
+            self._platform_selection_changed
+        )
+        version_form.addRow("输出类型", self.output_mode_combo)
         self.portable_check = QCheckBox("同时构建便携包")
         self.portable_check.setChecked(False)
         self.portable_check.setToolTip(
@@ -379,18 +391,16 @@ class ReleasePublisherWindow(QMainWindow):
         self.test_button.clicked.connect(self._run_tests)
         actions.addWidget(self.test_button, 0, 2)
         self.build_button = QPushButton("构建所选安装包")
-        self.build_button.setToolTip(
-            "生成可直接安装的 EXE/DEB，并同时生成可在另一台打包器导入的结果 ZIP"
-        )
+        self.build_button.setToolTip("按当前平台和输出类型生成产物")
         self.build_button.clicked.connect(self._run_build)
         actions.addWidget(self.build_button, 0, 3)
 
         result_label = QLabel("结果与代码")
         result_label.setObjectName("ActionGroupTitle")
         actions.addWidget(result_label, 1, 0)
-        self.export_windows_request_button = QPushButton("导出 Windows 构建任务")
+        self.export_windows_request_button = QPushButton("导出 Windows 构建请求包")
         self.export_windows_request_button.setToolTip(
-            "生成不含部署密钥的任务包，可带到无法访问程序服务器的 Windows 真机构建"
+            "生成不含部署密钥的请求包，交给 Windows 真机执行；它不是最终 EXE 或结果包"
         )
         self.export_windows_request_button.clicked.connect(
             self._export_windows_request
@@ -526,6 +536,8 @@ class ReleasePublisherWindow(QMainWindow):
         index = self.channel_combo.findData(settings.channel)
         self.channel_combo.setCurrentIndex(max(0, index))
         self.portable_check.setChecked(settings.build_portable)
+        output_index = self.output_mode_combo.findData(settings.build_output_mode)
+        self.output_mode_combo.setCurrentIndex(max(0, output_index))
         if not self.inno_edit.text().strip():
             compiler = find_inno_compiler()
             if compiler is not None:
@@ -565,6 +577,9 @@ class ReleasePublisherWindow(QMainWindow):
             self._refresh_release_readiness
         )
         self.portable_check.toggled.connect(self._refresh_release_readiness)
+        self.output_mode_combo.currentIndexChanged.connect(
+            self._refresh_release_readiness
+        )
 
     def _connection_parameters(self) -> tuple[str, str, str, str, str]:
         return (
@@ -774,20 +789,36 @@ class ReleasePublisherWindow(QMainWindow):
         windows = self.windows_check.isChecked()
         uos = self.uos_check.isChecked()
         native_uos = is_native_uos_arm64_builder()
-        mode = str(self.windows_build_mode_combo.currentData())
+        windows_mode = str(self.windows_build_mode_combo.currentData())
         if windows and uos:
-            self.build_button.setText("构建所选安装包（EXE + DEB）")
+            platforms = "EXE + DEB"
         elif windows:
-            self.build_button.setText("构建所选安装包（EXE）")
+            platforms = "EXE"
         elif uos:
-            self.build_button.setText("构建所选安装包（DEB）")
+            platforms = "DEB"
         else:
-            self.build_button.setText("构建所选安装包")
+            platforms = "所选平台"
+        output_mode = str(self.output_mode_combo.currentData())
+        mode_label = {
+            "native": "仅安装包",
+            "result": "仅构建包",
+            "both": "安装包 + 构建包",
+        }.get(output_mode, "构建")
+        self.build_button.setText(f"导出 {platforms}（{mode_label}）")
+        tooltip = {
+            "native": "只导出可直接安装的 EXE/DEB，不生成发布器结果 ZIP",
+            "result": (
+                "只导出可由另一台发布器导入的结果 ZIP；"
+                "结果包内仍包含用于校验的安装包"
+            ),
+            "both": "同时导出可直接安装的 EXE/DEB 和发布器结果 ZIP",
+        }.get(output_mode, "按当前平台和输出类型生成产物")
+        self.build_button.setToolTip(tooltip)
         self.portable_check.setEnabled(windows)
         self.windows_build_mode_combo.setEnabled(native_uos and windows)
         self.github_remote_edit.setEnabled(windows)
         self.github_repo_edit.setEnabled(
-            native_uos and windows and mode != "manual"
+            native_uos and windows and windows_mode != "manual"
         )
         self.inno_edit.setEnabled(not native_uos and windows)
         self.uos_builder_host_edit.setEnabled(not native_uos and uos)
@@ -808,6 +839,7 @@ class ReleasePublisherWindow(QMainWindow):
             identity_file=self.identity_edit.text().strip(),
             channel=str(self.channel_combo.currentData()),
             build_portable=self.portable_check.isChecked(),
+            build_output_mode=str(self.output_mode_combo.currentData()),
             build_windows=self.windows_check.isChecked(),
             build_uos=self.uos_check.isChecked(),
             windows_build_mode=str(self.windows_build_mode_combo.currentData()),
@@ -851,6 +883,7 @@ class ReleasePublisherWindow(QMainWindow):
             channel=str(self.channel_combo.currentData()),
             mandatory=self.mandatory_check.isChecked(),
             build_portable=self.portable_check.isChecked(),
+            build_output_mode=str(self.output_mode_combo.currentData()),
             inno_compiler=self.inno_edit.text().strip(),
             remote_host=self.remote_host_edit.text().strip(),
             remote_path=self.remote_path_edit.text().strip(),
@@ -893,6 +926,7 @@ class ReleasePublisherWindow(QMainWindow):
         message = (
             f"环境检查通过。\n\n目标版本：{options.version}\n"
             f"构建平台：{'Windows x64 + UOS ARM64' if options.build_windows and options.build_uos else ('Windows x64' if options.build_windows else 'UOS ARM64')}\n"
+            f"输出类型：{self.output_mode_combo.currentText()}\n"
             f"通道：{options.channel}\n"
             f"增量来源：{options.delta_from_version or '无'}\n"
             f"远程主机：{options.remote_host or '仅本地'}"

@@ -321,8 +321,10 @@ Windows 当前版本精确匹配差异包来源版本时才返回增量包，其
 bash scripts/uos-arm64/run-release-publisher.sh
 ```
 
-发布器可单选或全选构建 Windows EXE 与 UOS DEB。每次原生构建会同时生成可直接
-安装的 EXE/DEB 和可由另一台打包器导入的标准结果 ZIP。DEB 必须在 UOS ARM64
+发布器可单选或全选构建 Windows EXE 与 UOS DEB，并可在“输出类型”中单独选择
+安装包、标准结果 ZIP 或两者。仅安装包模式只生成可直接安装的 EXE/DEB；仅构建包
+模式生成可由另一台打包器导入的结果 ZIP（结果包内部仍含用于校验的安装包）。
+DEB 必须在 UOS ARM64
 真机生成；EXE 可在 Windows 本机生成，也可交给 GitHub Actions。GitHub 不可用时
 会保留可验证任务 ZIP，供个人或站点 Windows x64 真机完成。Windows 构建只把服务
 地址和公开 CA 写入安装包，不访问 IntDemo 程序服务器，因此 Windows 所在网络即使

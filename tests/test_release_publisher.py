@@ -25,6 +25,7 @@ from release_publisher.core import (
     build_git_mirror_push_plans,
     build_git_push_plan,
     build_pause_distribution_steps,
+    build_package_steps,
     build_release_plan,
     git_status,
     project_version,
@@ -350,6 +351,70 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             ["build_windows_github"],
         )
         self.assertEqual([step.key for step in publish], ["publish"])
+
+    def test_output_mode_can_separate_native_and_result_exports(self):
+        uos_native = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="uos",
+            build_windows=False,
+            build_uos=True,
+            build_output_mode="native",
+        )
+        uos_result = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="uos result",
+            build_windows=False,
+            build_uos=True,
+            build_output_mode="result",
+        )
+        windows_native = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="windows",
+            build_windows=True,
+            build_uos=False,
+            build_output_mode="native",
+        )
+        windows_result = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="windows result",
+            build_windows=True,
+            build_uos=False,
+            build_output_mode="result",
+        )
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=True,
+        ):
+            self.assertEqual(
+                [step.key for step in build_package_steps(uos_native)],
+                ["build_uos_package"],
+            )
+            self.assertEqual(
+                [step.key for step in build_package_steps(uos_result)],
+                ["export_uos_result"],
+            )
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=False,
+        ):
+            windows_steps = build_package_steps(windows_native)
+        self.assertEqual([step.key for step in windows_steps], ["build_windows_packages"])
+        self.assertTrue(any(Path(arg).name == "build-installer.ps1" for arg in windows_steps[0].arguments))
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=True,
+        ):
+            windows_result_steps = build_package_steps(windows_result)
+        self.assertEqual([step.key for step in windows_result_steps], ["build_windows_github"])
+        self.assertIn("--result-output", windows_result_steps[0].arguments)
 
     def test_pause_distribution_plan_only_targets_the_selected_remote_channel(self):
         options = ReleaseOptions(
@@ -1238,6 +1303,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertTrue(window.uos_check.isChecked())
         self.assertFalse(window.portable_check.isChecked())
         self.assertIn("自动识别", window.portable_check.toolTip())
+        self.assertEqual(window.output_mode_combo.currentData(), "both")
         self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")
         self.assertTrue(window.export_windows_request_button.isEnabled())
         self.assertTrue(window.import_windows_result_button.isEnabled())
@@ -1288,6 +1354,14 @@ class ReleasePublisherUiTests(unittest.TestCase):
             self.assertTrue(window.export_windows_request_button.isEnabled())
             self.assertTrue(window.import_windows_result_button.isEnabled())
             self.assertIn("EXE + DEB", window.build_button.text())
+            window.output_mode_combo.setCurrentIndex(
+                window.output_mode_combo.findData("native")
+            )
+            self.assertIn("仅安装包", window.build_button.text())
+            window.output_mode_combo.setCurrentIndex(
+                window.output_mode_combo.findData("result")
+            )
+            self.assertIn("仅构建包", window.build_button.text())
             window.uos_check.setChecked(False)
             self.assertIn("EXE", window.build_button.text())
             self.assertNotIn("DEB", window.build_button.text())

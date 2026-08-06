@@ -2278,6 +2278,7 @@ def github_windows_build(
     github_remote: str,
     github_repo: str,
     workflow_timeout: int,
+    result_output: Path | None = None,
 ) -> Path:
     request_archive = create_windows_request(
         root,
@@ -2440,6 +2441,12 @@ def github_windows_build(
             delta_from_version=delta_from_version,
             build_portable=build_portable,
         )
+        if result_output is not None:
+            copy_atomic(archives[0], result_output.expanduser().resolve())
+            print(
+                f"Windows 构建结果包已保存：{result_output.expanduser().resolve()}",
+                flush=True,
+            )
     cleanup_github_request(root, repository, github_remote, tag)
     return receipt
 
@@ -2469,6 +2476,11 @@ def build_parser() -> argparse.ArgumentParser:
     github.add_argument("--github-repo", default="")
     github.add_argument("--workflow-timeout", type=int, default=300)
     github.add_argument("--fallback-on-unavailable", action="store_true")
+    github.add_argument(
+        "--result-output",
+        default="",
+        help="保存 GitHub 返回的 Windows 标准结果 ZIP；留空则仅导入安装包",
+    )
 
     windows_build = commands.add_parser("windows-build")
     windows_build.add_argument("--request-archive", required=True)
@@ -2554,6 +2566,7 @@ def main(argv: list[str] | None = None) -> int:
                 github_remote=args.github_remote,
                 github_repo=args.github_repo,
                 workflow_timeout=args.workflow_timeout,
+                result_output=Path(args.result_output) if args.result_output else None,
             )
         elif args.command == "windows-build":
             build_windows_result(

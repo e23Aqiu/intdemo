@@ -51,6 +51,7 @@ class PublisherSettings:
     identity_file: str = ""
     channel: str = "test"
     build_portable: bool = False
+    build_output_mode: str = "both"
     build_windows: bool = True
     build_uos: bool = True
     windows_build_mode: str = "auto"
@@ -129,6 +130,7 @@ class ReleaseOptions:
     channel: str = "test"
     mandatory: bool = False
     build_portable: bool = False
+    build_output_mode: str = "both"
     inno_compiler: str = ""
     remote_host: str = ""
     remote_path: str = "/opt/intdemo/deploy/updates"
@@ -1179,6 +1181,10 @@ def validate_release_options(
         errors.append("发布通道只能是 test 或 stable")
     if options.windows_build_mode not in {"auto", "github", "manual"}:
         errors.append("Windows 构建方式无效")
+    if options.build_output_mode not in {"native", "result", "both"}:
+        errors.append("构建输出类型无效")
+    if for_pipeline and options.build_output_mode != "both":
+        errors.append("一键双端发布必须选择安装包 + 构建包")
     if (for_publish or for_pipeline) and not str(options.notes or "").strip():
         errors.append("更新说明不能为空")
 
@@ -1457,7 +1463,11 @@ def build_package_steps(
     options: ReleaseOptions,
     *,
     tests_already_run: bool = False,
+    output_mode: str | None = None,
 ) -> list[CommandStep]:
+    output_mode = output_mode or options.build_output_mode
+    if output_mode not in {"native", "result", "both"}:
+        raise PublisherError(f"构建输出类型无效：{output_mode}")
     windows_steps: list[CommandStep] = []
     uos_steps: list[CommandStep] = []
     if options.build_windows:
@@ -1485,7 +1495,7 @@ def build_package_steps(
                     _release_task_step(
                         options,
                         key="export_windows_request",
-                        title="导出 Windows 真机构建任务包",
+                        title="导出 Windows 构建请求包",
                         command="export-windows-request",
                         arguments=arguments,
                     )
@@ -1495,6 +1505,15 @@ def build_package_steps(
                     arguments.extend(["--github-repo", options.github_repo])
                 if options.windows_build_mode == "auto":
                     arguments.append("--fallback-on-unavailable")
+                if output_mode in {"result", "both"}:
+                    result_archive = (
+                        options.repo_root
+                        / "dist"
+                        / "windows-build-results"
+                        / options.version
+                        / f"windows-build-result-{options.version}-github.zip"
+                    )
+                    arguments.extend(["--result-output", str(result_archive)])
                 windows_steps.append(
                     _release_task_step(
                         options,
@@ -1527,19 +1546,56 @@ def build_package_steps(
                 arguments.extend(["--inno-compiler", options.inno_compiler])
             if tests_already_run:
                 arguments.append("--tests-prevalidated")
-            windows_steps.append(
-                _release_task_step(
-                    options,
-                    key="build_windows_packages",
-                    title=(
-                        "构建 Windows 安装包、便携包和标准结果 ZIP"
-                        if options.build_portable
-                        else "构建 Windows 安装包和标准结果 ZIP"
-                    ),
-                    command="windows-local",
-                    arguments=arguments,
+            if output_mode in {"result", "both"}:
+                windows_steps.append(
+                    _release_task_step(
+                        options,
+                        key="build_windows_packages",
+                        title=(
+                            "构建 Windows 安装包、便携包和标准结果 ZIP"
+                            if options.build_portable
+                            else "构建 Windows 安装包和标准结果 ZIP"
+                        ),
+                        command="windows-local",
+                        arguments=arguments,
+                    )
                 )
-            )
+            else:
+                native_arguments = [
+                    "-BaseUrl",
+                    options.base_url,
+                    "-Channel",
+                    options.channel,
+                    "-Version",
+                    options.version,
+                ]
+                if options.ca_bundle:
+                    native_arguments.extend(["-CaBundle", options.ca_bundle])
+                if options.delta_from_version:
+                    native_arguments.extend(
+                        ["-DeltaFromVersion", options.delta_from_version]
+                    )
+                if options.inno_compiler:
+                    native_arguments.extend(
+                        ["-InnoCompiler", options.inno_compiler]
+                    )
+                windows_steps.append(
+                    _powershell_step(
+                        options,
+                        key="build_windows_packages",
+                        title=(
+                            "构建 Windows 安装包和便携包"
+                            if options.build_portable
+                            else "构建 Windows 安装包"
+                        ),
+                        script_name=(
+                            "build-releases.ps1"
+                            if options.build_portable
+                            else "build-installer.ps1"
+                        ),
+                        script_arguments=native_arguments,
+                    )
+                )
     if options.build_uos:
         if is_native_uos_arm64_builder():
             uos_arguments = [
@@ -1553,15 +1609,16 @@ def build_package_steps(
                 uos_arguments.extend(["--ca-bundle", options.ca_bundle])
             else:
                 uos_arguments.append("--no-ca-bundle")
-            uos_steps.append(
-                CommandStep(
-                    key="build_uos_package",
-                    title="构建 UOS ARM64 DEB 安装包",
-                    program=shutil.which("bash") or "bash",
-                    arguments=tuple(uos_arguments),
-                    working_directory=options.repo_root,
+            if output_mode in {"native", "both"}:
+                uos_steps.append(
+                    CommandStep(
+                        key="build_uos_package",
+                        title="构建 UOS ARM64 DEB 安装包",
+                        program=shutil.which("bash") or "bash",
+                        arguments=tuple(uos_arguments),
+                        working_directory=options.repo_root,
+                    )
                 )
-            )
             record_arguments = [
                 "--version",
                 options.version,
@@ -1572,15 +1629,16 @@ def build_package_steps(
             ]
             if options.ca_bundle:
                 record_arguments.extend(["--ca-bundle", options.ca_bundle])
-            uos_steps.append(
-                _release_task_step(
-                    options,
-                    key="export_uos_result",
-                    title="校验 UOS DEB 并生成标准结果 ZIP",
-                    command="export-uos-result",
-                    arguments=record_arguments,
+            if output_mode in {"result", "both"}:
+                uos_steps.append(
+                    _release_task_step(
+                        options,
+                        key="export_uos_result",
+                        title="校验 UOS DEB 并生成标准结果 ZIP",
+                        command="export-uos-result",
+                        arguments=record_arguments,
+                    )
                 )
-            )
         else:
             remote_arguments = [
                 "-BuilderHost",
@@ -1598,6 +1656,8 @@ def build_package_steps(
                 remote_arguments.extend(["-IdentityFile", options.identity_file])
             if options.ca_bundle:
                 remote_arguments.extend(["-CaBundle", options.ca_bundle])
+            if output_mode in {"result", "both"}:
+                remote_arguments.append("-ExportResult")
             uos_steps.append(
                 _powershell_step(
                     options,
@@ -1607,18 +1667,19 @@ def build_package_steps(
                     script_arguments=remote_arguments,
                 )
             )
-            uos_steps.extend(
-                build_uos_result_import_steps(
-                    options,
-                    (
-                        options.repo_root
-                        / "dist"
-                        / "uos-build-results"
-                        / options.version
-                        / f"uos-build-result-{options.version}.zip"
-                    ),
+            if output_mode in {"result", "both"}:
+                uos_steps.extend(
+                    build_uos_result_import_steps(
+                        options,
+                        (
+                            options.repo_root
+                            / "dist"
+                            / "uos-build-results"
+                            / options.version
+                            / f"uos-build-result-{options.version}.zip"
+                        ),
+                    )
                 )
-            )
     if is_native_uos_arm64_builder():
         return [*uos_steps, *windows_steps]
     return [*windows_steps, *uos_steps]
@@ -1652,7 +1713,7 @@ def build_windows_request_export_steps(options: ReleaseOptions) -> list[CommandS
         _release_task_step(
             options,
             key="export_windows_request",
-            title="导出 Windows 真机构建任务包",
+            title="导出 Windows 构建请求包",
             command="export-windows-request",
             arguments=arguments,
         )
@@ -1756,7 +1817,11 @@ def build_release_plan(
         steps.extend(build_test_steps(options))
     if include_build:
         steps.extend(
-            build_package_steps(options, tests_already_run=include_tests)
+            build_package_steps(
+                options,
+                tests_already_run=include_tests,
+                output_mode=("both" if include_publish else None),
+            )
         )
     if include_publish:
         steps.extend(build_publish_steps(options))

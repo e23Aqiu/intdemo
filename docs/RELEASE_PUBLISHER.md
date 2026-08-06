@@ -1,9 +1,9 @@
 # 逃费车辆信息智能查询平台双端打包发布器
 
-Windows x64 和 UOS ARM64 现在都可以作为双端发布主控。每次原生构建会同时保留
-可直接安装的 EXE/DEB，以及可带到另一台打包器导入的标准结果 ZIP。任一端都能
-分别导入 Windows 或 UOS 结果，取得同版本、同提交、同在线配置的两份校验收据后
-统一发布。完整的 UOS 操作手册见
+Windows x64 和 UOS ARM64 现在都可以作为双端发布主控。构建区的“输出类型”可以
+选择仅安装包、仅构建包或两者：仅安装包用于直接安装，构建包是可带到另一台打包器
+导入的标准结果 ZIP。任一端都能分别导入 Windows 或 UOS 结果，取得同版本、同提交、
+同在线配置的两份校验收据后统一发布。完整的 UOS 操作手册见
 [`UOS_RELEASE_CONTROL.md`](UOS_RELEASE_CONTROL.md)。发布器不会被打进业务客户端，
 也不会向业务服务器开放构建命令执行接口。
 
@@ -64,12 +64,16 @@ UOS:     ~/.config/intdemo-release-publisher/settings.json
    Windows 主控需要构建 DEB 时填写 UOS ARM64 构建机。
 6. 便携包默认不构建，偶尔需要时再勾选；如果需要增量包，填写本机已有真实发布
    快照的精确来源版本。导入 Windows 构建包时会自动识别是否含便携包。
-7. 点击“环境检查”，再按需运行测试或“构建所选安装包”。构建结束后会同时得到
-   裸安装包和可导入结果 ZIP。
-8. GitHub 不可用时，把保留的任务 ZIP 带到 Windows x64 运行
+7. 在“输出类型”中选择：
+   - “仅安装包（EXE / DEB）”：只导出可直接安装的安装包；
+   - “仅构建包（发布器结果 ZIP）”：只准备可跨机器导入的结果包。UOS 需要已有
+     对应版本 DEB，Windows 本机会在生成结果 ZIP 的过程中构建 EXE；
+   - “安装包 + 构建包”：同时保留安装包和结果 ZIP，正式双端发布推荐此项。
+8. 点击“环境检查”，再按需运行测试或“导出 …”。按钮文字会随平台和输出类型自动变化。
+9. GitHub 不可用时，把保留的任务 ZIP 带到 Windows x64 运行
    `scripts/build-windows-request.ps1`，然后在任一主控点击“导入 Windows 构建包”。
    UOS 结果 ZIP 同样可带到任一主控点击“导入统信构建包”。
-9. 两个平台收据都校验通过后，点击“双端发布”；主控必须能够访问更新 API 和
+10. 两个平台收据都校验通过后，点击“双端发布”；主控必须能够访问更新 API 和
    发布服务器 SSH。
 
 版本区会持续显示“暂无结果”“仅 EXE/仅 DEB 就绪”“双端均已就绪”或“已发布”，
@@ -141,23 +145,29 @@ UOS 正式发布都要求 Git 工作区干净并填写 SSH 主机；服务器上
 下载不在指定断连范围内。该功能用于验证业务客户端离线行为，不等同于关闭
 服务器网络或停止 Caddy。
 
-### 构建安装包
+### 构建安装包或结果包
 
-两种主控都可以单选或全选 Windows x64 与 UOS ARM64。DEB 必须由
-`scripts/uos-arm64/build.sh` 在 ARM64 UOS 真机生成；构建后会生成裸 DEB、校验
-收据和 `uos-build-result-*.zip`。
+两种主控都可以单选或全选 Windows x64 与 UOS ARM64。先在“输出类型”选择产物范围。
+“仅安装包”只导出可直接安装的 EXE/DEB；“仅构建包”只把标准结果 ZIP 纳入导入流；
+“安装包 + 构建包”同时保留两类产物。DEB 必须由
+`scripts/uos-arm64/build.sh` 在 ARM64 UOS 真机生成；构建包内仍会携带用于校验的安装包，
+但不会把它单独作为本次导出结果。
 Windows 默认先导出不可变任务，再由 GitHub Actions 构建并自动导入；GitHub
 不可用返回专用提示码，任务 ZIP 保留给 Windows 真机使用。Windows 真机只需访问
 代码和依赖来源，构建过程不连接 IntDemo 程序服务器。
 
-Windows 主控的本机构建会运行 Windows 任务链，生成裸 EXE、可选增量/便携包、
-Windows 候选快照和 `windows-build-result-*.zip`，再自动导入为校验收据。Windows
+Windows 主控选择“仅安装包”时运行 `build-installer.ps1`（或带便携包时运行
+`build-releases.ps1`），只生成 EXE；选择“仅构建包”或“两者”时运行 Windows 结果
+任务链，生成用于导入的 `windows-build-result-*.zip`，并在结果包中携带 EXE。两种
+模式都会在成功后自动导入为校验收据。Windows
 也可通过 `scripts/build-uos-remote.ps1` 连接 ARM64 构建机，同时下载裸 DEB 和
 UOS 结果 ZIP。PyInstaller 不能跨架构编译，所以任何 DEB 都必须在 ARM64 Linux
 真机生成。
 
-### 导入构建包
+### 导出/导入构建包
 
+“导出 Windows 构建请求包”只生成交给 Windows 真机执行的输入 ZIP，不是 EXE，也
+不是可导入的最终结果包；Windows 真机构建完成后会生成 `windows-build-result-*.zip`。
 “导入 Windows 构建包”和“导入统信构建包”在 Windows、UOS 上都可用。标准结果
 ZIP 不只是压缩安装包，它还带有版本、完整 Git 提交、服务地址、通道、CA 指纹、
 产物集合、文件名、大小和 SHA-256。导入时这些内容必须与当前主控配置完全一致。
