@@ -1,8 +1,9 @@
 # 统信主控双端构建与发布
 
-本方案以 UOS Desktop 20 ARM64 真机作为发布主控：DEB 在本机生成，Windows EXE
-优先由 GitHub Actions 生成，GitHub 不可用时由任意 Windows x64 真机离线完成构建
-任务。最后由 UOS 校验两个结果并统一发布。
+本方案推荐以 UOS Desktop 20 ARM64 真机作为发布主控：DEB 在本机生成，Windows
+EXE 优先由 GitHub Actions 生成，GitHub 不可用时由任意 Windows x64 真机完成构建
+任务。Windows 也可以作为主控：把 UOS 生成的标准结果 ZIP 带到 Windows 导入后，
+可由 Windows 校验两个结果并统一发布。
 
 发布机不需要 Docker。Docker 只用于部署 IntDemo 服务端；以后即使把服务端迁移到
 这台 UOS，打包发布器与服务端容器仍是两套独立环境。
@@ -14,6 +15,7 @@
 | UOS ARM64 发布机 | GitHub/Gitee（同步代码）、更新服务器 HTTPS、发布服务器 SSH | Docker（只打包发布时） |
 | GitHub Actions | GitHub 仓库、Python/构建依赖 | IntDemo 程序服务器、发布服务器 |
 | 个人或站点 Windows x64 | GitHub/Gitee、Python/构建依赖（首次准备时） | IntDemo 程序服务器、发布服务器 |
+| Windows 发布主控 | GitHub/Gitee、更新服务器 HTTPS、发布服务器 SSH | UOS 本机构建环境（导入 UOS 结果 ZIP 时） |
 
 因此个人 Windows 即使使用 `198.x` 网络，无法访问只允许公司 `121.x` 的程序
 服务器，仍可拉取精确 Git 提交并构建 EXE。任务中的 HTTPS 地址和公开 CA 根证书
@@ -63,8 +65,9 @@ UOS 配置保存在：
 ## 3. 构建方式
 
 “Windows x64”和“UOS ARM64”可以单选，也可以全选。“构建所选安装包”只处理当前
-选择的平台；正式双端发布始终要求同一版本、同一 Git 提交和同一在线配置的 EXE
-与 DEB 都已经生成校验收据。
+选择的平台，并同时输出可直接安装的 EXE/DEB 与可在另一台打包器导入的标准结果
+ZIP；正式双端发布始终要求同一版本、同一 Git 提交和同一在线配置的 EXE 与 DEB
+都已经生成校验收据。
 
 Windows 构建方式有三种：
 
@@ -74,7 +77,7 @@ Windows 构建方式有三种：
 - `Windows 真机任务包`：只导出任务 ZIP，不尝试 GitHub。
 
 “同时生成 Windows 便携包”默认关闭；偶尔需要便携版时再勾选，Windows 结果会额外
-包含便携 ZIP。导入 Windows 结果时，发布器会校验结果元数据和文件清单，自动识别
+包含便携 ZIP。导入 Windows 构建包时，发布器会校验结果元数据和文件清单，自动识别
 是否含便携包并同步界面选项。Windows 增量包只在填写精确来源版本时生成；UOS
 始终发布完整 DEB。
 
@@ -92,7 +95,7 @@ Windows 构建方式有三种：
 
 1. UOS 本机执行 ARM64 完整检查并生成 DEB。
 2. 发布器核对 DEB 的版本、Git 提交、服务地址、通道、CA 和 SHA-256，写入 UOS
-   构建收据。
+   构建收据并生成可跨机器导入的 UOS 结果 ZIP。
 3. 发布器导出 Windows 请求 ZIP，创建临时 Git 标签和 GitHub prerelease 资源。
 4. GitHub Windows runner 运行完整客户端测试，构建 EXE、可选增量包/便携包和本次
    Windows 快照，上传一个结果 ZIP。
@@ -106,8 +109,10 @@ Windows 构建方式有三种：
 ```text
 dist/uos-arm64/IntDemo-UOS-arm64-<版本>.deb
 dist/uos-build-results/<版本>/validated-result.json
+dist/uos-build-results/<版本>/uos-build-result-<版本>-<提交前12位>.zip
 dist/installer/IntDemoOnline-Setup-<版本>.exe
 dist/windows-build-results/<版本>/validated-result.json
+dist/windows-build-results/<版本>/windows-build-result-*.zip
 dist/windows-build-requests/<版本>/<任务ID>/windows-build-request-*.zip
 ```
 
@@ -140,26 +145,33 @@ dist\windows-manual-results\windows-build-result-<时间>.zip
 ```
 
 已经准备好正确依赖的离线 Windows 环境可加 `-SkipDependencyInstall`，但不能跳过
-脚本内的完整测试。把结果 ZIP 带回 UOS，在保持服务地址、通道、CA 和增量来源与
-导出时完全一致的情况下，点击“导入 Windows 结果”。便携包选项会从结果中自动
+脚本内的完整测试。把结果 ZIP 带回 UOS 或 Windows，在保持服务地址、通道、CA 和
+增量来源与导出时完全一致的情况下，点击“导入 Windows 构建包”。便携包选项会从结果中自动
 识别并同步；其他配置或文件发生变化仍会拒绝导入，不能通过重命名 ZIP 绕过。
 
-## 6. 从 UOS 正式发布
+UOS 本机构建生成的 `uos-build-result-*.zip` 也可以通过 U 盘或单位批准的传输介质
+带到 Windows，在 Windows 发布器点击“导入统信构建包”。导入会核对完整 Git 提交、
+版本、服务地址、通道、CA 指纹、文件名、大小和 SHA-256。裸 DEB 仍可直接安装，
+但正式双端发布应导入结果 ZIP，以保留构建来源和配置校验。
 
-构建和导入完成后点击“双端发布”，或在 GitHub 可用时使用“测试 -> 双端构建 ->
-双端发布”一键流程。正式发布必须满足：
+## 6. 从 Windows 或 UOS 正式发布
+
+任一主控完成构建和导入后都可点击“双端发布”；能直接构建两端结果时也可使用
+“测试 -> 双端构建 -> 双端发布”一键流程。正式发布必须满足：
 
 - Git 工作区干净，当前版本与两个收据的完整 Git 提交一致；
 - EXE 与 DEB 的版本、服务地址、通道和 CA 指纹一致；
 - Windows 增量来源及便携包选择与收据一致；
-- UOS 能访问更新 API，并且 API 已支持 `X-IntDemo-Platform` 双端清单；
+- 当前 Windows/UOS 主控能访问更新 API，并且 API 已支持
+  `X-IntDemo-Platform` 双端清单；
 - 已填写可用的发布服务器 SSH 主机、更新目录及可选 SSH 私钥。
 
 发布器先检查远程通道不能覆盖同版本或更高版本，再按 SHA-256 上传缺少的产物。
 远程已有同名但不同哈希的文件会被拒绝。双端清单最后原子安装，并带并发变更
 保护；远程清单完整哈希验证成功后，才把 Windows 本次快照保存为正式发布快照。
 
-发布主控必须能访问程序服务器，但 Windows 构建机不需要。以后服务器迁移到
+发布主控必须能访问程序服务器和发布服务器 SSH，但仅负责构建的 Windows/UOS
+机器不需要。以后服务器迁移到
 UOS 并只允许 `121.x` 内网时，只要 UOS 发布机位于允许网段，个人 Windows 仍可
 照常构建 EXE 并传回结果。
 
@@ -180,6 +192,8 @@ Windows 候选包。不能切换到旧 Git 提交重新构建一个“看起来�
 - 提示提交尚未推送：先在发布器点击“推送”，确认 GitHub 对应分支指向当前提交。
 - 导入提示配置不一致：把 UOS 界面恢复为导出任务时的服务地址、通道、CA、增量
   来源和便携包选择，不能修改结果文件。
+- Windows 需要发布 UOS 包：从 UOS 取得 `uos-build-result-*.zip`，不要只复制裸
+  DEB；在 Windows 勾选 UOS ARM64 后点击“导入统信构建包”。
 - 缺少增量来源快照：从保存真实发布资料的 UOS 发布机恢复该版本快照；不要重建。
 - 发布 API 不支持双端平台：先部署当前服务端更新清单接口，再发布双端安装包。
 - UOS 没有 Docker：打包和 SSH 发布不受影响；只有在本机部署服务端时才安装

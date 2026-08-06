@@ -223,7 +223,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             self.assertTrue(readiness.uos_ready)
             self.assertIn("待发布", readiness.message)
 
-    def test_release_plan_reuses_existing_powershell_scripts(self):
+    def test_release_plan_creates_and_imports_cross_platform_results(self):
         options = ReleaseOptions(
             repo_root=REPO_ROOT,
             version="0.2.5",
@@ -258,34 +258,26 @@ class ReleasePublisherCoreTests(unittest.TestCase):
                 "test_server",
                 "build_windows_packages",
                 "build_uos_package",
+                "import_uos_result",
                 "publish",
-                "snapshot",
             ],
         )
         build_step = steps[3]
-        self.assertTrue(
-            any(
-                Path(argument).name == "build-releases.ps1"
-                for argument in build_step.arguments
-            )
-        )
-        self.assertIn("-DeltaFromVersion", build_step.arguments)
+        self.assertIn("windows-local", build_step.arguments)
+        self.assertIn("--delta-from-version", build_step.arguments)
+        self.assertIn("--tests-prevalidated", build_step.arguments)
         self.assertTrue(
             any(
                 Path(argument).name == "build-uos-remote.ps1"
                 for argument in steps[4].arguments
             )
         )
-        publish_step = steps[5]
-        self.assertTrue(
-            any(
-                Path(argument).name == "publish-update.ps1"
-                for argument in publish_step.arguments
-            )
-        )
-        self.assertIn("-Mandatory", publish_step.arguments)
-        self.assertIn("-RemoteHost", publish_step.arguments)
-        self.assertIn("-UosInstaller", publish_step.arguments)
+        self.assertEqual(steps[5].key, "import_uos_result")
+        self.assertIn("import-uos-result", steps[5].arguments)
+        publish_step = steps[6]
+        self.assertIn("publish", publish_step.arguments)
+        self.assertIn("--mandatory", publish_step.arguments)
+        self.assertIn("--remote-host", publish_step.arguments)
 
     def test_native_uos_plan_supports_selected_platforms_and_unified_publish(self):
         both = ReleaseOptions(
@@ -346,12 +338,12 @@ class ReleasePublisherCoreTests(unittest.TestCase):
 
         self.assertEqual(
             [step.key for step in both_build],
-            ["build_uos_package", "record_uos_result", "build_windows_github"],
+            ["build_uos_package", "export_uos_result", "build_windows_github"],
         )
         self.assertIn("--fallback-on-unavailable", both_build[-1].arguments)
         self.assertEqual(
             [step.key for step in uos_build],
-            ["build_uos_package", "record_uos_result"],
+            ["build_uos_package", "export_uos_result"],
         )
         self.assertEqual(
             [step.key for step in windows_build],
@@ -1037,6 +1029,29 @@ function global:git {
 
         self.assertIn("更新说明不能为空", errors)
         self.assertIn("增量来源版本必须低于目标版本", errors)
+        self.assertIn("双端正式发布必须填写更新服务器 SSH 主机", errors)
+
+    def test_windows_and_uos_publish_both_require_validated_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            options = ReleaseOptions(
+                repo_root=Path(directory),
+                version="1.2.3",
+                base_url="https://api.example.com",
+                notes="dual release",
+                remote_host="release-server",
+                build_windows=True,
+                build_uos=True,
+            )
+            with (
+                patch("release_publisher.core.project_version", return_value="1.2.3"),
+                patch("release_publisher.core.project_version_mismatches", return_value=[]),
+                patch("release_publisher.core.git_status", return_value=[]),
+                patch("release_publisher.core.shutil.which", return_value="tool"),
+            ):
+                errors = validate_release_options(options, for_publish=True)
+
+        self.assertTrue(any("Windows 构建收据" in item for item in errors))
+        self.assertTrue(any("UOS 构建收据" in item for item in errors))
 
     def test_connection_control_client_uses_transient_admin_session(self):
         session = Mock()
@@ -1224,8 +1239,9 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertFalse(window.portable_check.isChecked())
         self.assertIn("自动识别", window.portable_check.toolTip())
         self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")
-        self.assertFalse(window.export_windows_request_button.isEnabled())
-        self.assertFalse(window.import_windows_result_button.isEnabled())
+        self.assertTrue(window.export_windows_request_button.isEnabled())
+        self.assertTrue(window.import_windows_result_button.isEnabled())
+        self.assertTrue(window.import_uos_result_button.isEnabled())
         self.assertEqual(window.control_username_edit.text(), "admin")
         self.assertEqual(window.control_password_edit.text(), "")
         self.assertIn("断开全部", window.disconnect_all_button.text())
@@ -1320,6 +1336,30 @@ class ReleasePublisherUiTests(unittest.TestCase):
                     detected,
                 )
                 window.deleteLater()
+
+    def test_import_uos_result_is_available_on_windows(self):
+        selected = str(REPO_ROOT / "uos-build-result.zip")
+        with patch(
+            "release_publisher.ui.QFileDialog.getOpenFileName",
+            return_value=(selected, "ZIP 文件 (*.zip)"),
+        ):
+            window = ReleasePublisherWindow(REPO_ROOT)
+            with (
+                patch.object(
+                    window,
+                    "_validate",
+                    side_effect=lambda: window._options(),
+                ),
+                patch.object(window, "_save_settings"),
+                patch.object(window, "_run_steps") as run_steps,
+            ):
+                window._import_uos_result()
+
+        step = run_steps.call_args.args[0][0]
+        self.assertEqual(step.key, "import_uos_result")
+        self.assertIn("import-uos-result", step.arguments)
+        self.assertIn(str(Path(selected).resolve()), step.arguments)
+        window.deleteLater()
 
     def test_github_unavailable_exit_prompts_for_windows_transfer(self):
         window = ReleasePublisherWindow(REPO_ROOT)

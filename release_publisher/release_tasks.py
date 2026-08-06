@@ -33,6 +33,7 @@ GITHUB_REPOSITORY_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 GIT_REMOTE_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9._-]+$")
 REQUEST_FILE = "windows-build-request.json"
 RESULT_FILE = "windows-build-result.json"
+UOS_RESULT_FILE = "uos-build-result.json"
 WINDOWS_WORKFLOW_NAME = "Windows release build"
 WINDOWS_TAG_PREFIX = "intdemo-windows/v"
 GITHUB_UNAVAILABLE_EXIT = 20
@@ -594,6 +595,7 @@ def build_windows_result(
     run_tests: bool,
     github_run_id: str = "",
     github_run_url: str = "",
+    tests_prevalidated: bool = False,
 ) -> Path:
     machine = platform.machine().casefold()
     if (
@@ -676,10 +678,21 @@ def build_windows_result(
             powershell_arguments(build_script, build_arguments),
             cwd=root,
         )
+        candidate_snapshot = (
+            root
+            / "dist"
+            / "windows-build-candidates"
+            / f"{request['version']}.json"
+        )
         run_command(
             powershell_arguments(
                 root / "scripts" / "save-release-snapshot.ps1",
-                ["-Version", request["version"]],
+                [
+                    "-Version",
+                    request["version"],
+                    "-OutputPath",
+                    str(candidate_snapshot),
+                ],
             ),
             cwd=root,
         )
@@ -690,7 +703,7 @@ def build_windows_result(
                 root / "dist" / "installer" / f"IntDemoOnline-Setup-{version}.exe"
             ),
             "windows_snapshot": (
-                root / "dist" / "release-snapshots" / f"{version}.json"
+                candidate_snapshot
             ),
         }
         if request["delta_from_version"]:
@@ -749,7 +762,7 @@ def build_windows_result(
             "channel": request["channel"],
             "delta_from_version": request["delta_from_version"],
             "build_portable": request["build_portable"],
-            "tests_passed": bool(run_tests),
+            "tests_passed": bool(run_tests or tests_prevalidated),
             "built_at": utc_now(),
             "builder": {
                 "kind": "github-actions" if github_run_id else "windows-manual",
@@ -767,6 +780,56 @@ def build_windows_result(
     print(f"Windows 构建结果包：{output}", flush=True)
     print(f"SHA-256：{sha256(output)}", flush=True)
     return output
+
+
+def build_local_windows_result(
+    root: Path,
+    *,
+    version: str,
+    base_url: str,
+    channel: str,
+    ca_bundle: str,
+    delta_from_version: str,
+    build_portable: bool,
+    github_remote: str,
+    inno_compiler: str,
+    tests_prevalidated: bool,
+) -> Path:
+    request_archive = create_windows_request(
+        root,
+        version=version,
+        base_url=base_url,
+        channel=channel,
+        ca_bundle=ca_bundle,
+        delta_from_version=delta_from_version,
+        build_portable=build_portable,
+        github_remote=github_remote,
+    )
+    result_archive = (
+        root
+        / "dist"
+        / "windows-build-results"
+        / version
+        / f"windows-build-result-{request_archive.parent.name}.zip"
+    )
+    build_windows_result(
+        root,
+        request_archive=request_archive,
+        output=result_archive,
+        inno_compiler=inno_compiler,
+        run_tests=not tests_prevalidated,
+        tests_prevalidated=tests_prevalidated,
+    )
+    return import_windows_result(
+        root,
+        result_archive=result_archive,
+        version=version,
+        base_url=base_url,
+        channel=channel,
+        ca_bundle=ca_bundle,
+        delta_from_version=delta_from_version,
+        build_portable=build_portable,
+    )
 
 
 def expected_ca_hash(request: dict[str, Any]) -> str:
@@ -1192,8 +1255,9 @@ def record_uos_result(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    allow_detached: bool = False,
 ) -> Path:
-    _branch, commit = source_state(root)
+    _branch, commit = source_state(root, allow_detached=allow_detached)
     normalized_url = normalize_base_url(base_url)
     if channel not in {"test", "stable"}:
         raise ReleaseTaskError("UOS 构建通道无效")
@@ -1244,6 +1308,209 @@ def record_uos_result(
     )
     write_json(receipt_path, receipt)
     print(f"UOS DEB 构建结果已校验：{receipt_path}", flush=True)
+    return receipt_path
+
+
+def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict) or int(payload.get("schema_version") or 0) != 1:
+        raise ReleaseTaskError("UOS 构建结果版本不受支持")
+    platform_key = str(payload.get("platform") or "")
+    version = str(payload.get("version") or "")
+    source_commit = str(payload.get("source_commit") or "").casefold()
+    base_url = normalize_base_url(str(payload.get("base_url") or ""))
+    channel = str(payload.get("channel") or "")
+    ca_hash = str(payload.get("ca_sha256") or "").casefold()
+    artifacts = payload.get("artifacts")
+    if platform_key != "linux-aarch64":
+        raise ReleaseTaskError("UOS 构建结果平台必须是 linux-aarch64")
+    version_key(version)
+    if not COMMIT_PATTERN.fullmatch(source_commit):
+        raise ReleaseTaskError("UOS 构建结果缺少完整源提交")
+    if channel not in {"test", "stable"}:
+        raise ReleaseTaskError("UOS 构建结果通道无效")
+    if ca_hash and not re.fullmatch(r"[0-9a-f]{64}", ca_hash):
+        raise ReleaseTaskError("UOS 构建结果 CA 指纹无效")
+    if payload.get("payload_validated") is not True:
+        raise ReleaseTaskError("UOS 构建结果未声明已完成安装内容校验")
+    if not isinstance(artifacts, dict):
+        raise ReleaseTaskError("UOS 构建结果缺少 artifacts")
+    builder = payload.get("builder")
+    if not isinstance(builder, dict):
+        raise ReleaseTaskError("UOS 构建结果缺少构建机信息")
+    return {
+        **payload,
+        "platform": platform_key,
+        "version": version,
+        "source_commit": source_commit,
+        "base_url": base_url,
+        "channel": channel,
+        "ca_sha256": ca_hash,
+        "artifacts": artifacts,
+        "builder": builder,
+    }
+
+
+def uos_result_archive_path(root: Path, version: str, commit: str) -> Path:
+    return (
+        root
+        / "dist"
+        / "uos-build-results"
+        / version
+        / f"uos-build-result-{version}-{commit[:12]}.zip"
+    )
+
+
+def export_uos_result(
+    root: Path,
+    *,
+    version: str,
+    base_url: str,
+    channel: str,
+    ca_bundle: str,
+    output: Path | None = None,
+    allow_detached: bool = False,
+) -> Path:
+    validated_receipt_path = record_uos_result(
+        root,
+        version=version,
+        base_url=base_url,
+        channel=channel,
+        ca_bundle=ca_bundle,
+        allow_detached=allow_detached,
+    )
+    receipt = load_json_object(validated_receipt_path, "UOS 构建收据")
+    descriptor = receipt.get("artifacts", {}).get("uos_installer")
+    artifact = receipt_path(
+        root,
+        descriptor,
+        "UOS/uos_installer",
+    )
+    result_archive = (
+        output.expanduser().resolve()
+        if output is not None
+        else uos_result_archive_path(root, version, str(receipt["source_commit"]))
+    )
+    with tempfile.TemporaryDirectory(prefix="intdemo-uos-result-") as temporary:
+        staging = Path(temporary)
+        target = staging / "artifacts" / f"IntDemo-UOS-arm64-{version}.deb"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(artifact, target)
+        result = validate_uos_result_payload(
+            {
+                "schema_version": 1,
+                "platform": "linux-aarch64",
+                "version": version,
+                "source_commit": receipt["source_commit"],
+                "base_url": receipt["base_url"],
+                "channel": receipt["channel"],
+                "ca_sha256": receipt["ca_sha256"],
+                "payload_validated": True,
+                "built_at": receipt.get("validated_at") or utc_now(),
+                "builder": {
+                    "kind": "uos-native",
+                    "os": platform.platform(),
+                    "machine": platform.machine(),
+                    "python": platform.python_version(),
+                },
+                "artifacts": {
+                    "uos_installer": artifact_descriptor(
+                        target,
+                        f"artifacts/{target.name}",
+                    )
+                },
+            }
+        )
+        write_json(staging / UOS_RESULT_FILE, result)
+        make_zip(staging, result_archive)
+    write_bytes_atomic(
+        result_archive.with_suffix(result_archive.suffix + ".sha256"),
+        f"{sha256(result_archive)}  {result_archive.name}\n".encode("ascii"),
+    )
+    print(f"UOS 构建结果包：{result_archive}", flush=True)
+    print(f"SHA-256：{sha256(result_archive)}", flush=True)
+    return result_archive
+
+
+def import_uos_result(
+    root: Path,
+    *,
+    result_archive: Path,
+    version: str,
+    base_url: str,
+    channel: str,
+    ca_bundle: str,
+) -> Path:
+    _branch, commit = source_state(root)
+    result_archive = result_archive.expanduser().resolve()
+    if not result_archive.is_file():
+        raise ReleaseTaskError(f"UOS 构建结果包不存在：{result_archive}")
+    if current_version(root) != version:
+        raise ReleaseTaskError("当前项目版本与待导入 UOS 结果不一致")
+    with tempfile.TemporaryDirectory(prefix="intdemo-uos-import-") as temporary:
+        extracted = Path(temporary)
+        extract_zip_safely(result_archive, extracted)
+        result = validate_uos_result_payload(
+            load_json_object(extracted / UOS_RESULT_FILE, "UOS 构建结果元数据")
+        )
+        expected = {
+            "version": version,
+            "source_commit": commit,
+            "base_url": normalize_base_url(base_url),
+            "channel": channel,
+            "ca_sha256": ca_fingerprint(ca_bundle),
+        }
+        for key, value in expected.items():
+            if result.get(key) != value:
+                raise ReleaseTaskError(
+                    f"UOS 构建结果 {key} 与当前配置不一致："
+                    f"{result.get(key)!r} != {value!r}"
+                )
+        if set(result["artifacts"]) != {"uos_installer"}:
+            raise ReleaseTaskError("UOS 构建结果的产物集合不完整")
+        source = verify_file(
+            extracted,
+            result["artifacts"]["uos_installer"],
+            "UOS 安装包",
+        )
+        expected_name = f"IntDemo-UOS-arm64-{version}.deb"
+        if source.name != expected_name:
+            raise ReleaseTaskError(f"UOS 构建结果文件名不符合约定：{source.name}")
+        target = root / "dist" / "uos-arm64" / expected_name
+        copy_atomic(source, target)
+        if shutil.which("dpkg-deb") is not None:
+            validate_uos_deb_payload(
+                root,
+                target,
+                version=version,
+                commit=commit,
+                base_url=expected["base_url"],
+                channel=channel,
+                ca_hash=expected["ca_sha256"],
+            )
+        write_bytes_atomic(
+            target.with_suffix(target.suffix + ".sha256"),
+            f"{sha256(target)}  {target.name}\n".encode("ascii"),
+        )
+        receipt = {
+            "schema_version": 1,
+            "platform": "linux-aarch64",
+            "version": version,
+            "source_commit": commit,
+            "base_url": expected["base_url"],
+            "channel": channel,
+            "ca_sha256": expected["ca_sha256"],
+            "result_archive_sha256": sha256(result_archive),
+            "validated_at": utc_now(),
+            "builder": result["builder"],
+            "artifacts": {
+                "uos_installer": receipt_artifact(root, target),
+            },
+        }
+        receipt_path = (
+            root / "dist" / "uos-build-results" / version / "validated-result.json"
+        )
+        write_json(receipt_path, receipt)
+    print(f"UOS 构建结果已导入并校验：{receipt_path}", flush=True)
     return receipt_path
 
 
@@ -1706,7 +1973,7 @@ def publish_release(
     if not notes:
         raise ReleaseTaskError("更新说明不能为空")
     if not remote_host:
-        raise ReleaseTaskError("统信正式发布必须填写更新服务器 SSH 主机")
+        raise ReleaseTaskError("双端正式发布必须填写更新服务器 SSH 主机")
     if not REMOTE_HOST_PATTERN.fullmatch(remote_host):
         raise ReleaseTaskError("更新服务器 SSH 主机格式无效")
     normalized_remote_path = safe_remote_path(remote_path)
@@ -2188,7 +2455,7 @@ def add_common_build_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="IntDemo 统信主控双端构建任务、校验和发布工具"
+        description="IntDemo 双端构建结果、校验和发布工具"
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -2211,6 +2478,12 @@ def build_parser() -> argparse.ArgumentParser:
     windows_build.add_argument("--github-run-id", default="")
     windows_build.add_argument("--github-run-url", default="")
 
+    windows_local = commands.add_parser("windows-local")
+    add_common_build_arguments(windows_local)
+    windows_local.add_argument("--github-remote", default="origin")
+    windows_local.add_argument("--inno-compiler", default="")
+    windows_local.add_argument("--tests-prevalidated", action="store_true")
+
     import_result = commands.add_parser("import-windows-result")
     add_common_build_arguments(import_result)
     import_result.add_argument("--result-archive", required=True)
@@ -2220,6 +2493,21 @@ def build_parser() -> argparse.ArgumentParser:
     record_uos.add_argument("--base-url", required=True)
     record_uos.add_argument("--channel", choices=("test", "stable"), default="test")
     record_uos.add_argument("--ca-bundle", default="")
+
+    export_uos = commands.add_parser("export-uos-result")
+    export_uos.add_argument("--version", required=True)
+    export_uos.add_argument("--base-url", required=True)
+    export_uos.add_argument("--channel", choices=("test", "stable"), default="test")
+    export_uos.add_argument("--ca-bundle", default="")
+    export_uos.add_argument("--output", default="")
+    export_uos.add_argument("--allow-detached", action="store_true")
+
+    import_uos = commands.add_parser("import-uos-result")
+    import_uos.add_argument("--version", required=True)
+    import_uos.add_argument("--base-url", required=True)
+    import_uos.add_argument("--channel", choices=("test", "stable"), default="test")
+    import_uos.add_argument("--ca-bundle", default="")
+    import_uos.add_argument("--result-archive", required=True)
 
     publish = commands.add_parser("publish")
     add_common_build_arguments(publish)
@@ -2277,6 +2565,19 @@ def main(argv: list[str] | None = None) -> int:
                 github_run_id=args.github_run_id,
                 github_run_url=args.github_run_url,
             )
+        elif args.command == "windows-local":
+            build_local_windows_result(
+                root,
+                version=args.version,
+                base_url=args.base_url,
+                channel=args.channel,
+                ca_bundle=args.ca_bundle,
+                delta_from_version=args.delta_from_version,
+                build_portable=args.build_portable,
+                github_remote=args.github_remote,
+                inno_compiler=args.inno_compiler,
+                tests_prevalidated=args.tests_prevalidated,
+            )
         elif args.command == "import-windows-result":
             import_windows_result(
                 root,
@@ -2291,6 +2592,25 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "record-uos-result":
             record_uos_result(
                 root,
+                version=args.version,
+                base_url=args.base_url,
+                channel=args.channel,
+                ca_bundle=args.ca_bundle,
+            )
+        elif args.command == "export-uos-result":
+            export_uos_result(
+                root,
+                version=args.version,
+                base_url=args.base_url,
+                channel=args.channel,
+                ca_bundle=args.ca_bundle,
+                output=Path(args.output) if args.output else None,
+                allow_detached=args.allow_detached,
+            )
+        elif args.command == "import-uos-result":
+            import_uos_result(
+                root,
+                result_archive=Path(args.result_archive),
                 version=args.version,
                 base_url=args.base_url,
                 channel=args.channel,

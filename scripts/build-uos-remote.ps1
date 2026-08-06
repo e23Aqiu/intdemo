@@ -77,6 +77,11 @@ $quotedRepo = Quote-Posix $BuilderRepoPath
 $quotedCommit = Quote-Posix $sourceCommit
 $quotedBaseUrl = Quote-Posix $BaseUrl.TrimEnd("/")
 $quotedChannel = Quote-Posix $Channel
+$remoteResultArchive = (
+    "$BuilderRepoPath/dist/uos-build-results/$Version/" +
+    "uos-build-result-$Version.zip"
+)
+$quotedResultArchive = Quote-Posix $remoteResultArchive
 $remoteCaArgument = " --no-ca-bundle"
 if ($CaBundle) {
     $resolvedCaBundle = (Resolve-Path -LiteralPath $CaBundle).Path
@@ -105,7 +110,12 @@ $remoteCommand = (
     " && test `"`$(git rev-parse HEAD)`" = $quotedCommit" +
     " && bash scripts/uos-arm64/build.sh" +
     " --base-url $quotedBaseUrl --channel $quotedChannel" +
-    $remoteCaArgument
+    $remoteCaArgument +
+    " && ./.conda-uos-arm64/bin/python -m release_publisher.release_tasks" +
+    " export-uos-result --version " + (Quote-Posix $Version) +
+    " --base-url $quotedBaseUrl --channel $quotedChannel" +
+    $remoteCaArgument +
+    " --output $quotedResultArchive --allow-detached"
 )
 
 Write-Host "Building UOS ARM64 package on $BuilderHost at commit $sourceCommit"
@@ -140,5 +150,30 @@ if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$' -or
     $actualHash -ne $expectedHash.ToLowerInvariant()) {
     throw "The downloaded UOS ARM64 package failed SHA-256 verification"
 }
+
+$resultRoot = Join-Path $repoRoot "dist\uos-build-results\$Version"
+New-Item -ItemType Directory -Force -Path $resultRoot | Out-Null
+$resultArchive = Join-Path $resultRoot "uos-build-result-$Version.zip"
+$resultChecksum = "$resultArchive.sha256"
+& scp @scpArgs "${BuilderHost}:$remoteResultArchive" $resultArchive
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not download the UOS build result archive"
+}
+& scp @scpArgs "${BuilderHost}:$remoteResultArchive.sha256" $resultChecksum
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not download the UOS build result checksum"
+}
+$expectedResultHash = (
+    (Get-Content -LiteralPath $resultChecksum -Raw).Trim() -split '\s+'
+)[0]
+$actualResultHash = (
+    Get-FileHash -LiteralPath $resultArchive -Algorithm SHA256
+).Hash.ToLowerInvariant()
+if ($expectedResultHash -notmatch '^[0-9a-fA-F]{64}$' -or
+    $actualResultHash -ne $expectedResultHash.ToLowerInvariant()) {
+    throw "The downloaded UOS build result archive failed SHA-256 verification"
+}
 Write-Host "UOS ARM64 package downloaded: $artifact"
 Write-Host "SHA-256: $actualHash"
+Write-Host "UOS build result downloaded: $resultArchive"
+Write-Host "SHA-256: $actualResultHash"

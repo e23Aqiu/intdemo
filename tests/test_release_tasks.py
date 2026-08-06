@@ -115,6 +115,49 @@ def create_result_archive(
     return archive
 
 
+def create_uos_result_archive(
+    root: Path,
+    *,
+    version: str = "1.2.3",
+    commit: str = COMMIT,
+    base_url: str = "https://api.example.com",
+    channel: str = "test",
+    ca_hash: str = "",
+    tamper_installer: bool = False,
+) -> Path:
+    staging = root / "uos-result-source"
+    artifacts_root = staging / "artifacts"
+    artifacts_root.mkdir(parents=True)
+    installer = artifacts_root / f"IntDemo-UOS-arm64-{version}.deb"
+    installer.write_bytes(b"uos arm64 installer")
+    result = tasks.validate_uos_result_payload(
+        {
+            "schema_version": 1,
+            "platform": "linux-aarch64",
+            "version": version,
+            "source_commit": commit,
+            "base_url": base_url,
+            "channel": channel,
+            "ca_sha256": ca_hash,
+            "payload_validated": True,
+            "built_at": "2026-08-05T00:01:00Z",
+            "builder": {"kind": "uos-native", "machine": "aarch64"},
+            "artifacts": {
+                "uos_installer": tasks.artifact_descriptor(
+                    installer,
+                    f"artifacts/{installer.name}",
+                )
+            },
+        }
+    )
+    tasks.write_json(staging / tasks.UOS_RESULT_FILE, result)
+    if tamper_installer:
+        installer.write_bytes(b"changed after hashing")
+    archive = root / "uos-build-result.zip"
+    tasks.make_zip(staging, archive)
+    return archive
+
+
 class ReleaseTasksTests(unittest.TestCase):
     def test_windows_builder_accepts_exact_detached_commit(self):
         with patch.object(
@@ -421,6 +464,116 @@ class ReleaseTasksTests(unittest.TestCase):
                     channel="stable",
                     ca_bundle=str(source_ca),
                 )
+
+    def test_uos_result_archive_can_be_imported_on_either_platform(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = create_uos_result_archive(root)
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                patch.object(tasks.shutil, "which", return_value=None),
+            ):
+                receipt_path = tasks.import_uos_result(
+                    root,
+                    result_archive=archive,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                )
+
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            installer = root / receipt["artifacts"]["uos_installer"]["path"]
+            self.assertEqual(receipt["platform"], "linux-aarch64")
+            self.assertEqual(tasks.sha256(installer), receipt["artifacts"]["uos_installer"]["sha256"])
+            self.assertTrue(installer.with_suffix(".deb.sha256").is_file())
+
+    def test_uos_result_import_rejects_tampering_and_config_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            tampered = create_uos_result_archive(root, tamper_installer=True)
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                self.assertRaisesRegex(tasks.ReleaseTaskError, "大小|SHA-256"),
+            ):
+                tasks.import_uos_result(
+                    root,
+                    result_archive=tampered,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                )
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = create_uos_result_archive(root)
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+                self.assertRaisesRegex(tasks.ReleaseTaskError, "base_url"),
+            ):
+                tasks.import_uos_result(
+                    root,
+                    result_archive=archive,
+                    version="1.2.3",
+                    base_url="https://other.example.com",
+                    channel="test",
+                    ca_bundle="",
+                )
+
+    def test_uos_result_export_contains_validated_deb_and_checksum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = root / "dist" / "uos-arm64" / "IntDemo-UOS-arm64-1.2.3.deb"
+            installer.parent.mkdir(parents=True)
+            installer.write_bytes(b"validated uos installer")
+            receipt_path = root / "dist" / "uos-build-results" / "1.2.3" / "validated-result.json"
+            tasks.write_json(
+                receipt_path,
+                {
+                    "schema_version": 1,
+                    "platform": "linux-aarch64",
+                    "version": "1.2.3",
+                    "source_commit": COMMIT,
+                    "base_url": "https://api.example.com",
+                    "channel": "test",
+                    "ca_sha256": "",
+                    "validated_at": "2026-08-05T00:01:00Z",
+                    "artifacts": {
+                        "uos_installer": tasks.receipt_artifact(root, installer),
+                    },
+                },
+            )
+            output = root / "uos-result.zip"
+            with patch.object(tasks, "record_uos_result", return_value=receipt_path):
+                archive = tasks.export_uos_result(
+                    root,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                    output=output,
+                )
+
+            self.assertEqual(archive, output.resolve())
+            self.assertTrue(output.with_suffix(".zip.sha256").is_file())
+            with tempfile.TemporaryDirectory() as extracted_directory:
+                extracted = Path(extracted_directory)
+                tasks.extract_zip_safely(output, extracted)
+                result = tasks.validate_uos_result_payload(
+                    json.loads(
+                        (extracted / tasks.UOS_RESULT_FILE).read_text(encoding="utf-8")
+                    )
+                )
+                packaged = tasks.verify_file(
+                    extracted,
+                    result["artifacts"]["uos_installer"],
+                    "UOS 安装包",
+                )
+            self.assertEqual(packaged.name, "IntDemo-UOS-arm64-1.2.3.deb")
 
     def test_dual_manifest_keeps_legacy_windows_fields(self):
         windows = {"name": "setup.exe", "size": 10, "sha256": "1" * 64}

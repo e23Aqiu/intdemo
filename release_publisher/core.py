@@ -1266,18 +1266,17 @@ def validate_release_options(
             errors.append(f"增量安装包不存在：{options.delta_installer}")
         if options.build_uos and not options.uos_installer.is_file():
             errors.append(f"UOS ARM64 安装包不存在：{options.uos_installer}")
-        if is_native_uos_arm64_builder():
-            if not options.windows_result_receipt.is_file():
-                errors.append(
-                    f"缺少已校验的 Windows 构建收据：{options.windows_result_receipt}"
-                )
-            if not options.uos_result_receipt.is_file():
-                errors.append(
-                    f"缺少已校验的 UOS 构建收据：{options.uos_result_receipt}"
-                )
-            if not options.remote_host:
-                errors.append("统信正式发布必须填写更新服务器 SSH 主机")
+        if not options.windows_result_receipt.is_file():
+            errors.append(
+                f"缺少已校验的 Windows 构建收据：{options.windows_result_receipt}"
+            )
+        if not options.uos_result_receipt.is_file():
+            errors.append(
+                f"缺少已校验的 UOS 构建收据：{options.uos_result_receipt}"
+            )
     if for_publish or for_pipeline:
+        if not options.remote_host:
+            errors.append("双端正式发布必须填写更新服务器 SSH 主机")
         if options.snapshot_path.exists():
             errors.append(
                 f"版本 {options.version} 已存在发布快照；已发布版本不可覆盖"
@@ -1454,7 +1453,11 @@ def build_test_steps(options: ReleaseOptions) -> list[CommandStep]:
     ]
 
 
-def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
+def build_package_steps(
+    options: ReleaseOptions,
+    *,
+    tests_already_run: bool = False,
+) -> list[CommandStep]:
     windows_steps: list[CommandStep] = []
     uos_steps: list[CommandStep] = []
     if options.build_windows:
@@ -1503,35 +1506,38 @@ def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
                 )
         else:
             arguments = [
-                "-BaseUrl",
-                options.base_url,
-                "-Channel",
-                options.channel,
-                "-Version",
+                "--version",
                 options.version,
+                "--base-url",
+                options.base_url,
+                "--channel",
+                options.channel,
+                "--github-remote",
+                options.github_remote,
             ]
             if options.ca_bundle:
-                arguments.extend(["-CaBundle", options.ca_bundle])
+                arguments.extend(["--ca-bundle", options.ca_bundle])
             if options.delta_from_version:
-                arguments.extend(["-DeltaFromVersion", options.delta_from_version])
+                arguments.extend(
+                    ["--delta-from-version", options.delta_from_version]
+                )
+            if options.build_portable:
+                arguments.append("--build-portable")
             if options.inno_compiler:
-                arguments.extend(["-InnoCompiler", options.inno_compiler])
-            script_name = (
-                "build-releases.ps1"
-                if options.build_portable
-                else "build-installer.ps1"
-            )
+                arguments.extend(["--inno-compiler", options.inno_compiler])
+            if tests_already_run:
+                arguments.append("--tests-prevalidated")
             windows_steps.append(
-                _powershell_step(
+                _release_task_step(
                     options,
                     key="build_windows_packages",
                     title=(
-                        "构建 Windows 便携包、完整安装包和增量包"
+                        "构建 Windows 安装包、便携包和标准结果 ZIP"
                         if options.build_portable
-                        else "构建 Windows 完整安装包和增量包"
+                        else "构建 Windows 安装包和标准结果 ZIP"
                     ),
-                    script_name=script_name,
-                    script_arguments=arguments,
+                    command="windows-local",
+                    arguments=arguments,
                 )
             )
     if options.build_uos:
@@ -1569,9 +1575,9 @@ def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
             uos_steps.append(
                 _release_task_step(
                     options,
-                    key="record_uos_result",
-                    title="校验 UOS DEB 并生成构建收据",
-                    command="record-uos-result",
+                    key="export_uos_result",
+                    title="校验 UOS DEB 并生成标准结果 ZIP",
+                    command="export-uos-result",
                     arguments=record_arguments,
                 )
             )
@@ -1599,6 +1605,18 @@ def build_package_steps(options: ReleaseOptions) -> list[CommandStep]:
                     title=f"在 {options.uos_builder_host} 构建 UOS ARM64 DEB",
                     script_name="build-uos-remote.ps1",
                     script_arguments=remote_arguments,
+                )
+            )
+            uos_steps.extend(
+                build_uos_result_import_steps(
+                    options,
+                    (
+                        options.repo_root
+                        / "dist"
+                        / "uos-build-results"
+                        / options.version
+                        / f"uos-build-result-{options.version}.zip"
+                    ),
                 )
             )
     if is_native_uos_arm64_builder():
@@ -1654,100 +1672,75 @@ def build_windows_result_import_steps(
         _release_task_step(
             options,
             key="import_windows_result",
-            title="导入并校验 Windows 真机构建结果",
+            title="导入并校验 Windows 构建结果",
             command="import-windows-result",
             arguments=arguments,
         )
     ]
 
 
-def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
-    if is_native_uos_arm64_builder():
-        arguments = [
-            "--version",
-            options.version,
-            "--base-url",
-            options.base_url,
-            "--channel",
-            options.channel,
-            "--notes",
-            options.notes.strip(),
-            "--remote-host",
-            options.remote_host,
-            "--remote-path",
-            options.remote_path,
-            "--confirm-version",
-            options.version,
-        ]
-        if options.ca_bundle:
-            arguments.extend(["--ca-bundle", options.ca_bundle])
-        if options.delta_from_version:
-            arguments.extend(
-                ["--delta-from-version", options.delta_from_version]
-            )
-        if options.build_portable:
-            arguments.append("--build-portable")
-        if options.mandatory:
-            arguments.append("--mandatory")
-        if options.identity_file:
-            arguments.extend(["--identity-file", options.identity_file])
-        return [
-            _release_task_step(
-                options,
-                key="publish",
-                title=f"从统信发布双端版本 {options.version}",
-                command="publish",
-                arguments=arguments,
-            )
-        ]
+def build_uos_result_import_steps(
+    options: ReleaseOptions,
+    result_archive: str | Path,
+) -> list[CommandStep]:
     arguments = [
-        "-WindowsInstaller",
-        str(options.full_installer),
-        "-UosInstaller",
-        str(options.uos_installer),
-        "-Version",
+        "--version",
         options.version,
-        "-Notes",
-        options.notes.strip(),
-        "-Channel",
+        "--base-url",
+        options.base_url,
+        "--channel",
         options.channel,
-        "-RemotePath",
-        options.remote_path,
+        "--result-archive",
+        str(Path(result_archive).expanduser().resolve()),
     ]
-    if options.mandatory:
-        arguments.append("-Mandatory")
-    if options.delta_installer is not None:
-        arguments.extend(
-            [
-                "-DeltaInstaller",
-                str(options.delta_installer),
-                "-DeltaFromVersion",
-                options.delta_from_version,
-            ]
-        )
-    if options.remote_host:
-        arguments.extend(["-RemoteHost", options.remote_host])
-    if options.identity_file:
-        arguments.extend(["-IdentityFile", options.identity_file])
+    if options.ca_bundle:
+        arguments.extend(["--ca-bundle", options.ca_bundle])
     return [
-        _powershell_step(
+        _release_task_step(
+            options,
+            key="import_uos_result",
+            title="导入并校验 UOS 构建结果",
+            command="import-uos-result",
+            arguments=arguments,
+        )
+    ]
+
+
+def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
+    arguments = [
+        "--version",
+        options.version,
+        "--base-url",
+        options.base_url,
+        "--channel",
+        options.channel,
+        "--notes",
+        options.notes.strip(),
+        "--remote-host",
+        options.remote_host,
+        "--remote-path",
+        options.remote_path,
+        "--confirm-version",
+        options.version,
+    ]
+    if options.ca_bundle:
+        arguments.extend(["--ca-bundle", options.ca_bundle])
+    if options.delta_from_version:
+        arguments.extend(["--delta-from-version", options.delta_from_version])
+    if options.build_portable:
+        arguments.append("--build-portable")
+    if options.mandatory:
+        arguments.append("--mandatory")
+    if options.identity_file:
+        arguments.extend(["--identity-file", options.identity_file])
+    return [
+        _release_task_step(
             options,
             key="publish",
-            title=(
-                f"发布 {options.version} 到 {options.remote_host}"
-                if options.remote_host
-                else f"生成 {options.version} 本地发布目录"
-            ),
-            script_name="publish-update.ps1",
-            script_arguments=arguments,
-        ),
-        _powershell_step(
-            options,
-            key="snapshot",
-            title=f"保存 {options.version} 发布快照",
-            script_name="save-release-snapshot.ps1",
-            script_arguments=["-Version", options.version],
-        ),
+            title=f"发布双端版本 {options.version} 到 {options.remote_host}",
+            command="publish",
+            arguments=arguments,
+        )
     ]
 
 
@@ -1762,7 +1755,9 @@ def build_release_plan(
     if include_tests:
         steps.extend(build_test_steps(options))
     if include_build:
-        steps.extend(build_package_steps(options))
+        steps.extend(
+            build_package_steps(options, tests_already_run=include_tests)
+        )
     if include_publish:
         steps.extend(build_publish_steps(options))
     return steps

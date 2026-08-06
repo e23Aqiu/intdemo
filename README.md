@@ -321,15 +321,18 @@ Windows 当前版本精确匹配差异包来源版本时才返回增量包，其
 bash scripts/uos-arm64/run-release-publisher.sh
 ```
 
-发布器可单选或全选构建 Windows EXE 与 UOS DEB。DEB 在 UOS 本机生成；EXE 优先
-交给 GitHub Actions，GitHub 不可用时会保留可验证任务 ZIP，供个人或站点 Windows
-x64 真机完成后再导回 UOS。Windows 构建只把服务地址和公开 CA 写入安装包，不访问
-IntDemo 程序服务器，因此 Windows 所在网络即使无法进入公司 `121.x` 网段也能构建。
-UOS 打包与 SSH 发布本身不需要 Docker。
+发布器可单选或全选构建 Windows EXE 与 UOS DEB。每次原生构建会同时生成可直接
+安装的 EXE/DEB 和可由另一台打包器导入的标准结果 ZIP。DEB 必须在 UOS ARM64
+真机生成；EXE 可在 Windows 本机生成，也可交给 GitHub Actions。GitHub 不可用时
+会保留可验证任务 ZIP，供个人或站点 Windows x64 真机完成。Windows 构建只把服务
+地址和公开 CA 写入安装包，不访问 IntDemo 程序服务器，因此 Windows 所在网络即使
+无法进入公司 `121.x` 网段也能构建。UOS 打包与 SSH 发布本身不需要 Docker。
 
-Windows 开发机仍可双击 `run-release-publisher.bat` 使用原有主控方式。两种主控都
-支持版本字段同步、环境检查、双端发布确认、SSH 上传、发布快照归档、客户端断连
-测试和暂停远程更新通道；构建与发布权限不会进入业务客户端。
+Windows 开发机可双击 `run-release-publisher.bat` 作为双端主控。Windows 和 UOS
+都能点击“导入 Windows 构建包”或“导入统信构建包”，取得同版本、同提交和同在线
+配置的两端校验收据后执行完全相同的双端发布。两种主控都支持版本字段同步、环境
+检查、双端发布确认、SSH 上传、发布快照归档、客户端断连测试和暂停远程更新通道；
+构建与发布权限不会进入业务客户端。
 
 发布器可填写 Gitee 仓库链接，“推送 GitHub + Gitee”会依次使用普通 `git push`
 同步 `origin`（GitHub）和 `gitee` 两个远程，不会强制推送；版本区还会提醒 EXE、
