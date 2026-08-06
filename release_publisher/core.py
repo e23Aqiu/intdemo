@@ -1301,8 +1301,8 @@ def validate_release_options(
         if options.remote_host:
             if not REMOTE_HOST_PATTERN.fullmatch(options.remote_host):
                 errors.append("远程主机格式无效")
-            if shutil.which("ssh") is None or shutil.which("scp") is None:
-                errors.append("远程发布需要系统提供 ssh 和 scp")
+            if shutil.which("ssh") is None or shutil.which("sftp") is None:
+                errors.append("远程发布需要系统提供 ssh 和 sftp")
             try:
                 changes = git_status(root)
             except PublisherError as exc:

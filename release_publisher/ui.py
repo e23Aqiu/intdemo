@@ -437,6 +437,9 @@ class ReleasePublisherWindow(QMainWindow):
         )
         actions.addWidget(self.pause_distribution_button, 2, 1)
         self.publish_button = QPushButton("发布双端更新")
+        self.publish_button.setToolTip(
+            "大文件使用 SFTP 断点续传；网络中断会自动重试，重新发布也可继续断点"
+        )
         self.publish_button.clicked.connect(self._run_publish)
         actions.addWidget(self.publish_button, 2, 2)
         self.pipeline_button = QPushButton("测试 → 双端构建 → 双端发布")
@@ -1044,7 +1047,8 @@ class ReleasePublisherWindow(QMainWindow):
             f"通道：{options.channel}\n"
             f"包类型：{package}\n"
             f"强制更新：{warning}\n\n"
-            "发布清单会在安装包上传完成后原子替换。确定继续吗？",
+            "大文件会使用 SFTP 断点续传，网络中断时自动重试；重新点击发布也会"
+            "继续已有断点。发布清单会在安装包校验完成后原子替换。确定继续吗？",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Cancel,
         )
@@ -1426,7 +1430,8 @@ class ReleasePublisherWindow(QMainWindow):
             self,
             "停止当前操作",
             "确定停止当前步骤及后续流程吗？\n"
-            "已经上传或生成的文件不会被自动删除。",
+            "已经上传或生成的文件不会被自动删除；远程上传断点会保留，"
+            "下次发布可继续。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )

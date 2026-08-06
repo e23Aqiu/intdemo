@@ -37,6 +37,16 @@ UOS_RESULT_FILE = "uos-build-result.json"
 WINDOWS_WORKFLOW_NAME = "Windows release build"
 WINDOWS_TAG_PREFIX = "intdemo-windows/v"
 GITHUB_UNAVAILABLE_EXIT = 20
+SSH_CONNECTION_OPTIONS = (
+    "BatchMode=yes",
+    "ConnectTimeout=20",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=20",
+    "TCPKeepAlive=yes",
+)
+SFTP_UPLOAD_ATTEMPTS = 6
+SFTP_PROGRESS_INTERVAL_SECONDS = 10.0
+SFTP_RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 30)
 
 
 class ReleaseTaskError(RuntimeError):
@@ -1709,7 +1719,12 @@ def stage_release_artifact(source: Path, target: Path) -> dict[str, Any]:
 
 
 def ssh_options(identity_file: Path | None) -> list[str]:
-    return [] if identity_file is None else ["-i", str(identity_file)]
+    options: list[str] = []
+    for value in SSH_CONNECTION_OPTIONS:
+        options.extend(("-o", value))
+    if identity_file is not None:
+        options.extend(("-i", str(identity_file)))
+    return options
 
 
 def ssh_capture(
@@ -1737,6 +1752,345 @@ def remote_hash(
         f"if [ -f {quoted} ]; then sha256sum {quoted} | cut -d ' ' -f 1; fi",
         identity_file,
     ).strip().casefold()
+
+
+def remote_file_size(
+    root: Path,
+    host: str,
+    path: str,
+    identity_file: Path | None,
+) -> int | None:
+    quoted = shlex.quote(path)
+    value = ssh_capture(
+        root,
+        host,
+        f"if [ -f {quoted} ]; then wc -c < {quoted}; fi",
+        identity_file,
+    ).strip()
+    if not value:
+        return None
+    if not value.isdigit():
+        raise ReleaseTaskError(f"无法读取远程断点文件大小：{path}")
+    return int(value)
+
+
+def release_upload_fingerprint(
+    version: str,
+    source_commit: str,
+    artifacts: dict[str, dict[str, Any]],
+) -> str:
+    artifact_state = sorted(
+        (
+            {
+                "name": str(descriptor["name"]),
+                "size": int(descriptor["size"]),
+                "sha256": str(descriptor["sha256"]).casefold(),
+            }
+            for descriptor in artifacts.values()
+        ),
+        key=lambda item: (item["name"], item["size"], item["sha256"]),
+    )
+    state = {
+        "version": version,
+        "source_commit": source_commit.casefold(),
+        "artifacts": artifact_state,
+    }
+    encoded = json.dumps(
+        state,
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:16]
+
+
+def release_incoming_path(
+    remote_path: str,
+    version: str,
+    source_commit: str,
+    artifacts: dict[str, dict[str, Any]],
+) -> str:
+    fingerprint = release_upload_fingerprint(version, source_commit, artifacts)
+    return (
+        f"{remote_path}/.incoming/{version}-{source_commit[:12]}-"
+        f"{fingerprint}"
+    )
+
+
+def format_upload_size(value: int) -> str:
+    if value < 1024 * 1024:
+        return f"{value / 1024:.1f} KiB"
+    return f"{value / (1024 * 1024):.1f} MiB"
+
+
+def print_upload_progress(name: str, uploaded: int, total: int) -> None:
+    percentage = 100.0 if total == 0 else min(uploaded, total) / total * 100
+    print(
+        f"上传进度：{name} {format_upload_size(uploaded)} / "
+        f"{format_upload_size(total)}（{percentage:.1f}%）",
+        flush=True,
+    )
+
+
+def ensure_remote_partial(
+    root: Path,
+    host: str,
+    path: str,
+    identity_file: Path | None,
+) -> None:
+    quoted = shlex.quote(path)
+    command = (
+        f"if [ -e {quoted} ] && [ ! -f {quoted} ]; then exit 1; fi; "
+        f"if [ ! -e {quoted} ]; then : > {quoted}; fi"
+    )
+    run_command(
+        ["ssh", *ssh_options(identity_file), host, command],
+        cwd=root,
+    )
+
+
+def truncate_remote_file(
+    root: Path,
+    host: str,
+    path: str,
+    identity_file: Path | None,
+) -> None:
+    run_command(
+        [
+            "ssh",
+            *ssh_options(identity_file),
+            host,
+            f": > {shlex.quote(path)}",
+        ],
+        cwd=root,
+    )
+
+
+def sftp_argument(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def sftp_reput_once(
+    root: Path,
+    *,
+    host: str,
+    local_path: Path,
+    remote_path: str,
+    identity_file: Path | None,
+    progress_interval: float = SFTP_PROGRESS_INTERVAL_SECONDS,
+) -> None:
+    local_value = local_path.resolve().as_posix()
+    batch_line = (
+        f"reput {sftp_argument(local_value)} "
+        f"{sftp_argument(remote_path)}\n"
+    )
+    arguments: list[str]
+    with tempfile.TemporaryDirectory(prefix="intdemo-sftp-") as directory:
+        batch_path = Path(directory) / "upload.batch"
+        with batch_path.open("w", encoding="utf-8", newline="\n") as batch:
+            batch.write(batch_line)
+        arguments = [
+            "sftp",
+            *ssh_options(identity_file),
+            "-b",
+            str(batch_path),
+            host,
+        ]
+        with (
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout,
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr,
+        ):
+            try:
+                process = subprocess.Popen(
+                    arguments,
+                    cwd=str(root),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=stdout,
+                    stderr=stderr,
+                )
+            except OSError as exc:
+                raise ReleaseTaskError(f"无法启动命令 sftp：{exc}") from exc
+            try:
+                while True:
+                    try:
+                        returncode = process.wait(timeout=progress_interval)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            uploaded = remote_file_size(
+                                root,
+                                host,
+                                remote_path,
+                                identity_file,
+                            )
+                        except ReleaseTaskError:
+                            continue
+                        if uploaded is not None:
+                            print_upload_progress(
+                                local_path.name,
+                                uploaded,
+                                local_path.stat().st_size,
+                            )
+                    else:
+                        break
+            except BaseException:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise
+            stdout.seek(0)
+            stderr.seek(0)
+            stdout_text = stdout.read()
+            stderr_text = stderr.read()
+    if returncode != 0:
+        raise CommandFailure(
+            arguments,
+            returncode,
+            stdout_text,
+            stderr_text,
+        )
+
+
+def upload_file_resumable(
+    root: Path,
+    *,
+    host: str,
+    local_path: Path,
+    remote_path: str,
+    expected_sha256: str,
+    identity_file: Path | None,
+    max_attempts: int = SFTP_UPLOAD_ATTEMPTS,
+    retry_delays: tuple[int, ...] = SFTP_RETRY_DELAYS_SECONDS,
+    progress_interval: float = SFTP_PROGRESS_INTERVAL_SECONDS,
+) -> None:
+    total = local_path.stat().st_size
+    expected_hash = expected_sha256.casefold()
+    last_error: ReleaseTaskError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ensure_remote_partial(
+                root,
+                host,
+                remote_path,
+                identity_file,
+            )
+            uploaded = remote_file_size(
+                root,
+                host,
+                remote_path,
+                identity_file,
+            )
+            if uploaded is None:
+                raise ReleaseTaskError(
+                    f"远程断点文件未能创建：{local_path.name}"
+                )
+            if uploaded > total:
+                print(
+                    f"远程断点大于本地文件，将重新上传：{local_path.name}",
+                    flush=True,
+                )
+                truncate_remote_file(
+                    root,
+                    host,
+                    remote_path,
+                    identity_file,
+                )
+                uploaded = 0
+            elif uploaded == total:
+                if (
+                    remote_hash(root, host, remote_path, identity_file)
+                    == expected_hash
+                ):
+                    print(
+                        f"远程断点已完整并通过校验，直接复用：{local_path.name}",
+                        flush=True,
+                    )
+                    return
+                print(
+                    f"远程断点 SHA-256 不匹配，将重新上传：{local_path.name}",
+                    flush=True,
+                )
+                truncate_remote_file(
+                    root,
+                    host,
+                    remote_path,
+                    identity_file,
+                )
+                uploaded = 0
+
+            if uploaded:
+                print(
+                    f"从断点继续上传：{local_path.name}，已完成 "
+                    f"{format_upload_size(uploaded)} / {format_upload_size(total)}",
+                    flush=True,
+                )
+            else:
+                print(f"开始上传：{local_path.name}", flush=True)
+            sftp_reput_once(
+                root,
+                host=host,
+                local_path=local_path,
+                remote_path=remote_path,
+                identity_file=identity_file,
+                progress_interval=progress_interval,
+            )
+            uploaded = remote_file_size(
+                root,
+                host,
+                remote_path,
+                identity_file,
+            )
+            if uploaded != total:
+                raise ReleaseTaskError(
+                    f"上传后文件大小不完整：{local_path.name}"
+                )
+            if remote_hash(root, host, remote_path, identity_file) != expected_hash:
+                truncate_remote_file(
+                    root,
+                    host,
+                    remote_path,
+                    identity_file,
+                )
+                raise ReleaseTaskError(
+                    f"上传后 SHA-256 不匹配：{local_path.name}"
+                )
+            print_upload_progress(local_path.name, total, total)
+            print(f"上传完成并通过 SHA-256 校验：{local_path.name}", flush=True)
+            return
+        except ReleaseTaskError as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            try:
+                retained = remote_file_size(
+                    root,
+                    host,
+                    remote_path,
+                    identity_file,
+                )
+            except ReleaseTaskError:
+                retained = None
+            delay = retry_delays[min(attempt - 1, len(retry_delays) - 1)]
+            retained_text = (
+                f"已保留 {format_upload_size(retained)}"
+                if retained is not None
+                else "断点进度暂时无法读取"
+            )
+            print(
+                f"上传中断（第 {attempt}/{max_attempts} 次）："
+                f"{local_path.name}；{retained_text}，{delay} 秒后自动续传",
+                flush=True,
+            )
+            time.sleep(delay)
+    detail = f"；最后错误：{last_error}" if last_error is not None else ""
+    raise ReleaseTaskError(
+        f"上传多次中断：{local_path.name}。服务器上的已有断点不会删除；"
+        f"网络恢复后重新点击发布会从当前进度继续{detail}"
+    )
 
 
 def remote_manifest_guard(payload: dict[str, Any] | None, target: str) -> bool:
@@ -1828,9 +2182,11 @@ def publish_remote(
     remote_path: str,
     identity_file: Path | None,
 ) -> bool:
-    incoming = (
-        f"{remote_path}/.incoming/{version}-{source_commit[:12]}-"
-        f"{uuid.uuid4().hex[:10]}"
+    incoming = release_incoming_path(
+        remote_path,
+        version,
+        source_commit,
+        artifacts,
     )
     run_command(
         [
@@ -1876,32 +2232,26 @@ def publish_remote(
             raise ReleaseTaskError(
                 f"远程已存在同名但 SHA-256 不同的安装包，拒绝覆盖：{name}"
             )
-        temporary = f"{incoming}/{name}"
-        run_command(
-            [
-                "scp",
-                *ssh_options(identity_file),
-                str(descriptor["path"]),
-                f"{host}:{temporary}",
-            ],
-            cwd=root,
+        temporary = f"{incoming}/{name}.part"
+        upload_file_resumable(
+            root,
+            host=host,
+            local_path=Path(descriptor["path"]),
+            remote_path=temporary,
+            expected_sha256=str(descriptor["sha256"]),
+            identity_file=identity_file,
         )
-        if remote_hash(root, host, temporary, identity_file) != descriptor["sha256"]:
-            raise ReleaseTaskError(f"远程上传后 SHA-256 不匹配：{name}")
         moves.append((temporary, target))
 
-    incoming_manifest = f"{incoming}/{channel}.json"
-    run_command(
-        [
-            "scp",
-            *ssh_options(identity_file),
-            str(manifest_path),
-            f"{host}:{incoming_manifest}",
-        ],
-        cwd=root,
+    incoming_manifest = f"{incoming}/{channel}.json.part"
+    upload_file_resumable(
+        root,
+        host=host,
+        local_path=manifest_path,
+        remote_path=incoming_manifest,
+        expected_sha256=sha256(manifest_path),
+        identity_file=identity_file,
     )
-    if remote_hash(root, host, incoming_manifest, identity_file) != sha256(manifest_path):
-        raise ReleaseTaskError("远程更新清单上传后 SHA-256 不匹配")
     guard = (
         f"echo {shlex.quote(current_hash + '  ' + final_manifest)} | "
         "sha256sum -c - >/dev/null"
@@ -1977,8 +2327,8 @@ def publish_release(
     if not REMOTE_HOST_PATTERN.fullmatch(remote_host):
         raise ReleaseTaskError("更新服务器 SSH 主机格式无效")
     normalized_remote_path = safe_remote_path(remote_path)
-    if shutil.which("ssh") is None or shutil.which("scp") is None:
-        raise ReleaseTaskError("远程发布需要系统提供 ssh 和 scp")
+    if shutil.which("ssh") is None or shutil.which("sftp") is None:
+        raise ReleaseTaskError("远程发布需要系统提供 ssh 和 sftp")
     identity_file = None
     if identity_file_value:
         identity_file = Path(identity_file_value).expanduser().resolve()

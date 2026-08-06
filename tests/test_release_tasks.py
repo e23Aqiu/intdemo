@@ -616,6 +616,309 @@ class ReleaseTasksTests(unittest.TestCase):
             )
         )
 
+    def test_ssh_options_enable_keepalive_and_optional_identity(self):
+        identity = Path("release-key.pem")
+
+        options = tasks.ssh_options(identity)
+
+        for setting in tasks.SSH_CONNECTION_OPTIONS:
+            self.assertIn(setting, options)
+        self.assertIn("BatchMode=yes", options)
+        self.assertEqual(options[-2:], ["-i", str(identity)])
+        self.assertNotIn("-i", tasks.ssh_options(None))
+
+    def test_release_incoming_path_is_stable_for_the_same_artifacts(self):
+        first = {
+            "windows": {
+                "name": "setup.exe",
+                "path": Path("C:/first/setup.exe"),
+                "size": 10,
+                "sha256": "1" * 64,
+            },
+            "uos": {
+                "name": "setup.deb",
+                "path": Path("C:/first/setup.deb"),
+                "size": 20,
+                "sha256": "2" * 64,
+            },
+        }
+        second = {
+            "uos": {**first["uos"], "path": Path("D:/other/setup.deb")},
+            "windows": {
+                **first["windows"],
+                "path": Path("D:/other/setup.exe"),
+            },
+        }
+
+        first_path = tasks.release_incoming_path(
+            "/opt/intdemo/updates",
+            "1.2.3",
+            COMMIT,
+            first,
+        )
+        second_path = tasks.release_incoming_path(
+            "/opt/intdemo/updates",
+            "1.2.3",
+            COMMIT,
+            second,
+        )
+
+        self.assertEqual(first_path, second_path)
+        changed = {**second, "windows": {**second["windows"], "size": 11}}
+        self.assertNotEqual(
+            first_path,
+            tasks.release_incoming_path(
+                "/opt/intdemo/updates",
+                "1.2.3",
+                COMMIT,
+                changed,
+            ),
+        )
+
+    def test_sftp_upload_uses_reput_batch_command(self):
+        class CompletedProcess:
+            @staticmethod
+            def wait(timeout=None):
+                return 0
+
+            @staticmethod
+            def terminate():
+                return None
+
+            @staticmethod
+            def kill():
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"installer")
+            observed: dict[str, object] = {}
+
+            def start_process(arguments, **kwargs):
+                batch_index = arguments.index("-b") + 1
+                observed["arguments"] = arguments
+                observed["batch"] = Path(arguments[batch_index]).read_text(
+                    encoding="utf-8"
+                )
+                return CompletedProcess()
+
+            with patch.object(tasks.subprocess, "Popen", side_effect=start_process):
+                tasks.sftp_reput_once(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    identity_file=None,
+                    progress_interval=0.01,
+                )
+
+        self.assertTrue(str(observed["batch"]).startswith("reput "))
+        self.assertIn("setup.exe.part", str(observed["batch"]))
+        self.assertIn("ServerAliveInterval=15", observed["arguments"])
+
+    def test_resumable_upload_continues_an_existing_partial_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"0123456789")
+            expected_hash = tasks.sha256(artifact)
+            state = {"size": 4}
+
+            def finish_upload(*args, **kwargs):
+                state["size"] = artifact.stat().st_size
+
+            with (
+                patch.object(tasks, "ensure_remote_partial"),
+                patch.object(
+                    tasks,
+                    "remote_file_size",
+                    side_effect=lambda *args, **kwargs: state["size"],
+                ),
+                patch.object(tasks, "remote_hash", return_value=expected_hash),
+                patch.object(
+                    tasks,
+                    "sftp_reput_once",
+                    side_effect=finish_upload,
+                ) as reput,
+                patch.object(tasks, "truncate_remote_file") as truncate,
+                patch("builtins.print"),
+            ):
+                tasks.upload_file_resumable(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    expected_sha256=expected_hash,
+                    identity_file=None,
+                    max_attempts=1,
+                )
+
+        reput.assert_called_once()
+        truncate.assert_not_called()
+
+    def test_resumable_upload_retries_after_a_disconnect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"0123456789")
+            expected_hash = tasks.sha256(artifact)
+            state = {"size": 0, "attempt": 0}
+
+            def upload_once(*args, **kwargs):
+                state["attempt"] += 1
+                if state["attempt"] == 1:
+                    state["size"] = 4
+                    raise tasks.ReleaseTaskError("connection lost")
+                state["size"] = artifact.stat().st_size
+
+            with (
+                patch.object(tasks, "ensure_remote_partial"),
+                patch.object(
+                    tasks,
+                    "remote_file_size",
+                    side_effect=lambda *args, **kwargs: state["size"],
+                ),
+                patch.object(tasks, "remote_hash", return_value=expected_hash),
+                patch.object(
+                    tasks,
+                    "sftp_reput_once",
+                    side_effect=upload_once,
+                ) as reput,
+                patch.object(tasks.time, "sleep") as sleep,
+                patch("builtins.print"),
+            ):
+                tasks.upload_file_resumable(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    expected_sha256=expected_hash,
+                    identity_file=None,
+                    max_attempts=2,
+                    retry_delays=(0,),
+                )
+
+        self.assertEqual(reput.call_count, 2)
+        sleep.assert_called_once_with(0)
+
+    def test_resumable_upload_reuses_a_complete_verified_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"installer")
+            expected_hash = tasks.sha256(artifact)
+            with (
+                patch.object(tasks, "ensure_remote_partial"),
+                patch.object(
+                    tasks,
+                    "remote_file_size",
+                    return_value=artifact.stat().st_size,
+                ),
+                patch.object(tasks, "remote_hash", return_value=expected_hash),
+                patch.object(tasks, "sftp_reput_once") as reput,
+                patch("builtins.print"),
+            ):
+                tasks.upload_file_resumable(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    expected_sha256=expected_hash,
+                    identity_file=None,
+                )
+
+        reput.assert_not_called()
+
+    def test_resumable_upload_restarts_a_complete_invalid_partial(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"installer")
+            expected_hash = tasks.sha256(artifact)
+            state = {"size": artifact.stat().st_size}
+
+            def truncate_file(*args, **kwargs):
+                state["size"] = 0
+
+            def finish_upload(*args, **kwargs):
+                state["size"] = artifact.stat().st_size
+
+            with (
+                patch.object(tasks, "ensure_remote_partial"),
+                patch.object(
+                    tasks,
+                    "remote_file_size",
+                    side_effect=lambda *args, **kwargs: state["size"],
+                ),
+                patch.object(
+                    tasks,
+                    "remote_hash",
+                    side_effect=["f" * 64, expected_hash],
+                ),
+                patch.object(
+                    tasks,
+                    "truncate_remote_file",
+                    side_effect=truncate_file,
+                ) as truncate,
+                patch.object(
+                    tasks,
+                    "sftp_reput_once",
+                    side_effect=finish_upload,
+                ) as reput,
+                patch("builtins.print"),
+            ):
+                tasks.upload_file_resumable(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    expected_sha256=expected_hash,
+                    identity_file=None,
+                    max_attempts=1,
+                )
+
+        truncate.assert_called_once()
+        reput.assert_called_once()
+
+    def test_resumable_upload_keeps_partial_after_all_retries_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"0123456789")
+            state = {"size": 3}
+            with (
+                patch.object(tasks, "ensure_remote_partial"),
+                patch.object(
+                    tasks,
+                    "remote_file_size",
+                    side_effect=lambda *args, **kwargs: state["size"],
+                ),
+                patch.object(
+                    tasks,
+                    "sftp_reput_once",
+                    side_effect=tasks.ReleaseTaskError("connection lost"),
+                ) as reput,
+                patch.object(tasks.time, "sleep"),
+                patch("builtins.print"),
+                self.assertRaisesRegex(
+                    tasks.ReleaseTaskError,
+                    "重新点击发布会从当前进度继续",
+                ),
+            ):
+                tasks.upload_file_resumable(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    expected_sha256=tasks.sha256(artifact),
+                    identity_file=None,
+                    max_attempts=3,
+                    retry_delays=(0,),
+                )
+
+        self.assertEqual(reput.call_count, 3)
+
     def test_remote_publish_refuses_same_name_with_different_hash(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -652,6 +955,56 @@ class ReleaseTasksTests(unittest.TestCase):
                     identity_file=None,
                 )
             self.assertEqual(run_command.call_count, 1)
+
+    def test_remote_publish_uses_resumable_uploads_for_artifact_and_manifest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"new installer")
+            manifest = {"version": "1.2.3"}
+            manifest_path = root / "stable.json"
+            tasks.write_json(manifest_path, manifest)
+            descriptor = {
+                "name": artifact.name,
+                "path": artifact,
+                "size": artifact.stat().st_size,
+                "sha256": tasks.sha256(artifact),
+            }
+            manifest_hash = tasks.sha256(manifest_path)
+            with (
+                patch.object(tasks, "run_command") as run_command,
+                patch.object(tasks, "ssh_capture", return_value=""),
+                patch.object(
+                    tasks,
+                    "remote_hash",
+                    side_effect=["", "", "", manifest_hash],
+                ),
+                patch.object(tasks, "upload_file_resumable") as upload,
+                patch.object(tasks, "load_remote_json", return_value=manifest),
+            ):
+                paused = tasks.publish_remote(
+                    root,
+                    version="1.2.3",
+                    source_commit=COMMIT,
+                    channel="stable",
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                    artifacts={"windows_installer": descriptor},
+                    host="release-server",
+                    remote_path="/opt/intdemo/updates",
+                    identity_file=None,
+                )
+
+        self.assertFalse(paused)
+        self.assertEqual(upload.call_count, 2)
+        artifact_upload = upload.call_args_list[0].kwargs
+        manifest_upload = upload.call_args_list[1].kwargs
+        self.assertTrue(artifact_upload["remote_path"].endswith("setup.exe.part"))
+        self.assertTrue(manifest_upload["remote_path"].endswith("stable.json.part"))
+        self.assertEqual(run_command.call_count, 2)
+        self.assertFalse(
+            any(call.args[0][0] == "scp" for call in run_command.call_args_list)
+        )
 
     def test_github_run_can_be_identified_by_tag_display_title(self):
         tag = "intdemo-windows/v1.2.3-request"

@@ -1135,6 +1135,34 @@ function global:git {
         self.assertTrue(any("Windows 构建收据" in item for item in errors))
         self.assertTrue(any("UOS 构建收据" in item for item in errors))
 
+    def test_publish_validation_requires_sftp_for_resumable_uploads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            options = ReleaseOptions(
+                repo_root=Path(directory),
+                version="1.2.3",
+                base_url="https://api.example.com",
+                notes="dual release",
+                remote_host="release-server",
+                build_windows=True,
+                build_uos=True,
+            )
+
+            def locate_tool(name):
+                return None if name == "sftp" else "tool"
+
+            with (
+                patch("release_publisher.core.project_version", return_value="1.2.3"),
+                patch("release_publisher.core.project_version_mismatches", return_value=[]),
+                patch("release_publisher.core.git_status", return_value=[]),
+                patch(
+                    "release_publisher.core.shutil.which",
+                    side_effect=locate_tool,
+                ),
+            ):
+                errors = validate_release_options(options, for_publish=True)
+
+        self.assertIn("远程发布需要系统提供 ssh 和 sftp", errors)
+
     def test_connection_control_client_uses_transient_admin_session(self):
         session = Mock()
         session.headers = {}
