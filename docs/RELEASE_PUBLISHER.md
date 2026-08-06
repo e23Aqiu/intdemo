@@ -166,8 +166,10 @@ UOS 结果 ZIP。PyInstaller 不能跨架构编译，所以任何 DEB 都必须�
 
 ### 导出/导入构建包
 
-“导出 Windows 构建请求包”只生成交给 Windows 真机执行的输入 ZIP，不是 EXE，也
-不是可导入的最终结果包；Windows 真机构建完成后会生成 `windows-build-result-*.zip`。
+把“Windows 构建”设为“Windows 真机任务包”后，主导出按钮会改为“导出 Windows
+构建请求包”。它只生成交给 Windows 真机执行的输入 ZIP，不是 EXE，也不是可导入的
+最终结果包；Windows 真机构建完成后会生成 `windows-build-result-*.zip`。操作栏不再
+提供含义重复的独立请求包按钮。
 “导入 Windows 构建包”和“导入统信构建包”在 Windows、UOS 上都可用。标准结果
 ZIP 不只是压缩安装包，它还带有版本、完整 Git 提交、服务地址、通道、CA 指纹、
 产物集合、文件名、大小和 SHA-256。导入时这些内容必须与当前主控配置完全一致。

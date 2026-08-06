@@ -46,7 +46,6 @@ from .core import (
     build_pause_distribution_steps,
     build_release_plan,
     build_uos_result_import_steps,
-    build_windows_request_export_steps,
     build_windows_result_import_steps,
     find_inno_compiler,
     git_remote_url,
@@ -398,14 +397,6 @@ class ReleasePublisherWindow(QMainWindow):
         result_label = QLabel("结果与代码")
         result_label.setObjectName("ActionGroupTitle")
         actions.addWidget(result_label, 1, 0)
-        self.export_windows_request_button = QPushButton("导出 Windows 构建请求包")
-        self.export_windows_request_button.setToolTip(
-            "生成不含部署密钥的请求包，交给 Windows 真机执行；它不是最终 EXE 或结果包"
-        )
-        self.export_windows_request_button.clicked.connect(
-            self._export_windows_request
-        )
-        actions.addWidget(self.export_windows_request_button, 1, 1)
         self.import_windows_result_button = QPushButton("导入 Windows 构建包")
         self.import_windows_result_button.setToolTip(
             "校验 Windows 真机结果的版本、源提交、配置与 SHA-256 后纳入本次发布"
@@ -413,25 +404,25 @@ class ReleasePublisherWindow(QMainWindow):
         self.import_windows_result_button.clicked.connect(
             self._import_windows_result
         )
-        actions.addWidget(self.import_windows_result_button, 1, 2)
+        actions.addWidget(self.import_windows_result_button, 1, 1)
         self.import_uos_result_button = QPushButton("导入统信构建包")
         self.import_uos_result_button.setToolTip(
             "校验统信结果的版本、源提交、配置与 SHA-256 后纳入本次发布"
         )
         self.import_uos_result_button.clicked.connect(self._import_uos_result)
-        actions.addWidget(self.import_uos_result_button, 1, 3)
+        actions.addWidget(self.import_uos_result_button, 1, 2)
         self.commit_changes_button = QPushButton("提交到本地")
         self.commit_changes_button.setToolTip(
             "预览并暂存当前仓库的全部变更，创建本地 Git 提交；不会推送到远程"
         )
         self.commit_changes_button.clicked.connect(self._commit_changes)
-        actions.addWidget(self.commit_changes_button, 1, 4)
+        actions.addWidget(self.commit_changes_button, 1, 3)
         self.push_button = QPushButton("推送 GitHub + Gitee")
         self.push_button.setToolTip(
             "预览待推送提交并将当前分支同时推送到 GitHub(origin) 与 Gitee(gitee)；不会强制推送"
         )
         self.push_button.clicked.connect(self._push_changes)
-        actions.addWidget(self.push_button, 1, 5)
+        actions.addWidget(self.push_button, 1, 4, 1, 2)
 
         publish_label = QLabel("发布控制")
         publish_label.setObjectName("ActionGroupTitle")
@@ -840,7 +831,6 @@ class ReleasePublisherWindow(QMainWindow):
         self.uos_builder_host_edit.setEnabled(not native_uos and uos)
         self.uos_builder_path_edit.setEnabled(not native_uos and uos)
         if self.process is None:
-            self.export_windows_request_button.setEnabled(windows)
             self.import_windows_result_button.setEnabled(windows)
             self.import_uos_result_button.setEnabled(uos)
 
@@ -980,19 +970,6 @@ class ReleasePublisherWindow(QMainWindow):
                 include_build=True,
                 include_publish=False,
             )
-        )
-
-    def _export_windows_request(self) -> None:
-        if not self.windows_check.isChecked():
-            QMessageBox.warning(self, "未选择 Windows", "请先选择 Windows x64。")
-            return
-        options = self._validate()
-        if options is None:
-            return
-        self._save_settings()
-        self._run_steps(
-            build_windows_request_export_steps(options),
-            completion_message="Windows 真机构建任务包已生成",
         )
 
     def _import_windows_result(self) -> None:
@@ -1504,7 +1481,6 @@ class ReleasePublisherWindow(QMainWindow):
             self.preflight_button,
             self.test_button,
             self.build_button,
-            self.export_windows_request_button,
             self.import_windows_result_button,
             self.import_uos_result_button,
             self.commit_changes_button,

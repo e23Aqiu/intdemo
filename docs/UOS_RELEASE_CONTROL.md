@@ -129,7 +129,8 @@ Actions 日志中修复真实失败，再重新提交和构建。
 ## 5. GitHub 不可用时转 Windows 真机
 
 “自动”方式显示“需要 Windows 真机构建”后，在 `dist/windows-build-requests/` 中
-取最新的请求 ZIP；也可以提前点击“导出 Windows 构建请求包”。ZIP 内的
+取最新的请求 ZIP；也可以提前把“Windows 构建”改为“Windows 真机任务包”，再点击
+主导出按钮。ZIP 内的
 `BUILD-WINDOWS.txt` 记录了必须使用的完整 Git 提交。
 
 Windows x64 真机需要 Git、64 位 Python 3.9 和 Inno Setup 6。先获取完全相同的

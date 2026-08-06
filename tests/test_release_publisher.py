@@ -1322,7 +1322,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertIn("自动识别", window.portable_check.toolTip())
         self.assertEqual(window.output_mode_combo.currentData(), "both")
         self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")
-        self.assertTrue(window.export_windows_request_button.isEnabled())
+        self.assertFalse(hasattr(window, "export_windows_request_button"))
         self.assertTrue(window.import_windows_result_button.isEnabled())
         self.assertTrue(window.import_uos_result_button.isEnabled())
         self.assertEqual(window.control_username_edit.text(), "admin")
@@ -1368,7 +1368,6 @@ class ReleasePublisherUiTests(unittest.TestCase):
             window = ReleasePublisherWindow(REPO_ROOT)
 
             self.assertEqual(window.windows_build_mode_combo.currentData(), "auto")
-            self.assertTrue(window.export_windows_request_button.isEnabled())
             self.assertTrue(window.import_windows_result_button.isEnabled())
             self.assertIn("EXE + DEB", window.build_button.text())
             window.output_mode_combo.setCurrentIndex(
