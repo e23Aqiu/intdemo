@@ -2073,7 +2073,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(dialog.username_edit.text(), "")
         self.assertEqual(dialog.password_edit.text(), "")
         self.assertTrue(dialog.offline_login_btn.isEnabled())
-        self.assertIn("游客", dialog.offline_login_btn.text())
+        self.assertEqual(dialog.offline_login_btn.text(), "离线登录")
 
         with patch.object(self.db, "authenticate") as authenticate:
             dialog.offline_login_btn.click()

@@ -217,7 +217,7 @@ class LoginDialog(FramelessDialog):
         self.login_btn.setDefault(True)
         self.login_btn.setAutoDefault(True)
         self.login_btn.clicked.connect(self._login)
-        self.offline_login_btn = QPushButton("离线登录（游客）")
+        self.offline_login_btn = QPushButton("离线登录")
         self.offline_login_btn.setMinimumHeight(42)
         self.offline_login_btn.setDefault(False)
         self.offline_login_btn.setAutoDefault(False)
@@ -325,7 +325,7 @@ class LoginDialog(FramelessDialog):
             self.login_btn.setEnabled(True)
             self.login_btn.setText("登录")
             self.offline_login_btn.setEnabled(True)
-            self.offline_login_btn.setText("离线登录（游客）")
+            self.offline_login_btn.setText("离线登录")
 
         if account.must_change_password:
             dialog = PasswordDialog(
