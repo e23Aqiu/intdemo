@@ -20,6 +20,7 @@ from PyQt5.QtCore import QThread, pyqtSignal
 
 from .browser import get_builtin_chromium_path
 from .config import get_data_dir
+from .platform_support import chromium_launch_args
 
 COMPANY_HEADER_ALIASES = (
     "公司名称",
@@ -620,6 +621,7 @@ class _TencentDocsBrowserCapture:
                 "headless": headless,
                 "accept_downloads": False,
                 "args": [
+                    *chromium_launch_args(),
                     "--disable-blink-features=AutomationControlled",
                     "--disable-infobars",
                 ],

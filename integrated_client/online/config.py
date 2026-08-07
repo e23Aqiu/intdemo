@@ -63,9 +63,22 @@ class OnlineConfig:
             executable_dir = Path(sys.executable).resolve().parent
             package_default = Path(__file__).with_name("client-online.json")
             external = executable_dir / "client-online.json"
+            user_config = None
+            if sys.platform.startswith("linux"):
+                configured_root = os.environ.get("XDG_CONFIG_HOME", "").strip()
+                user_config_root = (
+                    Path(configured_root).expanduser()
+                    if configured_root
+                    else Path.home() / ".config"
+                )
+                user_config = (
+                    user_config_root / "intdemo-client" / "client-online.json"
+                )
             working_copy = Path.cwd() / "client-online.json"
             if external.is_file():
                 candidate = external
+            elif user_config is not None and user_config.is_file():
+                candidate = user_config
             elif working_copy.is_file():
                 candidate = working_copy
             else:

@@ -32,6 +32,7 @@ class PersonalCenterPage(QWidget):
         parent=None,
         *,
         updates_enabled=True,
+        updates_disabled_message="",
     ):
         super().__init__(parent)
         self.account = account
@@ -97,7 +98,10 @@ class PersonalCenterPage(QWidget):
         self.update_status_label = QLabel(
             "可手动检查新版本。"
             if updates_enabled
-            else "当前为本地模式，未配置在线更新。"
+            else (
+                str(updates_disabled_message or "").strip()
+                or "当前为本地模式，未配置在线更新。"
+            )
         )
         self.update_status_label.setObjectName("SettingCardDescription")
         self.update_status_label.setWordWrap(True)

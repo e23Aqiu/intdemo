@@ -1326,11 +1326,11 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIn("workflow", window._nav_buttons)
         self.assertIn("personal", window._nav_buttons)
         self.assertEqual(window.sidebar.width(), 230)
-        self.assertEqual(window.sidebar_brand_badge.text(), "逃")
+        self.assertEqual(window.sidebar_brand_badge.text(), "查")
         self.assertEqual(window.sidebar_brand_badge.objectName(), "BrandBadge")
         self.assertEqual(
             window.sidebar.findChild(QLabel, "BrandTitle").text(),
-            "逃费车辆智能\n查询平台",
+            "逃费车辆信息\n智能查询平台",
         )
         self.assertEqual(window.sidebar_role.text(), "管理员  ·  admin")
         self.assertEqual(window.sidebar_avatar.text(), "系")
@@ -1483,7 +1483,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(hasattr(window.workflow_page, "browser_combo"))
         self.assertEqual(
             window.workflow_page.browser_info.text(),
-            "内置 Chromium（统一使用）",
+            "Chromium（自动适配内置/系统）",
         )
         self.app.processEvents()
         self.assertEqual(
@@ -1577,6 +1577,73 @@ class ToolAndUiTests(unittest.TestCase):
         page = OnlineAccountPage(self.db, self.admin, session)
         self.assertEqual(session.api.account_requests, 0)
         self.assertFalse(page.edit_btn.isEnabled())
+        page.deleteLater()
+
+    def test_online_admin_refresh_removes_accounts_missing_from_server(self):
+        current_payload = {
+            "id": "server-admin",
+            "username": self.admin.username,
+            "display_name": self.admin.name_label,
+            "role": "admin",
+            "stats_scope": "all",
+            "is_active": True,
+            "is_archived": False,
+            "entitlement_revision": 1,
+        }
+        stale_payload = {
+            "id": "deleted-test-account",
+            "username": "test",
+            "display_name": "test",
+            "role": "user",
+            "stats_scope": "own",
+            "is_active": False,
+            "is_archived": True,
+            "entitlement_revision": 2,
+        }
+        current = self.db.upsert_remote_account(current_payload)
+        self.db.set_current_online_account(current.server_account_id, "all")
+        stale = self.db.upsert_remote_account(stale_payload)
+        self.db.record_activity_batch(
+            stale.id,
+            {WORKFLOW_TOTAL_METRIC: 1},
+            source="test",
+        )
+
+        class Api:
+            @staticmethod
+            def admin_accounts(_token):
+                return [current_payload]
+
+        class State:
+            is_online = True
+
+        class Session:
+            api = Api()
+            state = State()
+
+            @staticmethod
+            def access_token():
+                return "test-token"
+
+        page = OnlineAccountPage(self.db, current, Session())
+        deleted_ids = []
+        page.account_deleted.connect(deleted_ids.append)
+        with patch(
+            "integrated_client.ui.online_account_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            page.refresh()
+
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(deleted_ids, [stale.id])
+        self.assertNotIn(
+            "test",
+            {account.username for account in self.db.list_accounts()},
+        )
+        self.assertNotIn(
+            "test",
+            {row["username"] for row in self.db.get_all_account_totals()},
+        )
         page.deleteLater()
 
     def test_online_account_settings_exposes_device_limit(self):
@@ -1968,6 +2035,28 @@ class ToolAndUiTests(unittest.TestCase):
         )
         dialog.deleteLater()
 
+    def test_login_enter_submits_credentials_instead_of_guest_mode(self):
+        self.db.change_password(
+            self.admin.id,
+            DEFAULT_ADMIN_PASSWORD,
+            must_change=False,
+        )
+        store = Mock(is_available=True)
+        store.load.return_value = None
+        dialog = LoginDialog(self.db, credential_store=store)
+        dialog.show()
+        dialog.username_edit.setText(DEFAULT_ADMIN_USERNAME)
+        dialog.password_edit.setText(DEFAULT_ADMIN_PASSWORD)
+
+        QTest.keyClick(dialog.password_edit, Qt.Key_Return)
+        self.app.processEvents()
+
+        self.assertEqual(dialog.result(), dialog.Accepted)
+        self.assertEqual(dialog.account.username, DEFAULT_ADMIN_USERNAME)
+        self.assertFalse(dialog.offline_business_mode)
+        store.clear.assert_called_once_with()
+        dialog.deleteLater()
+
     def test_offline_login_enters_guest_without_credentials_or_account_access(self):
         store = Mock()
         store.is_available = True
@@ -1984,7 +2073,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(dialog.username_edit.text(), "")
         self.assertEqual(dialog.password_edit.text(), "")
         self.assertTrue(dialog.offline_login_btn.isEnabled())
-        self.assertIn("游客", dialog.offline_login_btn.text())
+        self.assertEqual(dialog.offline_login_btn.text(), "离线登录")
 
         with patch.object(self.db, "authenticate") as authenticate:
             dialog.offline_login_btn.click()
@@ -2133,6 +2222,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(window._window_hit_test(control_point), HTCLIENT)
         self.assertEqual(window._window_hit_test(QPoint(0, 0)), HTTOPLEFT)
         self.assertEqual(
+            window._resize_edges(QPoint(0, 0)),
+            Qt.LeftEdge | Qt.TopEdge,
+        )
+        self.assertEqual(
             window._window_hit_test(QPoint(window.width() - 1, window.height() - 1)),
             HTBOTTOMRIGHT,
         )
@@ -2154,6 +2247,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(login.minimumSize(), login.maximumSize())
         self.assertEqual(login._window_hit_test(QPoint(60, 20)), HTCAPTION)
         self.assertEqual(login.username_edit.text(), "")
+        self.assertTrue(login.login_btn.isDefault())
+        self.assertTrue(login.login_btn.autoDefault())
+        self.assertFalse(login.offline_login_btn.isDefault())
+        self.assertFalse(login.offline_login_btn.autoDefault())
         self.assertEqual(login.remember_password_checkbox.text(), "记住密码")
         self.assertEqual(login.auto_login_checkbox.text(), "自动登录")
         self.assertFalse(
@@ -4339,7 +4436,6 @@ class ToolAndUiTests(unittest.TestCase):
             chart._hover_card.height(),
             50 + chart._hover_card._detail_row_count * 22,
         )
-        donut_card_height = chart._hover_card.height()
         donut_card_width = chart._hover_card.width()
 
         bar_local = QPoint(int(bar_rect.center().x()), int(bar_rect.center().y()))
@@ -4358,7 +4454,10 @@ class ToolAndUiTests(unittest.TestCase):
             chart._hover_card.details,
             [("有电话", "2 条"), ("其他数据", "3 条")],
         )
-        self.assertEqual(chart._hover_card.height(), donut_card_height)
+        self.assertGreaterEqual(
+            chart._hover_card.height(),
+            50 + chart._hover_card._detail_row_count * 22,
+        )
         self.assertEqual(chart._hover_card.width(), donut_card_width)
         self.assertIsNone(chart._hovered_slice)
         phase = chart._animation_phase

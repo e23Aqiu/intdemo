@@ -26,6 +26,7 @@ from integrated_client.online.update import (
     UpdateInfo,
     version_key,
 )
+from integrated_client.platform_support import WINDOWS_UPDATE_PLATFORM
 from integrated_client.preferences import ClientPreferences, LoginCredentialStore
 
 
@@ -297,7 +298,11 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         )
 
-        update = UpdateClient(config, session=session).check()
+        update = UpdateClient(
+            config,
+            session=session,
+            platform_key=WINDOWS_UPDATE_PLATFORM,
+        ).check()
 
         self.assertEqual(update.version, target_version)
         self.assertEqual(
@@ -306,11 +311,81 @@ class OnlineClientTests(unittest.TestCase):
         )
         self.assertGreater(version_key(update.version), version_key(APP_VERSION))
         self.assertTrue(update.mandatory)
+        self.assertEqual(
+            session.headers["X-IntDemo-Platform"],
+            "windows-x86_64",
+        )
         session.get.assert_called_once()
 
         response.json.return_value["installer_path"] = "https://evil.example/x.exe"
         with self.assertRaisesRegex(UpdateError, "路径无效"):
-            UpdateClient(config, session=session).check()
+            UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).check()
+
+    def test_update_manifest_selects_uos_arm64_deb(self):
+        target_version = _next_patch_version(APP_VERSION)
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "schema_version": 1,
+            "channel": "test",
+            "version": target_version,
+            "notes": "双端更新测试",
+            "platforms": {
+                "windows-x86_64": {
+                    "full": {
+                        "installer_path": (
+                            f"/updates/files/IntDemoOnline-Setup-{target_version}.exe"
+                        ),
+                        "sha256": "a" * 64,
+                        "size": 123,
+                    }
+                },
+                "linux-aarch64": {
+                    "full": {
+                        "installer_path": (
+                            f"/updates/files/IntDemo-UOS-arm64-{target_version}.deb"
+                        ),
+                        "sha256": "b" * 64,
+                        "size": 456,
+                    }
+                },
+            },
+        }
+        session = Mock()
+        session.headers = {}
+        session.get.return_value = response
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+
+        update = UpdateClient(
+            config,
+            session=session,
+            platform_key="linux-aarch64",
+        ).check()
+
+        self.assertEqual(update.platform_key, "linux-aarch64")
+        self.assertTrue(update.installer_name.endswith(".deb"))
+        self.assertEqual(update.size, 456)
+        self.assertEqual(
+            session.headers["X-IntDemo-Platform"],
+            "linux-aarch64",
+        )
+
+        response.json.return_value["platforms"]["linux-aarch64"]["full"][
+            "installer_path"
+        ] = f"/updates/files/IntDemoOnline-Setup-{target_version}.exe"
+        with self.assertRaisesRegex(UpdateError, "当前平台不匹配"):
+            UpdateClient(
+                config,
+                session=session,
+                platform_key="linux-aarch64",
+            ).check()
 
     def test_update_manifest_prefers_matching_delta(self):
         full = b"full"
@@ -354,7 +429,11 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         )
 
-        update = UpdateClient(config, session=session).check()
+        update = UpdateClient(
+            config,
+            session=session,
+            platform_key=WINDOWS_UPDATE_PLATFORM,
+        ).check()
 
         self.assertTrue(update.is_delta)
         self.assertEqual(update.from_version, APP_VERSION)
@@ -376,13 +455,25 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         )
 
-        self.assertIsNone(UpdateClient(config, session=session).check())
+        self.assertIsNone(
+            UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).check()
+        )
 
         no_content = Mock(status_code=204)
         no_content.raise_for_status.return_value = None
         session.get.return_value = no_content
 
-        self.assertIsNone(UpdateClient(config, session=session).check())
+        self.assertIsNone(
+            UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).check()
+        )
         no_content.json.assert_not_called()
 
     def test_update_manifest_uses_delta_only_for_exact_current_version(self):
@@ -433,6 +524,7 @@ class OnlineClientTests(unittest.TestCase):
                     config,
                     session=session,
                     current_version=current_version,
+                    platform_key=WINDOWS_UPDATE_PLATFORM,
                 ).check()
 
                 self.assertEqual(update.package_kind, expected_kind)
@@ -487,7 +579,11 @@ class OnlineClientTests(unittest.TestCase):
         os.environ["INTDEMO_DATA_DIR"] = self.temp_dir.name
         progress = []
         try:
-            path = UpdateClient(config, session=session).download(
+            path = UpdateClient(
+                config,
+                session=session,
+                platform_key=WINDOWS_UPDATE_PLATFORM,
+            ).download(
                 update,
                 progress_callback=lambda received, total: progress.append(
                     (received, total)
@@ -541,7 +637,11 @@ class OnlineClientTests(unittest.TestCase):
         cancelled = [False]
         try:
             with self.assertRaises(UpdateCancelled):
-                UpdateClient(config, session=session).download(
+                UpdateClient(
+                    config,
+                    session=session,
+                    platform_key=WINDOWS_UPDATE_PLATFORM,
+                ).download(
                     update,
                     progress_callback=lambda received, _total: (
                         cancelled.__setitem__(0, True)
@@ -930,6 +1030,255 @@ class OnlineClientTests(unittest.TestCase):
             0,
         )
         self.assertEqual(own.id, self.session.state.account.id)
+
+    def test_remote_account_delete_change_purges_station_and_statistics(self):
+        self.session.login("station", "Online!234")
+        other_id = str(uuid.uuid4())
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        self.database.apply_sync_snapshot(
+            {
+                "revision": 10,
+                "accounts": [
+                    {
+                        "id": self.api.account_id,
+                        "username": "station",
+                        "display_name": "本站",
+                        "role": "user",
+                        "stats_scope": "all",
+                        "is_active": True,
+                        "is_archived": False,
+                        "entitlement_revision": 1,
+                    },
+                    {
+                        "id": other_id,
+                        "username": "deleted_station",
+                        "display_name": "待删除站点",
+                        "role": "user",
+                        "stats_scope": "own",
+                        "is_active": False,
+                        "is_archived": True,
+                        "entitlement_revision": 2,
+                    },
+                ],
+                "metrics": [],
+                "activity_events": [
+                    {
+                        "account_id": other_id,
+                        "event_uid": str(uuid.uuid4()),
+                        "metric_key": "workflow_detail_total",
+                        "amount": 5,
+                        "business_date": "2026-08-05",
+                        "source": "unified_workflow",
+                        "task_id": None,
+                        "summary": {},
+                        "occurred_at": occurred_at,
+                    }
+                ],
+                "workflow_batches": [],
+                "workflow_runs": [],
+                "entitlement_revision": 1,
+                "stats_scope": "all",
+            }
+        )
+        self.assertIn(
+            "deleted_station",
+            {account.username for account in self.database.list_accounts()},
+        )
+
+        self.database.apply_sync_changes(
+            {
+                "changes": [
+                    {
+                        "revision": 11,
+                        "account_id": None,
+                        "kind": "account",
+                        "entity_id": other_id,
+                        "entity_revision": 3,
+                        "operation": "delete",
+                        "payload": {"username": "deleted_station"},
+                        "occurred_at": occurred_at,
+                    }
+                ],
+                "latest_revision": 11,
+                "has_more": False,
+                "entitlement_revision": 1,
+                "stats_scope": "all",
+            }
+        )
+
+        self.assertNotIn(
+            "deleted_station",
+            {account.username for account in self.database.list_accounts()},
+        )
+        self.assertNotIn(
+            "deleted_station",
+            {row["username"] for row in self.database.get_all_account_totals()},
+        )
+
+    def test_full_snapshot_removes_remote_accounts_missing_from_server(self):
+        self.session.login("station", "Online!234")
+        stale_id = str(uuid.uuid4())
+        base_snapshot = {
+            "revision": 20,
+            "accounts": [
+                {
+                    "id": self.api.account_id,
+                    "username": "station",
+                    "display_name": "本站",
+                    "role": "user",
+                    "stats_scope": "all",
+                    "is_active": True,
+                    "is_archived": False,
+                    "entitlement_revision": 1,
+                },
+                {
+                    "id": stale_id,
+                    "username": "stale_station",
+                    "display_name": "已不存在站点",
+                    "role": "user",
+                    "stats_scope": "own",
+                    "is_active": False,
+                    "is_archived": True,
+                    "entitlement_revision": 2,
+                },
+            ],
+            "metrics": [],
+            "activity_events": [],
+            "workflow_batches": [],
+            "workflow_runs": [],
+            "entitlement_revision": 1,
+            "stats_scope": "all",
+        }
+        self.database.apply_sync_snapshot(base_snapshot)
+        base_snapshot["revision"] = 21
+        base_snapshot["accounts"] = base_snapshot["accounts"][:1]
+        self.database.apply_sync_snapshot(base_snapshot)
+
+        self.assertNotIn(
+            "stale_station",
+            {account.username for account in self.database.list_accounts()},
+        )
+
+    def test_complete_admin_account_list_purges_missing_remote_cache(self):
+        current = self.session.login("station", "Online!234")
+        local_only = self.database.create_account(
+            "local_only",
+            "Local!23456",
+            "user",
+            current.id,
+        )
+        stale_id = str(uuid.uuid4())
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        current_payload = {
+            "id": self.api.account_id,
+            "username": "station",
+            "display_name": "本站",
+            "role": "user",
+            "stats_scope": "all",
+            "is_active": True,
+            "is_archived": False,
+            "entitlement_revision": 1,
+        }
+        stale_payload = {
+            "id": stale_id,
+            "username": "stale_station",
+            "display_name": "已永久删除站点",
+            "role": "user",
+            "stats_scope": "own",
+            "is_active": False,
+            "is_archived": True,
+            "entitlement_revision": 2,
+        }
+        self.database.apply_sync_snapshot(
+            {
+                "revision": 30,
+                "accounts": [current_payload, stale_payload],
+                "metrics": [],
+                "activity_events": [
+                    {
+                        "account_id": stale_id,
+                        "event_uid": str(uuid.uuid4()),
+                        "metric_key": "workflow_detail_total",
+                        "amount": 9,
+                        "business_date": "2026-08-06",
+                        "source": "unified_workflow",
+                        "task_id": None,
+                        "summary": {},
+                        "occurred_at": occurred_at,
+                    }
+                ],
+                "workflow_batches": [
+                    {
+                        "account_id": stale_id,
+                        "entity_id": "stale-batch",
+                        "event_uid": str(uuid.uuid4()),
+                        "revision": 1,
+                        "status": "succeeded",
+                        "input_fingerprint": "a" * 64,
+                        "business_date": "2026-08-06",
+                    }
+                ],
+                "workflow_runs": [
+                    {
+                        "account_id": stale_id,
+                        "entity_id": "stale-run",
+                        "event_uid": str(uuid.uuid4()),
+                        "revision": 1,
+                        "batch_id": "stale-batch",
+                        "status": "succeeded",
+                    }
+                ],
+                "entitlement_revision": 1,
+                "stats_scope": "all",
+            }
+        )
+        with self.database._connect() as conn:
+            self.database._enqueue_sync_item(
+                conn,
+                server_account_id=stale_id,
+                kind="activity_event",
+                entity_id="stale-event",
+                revision=1,
+                occurred_at=occurred_at,
+                payload={"metric_key": "workflow_detail_total", "amount": 9},
+            )
+
+        reconciled = self.database.reconcile_remote_accounts([current_payload])
+
+        self.assertEqual(
+            [account.server_account_id for account in reconciled],
+            [self.api.account_id],
+        )
+        accounts = {account.username: account for account in self.database.list_accounts()}
+        self.assertIn("station", accounts)
+        self.assertEqual(accounts["local_only"].id, local_only.id)
+        self.assertNotIn("stale_station", accounts)
+        self.assertNotIn(
+            "stale_station",
+            {row["username"] for row in self.database.get_all_account_totals()},
+        )
+        with self.database._connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM remote_workflow_batches WHERE server_account_id=?",
+                    (stale_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM remote_workflow_runs WHERE server_account_id=?",
+                    (stale_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE server_account_id=?",
+                    (stale_id,),
+                ).fetchone()[0],
+                0,
+            )
 
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
     def test_dpapi_round_trip_and_ciphertext(self):

@@ -10,9 +10,9 @@ from PyQt5.QtGui import QDesktopServices, QIcon
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QInputDialog,
     QLabel,
@@ -27,12 +27,14 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
+from integrated_client.ui.file_dialogs import SystemFileDialog as QFileDialog
 from integrated_client.ui.loading_dialog import run_with_loading
 
 from .connection_control import (
     ConnectionControlClient,
     ConnectionControlError,
 )
+from .release_tasks import ReleaseTaskError, detect_windows_result_portable
 from .core import (
     CommandStep,
     PublisherError,
@@ -40,12 +42,17 @@ from .core import (
     ReleaseOptions,
     SettingsStore,
     build_git_commit_steps,
-    build_git_push_plan,
+    build_git_mirror_push_plans,
     build_pause_distribution_steps,
     build_release_plan,
+    build_uos_result_import_steps,
+    build_windows_result_import_steps,
     find_inno_compiler,
+    git_remote_url,
     git_status,
+    is_native_uos_arm64_builder,
     project_version,
+    release_readiness,
     set_project_version,
     validate_pause_distribution_options,
     validate_release_options,
@@ -69,7 +76,7 @@ class ReleasePublisherWindow(QMainWindow):
         self._connection_client: ConnectionControlClient | None = None
         self._connection_client_key: tuple[str, ...] | None = None
 
-        self.setWindowTitle("IntDemo 专用打包发布器")
+        self.setWindowTitle("逃费车辆信息智能查询平台 · 双端打包发布器")
         self.setMinimumSize(1120, 720)
         self.resize(1320, 820)
         icon_path = (
@@ -90,10 +97,10 @@ class ReleasePublisherWindow(QMainWindow):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("IntDemo 专用打包发布器")
+        title = QLabel("双端打包发布器")
         title.setObjectName("Title")
         subtitle = QLabel(
-            "开发者本地工具 · 测试、构建、校验、发布、暂停分发和快照归档"
+            "Windows / 统信双主控 · 原生安装包、跨机结果 ZIP、双端发布和快照归档"
         )
         subtitle.setObjectName("Muted")
         title_box.addWidget(title)
@@ -112,8 +119,10 @@ class ReleasePublisherWindow(QMainWindow):
         splitter.addWidget(self._build_log_panel())
         splitter.setSizes([500, 780])
 
-        root_layout.addLayout(self._build_action_bar())
+        root_layout.addWidget(self._build_action_bar())
         self._load_settings()
+        self._connect_release_readiness_signals()
+        self._platform_selection_changed()
         self._refresh_project_version()
         self._set_busy(False)
         self._apply_style()
@@ -132,6 +141,10 @@ class ReleasePublisherWindow(QMainWindow):
         self.current_version_value = QLabel("-")
         self.current_version_value.setObjectName("VersionValue")
         version_form.addRow("项目当前版本", self.current_version_value)
+        self.release_readiness_label = QLabel("正在检查待发布产物…")
+        self.release_readiness_label.setObjectName("ReleaseReadiness")
+        self.release_readiness_label.setWordWrap(True)
+        version_form.addRow("发布状态", self.release_readiness_label)
         version_row = QHBoxLayout()
         self.version_edit = QLineEdit()
         self.version_edit.setPlaceholderText("例如 0.2.6")
@@ -157,8 +170,36 @@ class ReleasePublisherWindow(QMainWindow):
             "现有服务端尚未拒绝旧版本；客户端在线检查到更新后不能忽略提示。"
         )
         version_form.addRow("", self.mandatory_check)
+        platform_row = QWidget()
+        platform_layout = QHBoxLayout(platform_row)
+        platform_layout.setContentsMargins(0, 0, 0, 0)
+        self.windows_check = QCheckBox("Windows x64")
+        self.windows_check.setChecked(True)
+        self.windows_check.toggled.connect(self._platform_selection_changed)
+        self.uos_check = QCheckBox("统信 UOS ARM64")
+        self.uos_check.setChecked(True)
+        self.uos_check.toggled.connect(self._platform_selection_changed)
+        platform_layout.addWidget(self.windows_check)
+        platform_layout.addWidget(self.uos_check)
+        platform_layout.addStretch()
+        version_form.addRow("构建平台", platform_row)
+        self.output_mode_combo = QComboBox()
+        self.output_mode_combo.addItem("仅安装包（EXE / DEB）", "native")
+        self.output_mode_combo.addItem("仅构建包（发布器结果 ZIP）", "result")
+        self.output_mode_combo.addItem("安装包 + 构建包", "both")
+        self.output_mode_combo.setToolTip(
+            "仅安装包用于直接安装；仅构建包用于带到另一台打包器导入。"
+            "构建包内仍包含用于校验的安装包。"
+        )
+        self.output_mode_combo.currentIndexChanged.connect(
+            self._platform_selection_changed
+        )
+        version_form.addRow("输出类型", self.output_mode_combo)
         self.portable_check = QCheckBox("同时构建便携包")
-        self.portable_check.setChecked(True)
+        self.portable_check.setChecked(False)
+        self.portable_check.setToolTip(
+            "默认不构建；导入 Windows 构建包时会自动识别并同步此选项"
+        )
         version_form.addRow("", self.portable_check)
         layout.addWidget(version_card)
 
@@ -171,11 +212,43 @@ class ReleasePublisherWindow(QMainWindow):
             "证书文件 (*.crt *.pem);;所有文件 (*)",
         )
         connection_form.addRow("私有 CA", ca_row)
+        self.windows_build_mode_combo = QComboBox()
+        self.windows_build_mode_combo.addItem(
+            "自动（GitHub 优先，不可用时导出真机任务）",
+            "auto",
+        )
+        self.windows_build_mode_combo.addItem("仅使用 GitHub Actions", "github")
+        self.windows_build_mode_combo.addItem("Windows 真机任务包", "manual")
+        self.windows_build_mode_combo.currentIndexChanged.connect(
+            self._platform_selection_changed
+        )
+        connection_form.addRow("Windows 构建", self.windows_build_mode_combo)
+        self.github_remote_edit = QLineEdit("origin")
+        self.github_remote_edit.setPlaceholderText("GitHub Git 远程名称，通常为 origin")
+        connection_form.addRow("GitHub 远程", self.github_remote_edit)
+        self.github_repo_edit = QLineEdit()
+        self.github_repo_edit.setPlaceholderText("可留空自动识别，例如 e23Aqiu/intdemo")
+        connection_form.addRow("GitHub 仓库", self.github_repo_edit)
+        self.gitee_url_edit = QLineEdit()
+        self.gitee_url_edit.setPlaceholderText(
+            "例如 https://gitee.com/e23aqiu/intdemo.git"
+        )
+        connection_form.addRow("Gitee 仓库", self.gitee_url_edit)
         self.inno_edit, inno_row = self._path_input(
             "选择 ISCC.exe",
             "程序文件 (ISCC.exe);;所有文件 (*)",
         )
         connection_form.addRow("Inno Setup", inno_row)
+        self.uos_builder_host_edit = QLineEdit()
+        self.uos_builder_host_edit.setPlaceholderText(
+            "Windows 上填写 UOS ARM64 构建机，例如 uos-builder"
+        )
+        connection_form.addRow("UOS 构建主机", self.uos_builder_host_edit)
+        self.uos_builder_path_edit = QLineEdit("/opt/intdemo")
+        self.uos_builder_path_edit.setPlaceholderText(
+            "构建机上已克隆且与本机提交一致的仓库绝对路径"
+        )
+        connection_form.addRow("UOS 仓库目录", self.uos_builder_path_edit)
         layout.addWidget(connection_card)
 
         control_card, control_form = self._card("客户端断连测试")
@@ -245,10 +318,10 @@ class ReleasePublisherWindow(QMainWindow):
         control_form.addRow("当前状态", self.connection_test_status)
         layout.addWidget(control_card)
 
-        remote_card, remote_form = self._card("远程发布")
+        remote_card, remote_form = self._card("更新服务器发布")
         self.remote_host_edit = QLineEdit()
         self.remote_host_edit.setPlaceholderText(
-            "留空仅生成 dist/update-release，例如 intdemo-test"
+            "双端发布必填，例如 intdemo-test"
         )
         remote_form.addRow("SSH 主机", self.remote_host_edit)
         self.remote_path_edit = QLineEdit("/opt/intdemo/deploy/updates")
@@ -299,31 +372,61 @@ class ReleasePublisherWindow(QMainWindow):
         layout.addWidget(self.log_edit, 1)
         return panel
 
-    def _build_action_bar(self) -> QHBoxLayout:
-        actions = QHBoxLayout()
-        actions.setSpacing(8)
+    def _build_action_bar(self) -> QWidget:
+        panel = QFrame()
+        panel.setObjectName("ActionCard")
+        actions = QGridLayout(panel)
+        actions.setContentsMargins(14, 10, 14, 10)
+        actions.setHorizontalSpacing(8)
+        actions.setVerticalSpacing(8)
+
+        build_label = QLabel("检查与构建")
+        build_label.setObjectName("ActionGroupTitle")
+        actions.addWidget(build_label, 0, 0)
         self.preflight_button = QPushButton("环境检查")
         self.preflight_button.clicked.connect(self._preflight)
-        actions.addWidget(self.preflight_button)
+        actions.addWidget(self.preflight_button, 0, 1)
         self.test_button = QPushButton("运行全部测试")
         self.test_button.clicked.connect(self._run_tests)
-        actions.addWidget(self.test_button)
-        self.build_button = QPushButton("构建安装包")
+        actions.addWidget(self.test_button, 0, 2)
+        self.build_button = QPushButton("导出所选产物")
+        self.build_button.setToolTip("按当前平台和输出类型生成产物")
         self.build_button.clicked.connect(self._run_build)
-        actions.addWidget(self.build_button)
-        self.commit_changes_button = QPushButton("提交变更")
+        actions.addWidget(self.build_button, 0, 3)
+
+        result_label = QLabel("结果与代码")
+        result_label.setObjectName("ActionGroupTitle")
+        actions.addWidget(result_label, 1, 0)
+        self.import_windows_result_button = QPushButton("导入 Windows 构建包")
+        self.import_windows_result_button.setToolTip(
+            "校验 Windows 真机结果的版本、源提交、配置与 SHA-256 后纳入本次发布"
+        )
+        self.import_windows_result_button.clicked.connect(
+            self._import_windows_result
+        )
+        actions.addWidget(self.import_windows_result_button, 1, 1)
+        self.import_uos_result_button = QPushButton("导入统信构建包")
+        self.import_uos_result_button.setToolTip(
+            "校验统信结果的版本、源提交、配置与 SHA-256 后纳入本次发布"
+        )
+        self.import_uos_result_button.clicked.connect(self._import_uos_result)
+        actions.addWidget(self.import_uos_result_button, 1, 2)
+        self.commit_changes_button = QPushButton("提交到本地")
         self.commit_changes_button.setToolTip(
             "预览并暂存当前仓库的全部变更，创建本地 Git 提交；不会推送到远程"
         )
         self.commit_changes_button.clicked.connect(self._commit_changes)
-        actions.addWidget(self.commit_changes_button)
-        self.push_button = QPushButton("推送")
+        actions.addWidget(self.commit_changes_button, 1, 3)
+        self.push_button = QPushButton("推送 GitHub + Gitee")
         self.push_button.setToolTip(
-            "预览待推送提交并将当前分支推送到上游；不会强制推送"
+            "预览待推送提交并将当前分支同时推送到 GitHub(origin) 与 Gitee(gitee)；不会强制推送"
         )
         self.push_button.clicked.connect(self._push_changes)
-        actions.addWidget(self.push_button)
-        actions.addStretch()
+        actions.addWidget(self.push_button, 1, 4, 1, 2)
+
+        publish_label = QLabel("发布控制")
+        publish_label.setObjectName("ActionGroupTitle")
+        actions.addWidget(publish_label, 2, 0)
         self.pause_distribution_button = QPushButton("暂停分发")
         self.pause_distribution_button.setObjectName("DangerButton")
         self.pause_distribution_button.setToolTip(
@@ -332,19 +435,23 @@ class ReleasePublisherWindow(QMainWindow):
         self.pause_distribution_button.clicked.connect(
             self._run_pause_distribution
         )
-        actions.addWidget(self.pause_distribution_button)
-        self.publish_button = QPushButton("发布")
+        actions.addWidget(self.pause_distribution_button, 2, 1)
+        self.publish_button = QPushButton("发布双端更新")
+        self.publish_button.setToolTip(
+            "大文件使用 SFTP 断点续传；网络中断会自动重试，重新发布也可继续断点"
+        )
         self.publish_button.clicked.connect(self._run_publish)
-        actions.addWidget(self.publish_button)
-        self.pipeline_button = QPushButton("测试 → 构建 → 发布")
+        actions.addWidget(self.publish_button, 2, 2)
+        self.pipeline_button = QPushButton("测试 → 双端构建 → 双端发布")
         self.pipeline_button.setObjectName("PrimaryButton")
         self.pipeline_button.clicked.connect(self._run_full_pipeline)
-        actions.addWidget(self.pipeline_button)
+        actions.addWidget(self.pipeline_button, 2, 3, 1, 2)
         self.cancel_button = QPushButton("停止")
         self.cancel_button.setObjectName("DangerButton")
         self.cancel_button.clicked.connect(self._cancel)
-        actions.addWidget(self.cancel_button)
-        return actions
+        actions.addWidget(self.cancel_button, 2, 5)
+        actions.setColumnStretch(6, 1)
+        return panel
 
     @staticmethod
     def _card(title: str) -> tuple[QFrame, QFormLayout]:
@@ -404,12 +511,27 @@ class ReleasePublisherWindow(QMainWindow):
         self.ca_edit.setText(settings.ca_bundle)
         self.control_username_edit.setText(settings.control_username)
         self.inno_edit.setText(settings.inno_compiler)
+        self.windows_check.setChecked(settings.build_windows)
+        self.uos_check.setChecked(settings.build_uos)
+        mode_index = self.windows_build_mode_combo.findData(
+            settings.windows_build_mode
+        )
+        self.windows_build_mode_combo.setCurrentIndex(max(0, mode_index))
+        self.github_remote_edit.setText(settings.github_remote)
+        self.github_repo_edit.setText(settings.github_repo)
+        self.gitee_url_edit.setText(
+            settings.gitee_url or git_remote_url(self.repo_root, "gitee")
+        )
+        self.uos_builder_host_edit.setText(settings.uos_builder_host)
+        self.uos_builder_path_edit.setText(settings.uos_builder_path)
         self.remote_host_edit.setText(settings.remote_host)
         self.remote_path_edit.setText(settings.remote_path)
         self.identity_edit.setText(settings.identity_file)
         index = self.channel_combo.findData(settings.channel)
         self.channel_combo.setCurrentIndex(max(0, index))
         self.portable_check.setChecked(settings.build_portable)
+        output_index = self.output_mode_combo.findData(settings.build_output_mode)
+        self.output_mode_combo.setCurrentIndex(max(0, output_index))
         if not self.inno_edit.text().strip():
             compiler = find_inno_compiler()
             if compiler is not None:
@@ -436,6 +558,22 @@ class ReleasePublisherWindow(QMainWindow):
             candidate = (path.parent / ca_bundle).resolve()
             if candidate.is_file():
                 self.ca_edit.setText(str(candidate))
+
+    def _connect_release_readiness_signals(self) -> None:
+        for edit in (
+            self.version_edit,
+            self.delta_edit,
+            self.base_url_edit,
+            self.ca_edit,
+        ):
+            edit.editingFinished.connect(self._refresh_release_readiness)
+        self.channel_combo.currentIndexChanged.connect(
+            self._refresh_release_readiness
+        )
+        self.portable_check.toggled.connect(self._refresh_release_readiness)
+        self.output_mode_combo.currentIndexChanged.connect(
+            self._refresh_release_readiness
+        )
 
     def _connection_parameters(self) -> tuple[str, str, str, str, str]:
         return (
@@ -641,6 +779,64 @@ class ReleasePublisherWindow(QMainWindow):
         if response is not None:
             self._append_log("已恢复全部客户端连接。")
 
+    def _platform_selection_changed(self, _value=None) -> None:
+        windows = self.windows_check.isChecked()
+        uos = self.uos_check.isChecked()
+        native_uos = is_native_uos_arm64_builder()
+        windows_mode = str(self.windows_build_mode_combo.currentData())
+        if windows and uos:
+            platforms = "EXE + DEB"
+        elif windows:
+            platforms = "EXE"
+        elif uos:
+            platforms = "DEB"
+        else:
+            platforms = "所选平台"
+        output_mode = str(self.output_mode_combo.currentData())
+        mode_label = {
+            "native": "仅安装包",
+            "result": "仅构建包",
+            "both": "安装包 + 构建包",
+        }.get(output_mode, "构建")
+        manual_windows_request = (
+            native_uos and windows and windows_mode == "manual"
+        )
+        if manual_windows_request:
+            if uos:
+                self.build_button.setText(
+                    f"导出 DEB + Windows 构建请求包（{mode_label}）"
+                )
+            else:
+                self.build_button.setText("导出 Windows 构建请求包")
+        else:
+            self.build_button.setText(f"导出 {platforms}（{mode_label}）")
+        tooltip = {
+            "native": "只导出可直接安装的 EXE/DEB，不生成发布器结果 ZIP",
+            "result": (
+                "只导出可由另一台发布器导入的结果 ZIP；"
+                "结果包内仍包含用于校验的安装包"
+            ),
+            "both": "同时导出可直接安装的 EXE/DEB 和发布器结果 ZIP",
+        }.get(output_mode, "按当前平台和输出类型生成产物")
+        if manual_windows_request:
+            tooltip = (
+                "Windows 真机模式只生成构建请求包，不会在统信主机上生成最终 EXE；"
+                "请把请求包交给 Windows 真机执行。"
+            )
+        self.build_button.setToolTip(tooltip)
+        self.portable_check.setEnabled(windows)
+        self.windows_build_mode_combo.setEnabled(native_uos and windows)
+        self.github_remote_edit.setEnabled(windows)
+        self.github_repo_edit.setEnabled(
+            native_uos and windows and windows_mode != "manual"
+        )
+        self.inno_edit.setEnabled(not native_uos and windows)
+        self.uos_builder_host_edit.setEnabled(not native_uos and uos)
+        self.uos_builder_path_edit.setEnabled(not native_uos and uos)
+        if self.process is None:
+            self.import_windows_result_button.setEnabled(windows)
+            self.import_uos_result_button.setEnabled(uos)
+
     def _save_settings(self) -> None:
         settings = PublisherSettings(
             base_url=self.base_url_edit.text().strip(),
@@ -652,6 +848,15 @@ class ReleasePublisherWindow(QMainWindow):
             identity_file=self.identity_edit.text().strip(),
             channel=str(self.channel_combo.currentData()),
             build_portable=self.portable_check.isChecked(),
+            build_output_mode=str(self.output_mode_combo.currentData()),
+            build_windows=self.windows_check.isChecked(),
+            build_uos=self.uos_check.isChecked(),
+            windows_build_mode=str(self.windows_build_mode_combo.currentData()),
+            github_remote=self.github_remote_edit.text().strip() or "origin",
+            github_repo=self.github_repo_edit.text().strip(),
+            gitee_url=self.gitee_url_edit.text().strip(),
+            uos_builder_host=self.uos_builder_host_edit.text().strip(),
+            uos_builder_path=self.uos_builder_path_edit.text().strip(),
         )
         self.settings_store.save(settings)
 
@@ -665,6 +870,16 @@ class ReleasePublisherWindow(QMainWindow):
         self.current_version_value.setText(f"v{version}")
         if not self.version_edit.text().strip():
             self.version_edit.setText(version)
+        self._refresh_release_readiness()
+
+    def _refresh_release_readiness(self, *_args) -> None:
+        readiness = release_readiness(self._options())
+        self.release_readiness_label.setText(readiness.message)
+        self.release_readiness_label.setProperty("state", readiness.state)
+        self.release_readiness_label.style().unpolish(
+            self.release_readiness_label
+        )
+        self.release_readiness_label.style().polish(self.release_readiness_label)
 
     def _options(self) -> ReleaseOptions:
         return ReleaseOptions(
@@ -677,10 +892,18 @@ class ReleasePublisherWindow(QMainWindow):
             channel=str(self.channel_combo.currentData()),
             mandatory=self.mandatory_check.isChecked(),
             build_portable=self.portable_check.isChecked(),
+            build_output_mode=str(self.output_mode_combo.currentData()),
             inno_compiler=self.inno_edit.text().strip(),
             remote_host=self.remote_host_edit.text().strip(),
             remote_path=self.remote_path_edit.text().strip(),
             identity_file=self.identity_edit.text().strip(),
+            build_windows=self.windows_check.isChecked(),
+            build_uos=self.uos_check.isChecked(),
+            windows_build_mode=str(self.windows_build_mode_combo.currentData()),
+            github_remote=self.github_remote_edit.text().strip() or "origin",
+            github_repo=self.github_repo_edit.text().strip(),
+            uos_builder_host=self.uos_builder_host_edit.text().strip(),
+            uos_builder_path=self.uos_builder_path_edit.text().strip(),
         )
 
     def _validate(
@@ -711,6 +934,8 @@ class ReleasePublisherWindow(QMainWindow):
         self._save_settings()
         message = (
             f"环境检查通过。\n\n目标版本：{options.version}\n"
+            f"构建平台：{'Windows x64 + UOS ARM64' if options.build_windows and options.build_uos else ('Windows x64' if options.build_windows else 'UOS ARM64')}\n"
+            f"输出类型：{self.output_mode_combo.currentText()}\n"
             f"通道：{options.channel}\n"
             f"增量来源：{options.delta_from_version or '无'}\n"
             f"远程主机：{options.remote_host or '仅本地'}"
@@ -750,12 +975,68 @@ class ReleasePublisherWindow(QMainWindow):
             )
         )
 
+    def _import_windows_result(self) -> None:
+        if not self.windows_check.isChecked():
+            QMessageBox.warning(self, "未选择 Windows", "请先选择 Windows x64。")
+            return
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Windows 构建结果包",
+            str(self.repo_root / "dist"),
+            "Windows 构建结果 (windows-build-result*.zip);;ZIP 文件 (*.zip)",
+        )
+        if not selected:
+            return
+        try:
+            build_portable = detect_windows_result_portable(selected)
+        except ReleaseTaskError as exc:
+            QMessageBox.warning(self, "无法识别 Windows 结果", str(exc))
+            return
+        self.portable_check.setChecked(build_portable)
+        portable_status = "包含便携包" if build_portable else "不含便携包"
+        self._append_log(
+            f"已自动识别 Windows 结果：{portable_status}，界面选项已同步。"
+        )
+        options = self._validate()
+        if options is None:
+            return
+        self._save_settings()
+        self._run_steps(
+            build_windows_result_import_steps(options, selected),
+            completion_message="Windows 构建包已导入并校验",
+        )
+
+    def _import_uos_result(self) -> None:
+        if not self.uos_check.isChecked():
+            QMessageBox.warning(
+                self,
+                "未选择统信",
+                "请先选择统信 UOS ARM64。",
+            )
+            return
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择统信构建结果包",
+            str(self.repo_root / "dist"),
+            "统信构建结果 (uos-build-result*.zip);;ZIP 文件 (*.zip)",
+        )
+        if not selected:
+            return
+        options = self._validate()
+        if options is None:
+            return
+        self._save_settings()
+        self._run_steps(
+            build_uos_result_import_steps(options, selected),
+            completion_message="统信构建包已导入并校验",
+        )
+
     def _confirm_publish(self, options: ReleaseOptions) -> bool:
         destination = options.remote_host or "本地 dist/update-release"
         package = (
-            f"完整包 + {options.delta_from_version} 增量包"
+            f"Windows 完整包 + {options.delta_from_version} 增量包 + UOS ARM64 DEB"
             if options.delta_from_version
-            else "完整包"
+            else "Windows x64 完整包 + UOS ARM64 DEB"
         )
         warning = "是（在线检查到后不可忽略）" if options.mandatory else "否"
         reply = QMessageBox.warning(
@@ -766,7 +1047,8 @@ class ReleasePublisherWindow(QMainWindow):
             f"通道：{options.channel}\n"
             f"包类型：{package}\n"
             f"强制更新：{warning}\n\n"
-            "发布清单会在安装包上传完成后原子替换。确定继续吗？",
+            "大文件会使用 SFTP 断点续传，网络中断时自动重试；重新点击发布也会"
+            "继续已有断点。发布清单会在安装包校验完成后原子替换。确定继续吗？",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Cancel,
         )
@@ -932,49 +1214,79 @@ class ReleasePublisherWindow(QMainWindow):
         )
 
     def _push_changes(self) -> None:
+        gitee_url = self.gitee_url_edit.text().strip()
+        if not gitee_url:
+            QMessageBox.warning(
+                self,
+                "缺少 Gitee 仓库",
+                "请先填写 Gitee 仓库链接。",
+            )
+            return
         try:
-            plan = build_git_push_plan(self.repo_root)
+            plans = build_git_mirror_push_plans(
+                self.repo_root,
+                remote_urls={"gitee": gitee_url},
+            )
         except PublisherError as exc:
             QMessageBox.warning(self, "无法推送", str(exc))
             self._append_log(f"准备 Git 推送失败：{exc}")
             return
-        if plan.upstream is not None and plan.ahead_count == 0:
+        pending = [
+            plan
+            for plan in plans
+            if plan.ahead_count > 0 or plan.setup_step is not None
+        ]
+        if not pending:
+            targets = "、".join(plan.target for plan in plans)
             self._append_log(
-                f"Git 分支 {plan.branch} 没有需要推送到 {plan.target} 的提交。"
+                f"Git 分支 {plans[0].branch} 已与 {targets} 同步。"
             )
             QMessageBox.information(
                 self,
                 "无需推送",
-                f"当前分支 {plan.branch} 已与 {plan.target} 同步。",
+                f"当前分支 {plans[0].branch} 已与 GitHub 和 Gitee 同步。",
             )
             return
 
-        preview = "\n".join(f"  {commit}" for commit in plan.commits)
-        remaining = plan.ahead_count - len(plan.commits)
-        if remaining > 0:
-            preview += f"\n  ……另有 {remaining} 个较早提交"
-        mode = (
-            "首次推送，并设置为当前分支的上游"
-            if plan.sets_upstream
-            else "推送到现有上游"
+        previews = []
+        for plan in plans:
+            commits = "\n".join(f"    {commit}" for commit in plan.commits)
+            remaining = plan.ahead_count - len(plan.commits)
+            if remaining > 0:
+                commits += f"\n    ……另有 {remaining} 个较早提交"
+            previews.append(
+                f"{plan.target}：{plan.ahead_count} 个待推送提交"
+                + (f"\n{commits}" if commits else "")
+            )
+        setup_notice = (
+            "\n点击继续后会新增或更新本仓库的 gitee 远程地址。"
+            if any(plan.setup_step is not None for plan in plans)
+            else ""
         )
         reply = QMessageBox.warning(
             self,
-            "确认推送当前分支",
-            f"本地分支：{plan.branch}\n"
-            f"远程目标：{plan.target}\n"
-            f"推送方式：{mode}\n"
-            f"待推送提交：{plan.ahead_count} 个\n\n"
-            f"{preview}\n\n"
-            "将执行普通 Git push，不会强制推送。是否继续？",
+            "确认双仓库推送",
+            f"本地分支：{plans[0].branch}\n\n"
+            + "\n\n".join(previews)
+            + f"\n\nGitee：{gitee_url}"
+            + setup_notice
+            + "\n\n将依次执行普通 Git push 到 GitHub 与 Gitee，"
+            "不会强制推送。任一远程拒绝时会停止并保留清晰日志。是否继续？",
             QMessageBox.Yes | QMessageBox.Cancel,
             QMessageBox.Cancel,
         )
         if reply != QMessageBox.Yes:
             return
+        steps = []
+        for plan in pending:
+            if plan.setup_step is not None:
+                steps.append(plan.setup_step)
+            if plan.ahead_count > 0 or plan.setup_step is not None:
+                steps.append(plan.step)
+        self._save_settings()
         self._run_steps(
-            [plan.step],
-            completion_message=f"当前分支已推送到 {plan.target}",
+            steps,
+            completion_message="当前分支已同步推送到 GitHub 与 Gitee",
         )
 
     def _run_steps(
@@ -1083,6 +1395,14 @@ class ReleasePublisherWindow(QMainWindow):
             return
         if exit_code != 0:
             title = step.title if step is not None else "当前步骤"
+            if step is not None and step.key == "build_windows_github" and exit_code == 20:
+                self._finish_pipeline(
+                    False,
+                    "GitHub 暂不可用，Windows 真机构建任务包已经保留；"
+                    "完成真机构建后点击“导入 Windows 构建包”继续",
+                    warning=True,
+                )
+                return
             self._finish_pipeline(False, f"{title}失败，退出码 {exit_code}")
             return
         self._completed_steps += 1
@@ -1110,7 +1430,8 @@ class ReleasePublisherWindow(QMainWindow):
             self,
             "停止当前操作",
             "确定停止当前步骤及后续流程吗？\n"
-            "已经上传或生成的文件不会被自动删除。",
+            "已经上传或生成的文件不会被自动删除；远程上传断点会保留，"
+            "下次发布可继续。",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -1137,17 +1458,26 @@ class ReleasePublisherWindow(QMainWindow):
             ),
         )
 
-    def _finish_pipeline(self, success: bool, message: str) -> None:
+    def _finish_pipeline(
+        self,
+        success: bool,
+        message: str,
+        *,
+        warning: bool = False,
+    ) -> None:
         self._steps.clear()
         self._current_step = None
         self._completion_message = "全部步骤执行成功"
         self._set_busy(False)
+        self._refresh_release_readiness()
         self.status_label.setText(message)
         self._append_log(
             f"\n{'成功' if success else '失败'}：{message}\n" + "=" * 72
         )
         if success:
             QMessageBox.information(self, "执行完成", message)
+        elif warning and not self._cancel_requested:
+            QMessageBox.warning(self, "需要 Windows 真机构建", message)
         elif not self._cancel_requested:
             QMessageBox.critical(self, "执行失败", message)
 
@@ -1156,6 +1486,8 @@ class ReleasePublisherWindow(QMainWindow):
             self.preflight_button,
             self.test_button,
             self.build_button,
+            self.import_windows_result_button,
+            self.import_uos_result_button,
             self.commit_changes_button,
             self.push_button,
             self.pause_distribution_button,
@@ -1172,6 +1504,7 @@ class ReleasePublisherWindow(QMainWindow):
         self.cancel_button.setEnabled(busy)
         if not busy:
             self._connection_selection_changed()
+            self._platform_selection_changed()
 
     def _append_log(self, text: str, *, add_newline: bool = True) -> None:
         cursor = self.log_edit.textCursor()
@@ -1239,7 +1572,32 @@ class ReleasePublisherWindow(QMainWindow):
                 padding: 8px 10px;
                 color: #245b8a;
             }
-            QFrame#Card, QFrame#LogCard {
+            QLabel#ReleaseReadiness {
+                background: #eef4fb;
+                border-radius: 6px;
+                padding: 8px 10px;
+                color: #486581;
+            }
+            QLabel#ReleaseReadiness[state="ready"] {
+                background: #e8f7ef;
+                color: #176b45;
+                font-weight: 700;
+            }
+            QLabel#ReleaseReadiness[state="partial"],
+            QLabel#ReleaseReadiness[state="mismatch"] {
+                background: #fff5df;
+                color: #8a5a00;
+            }
+            QLabel#ReleaseReadiness[state="published"] {
+                background: #edf2f7;
+                color: #52606d;
+            }
+            QLabel#ActionGroupTitle {
+                color: #52606d;
+                font-weight: 700;
+                min-width: 72px;
+            }
+            QFrame#Card, QFrame#LogCard, QFrame#ActionCard {
                 background: white;
                 border: 1px solid #d9e2ec;
                 border-radius: 9px;

@@ -1,0 +1,95 @@
+name: Windows release build
+
+run-name: Windows release · ${{ github.ref_name }}
+
+on:
+  push:
+    tags:
+      - "intdemo-windows/v*"
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows-result:
+    runs-on: windows-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+
+      - name: Download immutable build request
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $requestRoot = Join-Path $env:RUNNER_TEMP "intdemo-windows-request"
+          New-Item -ItemType Directory -Force -Path $requestRoot | Out-Null
+          $downloaded = $false
+          for ($attempt = 1; $attempt -le 30; $attempt++) {
+            gh release download "${{ github.ref_name }}" `
+              --pattern "windows-build-request-*.zip" `
+              --dir $requestRoot `
+              --clobber
+            if ($LASTEXITCODE -eq 0) {
+              $downloaded = $true
+              break
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $downloaded) {
+            throw "The UOS build request asset did not become available."
+          }
+          $archives = @(Get-ChildItem -LiteralPath $requestRoot -Filter "*.zip" -File)
+          if ($archives.Count -ne 1) {
+            throw "Expected exactly one Windows build request archive."
+          }
+          "INTDEMO_WINDOWS_REQUEST=$($archives[0].FullName)" >> $env:GITHUB_ENV
+
+      - name: Install Windows build dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --upgrade pip
+          .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build and test without contacting the application server
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $output = Join-Path $env:RUNNER_TEMP "windows-build-result-${{ github.run_id }}.zip"
+          .\.venv\Scripts\python.exe .\release_publisher\release_tasks.py `
+            windows-build `
+            --request-archive $env:INTDEMO_WINDOWS_REQUEST `
+            --output $output `
+            --run-tests `
+            --github-run-id "${{ github.run_id }}" `
+            --github-run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Windows build request failed."
+          }
+          "INTDEMO_WINDOWS_RESULT=$output" >> $env:GITHUB_ENV
+
+      - name: Upload verifiable Windows result
+        uses: actions/upload-artifact@v4
+        with:
+          name: intdemo-windows-result-${{ github.run_id }}
+          path: ${{ env.INTDEMO_WINDOWS_RESULT }}
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

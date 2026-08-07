@@ -1128,3 +1128,292 @@
 - 发布前客户端完整回归 `151/151`、服务端完整回归 `36/36`、客户端 Python
   编译检查、服务端 Ruff、版本字段检查和 `git diff --check` 全部通过。
 - 状态：已完成。
+
+### 步骤 117：增加统信 UOS Desktop 20 ARM64 首轮兼容
+
+- 新增 UOS ARM64 专用 conda 环境、依赖清单、PyInstaller onedir 配置、环境准备、
+  诊断、构建以及用户级安装/卸载脚本；目标基线为 UOS Desktop 20 1070、
+  `aarch64`、glibc 2.28、Wayland，并使用隔离的 Python 3.10 环境，不依赖系统
+  Python 3.7。
+- Linux 端优先自动发现统信浏览器或 Chromium，也支持通过
+  `INTDEMO_CHROMIUM_PATH` 指定浏览器；Wayland 会话默认借助 XWayland 运行 Qt
+  与 Chromium，并保留原生 Wayland 覆盖入口。
+- 在线凭据在 Windows 继续使用 DPAPI，在 Linux 改用 Secret Service 保存随机主密钥，
+  再以 AES-GCM 加密本地数据；UOS 配置文件支持 XDG 标准目录。
+- UOS 端暂不启用只适用于 Windows 安装包的自动更新，改为手动下载、覆盖安装；
+  中文字体栈补充 Noto Sans CJK、文泉驿和 DejaVu 回退。
+- 修复 GitHub Actions 从 PowerShell 7 启动 Windows PowerShell 5.1 测试时继承
+  不兼容 `PSModulePath` 的问题，避免发布脚本版本保护测试无法加载
+  `Get-FileHash`；生产发布脚本不受影响。
+- 新增真机搭建、诊断、构建、安装和验收文档；本地客户端完整回归 `160/160`、
+  Python 编译检查、PyInstaller spec 编译检查及 Bash 脚本语法检查通过。
+- 状态：首轮代码兼容已完成，等待 UOS ARM64 真机构建和业务流程验证。
+
+### 步骤 118：将真机验证通过的 ARM64 Chromium 装入 UOS 包
+
+- 在 UOS Desktop 20 Professional 1070、aarch64、glibc 2.28、Wayland 真机上，
+  项目 Python 3.10 环境的全部原生依赖成功导入；Playwright Chromium 145、
+  Secret Service 加解密及无头浏览器实际启动检查均通过。
+- 环境准备脚本默认把固定 Playwright 版本对应的 Chromium 下载到项目专用
+  `.playwright-uos-arm64` 缓存；源码运行自动识别该缓存，并继续保留系统浏览器
+  和 `INTDEMO_CHROMIUM_PATH` 作为回退与故障排查入口。
+- 构建脚本只允许使用项目缓存内的 Chromium，预检 ELF AArch64 架构和缺失
+  动态库，只复制正式 Chromium 运行目录而不携带无用的浏览器缓存，并在压缩前
+  对复制后的浏览器再做一次实际启动检查。
+- UOS 软件包启动器优先使用随包携带的 `browser/chrome`，最终用户无需安装
+  系统浏览器；文档、包内说明、缓存忽略规则和静态回归同步更新。
+- UOS 专项回归 `12/12`、客户端完整回归 `163/163`、Python 编译、Bash 语法及
+  `git diff --check` 通过。
+- 状态：内置浏览器构建代码已完成，等待 UOS 真机生成软件包并验收业务流程。
+
+### 步骤 119：修复 UOS 真机构建前的跨平台回归失败
+
+- 首次 UOS 真机构建日志确认环境更新、全部依赖导入、Chromium AArch64 ELF、
+  动态库、Chromium 145 实际启动及 Secret Service 加解密均通过，构建只在
+  离线回归测试阶段中止，尚未进入 PyInstaller 打包。
+- 发布器读取当前分支由 Git 2.22 才提供的 `git branch --show-current` 改为旧版
+  Git 也支持的 `git rev-parse --abbrev-ref HEAD`，并继续显式拒绝 detached HEAD，
+  兼容 UOS 20 自带 Git。
+- UOS 浏览器路径测试创建临时可执行文件后显式赋予执行权限，修复 Linux 会严格
+  检查执行位而 Windows 不检查所造成的三项测试环境差异。
+- 违规模块悬浮卡测试不再要求不同明细数量的卡片在所有字体环境下高度完全相等，
+  改为验证内容对应的最低高度和固定宽度，保留实际布局与可见性检查。
+- 针对失败点的专项回归 `7/7`、客户端完整回归 `165/165` 通过。
+- 状态：真机构建前阻断已修复，等待 UOS ARM64 重新构建并生成软件包。
+
+### 步骤 120：修复 UOS 成品 Qt 的 GLIBCXX 运行库冲突
+
+- UOS 真机成功生成首个 `0.2.8` ARM64 压缩包，但从压缩包全新解压启动时，
+  PyInstaller 收集到的系统旧版 `libstdc++.so.6` 缺少 conda-forge Qt 5.15
+  所需的 `GLIBCXX_3.4.26`，应用在导入 `PyQt5.QtCore` 时立即退出。
+- UOS conda 环境显式加入 ARM64 `libgcc-ng` 与 `libstdcxx-ng`；PyInstaller 完成后，
+  构建脚本强制用该环境中已经在 glibc 2.28 真机成功加载 Qt 的 `libstdc++.so.6`
+  和 `libgcc_s.so.1` 替换误收集的系统版本。
+- 出包前新增 `GLIBCXX_3.4.26` 符号检查、最高 GLIBCXX ABI 记录、Qt Core `ldd`
+  缺失库及实际解析路径检查，确保 Qt 使用包内 C++ 运行库。
+- 客户端增加不会进入登录和数据库流程的 `--self-check`，构建脚本会通过最终包
+  启动器以 Qt offscreen 模式执行它；导入或 Qt 插件加载失败将直接中止构建。
+- UOS 专项回归 `13/13`、客户端完整回归 `166/166`、Python 编译、Bash 语法、
+  本地 Qt 自检及 `git diff --check` 通过。
+- 状态：C++ ABI 修复和成品级防回归已完成，等待 UOS ARM64 真机重新出包启动。
+
+### 步骤 121：修复 Qt 运行库路径误判和旧产物残留
+
+- 真机确认 conda 与新 PyInstaller 目录中的 `libstdc++.so.6` 均已升级到
+  `GLIBCXX_3.4.35`，Qt 的 `ldd` 结果也实际指向包内库；ABI 修复本身生效。
+- Qt RPATH 输出的路径包含等价的 `/_internal/./libstdc++.so.6`，原构建校验却与
+  不含 `/./` 的字符串直接比较，造成误判并在成品组装前中止。
+- 新校验从 `ldd` 输出提取实际路径，并通过 `readlink -f` 与目标包内库的真实路径
+  比较，既接受等价路径，又继续拒绝意外解析到系统或其他目录的 C++ 运行库。
+- 同版本旧压缩包此前直到组装阶段才删除，失败后仍保留了 09:49 的旧包；现改为
+  在预检和 PyInstaller 开始前清理经过版本格式与目录边界校验的旧包、校验文件及
+  旧组装目录，失败构建不再留下名称相同的陈旧产物。
+- 状态：等待 UOS ARM64 真机快速重建并验证新压缩包启动。
+
+### 步骤 122：为 UOS 成品包补全在线测试服务配置
+
+- UOS Desktop 20 Professional 1070 ARM64 真机确认新成品可以正常进入登录页，
+  游客模式下的实际业务处理全部正常；Qt、内置 Chromium 和 GNU C++ 运行库链路
+  已通过，剩余阻点是成品包没有在线服务器配置。
+- 从现有 Windows 测试包确认在线测试地址为 `https://43.138.177.65`，并复用同一
+  公开 Caddy 根证书；证书标准 DER SHA-256 指纹为
+  `1ba425e2184fe9bab3e90620773ec9bc89aaf292f84c00cf54b5a0901c4bf69f`。
+  使用该证书访问服务端 `live` 与 `ready` 健康接口均返回 HTTP 200；服务端当前
+  自报版本为 `0.2.7`。
+- UOS 压缩包现会携带 `client-online.json` 和公开根证书。根启动器依次采用显式
+  环境变量、用户配置和随包配置；用户安装脚本只在配置不存在时复制默认值，升级
+  不覆盖已有环境。软件包不包含账号、密码、令牌或私钥。
+- 构建脚本在成品自检前加载一次随包在线配置，静态回归同时固定服务器地址、证书
+  相对路径和 DER 指纹，避免出包时漏复制或误替换；测试不依赖 PEM 文件换行符，
+  因此兼容 Windows CRLF 与 Linux LF 检出方式。
+- UOS 专项回归 `15/15`、客户端完整回归 `168/168`、Python 编译、Bash 语法、
+  在线配置加载、服务端健康检查及 `git diff --check` 通过。
+- 状态：默认在线配置已完成，等待 UOS 真机验证账号登录、记住密码、重启解密和
+  数据同步；客户端 `0.2.8` 与当前服务端 `0.2.7` 的最终兼容性以该轮结果为准。
+
+### 步骤 123：增加 UOS ARM64 原生 DEB 分发包
+
+- 在已经通过真机验证的便携包基础上新增独立 `build-deb.sh`，无需重新运行
+  PyInstaller 即可快速重封装；完整 `build.sh` 默认同时生成 `tar.gz` 和同版本
+  `.deb`，并继续提供 `--skip-deb` 故障排查入口。
+- DEB 包名和 AppID 统一为 `com.e23aqiu.intdemo`，架构固定为 `arm64`；应用按
+  UOS 规范放入 `/opt/apps/com.e23aqiu.intdemo/` 下的 `files`、`entries` 与
+  `info` 结构，桌面入口直接启动包内根启动器。
+- DEB 复用当前仓库中的启动器、在线配置与公开根证书，因此即使基于此前生成的
+  ARM64 便携成品重封装，也会带上最新连接配置；已有用户配置仍然优先。
+- 控制信息声明 UOS 桌面运行依赖和 ARM64 架构，生成 `md5sums`、包级 SHA-256，
+  使用 `--root-owner-group` 或 `fakeroot` 固定所有权，并在打包后复查包名、版本、
+  架构和入口清单。包中没有 `postinst`，不会修改用户目录或删除业务数据。
+- 首次从 `~/.local/opt/intdemo-client` 切换到 DEB 时，文档要求先运行原用户卸载
+  脚本清理旧程序和桌面入口；数据库、浏览器资料、Secret Service 密钥及在线配置
+  均继续保留在 XDG 用户目录。后续可由软件包安装器完成升级和卸载。
+- 在 WSL 原生 Linux 文件系统中实际生成最小测试 DEB，`dpkg-deb` 成功读取
+  `Package=com.e23aqiu.intdemo`、`Version=9.9.9`、`Architecture=arm64`，应用入口、
+  在线配置、根证书、UOS `info` 和桌面文件的归档路径及权限检查通过。
+- UOS 专项回归 `16/16`、客户端完整回归 `169/169`、Python 编译、Bash 语法和
+  `git diff --check` 通过。
+- 状态：DEB 构建与静态/最小归档验证完成，等待 UOS ARM64 真机用现有完整成品
+  生成约 400 MB 的实际包，并验收双击安装、应用菜单、覆盖升级和卸载保数。
+
+### 步骤 124：修复 UOS V20 的 DEB 菜单入口缓存冲突
+
+- UOS Desktop 20 Professional 1070 ARM64 真机确认 DEB 安装成功，直接执行
+  `/opt/apps/com.e23aqiu.intdemo/files/intdemo-client` 可以正常显示登录界面，但
+  复用历史用户安装桌面 ID 的原菜单项点击后没有反应。
+- 真机新建唯一桌面 ID 的诊断入口后，DDE 菜单可以正常执行同一 DEB 根启动器；
+  诊断日志确认 `HOME`、`PATH`、Wayland、X11 显示变量、内置浏览器、在线配置及
+  Qt XCB 设置均正常，因此问题限定为旧菜单 ID 缓存，而非权限或运行库失败。
+- DEB 桌面文件改为 `com.e23aqiu.intdemo.uos.desktop`，显示名增加“（UOS）”，并
+  在旧版 DDE 下关闭启动通知；历史用户安装继续使用原桌面 ID，两种分发入口不再
+  相互遮盖。构建后新增桌面入口归档校验，防止重封装时退回旧文件名。
+- 继续遵循 UOS 应用目录规范：全部应用文件仍位于 `/opt/apps/${appid}`，不写入
+  `/usr/share`、不增加 `postinst`、不修改任何用户目录。文档补充同版本测试包需
+  使用 `apt --reinstall` 刷新 `dpkg` 文件清单。
+- UOS 专项回归 `16/16`、客户端完整回归 `169/169`、Python 编译、Bash 语法和
+  `git diff --check` 通过；WSL 原生 Linux 文件系统中的最小 DEB 实际归档确认只
+  包含新的 UOS 桌面 ID，包名、版本与 ARM64 架构校验继续生效。
+- 状态：该独立桌面 ID 方案后续真机验证未通过，纠正过程见步骤 125。
+
+### 步骤 125：恢复 UOS AppID 同名入口并从干净环境重验
+
+- 真机强制重装独立桌面 ID 的 DEB 后，DDE 同时显示遗留旧入口与新 UOS 入口，
+  两者点击均没有启动；此前成功的诊断入口位于用户应用目录，并未经过 UOS
+  `/opt/apps` 应用注册链路，因此不能证明独立系统桌面 ID 可用。
+- 结合 UOS 打包规范中“应用入口一般以 AppID 命名”及该入口会由系统链接、后续经
+  沙箱启动的约束，撤销 `com.e23aqiu.intdemo.uos.desktop`。DEB 恢复唯一入口
+  `com.e23aqiu.intdemo.desktop`，与包名、`info.appid` 及 Qt DesktopFileName 完全
+  一致；显示名仍保留“（UOS）”，并继续关闭旧 DDE 启动通知。
+- 构建脚本继续校验桌面入口实际进入 DEB；静态回归新增桌面文件名与 `info.appid`
+  相等的断言，并拒绝重新引入独立 UOS 文件名。
+- 根启动器新增最小 `launcher.log`，仅记录被执行的 desktop 文件、包根目录和桌面
+  会话，并捕获应用入口启动前的标准错误；它不记录账号、令牌或业务内容。下一轮
+  若仍点击无反应，可直接区分“UOS 未执行入口”和“入口执行后应用退出”。
+- 真机已主动删除全部历史安装、用户与系统菜单入口以及 `dist` 产物，下一轮将从
+  干净源代码执行完整 ARM64 构建和首次安装，排除旧 DDE 链接及缓存干扰。
+- UOS 专项回归 `16/16`、客户端完整回归 `169/169`、Python 编译、Bash 语法、
+  启动日志行为及 `git diff --check` 通过；WSL 原生文件系统中的最小 ARM64 DEB
+  实际归档确认只包含 AppID 同名桌面入口，独立 UOS 文件名不存在。
+- 状态：AppID 同名入口已恢复并通过回归，等待干净真机完整重建与首次安装。
+
+### 步骤 126：修复 UOS 菜单注入 Qt Wayland 平台导致的静默退出
+
+- 干净环境完整重建并首次安装后，AppID 同名菜单入口仍点击无界面；新增的
+  `launcher.log` 证明 UOS 已正确执行 `/usr/share/applications/com.e23aqiu.intdemo.desktop`，
+  包路径、用户和显示变量均正常。
+- 日志捕获到 UOS 菜单环境注入了 `QT_QPA_PLATFORM=wayland`，而随包 Qt 只包含
+  `eglfs`、`minimal`、`offscreen`、`vnc`、`webgl` 与 `xcb` 插件，因此 Qt 在创建
+  QApplication 前立即退出。终端启动能够成功，是因为终端环境没有该注入值，旧
+  启动器的 `${QT_QPA_PLATFORM:-xcb}` 才会选择 `xcb`。
+- 根启动器和 Python 平台兼容层现把 UOS Wayland 会话中继承的空值、`wayland` 或
+  `wayland-egl` 统一回退到 `xcb`，同时保留构建自检所需的 `offscreen` 等明确值。
+  新增 `INTDEMO_QT_QPA_PLATFORM` 作为有意验证原生 Wayland 的唯一显式覆盖入口。
+- 启动日志追加最终生效的 Qt 平台与 Chromium Ozone 平台，后续无需再从启动前环境
+  猜测实际选择。
+- UOS 专项回归增至 `19/19`、客户端完整回归增至 `172/172`，Python 编译、Bash
+  语法和 `git diff --check` 通过；真实 Bash 启动器测试确认系统注入 `wayland`
+  会得到 `xcb`，`offscreen` 保持不变，项目专用原生 Wayland 覆盖仍然生效。
+- 状态：根因与修复已落地；由于 ARM64 便携成品已经重新生成，只需快速重封装并
+  强制重装 DEB，无需再次运行 PyInstaller。
+
+### 步骤 127：隔离 UOS Qt 5.11 插件与随包 Qt 5.15
+
+- UOS 真机继续出现菜单启动退出和直接运行返回 `139`。对照自检确认
+  `offscreen+compose` 正常，而 `xcb+compose`、`xcb+fcitx` 均发生段错误，因此
+  排除了 Wayland 注入和 Fcitx 输入法本身是必要触发条件。
+- `QT_DEBUG_PLUGINS=1` 进一步确认随包 Qt 5.15.15 实际加载了
+  `/usr/lib/aarch64-linux-gnu/qt5/plugins/imageformats/kimg_*.so`；这些插件元数据版本
+  `330499` 对应 UOS Qt 5.11.3，崩溃位置同时落在 `QApplication` 初始化和窗口图标
+  加载路径。根因是为发现系统 Fcitx 插件而把整个系统 Qt 插件根目录加入了
+  `QT_PLUGIN_PATH`。
+- ARM64 构建现只把系统 Fcitx 平台输入上下文复制到 PyInstaller 私有
+  `PyQt5/Qt5/plugins/platforminputcontexts` 目录，并用包内运行库执行 `ldd`，拒绝
+  缺失依赖或解析到包外 Qt。运行时会过滤继承到的系统 `QT_PLUGIN_PATH` 与
+  `QT_QPA_PLATFORM_PLUGIN_PATH`，保留应用自有插件路径。
+- 成品自检会显式创建输入法上下文，使用 `QT_DEBUG_PLUGINS` 确认私有 Fcitx 插件
+  已加载且没有发现任何系统 Qt 插件；构建会话存在 `DISPLAY` 时，再分别执行
+  `xcb+compose` 与 `xcb+fcitx` 两次真实图形初始化，防止仅靠 `offscreen` 漏检。
+- UOS 专项回归 `22/22`、客户端完整回归 `179/179`、Python 编译、本机 Qt
+  `offscreen` 自检、Bash 语法和 `git diff --check` 均通过。
+- 状态：代码和静态/本机回归完成，等待 UOS ARM64 真机重新完整构建，以私有插件
+  加载日志及两次 XCB 自检结果作为出包条件；当前有问题的 UOS 0.2.9 不应发布。
+
+### 步骤 128：以统信 ARM64 作为 Windows/UOS 双端发布主控
+
+- 双端发布器支持单选或全选构建 Windows x64 EXE 与 UOS ARM64 DEB；UOS 真机在
+  本地生成并校验 DEB，Windows 默认先导出不可变任务，再交给 GitHub Actions
+  完成测试、安装包、可选增量包/便携包和候选快照构建。
+- GitHub CLI 缺失、认证失败、连接中断、等待超时或结果下载失败时使用专用退出码，
+  保留不含部署凭据的请求 ZIP，并提示转 Windows x64 真机。个人 Windows 只需获取
+  精确 Git 提交和构建依赖，不连接 IntDemo 程序服务器，结果可通过批准的介质带回。
+- 新增 Windows 请求/结果格式，绑定完整源提交、版本、服务地址、通道、公开 CA、
+  增量来源、便携包选项及所有产物 SHA-256；UOS 导入后生成收据，正式发布要求同一
+  提交和配置的 Windows/UOS 两个平台收据。
+- Windows 增量任务携带实际已发布快照，拒绝缺失快照或重建旧提交代替；新候选
+  快照只在远程双端清单成功安装并通过完整哈希复核后转为正式发布快照。
+- UOS 发布命令检查服务端平台清单能力、远程版本防覆盖、同名文件哈希、上传后
+  哈希与并发清单变化，并最后原子安装清单；UOS 收据还会解开实际 DEB，复核其中
+  的提交、在线配置和 CA。暂停分发也提供跨平台 Python 路径。
+- 新增 UOS GUI 启动器、Windows 真机辅助脚本、GitHub Windows workflow、统信主控
+  操作手册和任务安全回归。UOS 打包/SSH 发布不依赖 Docker，服务端容器部署保持
+  独立。
+
+### 步骤 129：隔离 UOS 打包前测试与发布器用户配置
+
+- 发布器 UI 测试不再读取开发者真实的 `settings.json`，统一使用独立默认配置，
+  避免用户已选择 `stable` 通道时测试仍固定断言 `test` 而中止 UOS 构建。
+- Windows 暂停分发计划测试显式模拟 Windows 主控，不再在 UOS ARM64 上错误要求
+  PowerShell `pause-update.ps1`；UOS 原生 Python 暂停流程继续由专项计划覆盖。
+- 发布器专项回归 `26/26`、客户端完整回归 `195/195` 和静态检查通过。
+
+### 步骤 130：Windows/UOS 对称构建结果与双端发布主控
+
+- Windows 与 UOS 的“构建所选安装包”都会保留可直接安装的 EXE/DEB，并同时生成
+  可跨机器导入的标准结果 ZIP；Windows 本机构建不再把候选快照误写为正式发布
+  快照。
+- 新增 UOS 结果 ZIP 格式，记录版本、完整 Git 提交、服务地址、通道、CA 指纹、
+  构建机信息以及 DEB 的文件名、大小和 SHA-256；导入会拒绝路径越界、文件篡改、
+  配置不一致和提交不一致。
+- Windows 和 UOS 发布器都开放“导入 Windows 构建包”和“导入统信构建包”。
+  Windows 远程 UOS 构建会同时下载裸 DEB 与标准 UOS 结果 ZIP，再自动导入收据。
+- 两种主控统一使用 Python 双端发布流程，正式发布都必须同时具备 Windows/UOS
+  校验收据、可访问更新 API，并填写发布服务器 SSH 主机；上传、防覆盖、并发清单
+  替换和正式快照归档规则完全一致。
+- 发布器专项与安全回归 `49/49`、客户端完整回归 `209/209`、服务端回归 `37/37`、
+  Python 编译、PowerShell 语法和差异检查均通过。
+- 本轮准备发布的客户端、服务端、安装器、Docker 镜像和构建脚本版本统一升级为
+  `0.2.11`。
+
+### 步骤 131：支持独立导出安装包与发布器结果包
+
+- 发布器新增“输出类型”：可单独导出 Windows EXE/UOS DEB、单独生成可跨机器导入的
+  Windows/UOS 标准结果 ZIP，或一次生成两者；一键双端发布自动固定为“两者”。
+- UOS 仅结果包模式复用同版本已生成的 DEB 并重新校验后封装；Windows 仅结果包模式
+  在结果链路中构建 EXE 并把它放入结果 ZIP，安装包模式则使用轻量安装包脚本。
+- “导出 Windows 构建任务”改名为“导出 Windows 构建请求包”，界面和文档明确它是
+  交给 Windows 真机执行的输入，不是最终 EXE 或可导入结果包。
+- 定向发布器回归 `51/51`、客户端完整回归 `210/210`、服务端回归 `37/37`、Python
+  编译和 PowerShell 语法检查通过。
+
+### 步骤 132：合并重复的 Windows 请求包入口
+
+- 移除操作栏中独立的“导出 Windows 构建请求包”按钮，避免与“Windows 真机任务包”
+  模式下的主导出按钮重复。
+- 请求包底层能力、GitHub 不可用时自动保留请求包以及 Windows 真机执行流程保持
+  不变；选择真机模式后，主按钮会明确显示“导出 Windows 构建请求包”。
+- 发布器定向回归 `51/51` 通过。
+
+### 步骤 133：为双端正式发布增加大文件断点续传
+
+- 正式发布由一次性 `scp` 上传改为系统 OpenSSH `sftp reput`：EXE、可选增量包、
+  DEB 和更新清单均先写入远程 `.part` 文件，连接中断时保留已上传字节。
+- SSH 统一启用批处理模式、20 秒连接超时、15 秒服务端保活、TCP 保活和最大 20 次
+  保活容错；单文件上传最多自动尝试 6 次，并按短暂退避继续上次远端字节位置。
+- 版本、完整源提交及产物名称/大小/SHA-256 共同生成稳定临时目录。同一组产物重新
+  点击发布会复用原断点；已达到完整大小的断点先校验 SHA-256，正确时直接复用，
+  错误时只清空该精确文件重新上传。
+- 发布器日志约每 10 秒显示已上传容量和百分比，发布确认、停止提示及双端操作文档
+  均说明自动重试和重新发布续传行为；正式发布环境检查改为要求 `ssh + sftp`，
+  远程 UOS 构建和暂停分发的 `scp` 要求保持不变。
+- 新增稳定断点标识、SSH 保活参数、SFTP `reput`、部分文件续传、自动重试、完整
+  断点复用/纠错、多次失败保留以及正式文件防覆盖回归。发布器专项 `61/61`、客户端
+  完整回归 `221/221`、服务端回归 `37/37` 与 Python 编译检查均通过。

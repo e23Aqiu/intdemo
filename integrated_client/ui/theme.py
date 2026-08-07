@@ -174,7 +174,7 @@ def _control_asset_path(name):
 APP_STYLESHEET = """
 QWidget {
     color: #243047;
-    font-family: "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+    font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Micro Hei", "DejaVu Sans", sans-serif;
     font-size: 13px;
 }
 QMainWindow, QDialog {

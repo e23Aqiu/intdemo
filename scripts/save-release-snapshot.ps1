@@ -3,7 +3,9 @@ param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version,
 
-    [string]$StageDir = ""
+    [string]$StageDir = "",
+
+    [string]$OutputPath = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -13,8 +15,19 @@ if (-not $StageDir) {
     $StageDir = Join-Path $distRoot "installer-stage"
 }
 $resolvedStage = (Resolve-Path -LiteralPath $StageDir).Path
-$snapshotRoot = Join-Path $distRoot "release-snapshots"
-$snapshotPath = Join-Path $snapshotRoot "$Version.json"
+if ($OutputPath) {
+    $outputCandidate = $OutputPath
+    if (-not [System.IO.Path]::IsPathRooted($outputCandidate)) {
+        $outputCandidate = Join-Path (Get-Location) $outputCandidate
+    }
+    $snapshotPath = [System.IO.Path]::GetFullPath(
+        $outputCandidate
+    )
+    $snapshotRoot = Split-Path -Parent $snapshotPath
+} else {
+    $snapshotRoot = Join-Path $distRoot "release-snapshots"
+    $snapshotPath = Join-Path $snapshotRoot "$Version.json"
+}
 
 if (-not (Test-Path -LiteralPath (Join-Path $resolvedStage "_internal"))) {
     throw "The installer stage does not look like a PyInstaller onedir build: $resolvedStage"

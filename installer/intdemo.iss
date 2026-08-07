@@ -1,8 +1,8 @@
-#define MyAppName "逃费车辆智能查询平台"
-#define MyAppExeName "逃费车辆智能查询平台.exe"
+#define MyAppName "逃费车辆信息智能查询平台"
+#define MyAppExeName "逃费车辆信息智能查询平台.exe"
 #define MyAppId "F9B73C99-E62D-4DB4-8C5A-CE64DEB5609D"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.8"
+  #define MyAppVersion "1.0.1"
 #endif
 #ifndef StageDir
   #define StageDir "..\dist\installer-stage"
@@ -65,6 +65,9 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: 
 [InstallDelete]
 Type: files; Name: "{app}\IntDemoOnline-icon-*.ico"
 ; Remove files and shortcuts left by releases that used the previous display name.
+Type: files; Name: "{app}\逃费车辆智能查询平台.exe"
+Type: files; Name: "{autoprograms}\逃费车辆智能查询平台.lnk"
+Type: files; Name: "{autodesktop}\逃费车辆智能查询平台.lnk"
 Type: files; Name: "{app}\营运信息批量查询工具.exe"
 Type: files; Name: "{autoprograms}\营运信息批量查询工具.lnk"
 Type: files; Name: "{autodesktop}\营运信息批量查询工具.lnk"

@@ -6,7 +6,6 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QFrame,
-    QFileDialog,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -26,6 +25,7 @@ from .auth_dialogs import (
     RenameAccountDialog,
 )
 from .date_range import DateRangeSelector
+from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
 
 

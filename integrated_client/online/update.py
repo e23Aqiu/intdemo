@@ -11,12 +11,17 @@ from urllib.parse import urljoin, urlparse
 import requests
 
 from ..config import APP_VERSION, get_data_dir
+from ..platform_support import (
+    UOS_UPDATE_PLATFORM,
+    WINDOWS_UPDATE_PLATFORM,
+    update_platform_key,
+)
 from .config import OnlineConfig
 
 _VERSION_PATTERN = re.compile(r"^\d+(?:\.\d+){1,3}$")
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_INSTALLER_PATH_PATTERN = re.compile(
-    r"^/updates/files/[A-Za-z0-9][A-Za-z0-9._-]*\.exe$",
+_PACKAGE_PATH_PATTERN = re.compile(
+    r"^/updates/files/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:exe|deb)$",
     re.IGNORECASE,
 )
 _MAX_INSTALLER_BYTES = 2 * 1024 * 1024 * 1024
@@ -49,6 +54,7 @@ class UpdateInfo:
     mandatory: bool = False
     package_kind: str = "full"
     from_version: str | None = None
+    platform_key: str = ""
 
     @property
     def is_delta(self) -> bool:
@@ -61,16 +67,26 @@ class UpdateClient:
         config: OnlineConfig,
         session: requests.Session | None = None,
         current_version: str | None = None,
+        platform_key: str | None = None,
     ):
         self.config = config.validate()
         self.current_version = str(current_version or APP_VERSION).strip()
         version_key(self.current_version)
+        self.platform_key = str(
+            platform_key or update_platform_key()
+        ).strip().casefold()
+        if self.platform_key not in {
+            WINDOWS_UPDATE_PLATFORM,
+            UOS_UPDATE_PLATFORM,
+        }:
+            raise UpdateError("当前操作系统或处理器架构不支持在线更新")
         self.session = session or requests.Session()
         self.session.headers.update(
             {
                 "Accept": "application/json",
                 "User-Agent": f"IntDemoUpdater/{self.current_version}",
                 "X-IntDemo-Version": self.current_version,
+                "X-IntDemo-Platform": self.platform_key,
             }
         )
 
@@ -92,8 +108,15 @@ class UpdateClient:
 
     def _validated_package(self, payload: dict, *, label: str) -> dict:
         installer_path = str(payload.get("installer_path") or "").strip()
-        if not _INSTALLER_PATH_PATTERN.fullmatch(installer_path):
+        if not _PACKAGE_PATH_PATTERN.fullmatch(installer_path):
             raise UpdateError(f"服务器{label}路径无效")
+        expected_suffix = (
+            ".exe"
+            if self.platform_key == WINDOWS_UPDATE_PLATFORM
+            else ".deb"
+        )
+        if not installer_path.casefold().endswith(expected_suffix):
+            raise UpdateError(f"服务器{label}与当前平台不匹配")
         installer_url = urljoin(
             f"{self.config.base_url.rstrip('/')}/",
             installer_path,
@@ -121,6 +144,43 @@ class UpdateClient:
             "sha256": sha256,
             "size": size,
         }
+
+    def _platform_manifest(self, payload: dict) -> dict:
+        selected_platform = str(
+            payload.get("selected_platform") or ""
+        ).strip().casefold()
+        if selected_platform and selected_platform != self.platform_key:
+            raise UpdateError("服务器返回了其他平台的更新包")
+
+        platforms = payload.get("platforms")
+        if isinstance(platforms, dict):
+            platform_payload = platforms.get(self.platform_key)
+            if not isinstance(platform_payload, dict):
+                raise UpdateError("服务器尚未发布当前平台的更新包")
+            selected = dict(payload)
+            for key in (
+                "installer_path",
+                "sha256",
+                "size",
+                "full",
+                "delta",
+                "deltas",
+                "primary_kind",
+                "primary_from_version",
+            ):
+                selected.pop(key, None)
+            selected.update(platform_payload)
+            selected["selected_platform"] = self.platform_key
+            return selected
+
+        # Schema-v1 manifests without a platform map were Windows-only.  A
+        # server may still flatten a Linux package, but it must label it.
+        if (
+            self.platform_key != WINDOWS_UPDATE_PLATFORM
+            and selected_platform != self.platform_key
+        ):
+            raise UpdateError("服务器更新清单不包含 UOS ARM64 安装包")
+        return payload
 
     @staticmethod
     def _matching_delta(payload: dict, current_version: str) -> dict | None:
@@ -168,6 +228,8 @@ class UpdateClient:
         if version_key(version) <= version_key(self.current_version):
             return None
 
+        payload = self._platform_manifest(payload)
+
         full_payload = (
             payload.get("full")
             if isinstance(payload.get("full"), dict)
@@ -197,6 +259,7 @@ class UpdateClient:
             mandatory=bool(payload.get("mandatory", False)),
             package_kind=package_kind,
             from_version=from_version,
+            platform_key=self.platform_key,
         )
 
     @staticmethod

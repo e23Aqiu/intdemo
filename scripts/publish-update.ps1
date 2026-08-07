@@ -1,6 +1,9 @@
 param(
-    [Parameter(Mandatory = $true)]
-    [string]$Installer,
+    [string]$Installer = "",
+
+    [string]$WindowsInstaller = "",
+
+    [string]$UosInstaller = "",
 
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^\d+\.\d+\.\d+$')]
@@ -30,11 +33,40 @@ param(
 
 $ErrorActionPreference = "Stop"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$sourceInstaller = (Resolve-Path -LiteralPath $Installer).Path
+$normalizedRemotePath = $RemotePath.TrimEnd("/")
+$remotePathParts = @($normalizedRemotePath.Split("/") | Select-Object -Skip 1)
+if (
+    -not $normalizedRemotePath -or
+    $normalizedRemotePath -eq "/" -or
+    $remotePathParts.Count -eq 0 -or
+    @($remotePathParts | Where-Object { $_ -in @("", ".", "..") }).Count -gt 0
+) {
+    throw "RemotePath must be a safe, non-root absolute Linux path"
+}
+$RemotePath = $normalizedRemotePath
+if (-not $WindowsInstaller) {
+    $WindowsInstaller = $Installer
+}
+if (-not $WindowsInstaller) {
+    throw "WindowsInstaller is required for legacy Windows update compatibility"
+}
+$sourceInstaller = (Resolve-Path -LiteralPath $WindowsInstaller).Path
+if ([System.IO.Path]::GetExtension($sourceInstaller) -ne ".exe") {
+    throw "WindowsInstaller must be an .exe package"
+}
+$sourceUosInstaller = $null
+if ($UosInstaller) {
+    $sourceUosInstaller = (Resolve-Path -LiteralPath $UosInstaller).Path
+    if ([System.IO.Path]::GetExtension($sourceUosInstaller) -ne ".deb") {
+        throw "UosInstaller must be a .deb package"
+    }
+}
 $releaseRoot = Join-Path $repoRoot "dist\update-release"
 $filesRoot = Join-Path $releaseRoot "files"
 $publishedName = "IntDemoOnline-Setup-$Version.exe"
 $publishedInstaller = Join-Path $filesRoot $publishedName
+$uosPublishedName = "IntDemo-UOS-arm64-$Version.deb"
+$publishedUosInstaller = Join-Path $filesRoot $uosPublishedName
 $manifestPath = Join-Path $releaseRoot "$Channel.json"
 
 $sourceCommit = [string](& git -C $repoRoot rev-parse HEAD)
@@ -55,6 +87,23 @@ New-Item -ItemType Directory -Force -Path $filesRoot | Out-Null
 Copy-Item -LiteralPath $sourceInstaller -Destination $publishedInstaller -Force
 $file = Get-Item -LiteralPath $publishedInstaller
 $hash = (Get-FileHash -LiteralPath $publishedInstaller -Algorithm SHA256).Hash.ToLowerInvariant()
+$uosFile = $null
+$uosHash = ""
+if ($sourceUosInstaller) {
+    Copy-Item -LiteralPath $sourceUosInstaller -Destination $publishedUosInstaller -Force
+    $uosFile = Get-Item -LiteralPath $publishedUosInstaller
+    $uosHash = (
+        Get-FileHash -LiteralPath $publishedUosInstaller -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+}
+$windowsFull = [ordered]@{
+    installer_path = "/updates/files/$publishedName"
+    sha256 = $hash
+    size = $file.Length
+}
+$windowsPlatform = [ordered]@{
+    full = $windowsFull
+}
 $manifest = [ordered]@{
     schema_version = 1
     channel = $Channel
@@ -68,6 +117,18 @@ $manifest = [ordered]@{
     primary_kind = "full"
     mandatory = [bool]$Mandatory
     notes = $Notes
+    platforms = [ordered]@{
+        "windows-x86_64" = $windowsPlatform
+    }
+}
+if ($uosFile) {
+    $manifest.platforms["linux-aarch64"] = [ordered]@{
+        full = [ordered]@{
+            installer_path = "/updates/files/$uosPublishedName"
+            sha256 = $uosHash
+            size = $uosFile.Length
+        }
+    }
 }
 $publishedDelta = $null
 $deltaPublishedName = ""
@@ -96,6 +157,14 @@ if ($DeltaInstaller -or $DeltaFromVersion) {
             size = $deltaFile.Length
         }
     )
+    $windowsPlatform.deltas = @(
+        [ordered]@{
+            from_version = $DeltaFromVersion
+            installer_path = "/updates/files/$deltaPublishedName"
+            sha256 = $deltaHash
+            size = $deltaFile.Length
+        }
+    )
     if ($LegacyDeltaPrimary) {
         Write-Warning (
             "LegacyDeltaPrimary is deprecated. The canonical manifest now " +
@@ -117,6 +186,10 @@ Write-Host "Update release prepared: $releaseRoot"
 Write-Host "Manifest: $manifestPath"
 Write-Host "Installer: $publishedInstaller"
 Write-Host "SHA-256: $hash"
+if ($uosFile) {
+    Write-Host "UOS ARM64 installer: $publishedUosInstaller"
+    Write-Host "UOS ARM64 SHA-256: $uosHash"
+}
 if ($publishedDelta) {
     Write-Host "Delta installer: $publishedDelta"
     Write-Host "Delta SHA-256: $deltaHash"
@@ -206,6 +279,23 @@ if ($RemoteHost) {
             Write-Host "Remote delta installer already matches; upload skipped"
         }
     }
+    $uosUploaded = $false
+    if ($uosFile) {
+        $remoteUosHashOutput = @(
+            & ssh @sshArgs $RemoteHost `
+                "if [ -f '$RemotePath/files/$uosPublishedName' ]; then sha256sum '$RemotePath/files/$uosPublishedName' | cut -d ' ' -f 1; fi"
+        )
+        $remoteUosHash = ($remoteUosHashOutput -join "").Trim()
+        $uosUploaded = $remoteUosHash -ne $uosHash
+        if ($uosUploaded) {
+            & scp @scpArgs $publishedUosInstaller "${RemoteHost}:$incoming/$uosPublishedName"
+            if ($LASTEXITCODE -ne 0) {
+                throw "Could not upload the UOS ARM64 installer"
+            }
+        } else {
+            Write-Host "Remote UOS ARM64 installer already matches; upload skipped"
+        }
+    }
     & scp @scpArgs $manifestPath "${RemoteHost}:$incoming/$Channel.json"
     if ($LASTEXITCODE -ne 0) {
         throw "Could not upload the manifest"
@@ -216,6 +306,9 @@ if ($RemoteHost) {
     }
     if ($publishedDelta -and $deltaUploaded) {
         $publishSteps += "mv '$incoming/$deltaPublishedName' '$RemotePath/files/$deltaPublishedName'"
+    }
+    if ($uosFile -and $uosUploaded) {
+        $publishSteps += "mv '$incoming/$uosPublishedName' '$RemotePath/files/$uosPublishedName'"
     }
     $publishSteps += "mv '$incoming/$Channel.json' '$RemotePath/$Channel.json'"
     $publishCommand = $publishSteps -join " && "

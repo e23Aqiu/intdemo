@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import replace
+from datetime import UTC, date, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -11,7 +13,7 @@ import app.main as main_module
 from app.config import get_settings
 from app.connection_test import connection_test_gate
 from app.database import SessionLocal
-from app.models import Account
+from app.models import Account, ActivityEvent, WorkflowBatch, WorkflowRun
 
 from .conftest import auth_header, changed_admin, device_uid, login
 
@@ -573,6 +575,42 @@ def test_archived_account_can_be_permanently_deleted(client):
         f"/api/v1/admin/accounts/{account_id}/archive",
         headers=headers,
     ).status_code == 200
+    with SessionLocal() as db:
+        occurred_at = datetime.now(UTC)
+        db.add_all(
+            [
+                ActivityEvent(
+                    account_id=uuid.UUID(account_id),
+                    event_uid=uuid.uuid4(),
+                    metric_key="workflow_detail_total",
+                    amount=7,
+                    business_date=date.today(),
+                    source="test",
+                    summary={},
+                    occurred_at=occurred_at,
+                ),
+                WorkflowBatch(
+                    account_id=uuid.UUID(account_id),
+                    entity_id="deleted-account-batch",
+                    event_uid=uuid.uuid4(),
+                    revision=1,
+                    status="succeeded",
+                    input_fingerprint="a" * 64,
+                    business_date=date.today(),
+                    occurred_at=occurred_at,
+                ),
+                WorkflowRun(
+                    account_id=uuid.UUID(account_id),
+                    entity_id="deleted-account-run",
+                    batch_entity_id="deleted-account-batch",
+                    event_uid=uuid.uuid4(),
+                    revision=1,
+                    status="succeeded",
+                    occurred_at=occurred_at,
+                ),
+            ]
+        )
+        db.commit()
     deleted = client.delete(
         f"/api/v1/admin/accounts/{account_id}",
         headers=headers,
@@ -580,6 +618,23 @@ def test_archived_account_can_be_permanently_deleted(client):
     assert deleted.status_code == 204
     accounts = client.get("/api/v1/admin/accounts", headers=headers).json()
     assert account_id not in {str(account["id"]) for account in accounts}
+    with SessionLocal() as db:
+        assert db.get(Account, uuid.UUID(account_id)) is None
+        assert db.scalar(
+            select(ActivityEvent.id).where(
+                ActivityEvent.account_id == uuid.UUID(account_id)
+            )
+        ) is None
+        assert db.scalar(
+            select(WorkflowBatch.id).where(
+                WorkflowBatch.account_id == uuid.UUID(account_id)
+            )
+        ) is None
+        assert db.scalar(
+            select(WorkflowRun.id).where(
+                WorkflowRun.account_id == uuid.UUID(account_id)
+            )
+        ) is None
     audit_rows = client.get("/api/v1/admin/audit", headers=headers).json()["items"]
     assert any(
         row["action"] == "account.delete" and row["target_id"] == account_id

@@ -5,8 +5,11 @@ param(
 
     [string]$CaBundle = "",
 
+    [ValidateSet("test", "stable")]
+    [string]$Channel = "test",
+
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "0.2.8",
+    [string]$Version = "1.0.1",
     [string]$InnoCompiler = "",
 
     [ValidatePattern('^$|^\d+\.\d+\.\d+$')]
@@ -98,7 +101,7 @@ try {
     $config = [ordered]@{
         base_url = $BaseUrl.TrimEnd("/")
         ca_bundle = $relativeCa
-        channel = "test"
+        channel = $Channel
         connect_timeout = 5
         read_timeout = 20
     }

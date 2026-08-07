@@ -2,7 +2,14 @@ import os
 import threading
 from dataclasses import replace
 
-from PyQt5.QtCore import QProcess, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import (
+    QProcess,
+    QProcessEnvironment,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication,
@@ -21,6 +28,11 @@ from ..config import APP_NAME, APP_VERSION
 from ..database import Database
 from ..models import Account
 from ..online.captcha_learning import CaptchaLearningService
+from ..platform_support import (
+    supports_self_update,
+    update_install_command,
+    update_install_environment,
+)
 from ..preferences import ClientPreferences
 from ..timing import WorkflowTimingService
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
@@ -208,6 +220,11 @@ class MainWindow(FramelessMainWindow):
             self.personal_center_page = PersonalCenterPage(
                 account,
                 updates_enabled=self.update_coordinator is not None,
+                updates_disabled_message=(
+                    "当前系统或处理器架构不支持自动安装更新，业务数据会独立保留。"
+                    if not supports_self_update()
+                    else ""
+                ),
             )
             self.personal_center_page.change_password_requested.connect(
                 self._change_password
@@ -369,7 +386,7 @@ class MainWindow(FramelessMainWindow):
         brand_row = QHBoxLayout()
         brand_row.setContentsMargins(2, 0, 2, 0)
         brand_row.setSpacing(11)
-        self.sidebar_brand_badge = QLabel("逃")
+        self.sidebar_brand_badge = QLabel("查")
         self.sidebar_brand_badge.setObjectName("BrandBadge")
         self.sidebar_brand_badge.setAlignment(Qt.AlignCenter)
         self.sidebar_brand_badge.setFixedSize(44, 44)
@@ -378,7 +395,7 @@ class MainWindow(FramelessMainWindow):
         brand_text = QVBoxLayout()
         brand_text.setContentsMargins(0, 0, 0, 0)
         brand_text.setSpacing(1)
-        brand = QLabel(APP_NAME.replace("智能查询平台", "智能\n查询平台"))
+        brand = QLabel(APP_NAME.replace("信息智能查询平台", "信息\n智能查询平台"))
         brand.setObjectName("BrandTitle")
         brand.setWordWrap(True)
         sub = QLabel(f"INTDEMO  ·  v{APP_VERSION}")
@@ -620,11 +637,12 @@ class MainWindow(FramelessMainWindow):
         self.announcement_ticker_button = QPushButton("暂无公告")
         self.announcement_ticker_button.setObjectName("AnnouncementTickerButton")
         self.announcement_ticker_button.setSizePolicy(
-            QSizePolicy.Expanding,
+            QSizePolicy.Preferred,
             QSizePolicy.Fixed,
         )
+        self.announcement_ticker_button.setMinimumWidth(260)
         self.announcement_ticker_button.setMinimumHeight(38)
-        self.announcement_ticker_button.setMaximumWidth(720)
+        self.announcement_ticker_button.setMaximumWidth(480)
         self.announcement_ticker_button.setEnabled(False)
         self.announcement_ticker_button.setVisible(
             self.announcement_service_available
@@ -994,10 +1012,22 @@ class MainWindow(FramelessMainWindow):
                 return
         if not self._prepare_close():
             return
-        launched = QProcess.startDetached(
-            str(installer_path),
-            ["/SP-", "/CLOSEAPPLICATIONS"],
-        )
+        try:
+            installer_program, installer_arguments = update_install_command(
+                installer_path
+            )
+        except RuntimeError as exc:
+            self._prepared_to_close = False
+            QMessageBox.critical(self, "无法启动安装包", str(exc))
+            return
+        installer_process = QProcess()
+        installer_process.setProgram(installer_program)
+        installer_process.setArguments(installer_arguments)
+        process_environment = QProcessEnvironment()
+        for name, value in update_install_environment().items():
+            process_environment.insert(name, value)
+        installer_process.setProcessEnvironment(process_environment)
+        launched = installer_process.startDetached()
         if isinstance(launched, tuple):
             launched = launched[0]
         if not launched:

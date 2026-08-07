@@ -21,7 +21,7 @@ from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
-    QProgressBar, QFileDialog, QMessageBox, QGroupBox, QTextEdit,
+    QProgressBar, QMessageBox, QGroupBox, QTextEdit,
     QSplitter, QFrame, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -31,6 +31,8 @@ import openpyxl
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 from ..browser import get_builtin_chromium_path
+from ..platform_support import chromium_launch_args
+from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 
 
 # ==================== 配置 ====================
@@ -93,11 +95,13 @@ def _available_local_port():
 
 
 def create_browser(profile_directory=None):
-    """使用项目随 Playwright 安装的内置 Chromium 创建浏览器实例。"""
+    """使用自动解析的兼容 Chromium 创建浏览器实例。"""
     co = ChromiumOptions()
     co.set_argument('--disable-blink-features=AutomationControlled')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-infobars')
+    for argument in chromium_launch_args():
+        co.set_argument(argument)
     if profile_directory:
         profile_directory = Path(profile_directory).resolve()
         profile_directory.mkdir(parents=True, exist_ok=True)
@@ -1033,7 +1037,7 @@ class MainWindow(QMainWindow):
 
         # ===== 浏览器信息 =====
         browser_layout = QHBoxLayout()
-        browser_label = QLabel("🌐 使用浏览器：内置 Chromium")
+        browser_label = QLabel("🌐 使用浏览器：兼容 Chromium")
         browser_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #2d7d46;")
         browser_layout.addWidget(browser_label)
         browser_layout.addStretch(1)
@@ -1327,7 +1331,7 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: orange; font-weight: bold;")
         
         # 启动工作线程
-        self._log("🌐 使用浏览器：内置 Chromium")
+        self._log("🌐 使用浏览器：兼容 Chromium")
         self.worker = QueryWorker(self.df.copy(), COMPANY_COL_NAME)
         self.worker.log_signal.connect(self._log)
         self.worker.progress_signal.connect(self._on_progress)

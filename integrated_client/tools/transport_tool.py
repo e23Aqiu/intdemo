@@ -25,6 +25,8 @@ from PyQt5.QtGui import QFont
 
 USING_PYQT6 = False
 from ..browser import get_builtin_chromium_path
+from ..platform_support import chromium_launch_args
+from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 from playwright.sync_api import sync_playwright, Page, Browser
 try:
     from ddddocr import DdddOcr
@@ -642,6 +644,7 @@ class Worker(QThread):
                 headless=False,
                 slow_mo=600,
                 executable_path=browser_path,
+                args=chromium_launch_args(),
             )
             self.context = self.browser.new_context(
                 viewport={"width": 390, "height": 844},
@@ -652,7 +655,7 @@ class Worker(QThread):
                 ),
             )
             self.page = self.context.new_page()
-            self.log.emit("🔧 使用内置 Chromium 浏览器")
+            self.log.emit(f"🔧 使用 Chromium 浏览器：{browser_path}")
             return True
         except Exception as exc:
             self.log.emit(f"❌ 浏览器启动失败：{str(exc)[:160]}")
@@ -1530,9 +1533,12 @@ class BusinessBackfillWorker(QThread):
                 "headless": False,
                 "slow_mo": 600,
                 "executable_path": get_builtin_chromium_path(self.playwright),
+                "args": chromium_launch_args(),
             }
             self.browser = self.playwright.chromium.launch(**launch_kwargs)
-            self.log.emit("🔧 使用内置 Chromium 浏览器")
+            self.log.emit(
+                f"🔧 使用 Chromium 浏览器：{launch_kwargs['executable_path']}"
+            )
             self.context = self.browser.new_context(
                 no_viewport=True  # ← 禁用固定视口，窗口可调整
             )
@@ -2581,7 +2587,7 @@ class MainWindow(QMainWindow):
 
         browser_group = QGroupBox("浏览器")
         browser_layout = QHBoxLayout(browser_group)
-        builtin_label = QLabel("🔧 正在使用内置 Chromium 浏览器")
+        builtin_label = QLabel("🔧 正在使用自动适配的 Chromium 浏览器")
         builtin_label.setStyleSheet("font-weight: bold; color: #2d7d46;")
         browser_layout.addWidget(builtin_label)
         browser_layout.addStretch()

@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+package_root="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+bundled_browser="$package_root/browser/chrome"
+bundled_connection_config="$package_root/client-online.json"
+user_config_root="${XDG_CONFIG_HOME:-$HOME/.config}/intdemo-client"
+user_connection_config="$user_config_root/client-online.json"
+launcher_log=""
+
+if [[ -n "${HOME:-}" ]]; then
+  launcher_log_dir="${XDG_DATA_HOME:-$HOME/.local/share}/intdemo-client-online-test/logs"
+  if mkdir -p "$launcher_log_dir" 2>/dev/null; then
+    launcher_log="$launcher_log_dir/launcher.log"
+    {
+      printf '=== %s pid=%s ===\n' "$(date -Is 2>/dev/null || date)" "$$"
+      printf 'desktop_file=%s\n' "${GIO_LAUNCHED_DESKTOP_FILE:-}"
+      printf 'package_root=%s\n' "$package_root"
+      printf 'session=%s display=%s wayland_display=%s qt_platform=%s\n' \
+        "${XDG_SESSION_TYPE:-}" "${DISPLAY:-}" "${WAYLAND_DISPLAY:-}" \
+        "${QT_QPA_PLATFORM:-}"
+    } >>"$launcher_log" 2>&1 || true
+  fi
+fi
+
+if [[ -x "$bundled_browser" ]]; then
+  export INTDEMO_CHROMIUM_PATH="${INTDEMO_CHROMIUM_PATH:-$bundled_browser}"
+fi
+if [[ -z "${INTDEMO_CONNECTION_CONFIG:-}" ]]; then
+  if [[ -f "$user_connection_config" ]]; then
+    export INTDEMO_CONNECTION_CONFIG="$user_connection_config"
+  elif [[ -f "$bundled_connection_config" ]]; then
+    export INTDEMO_CONNECTION_CONFIG="$bundled_connection_config"
+  fi
+fi
+
+# UOS 20 Wayland normally provides XWayland.  Its application launcher may
+# inject QT_QPA_PLATFORM=wayland even though the bundled Qt has no Wayland
+# plugin, so treat that inherited value as unsafe and force XCB.  A deliberate
+# native Wayland test must use the project-specific override below.
+if [[ -n "${INTDEMO_QT_QPA_PLATFORM:-}" ]]; then
+  export QT_QPA_PLATFORM="$INTDEMO_QT_QPA_PLATFORM"
+elif [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${DISPLAY:-}" ]]; then
+  case "${QT_QPA_PLATFORM:-}" in
+    ""|wayland|wayland-egl) export QT_QPA_PLATFORM=xcb ;;
+  esac
+fi
+if [[ "${XDG_SESSION_TYPE:-}" == "wayland" && -n "${DISPLAY:-}" ]]; then
+  export INTDEMO_CHROMIUM_OZONE_PLATFORM="${INTDEMO_CHROMIUM_OZONE_PLATFORM:-x11}"
+fi
+export QT_AUTO_SCREEN_SCALE_FACTOR="${QT_AUTO_SCREEN_SCALE_FACTOR:-1}"
+
+# Qt 5's XCB backend does not infer the UOS Fcitx service reliably from every
+# desktop launcher.  Respect an explicit module, mirror IBus when configured,
+# and otherwise use the bundled Fcitx/Fcitx5 platform input context.
+if [[ -z "${QT_IM_MODULE:-}" ]]; then
+  input_method_hint="${GTK_IM_MODULE:-} ${XMODIFIERS:-} ${INPUT_METHOD:-}"
+  if [[ "${input_method_hint,,}" == *ibus* ]]; then
+    export QT_IM_MODULE=ibus
+  else
+    export QT_IM_MODULE=fcitx
+  fi
+fi
+if [[ "$QT_IM_MODULE" == fcitx && -z "${XMODIFIERS:-}" ]]; then
+  export XMODIFIERS=@im=fcitx
+fi
+
+if [[ -n "$launcher_log" ]]; then
+  printf 'effective_qt_platform=%s qt_im_module=%s chromium_ozone=%s\n' \
+    "${QT_QPA_PLATFORM:-}" "${QT_IM_MODULE:-}" \
+    "${INTDEMO_CHROMIUM_OZONE_PLATFORM:-}" \
+    >>"$launcher_log" 2>&1 || true
+fi
+
+if [[ -n "$launcher_log" ]]; then
+  exec "$package_root/app/intdemo-client" "$@" 2>>"$launcher_log"
+fi
+exec "$package_root/app/intdemo-client" "$@"

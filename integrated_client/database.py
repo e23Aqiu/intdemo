@@ -2758,6 +2758,133 @@ class Database:
             ).fetchone()
             return self._account_from_row(row)
 
+    def reconcile_remote_accounts(self, payloads: Iterable[Dict]) -> List[Account]:
+        """Mirror one complete server account list into the local cache.
+
+        An account delete change can be missed when a client was offline or its
+        local sync cursor predates a server-side cleanup.  The administration
+        endpoint returns a complete list, so a successful response is also an
+        authoritative opportunity to remove remote accounts that no longer
+        exist.  Local-only accounts and the currently signed-in account are
+        deliberately preserved.
+        """
+        rows = list(payloads)
+        with self._connect() as conn:
+            account_ids = []
+            server_account_ids = set()
+            for payload in rows:
+                account_id = self._upsert_remote_account_conn(conn, payload)
+                account_ids.append(account_id)
+                server_account_id = str(
+                    payload.get("id") or payload.get("account_id") or ""
+                ).strip()
+                if server_account_id:
+                    server_account_ids.add(server_account_id)
+
+            state = conn.execute(
+                "SELECT current_server_account_id FROM sync_state WHERE id=1"
+            ).fetchone()
+            current_server_account_id = (
+                str(state["current_server_account_id"] or "").strip()
+                if state
+                else ""
+            )
+            cached_ids = conn.execute(
+                """
+                SELECT server_account_id FROM accounts
+                WHERE server_account_id IS NOT NULL
+                """
+            ).fetchall()
+            for cached in cached_ids:
+                server_account_id = str(cached["server_account_id"] or "").strip()
+                if (
+                    server_account_id
+                    and server_account_id not in server_account_ids
+                    and server_account_id != current_server_account_id
+                ):
+                    self._purge_remote_account_cache_conn(
+                        conn,
+                        server_account_id,
+                    )
+
+            accounts = []
+            for account_id in account_ids:
+                row = conn.execute(
+                    "SELECT * FROM accounts WHERE id=?",
+                    (account_id,),
+                ).fetchone()
+                if row:
+                    accounts.append(self._account_from_row(row))
+            return accounts
+
+    @staticmethod
+    def _purge_remote_account_cache_conn(conn, server_account_id: str) -> bool:
+        """Remove one remote account and every local row that can identify it."""
+        normalized = str(server_account_id or "").strip()
+        if not normalized:
+            return False
+        row = conn.execute(
+            "SELECT id FROM accounts WHERE server_account_id=?",
+            (normalized,),
+        ).fetchone()
+        conn.execute(
+            "DELETE FROM sync_outbox WHERE server_account_id=?",
+            (normalized,),
+        )
+        conn.execute(
+            "DELETE FROM remote_workflow_runs WHERE server_account_id=?",
+            (normalized,),
+        )
+        conn.execute(
+            "DELETE FROM remote_workflow_batches WHERE server_account_id=?",
+            (normalized,),
+        )
+        if not row:
+            return False
+        local_account_id = int(row["id"])
+        # The oldest local schema did not declare ON DELETE CASCADE on every
+        # business table. Remove timer/run children explicitly before deleting
+        # the account so no historical rows can survive a permanent purge.
+        conn.execute(
+            """
+            DELETE FROM workflow_timer_events
+            WHERE batch_id IN (
+                SELECT batch_id FROM workflow_batches WHERE user_id=?
+            )
+            OR run_id IN (
+                SELECT run_id FROM workflow_runs WHERE user_id=?
+            )
+            """,
+            (local_account_id, local_account_id),
+        )
+        conn.execute(
+            """
+            DELETE FROM workflow_step_attempts
+            WHERE run_id IN (
+                SELECT run_id FROM workflow_runs WHERE user_id=?
+            )
+            """,
+            (local_account_id,),
+        )
+        conn.execute(
+            "DELETE FROM workflow_runs WHERE user_id=?",
+            (local_account_id,),
+        )
+        conn.execute(
+            "DELETE FROM workflow_batches WHERE user_id=?",
+            (local_account_id,),
+        )
+        conn.execute(
+            "DELETE FROM activity_events WHERE user_id=?",
+            (local_account_id,),
+        )
+        conn.execute(
+            "UPDATE accounts SET created_by=NULL WHERE created_by=?",
+            (local_account_id,),
+        )
+        conn.execute("DELETE FROM accounts WHERE id=?", (local_account_id,))
+        return True
+
     def purge_remote_account_cache(self, server_account_id: str) -> bool:
         """Remove a permanently deleted remote account and all local mirrors."""
         normalized = str(server_account_id or "").strip()
@@ -2769,26 +2896,7 @@ class Database:
             ).fetchone()
             if current and current["current_server_account_id"] == normalized:
                 raise DatabaseError("不能删除当前登录账号的本机缓存")
-            row = conn.execute(
-                "SELECT id FROM accounts WHERE server_account_id=?",
-                (normalized,),
-            ).fetchone()
-            conn.execute(
-                "DELETE FROM sync_outbox WHERE server_account_id=?",
-                (normalized,),
-            )
-            conn.execute(
-                "DELETE FROM remote_workflow_runs WHERE server_account_id=?",
-                (normalized,),
-            )
-            conn.execute(
-                "DELETE FROM remote_workflow_batches WHERE server_account_id=?",
-                (normalized,),
-            )
-            if not row:
-                return False
-            conn.execute("DELETE FROM accounts WHERE id=?", (int(row["id"]),))
-            return True
+            return self._purge_remote_account_cache_conn(conn, normalized)
 
     def set_current_online_account(
         self,
@@ -3322,8 +3430,13 @@ class Database:
                 account_id = str(change.get("account_id") or "")
                 payload = change.get("payload") or {}
                 if kind == "account":
-                    merged = {"id": entity_id, **payload}
-                    self._upsert_remote_account_conn(conn, merged)
+                    if str(change.get("operation") or "upsert") == "delete":
+                        if entity_id == current_server_account_id:
+                            raise DatabaseError("当前登录账号已被服务器永久删除")
+                        self._purge_remote_account_cache_conn(conn, entity_id)
+                    else:
+                        merged = {"id": entity_id, **payload}
+                        self._upsert_remote_account_conn(conn, merged)
                 elif kind == "activity_event":
                     self._apply_remote_activity_conn(conn, payload)
                 elif kind == "workflow_batch_snapshot":
@@ -3381,7 +3494,13 @@ class Database:
             conn.execute("DELETE FROM activity_events WHERE remote_cached=1")
             conn.execute("DELETE FROM remote_workflow_batches")
             conn.execute("DELETE FROM remote_workflow_runs")
+            snapshot_account_ids = set()
             for account in snapshot.get("accounts") or []:
+                server_account_id = str(
+                    account.get("id") or account.get("account_id") or ""
+                ).strip()
+                if server_account_id:
+                    snapshot_account_ids.add(server_account_id)
                 self._upsert_remote_account_conn(conn, account)
             for metric in snapshot.get("metrics") or []:
                 conn.execute(
@@ -3425,6 +3544,24 @@ class Database:
                     conn,
                     current_server_account_id,
                 )
+            else:
+                stale_account_ids = [
+                    str(row["server_account_id"])
+                    for row in conn.execute(
+                        """
+                        SELECT server_account_id FROM accounts
+                        WHERE server_account_id IS NOT NULL
+                          AND server_account_id<>?
+                        """,
+                        (current_server_account_id or "",),
+                    ).fetchall()
+                    if str(row["server_account_id"]) not in snapshot_account_ids
+                ]
+                for server_account_id in stale_account_ids:
+                    self._purge_remote_account_cache_conn(
+                        conn,
+                        server_account_id,
+                    )
             conn.execute(
                 """
                 UPDATE sync_state
