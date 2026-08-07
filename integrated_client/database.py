@@ -2758,6 +2758,65 @@ class Database:
             ).fetchone()
             return self._account_from_row(row)
 
+    def reconcile_remote_accounts(self, payloads: Iterable[Dict]) -> List[Account]:
+        """Mirror one complete server account list into the local cache.
+
+        An account delete change can be missed when a client was offline or its
+        local sync cursor predates a server-side cleanup.  The administration
+        endpoint returns a complete list, so a successful response is also an
+        authoritative opportunity to remove remote accounts that no longer
+        exist.  Local-only accounts and the currently signed-in account are
+        deliberately preserved.
+        """
+        rows = list(payloads)
+        with self._connect() as conn:
+            account_ids = []
+            server_account_ids = set()
+            for payload in rows:
+                account_id = self._upsert_remote_account_conn(conn, payload)
+                account_ids.append(account_id)
+                server_account_id = str(
+                    payload.get("id") or payload.get("account_id") or ""
+                ).strip()
+                if server_account_id:
+                    server_account_ids.add(server_account_id)
+
+            state = conn.execute(
+                "SELECT current_server_account_id FROM sync_state WHERE id=1"
+            ).fetchone()
+            current_server_account_id = (
+                str(state["current_server_account_id"] or "").strip()
+                if state
+                else ""
+            )
+            cached_ids = conn.execute(
+                """
+                SELECT server_account_id FROM accounts
+                WHERE server_account_id IS NOT NULL
+                """
+            ).fetchall()
+            for cached in cached_ids:
+                server_account_id = str(cached["server_account_id"] or "").strip()
+                if (
+                    server_account_id
+                    and server_account_id not in server_account_ids
+                    and server_account_id != current_server_account_id
+                ):
+                    self._purge_remote_account_cache_conn(
+                        conn,
+                        server_account_id,
+                    )
+
+            accounts = []
+            for account_id in account_ids:
+                row = conn.execute(
+                    "SELECT * FROM accounts WHERE id=?",
+                    (account_id,),
+                ).fetchone()
+                if row:
+                    accounts.append(self._account_from_row(row))
+            return accounts
+
     @staticmethod
     def _purge_remote_account_cache_conn(conn, server_account_id: str) -> bool:
         """Remove one remote account and every local row that can identify it."""
@@ -2783,7 +2842,38 @@ class Database:
         if not row:
             return False
         local_account_id = int(row["id"])
-        # The oldest local schema did not declare ON DELETE CASCADE here.
+        # The oldest local schema did not declare ON DELETE CASCADE on every
+        # business table. Remove timer/run children explicitly before deleting
+        # the account so no historical rows can survive a permanent purge.
+        conn.execute(
+            """
+            DELETE FROM workflow_timer_events
+            WHERE batch_id IN (
+                SELECT batch_id FROM workflow_batches WHERE user_id=?
+            )
+            OR run_id IN (
+                SELECT run_id FROM workflow_runs WHERE user_id=?
+            )
+            """,
+            (local_account_id, local_account_id),
+        )
+        conn.execute(
+            """
+            DELETE FROM workflow_step_attempts
+            WHERE run_id IN (
+                SELECT run_id FROM workflow_runs WHERE user_id=?
+            )
+            """,
+            (local_account_id,),
+        )
+        conn.execute(
+            "DELETE FROM workflow_runs WHERE user_id=?",
+            (local_account_id,),
+        )
+        conn.execute(
+            "DELETE FROM workflow_batches WHERE user_id=?",
+            (local_account_id,),
+        )
         conn.execute(
             "DELETE FROM activity_events WHERE user_id=?",
             (local_account_id,),

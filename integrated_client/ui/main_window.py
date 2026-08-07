@@ -2,7 +2,14 @@ import os
 import threading
 from dataclasses import replace
 
-from PyQt5.QtCore import QProcess, QSize, Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import (
+    QProcess,
+    QProcessEnvironment,
+    QSize,
+    Qt,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import (
     QApplication,
@@ -21,7 +28,11 @@ from ..config import APP_NAME, APP_VERSION
 from ..database import Database
 from ..models import Account
 from ..online.captcha_learning import CaptchaLearningService
-from ..platform_support import supports_self_update, update_install_command
+from ..platform_support import (
+    supports_self_update,
+    update_install_command,
+    update_install_environment,
+)
 from ..preferences import ClientPreferences
 from ..timing import WorkflowTimingService
 from ..tools.transport_tool import DDDDOCR_IMPORT_ERROR
@@ -1009,10 +1020,14 @@ class MainWindow(FramelessMainWindow):
             self._prepared_to_close = False
             QMessageBox.critical(self, "无法启动安装包", str(exc))
             return
-        launched = QProcess.startDetached(
-            installer_program,
-            installer_arguments,
-        )
+        installer_process = QProcess()
+        installer_process.setProgram(installer_program)
+        installer_process.setArguments(installer_arguments)
+        process_environment = QProcessEnvironment()
+        for name, value in update_install_environment().items():
+            process_environment.insert(name, value)
+        installer_process.setProcessEnvironment(process_environment)
+        launched = installer_process.startDetached()
         if isinstance(launched, tuple):
             launched = launched[0]
         if not launched:

@@ -40,7 +40,7 @@ sudo apt install -y \
   libx11-6 libx11-xcb1 libxcb1 libxcb-xinerama0 libxkbcommon-x11-0 \
   libxrender1 libxi6 libxrandr2 libxfixes3 libxcursor1 \
   libgl1 libegl1 libgbm1 libnss3 libasound2 fonts-noto-cjk \
-  fcitx-frontend-qt5 policykit-1 xdg-utils zenity
+  fcitx-frontend-qt5 deepin-deb-installer policykit-1 xdg-utils zenity
 ```
 
 不同 UOS 补丁级别可能已预装其中一部分；`apt` 会跳过已安装的软件包。如果
@@ -302,7 +302,8 @@ sudo apt remove com.e23aqiu.intdemo
 3. 在线登录成功；勾选“记住密码”，关闭并重开后资料可解密；断网时可用有效的
    本机离线授权登录。
 4. “系统设置”显示版本并可检查更新；UOS 只接受 `linux-aarch64` 的 `.deb`，
-   下载和 SHA-256 校验完成后通过 `pkexec + dpkg`（或系统软件包界面）安装。
+   下载和 SHA-256 校验完成后打开 Deepin DEB 安装器；确认安装时应出现
+   PolicyKit 密码授权界面并完成安装。
 5. “运行设置”中的 Chromium 健康检查通过，并显示软件包内
    `browser/chrome` 的真实路径和版本。
 6. 用一份脱敏 `.xlsx` 分别跑运输证、营运企业回填、爱企查；检查人工验证码、
@@ -339,8 +340,9 @@ echo "$XDG_SESSION_TYPE $DISPLAY $WAYLAND_DISPLAY $QT_QPA_PLATFORM"
 
 ## 当前限制
 
-- UOS 应用内更新需要系统存在 `pkexec + dpkg` 或可处理 `.deb` 的 `xdg-open`；
-  企业策略禁用提权时仍需管理员手动安装已经校验的 DEB。
+- UOS 应用内更新优先使用 `deepin-deb-installer`，其次使用可处理 `.deb` 的
+  `xdg-open`，最后才回退到 `pkexec + dpkg`；企业策略禁用提权时仍需管理员
+  手动安装已经校验的 DEB。
 - Playwright 官方支持的是更新的 Debian/Ubuntu 版本；本项目内置 Chromium
   已在 UOS Desktop 20 1070 ARM64、glibc 2.28 上完成启动验证；游客模式的实际
   业务处理已经通过，在线账号登录、凭据重启解密与同步链路仍需真机验收。

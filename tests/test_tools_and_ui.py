@@ -1579,6 +1579,73 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(page.edit_btn.isEnabled())
         page.deleteLater()
 
+    def test_online_admin_refresh_removes_accounts_missing_from_server(self):
+        current_payload = {
+            "id": "server-admin",
+            "username": self.admin.username,
+            "display_name": self.admin.name_label,
+            "role": "admin",
+            "stats_scope": "all",
+            "is_active": True,
+            "is_archived": False,
+            "entitlement_revision": 1,
+        }
+        stale_payload = {
+            "id": "deleted-test-account",
+            "username": "test",
+            "display_name": "test",
+            "role": "user",
+            "stats_scope": "own",
+            "is_active": False,
+            "is_archived": True,
+            "entitlement_revision": 2,
+        }
+        current = self.db.upsert_remote_account(current_payload)
+        self.db.set_current_online_account(current.server_account_id, "all")
+        stale = self.db.upsert_remote_account(stale_payload)
+        self.db.record_activity_batch(
+            stale.id,
+            {WORKFLOW_TOTAL_METRIC: 1},
+            source="test",
+        )
+
+        class Api:
+            @staticmethod
+            def admin_accounts(_token):
+                return [current_payload]
+
+        class State:
+            is_online = True
+
+        class Session:
+            api = Api()
+            state = State()
+
+            @staticmethod
+            def access_token():
+                return "test-token"
+
+        page = OnlineAccountPage(self.db, current, Session())
+        deleted_ids = []
+        page.account_deleted.connect(deleted_ids.append)
+        with patch(
+            "integrated_client.ui.online_account_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            page.refresh()
+
+        self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(deleted_ids, [stale.id])
+        self.assertNotIn(
+            "test",
+            {account.username for account in self.db.list_accounts()},
+        )
+        self.assertNotIn(
+            "test",
+            {row["username"] for row in self.db.get_all_account_totals()},
+        )
+        page.deleteLater()
+
     def test_online_account_settings_exposes_device_limit(self):
         dialog = _AccountSettingsDialog()
         self.assertEqual(dialog.device_limit.minimum(), 1)

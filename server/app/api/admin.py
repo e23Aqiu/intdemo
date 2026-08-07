@@ -278,8 +278,14 @@ async def delete_archived_account(
         target_id=str(account.id),
         details={"username": username, "permanent": True},
     )
-    # Use a SQL delete so database-level ON DELETE rules remove every piece of
-    # archived business, device and session data without ORM nulling children.
+    # Delete the business rows explicitly before the account.  This keeps the
+    # permanent-delete contract reliable even on an older deployment whose
+    # account foreign keys were created without ON DELETE CASCADE.
+    for model in (ActivityEvent, WorkflowBatch, WorkflowRun):
+        db.execute(delete(model).where(model.account_id == account.id))
+    # Use a SQL delete so the remaining database-level ON DELETE rules remove
+    # device, session, receipt and account-targeted rows without ORM nulling
+    # children.
     db.execute(delete(Account).where(Account.id == account.id))
     change = append_change(
         db,

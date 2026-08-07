@@ -164,14 +164,54 @@ def update_install_command(package_path):
     if target == WINDOWS_UPDATE_PLATFORM and path.suffix.casefold() == ".exe":
         return str(path), ["/SP-", "/CLOSEAPPLICATIONS"]
     if target == UOS_UPDATE_PLATFORM and path.suffix.casefold() == ".deb":
+        # UOS ships Deepin Package Manager as its desktop DEB installer. It
+        # presents package details and obtains administrator authorization
+        # through the desktop PolicyKit agent. Starting pkexec directly from
+        # a detached GUI process can exit without ever showing that prompt.
+        graphical_installer = shutil.which("deepin-deb-installer")
+        if graphical_installer:
+            return graphical_installer, [str(path)]
+        opener = shutil.which("xdg-open")
+        if opener:
+            return opener, [str(path)]
         pkexec = shutil.which("pkexec")
         dpkg = shutil.which("dpkg")
         if pkexec and dpkg:
             return pkexec, [dpkg, "--install", str(path)]
-        opener = shutil.which("xdg-open")
-        if opener:
-            return opener, [str(path)]
         raise RuntimeError(
-            "未找到 pkexec/dpkg 或 xdg-open，无法启动 UOS 更新安装包"
+            "未找到 deepin-deb-installer、xdg-open 或 pkexec/dpkg，"
+            "无法启动 UOS 更新安装包"
         )
     raise RuntimeError("当前平台或更新包格式不支持自动安装")
+
+
+def update_install_environment(environment=None):
+    """Return an environment safe for launching a system-owned installer.
+
+    PyInstaller temporarily prepends its bundled libraries to
+    ``LD_LIBRARY_PATH``. Passing that environment to UOS's Qt-based package
+    installer can make the system application load the client's bundled Qt
+    libraries and terminate before its window appears.
+    """
+    source = os.environ if environment is None else environment
+    cleaned = {str(key): str(value) for key, value in source.items()}
+    if update_platform_key() != UOS_UPDATE_PLATFORM:
+        return cleaned
+
+    original_library_path = cleaned.pop("LD_LIBRARY_PATH_ORIG", None)
+    if original_library_path:
+        cleaned["LD_LIBRARY_PATH"] = original_library_path
+    else:
+        cleaned.pop("LD_LIBRARY_PATH", None)
+    for variable in (
+        "QT_PLUGIN_PATH",
+        "QT_QPA_PLATFORM_PLUGIN_PATH",
+        "QT_QPA_PLATFORM",
+        "QML_IMPORT_PATH",
+        "QML2_IMPORT_PATH",
+        "QTWEBENGINEPROCESS_PATH",
+        "QTWEBENGINE_RESOURCES_PATH",
+        "QTWEBENGINE_LOCALES_PATH",
+    ):
+        cleaned.pop(variable, None)
+    return cleaned

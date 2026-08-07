@@ -212,14 +212,78 @@ class UosCompatibilityTests(unittest.TestCase):
         ), patch.object(
             platform_support.shutil,
             "which",
-            side_effect=lambda name: f"/usr/bin/{name}",
+            side_effect=lambda name: (
+                "/usr/bin/deepin-deb-installer"
+                if name == "deepin-deb-installer"
+                else f"/usr/bin/{name}"
+            ),
         ):
+            program, arguments = platform_support.update_install_command(
+                "/tmp/IntDemo-UOS-arm64-1.2.3.deb"
+            )
+        self.assertEqual(program, "/usr/bin/deepin-deb-installer")
+        self.assertEqual(len(arguments), 1)
+        self.assertTrue(arguments[0].endswith("IntDemo-UOS-arm64-1.2.3.deb"))
+
+    def test_uos_deb_install_command_falls_back_to_mime_opener(self):
+        def which(name):
+            return "/usr/bin/xdg-open" if name == "xdg-open" else None
+
+        with patch.object(
+            platform_support,
+            "update_platform_key",
+            return_value=platform_support.UOS_UPDATE_PLATFORM,
+        ), patch.object(platform_support.shutil, "which", side_effect=which):
+            program, arguments = platform_support.update_install_command(
+                "/tmp/IntDemo-UOS-arm64-1.2.3.deb"
+            )
+        self.assertEqual(program, "/usr/bin/xdg-open")
+        self.assertEqual(len(arguments), 1)
+        self.assertTrue(arguments[0].endswith("IntDemo-UOS-arm64-1.2.3.deb"))
+
+    def test_uos_deb_install_command_falls_back_to_pkexec_last(self):
+        def which(name):
+            return {
+                "pkexec": "/usr/bin/pkexec",
+                "dpkg": "/usr/bin/dpkg",
+            }.get(name)
+
+        with patch.object(
+            platform_support,
+            "update_platform_key",
+            return_value=platform_support.UOS_UPDATE_PLATFORM,
+        ), patch.object(platform_support.shutil, "which", side_effect=which):
             program, arguments = platform_support.update_install_command(
                 "/tmp/IntDemo-UOS-arm64-1.2.3.deb"
             )
         self.assertEqual(program, "/usr/bin/pkexec")
         self.assertEqual(arguments[:2], ["/usr/bin/dpkg", "--install"])
         self.assertTrue(arguments[-1].endswith(".deb"))
+
+    def test_uos_installer_environment_drops_bundled_runtime_paths(self):
+        source = {
+            "LD_LIBRARY_PATH": "/opt/intdemo/_internal",
+            "LD_LIBRARY_PATH_ORIG": "/usr/lib/aarch64-linux-gnu",
+            "QT_PLUGIN_PATH": "/opt/intdemo/_internal/qt5/plugins",
+            "QT_QPA_PLATFORM_PLUGIN_PATH": "/opt/intdemo/_internal/platforms",
+            "QT_QPA_PLATFORM": "xcb",
+            "PATH": "/usr/bin",
+        }
+        with patch.object(
+            platform_support,
+            "update_platform_key",
+            return_value=platform_support.UOS_UPDATE_PLATFORM,
+        ):
+            cleaned = platform_support.update_install_environment(source)
+        self.assertEqual(cleaned["LD_LIBRARY_PATH"], "/usr/lib/aarch64-linux-gnu")
+        self.assertNotIn("LD_LIBRARY_PATH_ORIG", cleaned)
+        for variable in (
+            "QT_PLUGIN_PATH",
+            "QT_QPA_PLATFORM_PLUGIN_PATH",
+            "QT_QPA_PLATFORM",
+        ):
+            self.assertNotIn(variable, cleaned)
+        self.assertEqual(cleaned["PATH"], "/usr/bin")
 
     def test_uos_environment_selects_fcitx_and_isolates_system_qt_plugins(self):
         app_plugin_root = "/opt/intdemo/qt5/plugins"
@@ -393,6 +457,7 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("Architecture: arm64", control)
         self.assertIn("libsecret-tools", control)
         self.assertIn("fcitx-frontend-qt5", control)
+        self.assertIn("deepin-deb-installer", control)
         self.assertIn("policykit-1", control)
         self.assertEqual(info["appid"], "com.e23aqiu.intdemo")
         self.assertEqual(info["version"], "0.2.8.0")

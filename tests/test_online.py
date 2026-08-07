@@ -1159,6 +1159,127 @@ class OnlineClientTests(unittest.TestCase):
             {account.username for account in self.database.list_accounts()},
         )
 
+    def test_complete_admin_account_list_purges_missing_remote_cache(self):
+        current = self.session.login("station", "Online!234")
+        local_only = self.database.create_account(
+            "local_only",
+            "Local!23456",
+            "user",
+            current.id,
+        )
+        stale_id = str(uuid.uuid4())
+        occurred_at = datetime.now(timezone.utc).isoformat()
+        current_payload = {
+            "id": self.api.account_id,
+            "username": "station",
+            "display_name": "本站",
+            "role": "user",
+            "stats_scope": "all",
+            "is_active": True,
+            "is_archived": False,
+            "entitlement_revision": 1,
+        }
+        stale_payload = {
+            "id": stale_id,
+            "username": "stale_station",
+            "display_name": "已永久删除站点",
+            "role": "user",
+            "stats_scope": "own",
+            "is_active": False,
+            "is_archived": True,
+            "entitlement_revision": 2,
+        }
+        self.database.apply_sync_snapshot(
+            {
+                "revision": 30,
+                "accounts": [current_payload, stale_payload],
+                "metrics": [],
+                "activity_events": [
+                    {
+                        "account_id": stale_id,
+                        "event_uid": str(uuid.uuid4()),
+                        "metric_key": "workflow_detail_total",
+                        "amount": 9,
+                        "business_date": "2026-08-06",
+                        "source": "unified_workflow",
+                        "task_id": None,
+                        "summary": {},
+                        "occurred_at": occurred_at,
+                    }
+                ],
+                "workflow_batches": [
+                    {
+                        "account_id": stale_id,
+                        "entity_id": "stale-batch",
+                        "event_uid": str(uuid.uuid4()),
+                        "revision": 1,
+                        "status": "succeeded",
+                        "input_fingerprint": "a" * 64,
+                        "business_date": "2026-08-06",
+                    }
+                ],
+                "workflow_runs": [
+                    {
+                        "account_id": stale_id,
+                        "entity_id": "stale-run",
+                        "event_uid": str(uuid.uuid4()),
+                        "revision": 1,
+                        "batch_id": "stale-batch",
+                        "status": "succeeded",
+                    }
+                ],
+                "entitlement_revision": 1,
+                "stats_scope": "all",
+            }
+        )
+        with self.database._connect() as conn:
+            self.database._enqueue_sync_item(
+                conn,
+                server_account_id=stale_id,
+                kind="activity_event",
+                entity_id="stale-event",
+                revision=1,
+                occurred_at=occurred_at,
+                payload={"metric_key": "workflow_detail_total", "amount": 9},
+            )
+
+        reconciled = self.database.reconcile_remote_accounts([current_payload])
+
+        self.assertEqual(
+            [account.server_account_id for account in reconciled],
+            [self.api.account_id],
+        )
+        accounts = {account.username: account for account in self.database.list_accounts()}
+        self.assertIn("station", accounts)
+        self.assertEqual(accounts["local_only"].id, local_only.id)
+        self.assertNotIn("stale_station", accounts)
+        self.assertNotIn(
+            "stale_station",
+            {row["username"] for row in self.database.get_all_account_totals()},
+        )
+        with self.database._connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM remote_workflow_batches WHERE server_account_id=?",
+                    (stale_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM remote_workflow_runs WHERE server_account_id=?",
+                    (stale_id,),
+                ).fetchone()[0],
+                0,
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM sync_outbox WHERE server_account_id=?",
+                    (stale_id,),
+                ).fetchone()[0],
+                0,
+            )
+
     @unittest.skipUnless(os.name == "nt", "Windows DPAPI test")
     def test_dpapi_round_trip_and_ciphertext(self):
         protector = DpapiProtector()

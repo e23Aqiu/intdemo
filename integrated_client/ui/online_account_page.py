@@ -472,12 +472,31 @@ class OnlineAccountPage(AccountPage):
         rows = self._call(self.session.api.admin_accounts)
         if rows is _CALL_FAILED:
             return
+        if rows is None:
+            return
+        rows = list(rows)
         selected = self._selected_account()
         selected_server_id = selected.server_account_id if selected else None
+        server_account_ids = {
+            str(row.get("id") or row.get("account_id") or "").strip()
+            for row in rows
+            if str(row.get("id") or row.get("account_id") or "").strip()
+        }
+        cached_remote_accounts = {
+            account.server_account_id: account
+            for account in self.database.list_accounts()
+            if account.server_account_id
+        }
         self.accounts = []
         self.server_rows = {}
-        for server_row in rows:
-            account = self.database.upsert_remote_account(server_row)
+        reconciled_accounts = self.database.reconcile_remote_accounts(rows)
+        removed_account_ids = [
+            account.id
+            for server_account_id, account in cached_remote_accounts.items()
+            if server_account_id not in server_account_ids
+            and account.id != self.current_account.id
+        ]
+        for server_row, account in zip(rows, reconciled_accounts):
             object.__setattr__(
                 account,
                 "_device_limit",
@@ -560,6 +579,8 @@ class OnlineAccountPage(AccountPage):
                 self.table.selectRow(row)
         self.table.blockSignals(False)
         self._selection_changed()
+        for account_id in removed_account_ids:
+            self.account_deleted.emit(account_id)
 
     def _selection_changed(self):
         account = self._selected_account()
