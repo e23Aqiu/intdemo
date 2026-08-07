@@ -44,6 +44,9 @@ SSH_CONNECTION_OPTIONS = (
     "ServerAliveCountMax=20",
     "TCPKeepAlive=yes",
 )
+SSH_COMMAND_TIMEOUT_SECONDS = 60.0
+SSH_PROGRESS_QUERY_TIMEOUT_SECONDS = 30.0
+SSH_HASH_TIMEOUT_SECONDS = 600.0
 SFTP_UPLOAD_ATTEMPTS = 6
 SFTP_PROGRESS_INTERVAL_SECONDS = 10.0
 SFTP_RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 30)
@@ -174,6 +177,7 @@ def run_command(
     cwd: Path,
     capture: bool = False,
     env: dict[str, str] | None = None,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -185,7 +189,13 @@ def run_command(
             errors="replace",
             capture_output=capture,
             env=env,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as exc:
+        seconds = timeout if timeout is not None else exc.timeout
+        raise ReleaseTaskError(
+            f"命令执行超时（{seconds:g} 秒）：{' '.join(arguments)}"
+        ) from exc
     except OSError as exc:
         raise ReleaseTaskError(f"无法启动命令 {arguments[0]}：{exc}") from exc
     if result.returncode != 0:
@@ -198,8 +208,18 @@ def run_command(
     return result
 
 
-def capture_command(arguments: list[str], *, cwd: Path) -> str:
-    return run_command(arguments, cwd=cwd, capture=True).stdout.strip()
+def capture_command(
+    arguments: list[str],
+    *,
+    cwd: Path,
+    timeout: float | None = None,
+) -> str:
+    return run_command(
+        arguments,
+        cwd=cwd,
+        capture=True,
+        timeout=timeout,
+    ).stdout.strip()
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -1732,10 +1752,13 @@ def ssh_capture(
     host: str,
     command: str,
     identity_file: Path | None,
+    *,
+    timeout: float = SSH_COMMAND_TIMEOUT_SECONDS,
 ) -> str:
     return capture_command(
         ["ssh", *ssh_options(identity_file), host, command],
         cwd=root,
+        timeout=timeout,
     )
 
 
@@ -1751,6 +1774,7 @@ def remote_hash(
         host,
         f"if [ -f {quoted} ]; then sha256sum {quoted} | cut -d ' ' -f 1; fi",
         identity_file,
+        timeout=SSH_HASH_TIMEOUT_SECONDS,
     ).strip().casefold()
 
 
@@ -1766,6 +1790,7 @@ def remote_file_size(
         host,
         f"if [ -f {quoted} ]; then wc -c < {quoted}; fi",
         identity_file,
+        timeout=SSH_PROGRESS_QUERY_TIMEOUT_SECONDS,
     ).strip()
     if not value:
         return None
@@ -1846,6 +1871,7 @@ def ensure_remote_partial(
     run_command(
         ["ssh", *ssh_options(identity_file), host, command],
         cwd=root,
+        timeout=SSH_COMMAND_TIMEOUT_SECONDS,
     )
 
 
@@ -1863,6 +1889,7 @@ def truncate_remote_file(
             f": > {shlex.quote(path)}",
         ],
         cwd=root,
+        timeout=SSH_COMMAND_TIMEOUT_SECONDS,
     )
 
 
@@ -1925,6 +1952,11 @@ def sftp_reput_once(
                                 identity_file,
                             )
                         except ReleaseTaskError:
+                            print(
+                                "远程上传进度暂时无法读取；"
+                                "SFTP 仍在运行，将继续等待并自动重试。",
+                                flush=True,
+                            )
                             continue
                         if uploaded is not None:
                             print_upload_progress(
@@ -2196,6 +2228,7 @@ def publish_remote(
             f"mkdir -p {shlex.quote(remote_path + '/files')} {shlex.quote(incoming)}",
         ],
         cwd=root,
+        timeout=SSH_COMMAND_TIMEOUT_SECONDS,
     )
     final_manifest = f"{remote_path}/{channel}.json"
     current_hash = remote_hash(root, host, final_manifest, identity_file)
@@ -2272,6 +2305,7 @@ def publish_remote(
     run_command(
         ["ssh", *ssh_options(identity_file), host, " && ".join(commands)],
         cwd=root,
+        timeout=SSH_COMMAND_TIMEOUT_SECONDS,
     )
     if remote_hash(root, host, final_manifest, identity_file) != sha256(manifest_path):
         raise ReleaseTaskError("发布后的远程清单 SHA-256 不匹配")
@@ -2503,6 +2537,7 @@ def pause_distribution(
                 ),
             ],
             cwd=root,
+            timeout=SSH_COMMAND_TIMEOUT_SECONDS,
         )
         run_command(
             [
@@ -2512,6 +2547,7 @@ def pause_distribution(
                 f"{remote_host}:{incoming_path}",
             ],
             cwd=root,
+            timeout=SSH_COMMAND_TIMEOUT_SECONDS,
         )
         command = (
             f"echo {shlex.quote(before_hash + '  ' + manifest_path)} | "
@@ -2523,6 +2559,7 @@ def pause_distribution(
         run_command(
             ["ssh", *ssh_options(identity_file), remote_host, command],
             cwd=root,
+            timeout=SSH_COMMAND_TIMEOUT_SECONDS,
         )
     print(f"已暂停 {channel} 通道，原版本：{active_version}", flush=True)
     print(f"安装包仍保留在：{normalized_path}/files", flush=True)

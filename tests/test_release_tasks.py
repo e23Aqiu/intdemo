@@ -627,6 +627,57 @@ class ReleaseTasksTests(unittest.TestCase):
         self.assertEqual(options[-2:], ["-i", str(identity)])
         self.assertNotIn("-i", tasks.ssh_options(None))
 
+    def test_run_command_turns_process_timeout_into_release_error(self):
+        arguments = ["ssh", "release-server", "wc -c /tmp/file"]
+        with (
+            patch.object(
+                tasks.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired(arguments, 3),
+            ),
+            self.assertRaisesRegex(
+                tasks.ReleaseTaskError,
+                r"命令执行超时（3 秒）",
+            ),
+        ):
+            tasks.run_command(
+                arguments,
+                cwd=Path("repository"),
+                capture=True,
+                timeout=3,
+            )
+
+    def test_remote_queries_use_operation_specific_timeouts(self):
+        with patch.object(tasks, "capture_command", return_value="123") as capture:
+            self.assertEqual(
+                tasks.remote_file_size(
+                    Path("repository"),
+                    "release-server",
+                    "/opt/intdemo/updates/setup.exe.part",
+                    None,
+                ),
+                123,
+            )
+        self.assertEqual(
+            capture.call_args.kwargs["timeout"],
+            tasks.SSH_PROGRESS_QUERY_TIMEOUT_SECONDS,
+        )
+
+        with patch.object(tasks, "capture_command", return_value="a" * 64) as capture:
+            self.assertEqual(
+                tasks.remote_hash(
+                    Path("repository"),
+                    "release-server",
+                    "/opt/intdemo/updates/setup.exe.part",
+                    None,
+                ),
+                "a" * 64,
+            )
+        self.assertEqual(
+            capture.call_args.kwargs["timeout"],
+            tasks.SSH_HASH_TIMEOUT_SECONDS,
+        )
+
     def test_release_incoming_path_is_stable_for_the_same_artifacts(self):
         first = {
             "windows": {
@@ -716,6 +767,52 @@ class ReleaseTasksTests(unittest.TestCase):
         self.assertTrue(str(observed["batch"]).startswith("reput "))
         self.assertIn("setup.exe.part", str(observed["batch"]))
         self.assertIn("ServerAliveInterval=15", observed["arguments"])
+
+    def test_sftp_upload_recovers_when_progress_query_times_out(self):
+        class CompletedAfterProbe:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self, timeout=None):
+                self.wait_count += 1
+                if self.wait_count == 1:
+                    raise subprocess.TimeoutExpired(["sftp"], timeout)
+                return 0
+
+            @staticmethod
+            def terminate():
+                return None
+
+            @staticmethod
+            def kill():
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"installer")
+            process = CompletedAfterProbe()
+            with (
+                patch.object(tasks.subprocess, "Popen", return_value=process),
+                patch.object(
+                    tasks,
+                    "remote_file_size",
+                    side_effect=tasks.ReleaseTaskError("SSH progress query timed out"),
+                ) as remote_size,
+                patch("builtins.print") as output,
+            ):
+                tasks.sftp_reput_once(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    identity_file=None,
+                    progress_interval=0.01,
+                )
+
+        remote_size.assert_called_once()
+        self.assertEqual(process.wait_count, 2)
+        self.assertIn("自动重试", output.call_args.args[0])
 
     def test_resumable_upload_continues_an_existing_partial_file(self):
         with tempfile.TemporaryDirectory() as directory:
