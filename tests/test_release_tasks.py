@@ -814,6 +814,105 @@ class ReleaseTasksTests(unittest.TestCase):
         self.assertEqual(process.wait_count, 2)
         self.assertIn("自动重试", output.call_args.args[0])
 
+    def test_sftp_upload_terminates_when_progress_stays_unavailable(self):
+        class StalledProcess:
+            def __init__(self):
+                self.terminated = False
+
+            def wait(self, timeout=None):
+                if self.terminated:
+                    return 1
+                raise subprocess.TimeoutExpired(["sftp"], timeout)
+
+            def terminate(self):
+                self.terminated = True
+
+            @staticmethod
+            def kill():
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"installer")
+            process = StalledProcess()
+            with (
+                patch.object(tasks.subprocess, "Popen", return_value=process),
+                patch.object(
+                    tasks,
+                    "remote_file_size",
+                    side_effect=tasks.ReleaseTaskError("progress unavailable"),
+                ) as remote_size,
+                patch.object(
+                    tasks.time,
+                    "monotonic",
+                    side_effect=[0.0, 0.5, 1.5],
+                ),
+                patch("builtins.print"),
+                self.assertRaisesRegex(
+                    tasks.ReleaseTaskError,
+                    r"连续 1 秒无可确认上传进度",
+                ),
+            ):
+                tasks.sftp_reput_once(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    identity_file=None,
+                    progress_interval=0.01,
+                    stall_timeout=1.0,
+                )
+
+        self.assertTrue(process.terminated)
+        self.assertEqual(remote_size.call_count, 2)
+
+    def test_sftp_upload_resets_stall_timer_when_remote_size_grows(self):
+        class CompletedAfterProgress:
+            def __init__(self):
+                self.wait_count = 0
+
+            def wait(self, timeout=None):
+                self.wait_count += 1
+                if self.wait_count <= 2:
+                    raise subprocess.TimeoutExpired(["sftp"], timeout)
+                return 0
+
+            @staticmethod
+            def terminate():
+                return None
+
+            @staticmethod
+            def kill():
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"installer")
+            process = CompletedAfterProgress()
+            with (
+                patch.object(tasks.subprocess, "Popen", return_value=process),
+                patch.object(tasks, "remote_file_size", side_effect=[1, 2]),
+                patch.object(
+                    tasks.time,
+                    "monotonic",
+                    side_effect=[0.0, 0.5, 0.5, 1.2, 1.2],
+                ),
+                patch("builtins.print"),
+            ):
+                tasks.sftp_reput_once(
+                    root,
+                    host="release-server",
+                    local_path=artifact,
+                    remote_path="/opt/intdemo/updates/setup.exe.part",
+                    identity_file=None,
+                    progress_interval=0.01,
+                    stall_timeout=1.0,
+                )
+
+        self.assertEqual(process.wait_count, 3)
+
     def test_resumable_upload_continues_an_existing_partial_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

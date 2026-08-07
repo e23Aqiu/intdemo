@@ -49,6 +49,7 @@ SSH_PROGRESS_QUERY_TIMEOUT_SECONDS = 30.0
 SSH_HASH_TIMEOUT_SECONDS = 600.0
 SFTP_UPLOAD_ATTEMPTS = 6
 SFTP_PROGRESS_INTERVAL_SECONDS = 10.0
+SFTP_STALL_TIMEOUT_SECONDS = 300.0
 SFTP_RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 30)
 
 
@@ -1905,6 +1906,7 @@ def sftp_reput_once(
     remote_path: str,
     identity_file: Path | None,
     progress_interval: float = SFTP_PROGRESS_INTERVAL_SECONDS,
+    stall_timeout: float = SFTP_STALL_TIMEOUT_SECONDS,
 ) -> None:
     local_value = local_path.resolve().as_posix()
     batch_line = (
@@ -1939,6 +1941,8 @@ def sftp_reput_once(
                 )
             except OSError as exc:
                 raise ReleaseTaskError(f"无法启动命令 sftp：{exc}") from exc
+            last_uploaded: int | None = None
+            last_progress_at = time.monotonic()
             try:
                 while True:
                     try:
@@ -1957,12 +1961,23 @@ def sftp_reput_once(
                                 "SFTP 仍在运行，将继续等待并自动重试。",
                                 flush=True,
                             )
-                            continue
-                        if uploaded is not None:
-                            print_upload_progress(
-                                local_path.name,
-                                uploaded,
-                                local_path.stat().st_size,
+                        else:
+                            if uploaded is not None and (
+                                last_uploaded is None or uploaded > last_uploaded
+                            ):
+                                last_uploaded = uploaded
+                                last_progress_at = time.monotonic()
+                            if uploaded is not None:
+                                print_upload_progress(
+                                    local_path.name,
+                                    uploaded,
+                                    local_path.stat().st_size,
+                                )
+                        stalled_for = time.monotonic() - last_progress_at
+                        if stalled_for >= stall_timeout:
+                            raise ReleaseTaskError(
+                                f"SFTP 连续 {int(stall_timeout)} 秒无可确认上传进度："
+                                f"{local_path.name}"
                             )
                     else:
                         break
