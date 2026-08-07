@@ -44,7 +44,7 @@ class LoginRequest(StrictModel):
     password: str = Field(min_length=1, max_length=256)
     device_uid: uuid.UUID
     device_name: str = Field(default="Windows device", min_length=1, max_length=160)
-    client_version: str = Field(default="0.2.11", min_length=1, max_length=40)
+    client_version: str = Field(default="1.0.1", min_length=1, max_length=40)
     control_client: bool = False
 
     @field_validator("username")
