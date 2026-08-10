@@ -4042,6 +4042,22 @@ class ToolAndUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(len(chart._slice_hitboxes), 2)
         self.assertEqual(
+            len(chart._bar_rects),
+            min(7, len(chart._rows)),
+        )
+        self.assertTrue(
+            all(rect.height() == chart.BAR_HEIGHT for rect in chart._bar_rects)
+        )
+        chart.resize(600, 280)
+        chart.grab()
+        self.app.processEvents()
+        self.assertTrue(
+            all(rect.right() <= chart.width() - 20 for rect in chart._bar_rects)
+        )
+        chart.resize(1000, 280)
+        chart.grab()
+        self.app.processEvents()
+        self.assertEqual(
             {
                 item["payload"]["series"]
                 for item in chart._slice_hitboxes

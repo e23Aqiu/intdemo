@@ -830,6 +830,7 @@ class StationDistributionChart(AnimatedDonutChart):
         super().__init__(parent)
         self._rows = []
         self._legend_hitboxes = []
+        self._bar_rects = []
         self._series_mode = "counts"
         self._timing_basis = "total"
         self.setMinimumHeight(280)
@@ -948,6 +949,7 @@ class StationDistributionChart(AnimatedDonutChart):
     def paintEvent(self, event):
         self._slice_hitboxes = []
         self._legend_hitboxes = []
+        self._bar_rects = []
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
@@ -959,7 +961,7 @@ class StationDistributionChart(AnimatedDonutChart):
         panel_title = "各站用时效率分布" if is_timing_mode else "各站业务分布"
         timing_label = "有效用时" if self._timing_basis == "active" else "总用时"
         panel_subtitle = (
-            f"{timing_label}占全部站点对应指标的比例"
+            f"{timing_label}占比，圆环与动态计量条同步展示"
             if is_timing_mode
             else "总计数与有电话数占全部站点对应指标的比例"
         )
@@ -975,7 +977,11 @@ class StationDistributionChart(AnimatedDonutChart):
             painter.drawText(self.rect(), Qt.AlignCenter, "暂无站点数据")
             return
 
-        chart_area_width = min(470, max(350, int(self.width() * 0.43)))
+        chart_area_width = (
+            min(390, max(210, int(self.width() * 0.38)))
+            if is_timing_mode
+            else min(470, max(350, int(self.width() * 0.43)))
+        )
         chart_gap = 24
         chart_top = 82
         if is_timing_mode:
@@ -1024,12 +1030,20 @@ class StationDistributionChart(AnimatedDonutChart):
                 is_duration=is_duration,
             )
 
-        legend_left = chart_area_width + 34
-        legend_width = max(270, self.width() - legend_left - 22)
+        legend_left = chart_area_width + (24 if is_timing_mode else 34)
+        legend_width = max(
+            180 if is_timing_mode else 270,
+            self.width() - legend_left - 22,
+        )
         if is_timing_mode:
-            first_column = legend_left + legend_width - 180
+            first_column_width = min(
+                180,
+                max(118, int(legend_width * 0.48)),
+            )
+            first_column = legend_left + legend_width - first_column_width
             second_column = None
         else:
+            first_column_width = 145
             first_column = legend_left + legend_width - 300
             second_column = legend_left + legend_width - 145
         painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
@@ -1042,7 +1056,7 @@ class StationDistributionChart(AnimatedDonutChart):
         )
         painter.setPen(selected_timing_color if is_timing_mode else self.TOTAL_COLOR)
         painter.drawText(
-            QRectF(first_column, 40, 145, 18),
+            QRectF(first_column, 40, first_column_width, 18),
             Qt.AlignRight | Qt.AlignVCenter,
             (
                 f"{timing_label} / 占比"
@@ -1073,16 +1087,21 @@ class StationDistributionChart(AnimatedDonutChart):
                 legend_left, row_top, legend_width, max(27, row_height - 2)
             )
             self._legend_hitboxes.append((hitbox, dict(row)))
-            if index % 2:
+            if not is_timing_mode and index % 2:
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor("#f5f8f7"))
                 painter.drawRoundedRect(hitbox, 6, 6)
 
             color = self.COLORS[index % len(self.COLORS)]
+            label_height = (
+                max(17, row_height - int(self.BAR_HEIGHT) - 4)
+                if is_timing_mode
+                else row_height - 2
+            )
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(
-                QRectF(legend_left + 2, row_top + row_height / 2 - 5, 10, 10),
+                QRectF(legend_left + 2, row_top + label_height / 2 - 5, 10, 10),
                 3,
                 3,
             )
@@ -1091,15 +1110,15 @@ class StationDistributionChart(AnimatedDonutChart):
                 str(row["station"]), Qt.ElideRight, label_width
             )
             painter.drawText(
-                QRectF(legend_left + 18, row_top, label_width, row_height - 2),
+                QRectF(legend_left + 18, row_top, label_width, label_height),
                 Qt.AlignLeft | Qt.AlignVCenter,
                 station,
             )
             painter.setPen(
-                selected_timing_color if is_timing_mode else self.TOTAL_COLOR
+                QColor("#173a3d") if is_timing_mode else self.TOTAL_COLOR
             )
             painter.drawText(
-                QRectF(first_column, row_top, 145, row_height - 2),
+                QRectF(first_column, row_top, first_column_width, label_height),
                 Qt.AlignRight | Qt.AlignVCenter,
                 (
                     f'{format_hours(row[series[0][0]])} · '
@@ -1109,6 +1128,26 @@ class StationDistributionChart(AnimatedDonutChart):
                     f'{self._format_share(row["total_share"])}'
                 ),
             )
+            if is_timing_mode:
+                bar_rect = QRectF(
+                    legend_left,
+                    row_top + row_height - self.BAR_HEIGHT - 2,
+                    legend_width,
+                    self.BAR_HEIGHT,
+                )
+                self._bar_rects.append(QRectF(bar_rect))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#e8f1ef"))
+                painter.drawRoundedRect(bar_rect, 5, 5)
+                share = max(0.0, min(100.0, float(row[series[0][1]])))
+                if share:
+                    value_rect = QRectF(bar_rect)
+                    value_rect.setWidth(max(10, bar_rect.width() * share / 100))
+                    painter.setBrush(color)
+                    value_path = QPainterPath()
+                    value_path.addRoundedRect(value_rect, 5, 5)
+                    painter.drawPath(value_path)
+                    self._draw_flow_highlight(painter, value_path, value_rect)
             if second_column is not None:
                 painter.setPen(self.PHONE_COLOR)
                 painter.drawText(
