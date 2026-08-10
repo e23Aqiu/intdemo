@@ -40,6 +40,8 @@ from .account_page import AccountPage
 from .announcement_page import (
     AnnouncementAdminPage,
     AnnouncementDetailDialog,
+    AnnouncementListDialog,
+    AnnouncementTickerButton,
     start_api_task,
 )
 from .auth_dialogs import PasswordDialog
@@ -128,6 +130,7 @@ class MainWindow(FramelessMainWindow):
         self.announcements = []
         self.announcement_index = 0
         self.announcement_dialog = None
+        self.announcement_list_dialog = None
         self._announcement_poll_task = None
         self._announcement_action_tasks = []
         self._announcement_poll_timer = None
@@ -631,10 +634,13 @@ class MainWindow(FramelessMainWindow):
         self.announcement_horn_button.setVisible(
             self.announcement_service_available
         )
-        self.announcement_horn_button.clicked.connect(self._show_current_announcement)
+        self.announcement_horn_button.clicked.connect(self._show_announcement_list)
         layout.addWidget(self.announcement_horn_button)
 
-        self.announcement_ticker_button = QPushButton("暂无公告")
+        self.announcement_ticker_button = AnnouncementTickerButton(
+            "暂无公告",
+            bar,
+        )
         self.announcement_ticker_button.setObjectName("AnnouncementTickerButton")
         self.announcement_ticker_button.setSizePolicy(
             QSizePolicy.Preferred,
@@ -677,7 +683,10 @@ class MainWindow(FramelessMainWindow):
         def load():
             token = self.session_manager.access_token()
             result = {
-                "announcements": self.session_manager.api.announcements(token),
+                "announcements": self.session_manager.api.announcements(
+                    token,
+                    limit=100,
+                ),
                 "unread_messages": 0,
             }
             if self.account.is_admin:
@@ -714,6 +723,9 @@ class MainWindow(FramelessMainWindow):
             int(result.get("unread_messages") or 0)
         )
         self._update_announcement_ticker()
+        announcement_list = self.announcement_list_dialog
+        if announcement_list is not None and announcement_list.isVisible():
+            announcement_list.set_announcements(self.announcements)
         startup_announcement = next(
             (
                 announcement
@@ -752,6 +764,7 @@ class MainWindow(FramelessMainWindow):
             self.announcement_horn_button.setToolTip("暂无公告")
             self.announcement_ticker_button.setText("暂无公告")
             self.announcement_ticker_button.setToolTip("")
+            self.announcement_ticker_button.set_announcement(None)
         else:
             self.announcement_index %= len(self.announcements)
             announcement = self.announcements[self.announcement_index]
@@ -765,11 +778,16 @@ class MainWindow(FramelessMainWindow):
             )
             self.announcement_horn_button.setProperty("hasUnread", unread)
             self.announcement_horn_button.setToolTip(
-                "有未读公告，点击查看" if unread else "点击查看公告"
+                "有未读公告，点击查看全部公告"
+                if unread
+                else "点击查看全部公告"
             )
             self.announcement_ticker_button.setText(ticker_text)
-            self.announcement_ticker_button.setToolTip(
-                f"{announcement.get('title') or '公告'}\n{ticker_text}"
+            self.announcement_ticker_button.setToolTip("")
+            self.announcement_ticker_button.set_announcement(
+                announcement,
+                self.announcement_index,
+                len(self.announcements),
             )
         self.announcement_horn_button.style().unpolish(self.announcement_horn_button)
         self.announcement_horn_button.style().polish(self.announcement_horn_button)
@@ -782,6 +800,30 @@ class MainWindow(FramelessMainWindow):
             self.announcements[self.announcement_index],
             startup_shown=False,
         )
+
+    def _show_announcement_list(self, *_args):
+        if not self.announcements:
+            return
+        current = self.announcement_list_dialog
+        if current is not None and current.isVisible():
+            current.raise_()
+            current.activateWindow()
+            return
+        dialog = AnnouncementListDialog(self.announcements, self)
+
+        def clear_dialog(*_args):
+            if self.announcement_list_dialog is dialog:
+                self.announcement_list_dialog = None
+
+        dialog.announcement_open_requested.connect(
+            lambda announcement: self._open_announcement(
+                announcement,
+                startup_shown=False,
+            )
+        )
+        dialog.finished.connect(clear_dialog)
+        self.announcement_list_dialog = dialog
+        dialog.open()
 
     def _open_announcement(self, announcement, *, startup_shown):
         current = self.announcement_dialog

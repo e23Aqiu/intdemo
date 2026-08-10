@@ -258,6 +258,7 @@ class WorkflowPage(QWidget):
         self.pipeline_running = False
         self.stopping = False
         self.awaiting_login = False
+        self._backfill_browser_loading = False
         self._task_id = None
         self._stats_recorded = False
         self._last_file_mtime = None
@@ -1353,12 +1354,50 @@ class WorkflowPage(QWidget):
             worker.retry_signal.connect(self._timing_retry)
         if hasattr(worker, "captcha_attempt_signal"):
             worker.captcha_attempt_signal.connect(self._report_captcha_attempt)
+        worker.browser_loading_started.connect(
+            self._on_backfill_browser_loading_started
+        )
+        worker.browser_loading_finished.connect(
+            self._on_backfill_browser_loading_finished
+        )
         worker.finished.connect(lambda result, obj=worker: self._backfill_finished(obj, result))
+        self._on_backfill_browser_loading_started()
         worker.start()
+
+    def _on_backfill_browser_loading_started(self):
+        if (
+            not self.pipeline_running
+            or self.stopping
+            or self.current_step != 2
+        ):
+            return
+        was_loading = self._backfill_browser_loading
+        self._backfill_browser_loading = True
+        self._timing_pause("等待步骤 2 浏览器加载")
+        if not self.continue_btn.isEnabled():
+            self._set_step_status(2, "等待浏览器加载", "paused")
+        if not was_loading:
+            self._log("步骤 2 正在加载浏览器，此段等待不计入有效用时。")
+
+    def _on_backfill_browser_loading_finished(self):
+        if not self._backfill_browser_loading:
+            return
+        self._backfill_browser_loading = False
+        if (
+            not self.pipeline_running
+            or self.stopping
+            or self.current_step != 2
+        ):
+            return
+        if not self.continue_btn.isEnabled():
+            self._timing_resume("步骤 2 浏览器加载完成")
+            self._set_step_status(2, "正在执行", "running")
+        self._log("步骤 2 浏览器加载完成，开始计入有效用时。")
 
     def _backfill_finished(self, worker, result):
         if worker is not self.current_worker:
             return
+        self._backfill_browser_loading = False
         self._retire_worker(worker)
         self._reload_preview(force=True)
         if self.stopping:
@@ -1657,10 +1696,19 @@ class WorkflowPage(QWidget):
             self.awaiting_login = False
         else:
             worker.resume()
-        self._timing_resume("用户继续执行")
+        if not self._backfill_browser_loading:
+            self._timing_resume("用户继续执行")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
-        self._set_step_status(self.current_step, "正在执行", "running")
+        self._set_step_status(
+            self.current_step,
+            (
+                "等待浏览器加载"
+                if self._backfill_browser_loading
+                else "正在执行"
+            ),
+            "paused" if self._backfill_browser_loading else "running",
+        )
         self._log("流水线已恢复执行。")
 
     def stop_pipeline(self):
@@ -1696,6 +1744,7 @@ class WorkflowPage(QWidget):
         self._timing_finish_run(outcome, message)
         self.current_worker = None
         self.awaiting_login = False
+        self._backfill_browser_loading = False
         self._set_controls_running(False)
         self._reload_preview(force=True)
         self._log(("✅ " if success else "⚠️ ") + message)

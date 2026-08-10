@@ -1383,6 +1383,8 @@ class BusinessBackfillWorker(QThread):
     stat_event = pyqtSignal(str, int)
     retry_signal = pyqtSignal(str, str)
     captcha_attempt_signal = pyqtSignal(object)
+    browser_loading_started = pyqtSignal()
+    browser_loading_finished = pyqtSignal()
 
     input_result = ""
 
@@ -1551,11 +1553,13 @@ class BusinessBackfillWorker(QThread):
 
     def _create_browser_with_retries(self, retry_type, reason):
         """持续启动浏览器，直到成功或用户主动停止。"""
+        self.browser_loading_started.emit()
         attempt = 0
         while self._running:
             self._check_stopped()
             attempt += 1
             if self._create_new_browser():
+                self.browser_loading_finished.emit()
                 return True
             self.retry_signal.emit(
                 retry_type,
@@ -1567,6 +1571,24 @@ class BusinessBackfillWorker(QThread):
             )
             wait_before_browser_retry(self._check_stopped)
         return False
+
+    def _load_business_query_page(self):
+        """加载步骤 2 业务页，并向主界面标记不可计入的等待区间。"""
+        self.browser_loading_started.emit()
+        try:
+            response = self.page.goto(
+                CONFIG["BUSINESS_QUERY_URL"],
+                timeout=self.web_timeout,
+            )
+            ensure_successful_navigation(response, "营运查询页")
+            self.page.wait_for_selector(
+                "a:has-text('营运车辆')",
+                timeout=self.web_timeout,
+            )
+            self.page.click("a:has-text('营运车辆')")
+            time.sleep(0.5)
+        finally:
+            self.browser_loading_finished.emit()
 
     def _captcha_prompt_is_visible(self):
         try:
@@ -2301,14 +2323,7 @@ class BusinessBackfillWorker(QThread):
                         ):
                             raise BrowserRecoveryError("营运查询浏览器无法重新启动")
 
-                    response = self.page.goto(
-                        CONFIG["BUSINESS_QUERY_URL"],
-                        timeout=self.web_timeout,
-                    )
-                    ensure_successful_navigation(response, "营运查询页")
-                    self.page.wait_for_selector("a:has-text('营运车辆')", timeout=self.web_timeout)
-                    self.page.click("a:has-text('营运车辆')")
-                    time.sleep(0.5)
+                    self._load_business_query_page()
 
                     self.page.fill('input[placeholder="请输入车辆号牌"]', plate)
                     self.page.fill('input[placeholder="请输入道路运输证号"]', cert_no)

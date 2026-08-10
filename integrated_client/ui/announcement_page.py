@@ -5,20 +5,25 @@ import mimetypes
 import os
 from pathlib import Path
 
-from PyQt5.QtCore import QObject, QRunnable, QSize, Qt, QThreadPool, pyqtSignal
+from PyQt5.QtCore import QPoint, QRectF, QObject, QRunnable, QSize, Qt, QThreadPool, pyqtSignal
 from PyQt5.QtGui import (
     QColor,
     QFont,
     QIcon,
+    QPainter,
+    QPainterPath,
+    QPen,
     QPixmap,
     QTextCharFormat,
     QTextListFormat,
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QColorDialog,
     QComboBox,
+    QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
@@ -92,6 +97,394 @@ def _format_size(size):
 
 def _display_time(value):
     return str(value or "").replace("T", " ")[:19] or "-"
+
+
+class AnnouncementHoverCard(QFrame):
+    """Top-bar announcement preview that is independent of native tooltips."""
+
+    def __init__(self, parent=None):
+        super().__init__(
+            parent,
+            Qt.ToolTip | Qt.FramelessWindowHint | Qt.NoDropShadowWindowHint,
+        )
+        self.announcement = None
+        self.setObjectName("AnnouncementHoverCard")
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setFixedWidth(430)
+        self.setStyleSheet(
+            """
+            QFrame#AnnouncementHoverCard {
+                background: transparent;
+                border: none;
+            }
+            QLabel#AnnouncementHoverBadge {
+                color: #b9eee4;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#AnnouncementHoverState {
+                color: #ffd4ae;
+                background: #5d4539;
+                border: 1px solid #8c654e;
+                border-radius: 9px;
+                padding: 2px 8px;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            QLabel#AnnouncementHoverTitle {
+                color: #ffffff;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            QLabel#AnnouncementHoverSummary {
+                color: #d9ebe7;
+                font-size: 13px;
+            }
+            QLabel#AnnouncementHoverMeta {
+                color: #99bbb5;
+                font-size: 11px;
+            }
+            QLabel#AnnouncementHoverHint {
+                color: #83d6c7;
+                font-size: 11px;
+                font-weight: 700;
+            }
+            """
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(9)
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        self.badge_label = QLabel("公告")
+        self.badge_label.setObjectName("AnnouncementHoverBadge")
+        self.state_label = QLabel("未读")
+        self.state_label.setObjectName("AnnouncementHoverState")
+        header.addWidget(self.badge_label)
+        header.addStretch()
+        header.addWidget(self.state_label)
+        root.addLayout(header)
+
+        self.title_label = QLabel()
+        self.title_label.setObjectName("AnnouncementHoverTitle")
+        self.title_label.setWordWrap(True)
+        root.addWidget(self.title_label)
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("AnnouncementHoverSummary")
+        self.summary_label.setWordWrap(True)
+        root.addWidget(self.summary_label)
+        self.meta_label = QLabel()
+        self.meta_label.setObjectName("AnnouncementHoverMeta")
+        self.meta_label.setWordWrap(True)
+        root.addWidget(self.meta_label)
+        self.hint_label = QLabel("点击轮播内容查看公告详情")
+        self.hint_label.setObjectName("AnnouncementHoverHint")
+        root.addWidget(self.hint_label)
+        self.hide()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        card_rect = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        path = QPainterPath()
+        path.addRoundedRect(card_rect, 13, 13)
+        painter.fillPath(path, QColor(23, 58, 61, 248))
+        painter.setPen(QPen(QColor("#4f8580"), 1))
+        painter.drawPath(path)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#55c2b1"))
+        painter.drawRoundedRect(QRectF(18, 0, 92, 4), 2, 2)
+
+    def show_announcement(self, announcement, index, total, anchor):
+        self.announcement = announcement
+        unread = not bool(announcement.get("read_at"))
+        self.badge_label.setText(f"公告 {int(index) + 1} / {max(1, int(total))}")
+        self.state_label.setText("未读" if unread else "已读")
+        self.state_label.setVisible(unread)
+        self.title_label.setText(str(announcement.get("title") or "公告"))
+        self.summary_label.setText(
+            str(
+                announcement.get("ticker_text")
+                or "点击查看该公告的完整内容。"
+            )
+        )
+        self.meta_label.setText(
+            f"{announcement.get('created_by_name') or '管理员'}  ·  "
+            f"{_display_time(announcement.get('created_at'))}"
+        )
+        self.layout().activate()
+        self.adjustSize()
+        card_width = self.width()
+        card_height = self.height()
+        x = int(anchor.x() - card_width / 2)
+        y = int(anchor.y() + 10)
+        screen = QApplication.screenAt(anchor) or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            x = max(
+                available.left() + 8,
+                min(x, available.right() - card_width - 8),
+            )
+            if y + card_height > available.bottom() - 8:
+                y = int(anchor.y() - card_height - 10)
+            y = max(
+                available.top() + 8,
+                min(y, available.bottom() - card_height - 8),
+            )
+        self.move(x, y)
+        self.show()
+        self.raise_()
+
+
+class AnnouncementTickerButton(QPushButton):
+    """Ticker button with a branded, multi-line hover preview."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._announcement = None
+        self._announcement_index = 0
+        self._announcement_total = 0
+        self._hover_card = AnnouncementHoverCard(self)
+        self.setMouseTracking(True)
+
+    def set_announcement(self, announcement, index=0, total=0):
+        self._announcement = announcement
+        self._announcement_index = int(index)
+        self._announcement_total = int(total)
+        if announcement is None or not self.isEnabled():
+            self._hover_card.hide()
+        elif self._hover_card.isVisible():
+            self._show_hover_card()
+
+    def _show_hover_card(self, anchor=None):
+        if self._announcement is None or not self.isEnabled():
+            return
+        anchor = anchor or self.mapToGlobal(
+            QPoint(self.width() // 2, self.height())
+        )
+        self._hover_card.show_announcement(
+            self._announcement,
+            self._announcement_index,
+            self._announcement_total,
+            anchor,
+        )
+
+    def enterEvent(self, event):
+        self._show_hover_card()
+        super().enterEvent(event)
+
+    def mouseMoveEvent(self, event):
+        self._show_hover_card(
+            self.mapToGlobal(QPoint(event.pos().x(), self.height()))
+        )
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_card.hide()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        self._hover_card.hide()
+        super().mousePressEvent(event)
+
+    def hideEvent(self, event):
+        self._hover_card.hide()
+        super().hideEvent(event)
+
+
+class AnnouncementListDialog(FramelessDialog):
+    """Archive-style list of every announcement visible to the account."""
+
+    announcement_open_requested = pyqtSignal(object)
+
+    def __init__(self, announcements, parent=None):
+        super().__init__(
+            parent,
+            resizable=True,
+            show_minimize=True,
+            show_maximize=True,
+        )
+        self.announcements = []
+        self.setWindowTitle("全部公告")
+        self.setModal(True)
+        self.resize(980, 680)
+        self.setMinimumSize(760, 540)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 46, 28, 24)
+        root.setSpacing(14)
+        heading_row = QHBoxLayout()
+        heading_box = QVBoxLayout()
+        title = QLabel("全部公告")
+        title.setObjectName("PageTitle")
+        subtitle = QLabel("按发布时间查看当前账号可见的全部公告")
+        subtitle.setObjectName("Muted")
+        heading_box.addWidget(title)
+        heading_box.addWidget(subtitle)
+        heading_row.addLayout(heading_box)
+        heading_row.addStretch()
+        self.count_label = QLabel()
+        self.count_label.setObjectName("AnnouncementListCount")
+        heading_row.addWidget(self.count_label)
+        root.addLayout(heading_row)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.announcement_list = QListWidget()
+        self.announcement_list.setObjectName("AnnouncementArchiveList")
+        self.announcement_list.setSelectionMode(
+            QAbstractItemView.SingleSelection
+        )
+        self.announcement_list.setMinimumWidth(330)
+        self.announcement_list.itemSelectionChanged.connect(
+            self._selection_changed
+        )
+        self.announcement_list.itemDoubleClicked.connect(
+            lambda _item: self._open_selected()
+        )
+        splitter.addWidget(self.announcement_list)
+
+        preview = QFrame()
+        preview.setObjectName("AnnouncementListPreview")
+        preview_layout = QVBoxLayout(preview)
+        preview_layout.setContentsMargins(22, 20, 22, 20)
+        preview_layout.setSpacing(10)
+        self.preview_state = QLabel()
+        self.preview_state.setObjectName("AnnouncementPreviewState")
+        preview_layout.addWidget(self.preview_state, 0, Qt.AlignLeft)
+        self.preview_title = QLabel("请选择一条公告")
+        self.preview_title.setObjectName("AnnouncementPreviewTitle")
+        self.preview_title.setWordWrap(True)
+        preview_layout.addWidget(self.preview_title)
+        self.preview_meta = QLabel()
+        self.preview_meta.setObjectName("Muted")
+        self.preview_meta.setWordWrap(True)
+        preview_layout.addWidget(self.preview_meta)
+        self.preview_ticker = QLabel()
+        self.preview_ticker.setObjectName("AnnouncementPreviewTicker")
+        self.preview_ticker.setWordWrap(True)
+        preview_layout.addWidget(self.preview_ticker)
+        self.preview_body = QTextBrowser()
+        self.preview_body.setObjectName("AnnouncementBody")
+        self.preview_body.setOpenExternalLinks(False)
+        self.preview_body.setPlaceholderText("选择公告后在这里预览正文。")
+        preview_layout.addWidget(self.preview_body, 1)
+        self.preview_attachments = QLabel()
+        self.preview_attachments.setObjectName("Muted")
+        preview_layout.addWidget(self.preview_attachments)
+        splitter.addWidget(preview)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+        root.addWidget(splitter, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        self.open_button = QPushButton("查看公告详情")
+        self.open_button.setObjectName("PrimaryButton")
+        self.open_button.clicked.connect(self._open_selected)
+        buttons.addWidget(close_btn)
+        buttons.addWidget(self.open_button)
+        root.addLayout(buttons)
+
+        self.set_announcements(announcements)
+
+    def set_announcements(self, announcements):
+        selected = self.selected_announcement()
+        selected_id = str(selected.get("id") or "") if selected else ""
+        self.announcements = list(announcements or [])
+        self.announcement_list.clear()
+        unread_count = sum(
+            not bool(announcement.get("read_at"))
+            for announcement in self.announcements
+        )
+        self.count_label.setText(
+            f"共 {len(self.announcements)} 条 · 未读 {unread_count} 条"
+        )
+        selected_row = 0
+        for index, announcement in enumerate(self.announcements):
+            unread = not bool(announcement.get("read_at"))
+            state = "● 未读" if unread else "已读"
+            title = str(announcement.get("title") or "公告")
+            summary = str(
+                announcement.get("ticker_text") or "暂无轮播摘要"
+            )
+            created_at = _display_time(announcement.get("created_at"))
+            item = QListWidgetItem(
+                f"{state}  ·  {created_at}\n{title}\n{summary}"
+            )
+            item.setData(Qt.UserRole, index)
+            item.setSizeHint(QSize(300, 82))
+            if unread:
+                item.setForeground(QColor("#176f68"))
+                font = item.font()
+                font.setBold(True)
+                item.setFont(font)
+            self.announcement_list.addItem(item)
+            if str(announcement.get("id") or "") == selected_id:
+                selected_row = index
+        has_announcements = bool(self.announcements)
+        self.open_button.setEnabled(has_announcements)
+        if has_announcements:
+            self.announcement_list.setCurrentRow(selected_row)
+        else:
+            self._clear_preview()
+
+    def selected_announcement(self):
+        item = self.announcement_list.currentItem()
+        if item is None:
+            return None
+        index = item.data(Qt.UserRole)
+        try:
+            return self.announcements[int(index)]
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def _clear_preview(self):
+        self.preview_state.clear()
+        self.preview_title.setText("暂无公告")
+        self.preview_meta.clear()
+        self.preview_ticker.clear()
+        self.preview_body.clear()
+        self.preview_attachments.clear()
+
+    def _selection_changed(self):
+        announcement = self.selected_announcement()
+        if announcement is None:
+            self._clear_preview()
+            self.open_button.setEnabled(False)
+            return
+        unread = not bool(announcement.get("read_at"))
+        self.preview_state.setText("● 未读公告" if unread else "已读公告")
+        self.preview_state.setProperty("unread", unread)
+        self.preview_state.style().unpolish(self.preview_state)
+        self.preview_state.style().polish(self.preview_state)
+        self.preview_title.setText(str(announcement.get("title") or "公告"))
+        self.preview_meta.setText(
+            f"发布人：{announcement.get('created_by_name') or '管理员'}    "
+            f"发布时间：{_display_time(announcement.get('created_at'))}"
+        )
+        self.preview_ticker.setText(
+            str(announcement.get("ticker_text") or "暂无轮播摘要")
+        )
+        self.preview_body.setHtml(str(announcement.get("body_html") or ""))
+        attachment_count = len(announcement.get("attachments") or [])
+        self.preview_attachments.setText(
+            f"附件：{attachment_count} 个" if attachment_count else "无附件"
+        )
+        self.open_button.setEnabled(True)
+
+    def _open_selected(self):
+        announcement = self.selected_announcement()
+        if announcement is None:
+            return
+        self.accept()
+        self.announcement_open_requested.emit(announcement)
 
 
 class ContactAdminDialog(FramelessDialog):
