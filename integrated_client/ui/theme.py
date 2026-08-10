@@ -270,6 +270,10 @@ QPushButton#SyncActionButton {
     font-size: 10px;
     font-weight: 700;
 }
+QPushButton#SyncActionButton[split="true"] {
+    padding: 6px 1px;
+    font-size: 9px;
+}
 QPushButton#SyncActionButton:hover {
     color: white;
     background: #205156;

@@ -113,7 +113,12 @@ class MainWindow(FramelessMainWindow):
             self._captcha_learning_client_is_available()
         )
         self.captcha_learning_service = (
-            CaptchaLearningService(self.session_manager, self)
+            CaptchaLearningService(
+                self.session_manager,
+                self,
+                database=self.database,
+                server_account_id=account.server_account_id,
+            )
             if self.captcha_learning_client_available
             else None
         )
@@ -295,6 +300,19 @@ class MainWindow(FramelessMainWindow):
             self.sync_coordinator.status_changed.connect(self._update_sync_status)
             self.sync_coordinator.data_changed.connect(self._online_data_changed)
             self._update_sync_status(self.sync_coordinator.engine.status())
+        if self.captcha_learning_service is not None:
+            self.captcha_learning_service.policy_changed.connect(
+                self._update_captcha_sync_policy
+            )
+            self.captcha_learning_service.pending_count_changed.connect(
+                self._update_captcha_pending_count
+            )
+            self._update_captcha_sync_policy(
+                self.captcha_learning_service.policy
+            )
+            self._update_captcha_pending_count(
+                self.captcha_learning_service.pending_upload_count()
+            )
         if self.update_coordinator is not None:
             self.update_coordinator.update_available.connect(self._update_available)
             self.update_coordinator.state_changed.connect(self._update_download_state)
@@ -542,9 +560,31 @@ class MainWindow(FramelessMainWindow):
         self.sync_retry_button = QPushButton("待同步：0")
         self.sync_retry_button.setObjectName("SyncActionButton")
         self.sync_retry_button.setProperty("hasPending", False)
+        self.sync_retry_button.setProperty("split", False)
+        self.sync_retry_button.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Fixed,
+        )
         self.sync_retry_button.setVisible(self.sync_coordinator is not None)
         self.sync_retry_button.clicked.connect(self._retry_sync)
-        sync_layout.addWidget(self.sync_retry_button)
+        self.captcha_sync_retry_button = QPushButton("验证码待同步：0")
+        self.captcha_sync_retry_button.setObjectName("SyncActionButton")
+        self.captcha_sync_retry_button.setProperty("hasPending", False)
+        self.captcha_sync_retry_button.setProperty("split", False)
+        self.captcha_sync_retry_button.setSizePolicy(
+            QSizePolicy.Ignored,
+            QSizePolicy.Fixed,
+        )
+        self.captcha_sync_retry_button.hide()
+        self.captcha_sync_retry_button.clicked.connect(
+            self._retry_captcha_sync
+        )
+        sync_actions = QHBoxLayout()
+        sync_actions.setContentsMargins(0, 0, 0, 0)
+        sync_actions.setSpacing(5)
+        sync_actions.addWidget(self.sync_retry_button, 1)
+        sync_actions.addWidget(self.captcha_sync_retry_button, 1)
+        sync_layout.addLayout(sync_actions)
         # Compatibility alias retained for older UI automation.
         self.sync_pending_badge = self.sync_retry_button
         # Compatibility alias for older UI automation.
@@ -1128,6 +1168,56 @@ class MainWindow(FramelessMainWindow):
     def _retry_sync(self):
         if self.sync_coordinator is not None and not self._update_busy:
             self.sync_coordinator.retry_now()
+
+    def _retry_captcha_sync(self):
+        if self.captcha_learning_service is None:
+            return
+        self.captcha_learning_service.retry_pending()
+        self._update_captcha_pending_count(
+            self.captcha_learning_service.pending_upload_count()
+        )
+
+    def _update_captcha_sync_policy(self, policy):
+        if not hasattr(self, "captcha_sync_retry_button"):
+            return
+        policy = policy or {}
+        upload_mode = str(policy.get("upload_mode") or "")
+        if not upload_mode:
+            upload_mode = (
+                "samples_and_metrics"
+                if policy.get("upload_enabled")
+                else "off"
+            )
+        split = (
+            upload_mode == "samples_and_metrics"
+            and self.captcha_learning_service is not None
+        )
+        self.captcha_sync_retry_button.setVisible(split)
+        for button in (
+            self.sync_retry_button,
+            self.captcha_sync_retry_button,
+        ):
+            button.setProperty("split", split)
+            button.style().unpolish(button)
+            button.style().polish(button)
+
+    def _update_captcha_pending_count(self, count):
+        if not hasattr(self, "captcha_sync_retry_button"):
+            return
+        count = max(0, int(count or 0))
+        self.captcha_sync_retry_button.setText(f"验证码待同步：{count}")
+        self.captcha_sync_retry_button.setProperty("hasPending", bool(count))
+        self.captcha_sync_retry_button.setToolTip(
+            "点击重新上传失败的验证码样本"
+            if count
+            else "没有待上传的验证码样本"
+        )
+        self.captcha_sync_retry_button.style().unpolish(
+            self.captcha_sync_retry_button
+        )
+        self.captcha_sync_retry_button.style().polish(
+            self.captcha_sync_retry_button
+        )
 
     def _update_sync_status(self, status):
         if not hasattr(self, "sync_status_card"):
