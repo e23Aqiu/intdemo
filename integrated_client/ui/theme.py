@@ -456,6 +456,26 @@ QPushButton#DashboardPanelAction:checked {
     background: #1d8178;
     border-color: #1d8178;
 }
+QPushButton#TimingBasisToggleButton {
+    min-height: 26px;
+    min-width: 104px;
+    padding: 4px 13px;
+    color: #17665f;
+    background: #edf8f5;
+    border: 1px solid #b9ddd6;
+    border-radius: 13px;
+    font-size: 12px;
+    font-weight: 700;
+}
+QPushButton#TimingBasisToggleButton:hover {
+    background: #e0f2ed;
+    border-color: #7fbaaf;
+}
+QPushButton#TimingBasisToggleButton:checked {
+    color: #ffffff;
+    background: #d68b3f;
+    border-color: #c4772f;
+}
 QTableWidget#DashboardTable {
     background: #ffffff;
     alternate-background-color: #f7faf9;
@@ -523,6 +543,72 @@ QTextBrowser#AnnouncementBody {
     border: 1px solid #dfe6f1;
     border-radius: 8px;
     padding: 12px;
+}
+QLabel#AnnouncementListCount {
+    color: #176f68;
+    background: #e7f6f2;
+    border: 1px solid #bfe1d9;
+    border-radius: 12px;
+    padding: 5px 12px;
+    font-weight: 700;
+}
+QListWidget#AnnouncementArchiveList {
+    color: #365654;
+    background: #f7faf9;
+    border: 1px solid #d8e7e3;
+    border-radius: 11px;
+    padding: 7px;
+    outline: none;
+}
+QListWidget#AnnouncementArchiveList::item {
+    background: #ffffff;
+    border: 1px solid #e1ebe9;
+    border-radius: 9px;
+    margin: 3px;
+    padding: 9px 11px;
+}
+QListWidget#AnnouncementArchiveList::item:hover {
+    background: #edf7f4;
+    border-color: #b7dcd5;
+}
+QListWidget#AnnouncementArchiveList::item:selected {
+    color: #145f58;
+    background: #def2ed;
+    border-color: #78bdb1;
+}
+QFrame#AnnouncementListPreview {
+    background: #ffffff;
+    border: 1px solid #d8e7e3;
+    border-radius: 11px;
+}
+QLabel#AnnouncementPreviewState {
+    color: #647c7b;
+    background: #edf4f3;
+    border: 1px solid #d5e6e2;
+    border-radius: 10px;
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QLabel#AnnouncementPreviewState[unread="true"] {
+    color: #a85a1d;
+    background: #fff3e8;
+    border-color: #efc49f;
+}
+QLabel#AnnouncementPreviewTitle {
+    color: #173a3d;
+    background: transparent;
+    border: none;
+    font-size: 19px;
+    font-weight: 700;
+}
+QLabel#AnnouncementPreviewTicker {
+    color: #315d5c;
+    background: #edf6f4;
+    border: 1px solid #d3e7e3;
+    border-radius: 8px;
+    padding: 9px 11px;
+    font-weight: 600;
 }
 QWidget#MessageBoxPanel {
     background: #f7f9fc;

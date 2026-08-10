@@ -16,6 +16,8 @@ from integrated_client.ui.announcement_page import (
     AnnouncementAdminPage,
     AnnouncementDetailDialog,
     AnnouncementEditorDialog,
+    AnnouncementListDialog,
+    AnnouncementTickerButton,
     ContactAdminDialog,
 )
 from integrated_client.ui.main_window import MainWindow
@@ -219,6 +221,81 @@ class AnnouncementUiTests(unittest.TestCase):
             "read receipt was not sent",
         )
         self.assertEqual(api.read_calls[-1], ("announcement-1", False))
+
+    def test_horn_opens_complete_announcement_list_and_selected_detail(self):
+        api = FakeAnnouncementApi()
+        api.visible_announcements = [
+            self._announcement(),
+            self._announcement(
+                id="announcement-2",
+                title="业务提醒",
+                ticker_text="请及时完成今日数据处理",
+                read_at="2026-07-28T12:00:00",
+                created_at="2026-07-28T11:00:00",
+            ),
+        ]
+        window = MainWindow(
+            self.database,
+            self.admin,
+            session_manager=FakeSession(api),
+        )
+        window.show()
+        self.assertTrue(self._wait_until(lambda: len(window.announcements) == 2))
+
+        window.announcement_horn_button.click()
+        self.app.processEvents()
+        dialog = window.announcement_list_dialog
+        self.assertIsInstance(dialog, AnnouncementListDialog)
+        self.assertTrue(dialog.isVisible())
+        self.assertEqual(dialog.announcement_list.count(), 2)
+        self.assertEqual(dialog.count_label.text(), "共 2 条 · 未读 1 条")
+        self.assertEqual(dialog.preview_title.text(), "系统维护公告")
+
+        dialog.announcement_list.setCurrentRow(1)
+        self.app.processEvents()
+        self.assertEqual(dialog.preview_title.text(), "业务提醒")
+        self.assertEqual(dialog.preview_state.text(), "已读公告")
+        dialog._open_selected()
+        self.assertTrue(
+            self._wait_until(
+                lambda: (
+                    window.announcement_dialog is not None
+                    and window.announcement_dialog.isVisible()
+                )
+            )
+        )
+        self.assertEqual(
+            window.announcement_dialog.announcement["id"],
+            "announcement-2",
+        )
+
+    def test_ticker_uses_styled_hover_preview(self):
+        api = FakeAnnouncementApi()
+        api.visible_announcements = [self._announcement()]
+        window = MainWindow(
+            self.database,
+            self.admin,
+            session_manager=FakeSession(api),
+        )
+        window.show()
+        self.assertTrue(self._wait_until(lambda: bool(window.announcements)))
+
+        ticker = window.announcement_ticker_button
+        self.assertIsInstance(ticker, AnnouncementTickerButton)
+        ticker.enterEvent(QEvent(QEvent.Enter))
+        self.app.processEvents()
+        hover = ticker._hover_card
+        self.assertTrue(hover.isVisible())
+        self.assertEqual(hover.title_label.text(), "系统维护公告")
+        self.assertEqual(
+            hover.summary_label.text(),
+            "今晚 22:00 维护，请提前保存数据",
+        )
+        self.assertEqual(hover.badge_label.text(), "公告 1 / 1")
+        self.assertEqual(ticker.toolTip(), "")
+        self.assertTrue(hover.testAttribute(Qt.WA_TranslucentBackground))
+        ticker.leaveEvent(QEvent(QEvent.Leave))
+        self.assertFalse(hover.isVisible())
 
     def test_startup_announcement_opens_once_and_records_startup_display(self):
         api = FakeAnnouncementApi()

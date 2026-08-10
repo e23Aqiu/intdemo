@@ -1310,7 +1310,9 @@ class ReleasePublisherUiTests(unittest.TestCase):
     def setUp(self):
         settings_patcher = patch(
             "release_publisher.ui.SettingsStore.load",
-            return_value=PublisherSettings(),
+            return_value=PublisherSettings(
+                gitee_url="https://gitee.com/e23aqiu/intdemo.git"
+            ),
         )
         platform_patcher = patch(
             "release_publisher.ui.is_native_uos_arm64_builder",

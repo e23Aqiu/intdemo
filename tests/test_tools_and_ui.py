@@ -19,6 +19,7 @@ from PyQt5.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QRectF,
     QSize,
     Qt,
     pyqtSignal,
@@ -693,6 +694,39 @@ class ToolAndUiTests(unittest.TestCase):
         ):
             self.assertTrue(worker._wait_for_business_result())
         self.assertEqual(page.waits, [250, 250])
+
+    def test_business_browser_and_page_loading_emit_wait_boundaries(self):
+        worker = BusinessBackfillWorker("unused.xlsx", True, True, 2, False)
+        events = []
+        worker.browser_loading_started.connect(lambda: events.append("start"))
+        worker.browser_loading_finished.connect(lambda: events.append("finish"))
+
+        with patch.object(worker, "_create_new_browser", return_value=True):
+            self.assertTrue(
+                worker._create_browser_with_retries(
+                    "business_browser_start",
+                    "浏览器启动失败",
+                )
+            )
+
+        class Response:
+            status = 200
+
+        class Page:
+            def goto(self, *_args, **_kwargs):
+                return Response()
+
+            def wait_for_selector(self, *_args, **_kwargs):
+                return None
+
+            def click(self, *_args, **_kwargs):
+                return None
+
+        worker.page = Page()
+        with patch("integrated_client.tools.transport_tool.time.sleep"):
+            worker._load_business_query_page()
+
+        self.assertEqual(events, ["start", "finish", "start", "finish"])
 
     def test_aiqicha_worker_restarts_browser_without_limit_and_retries_same_row(self):
         dataframe = pd.DataFrame(
@@ -3031,10 +3065,15 @@ class ToolAndUiTests(unittest.TestCase):
             return labels[-1].text()
 
         self.assertEqual(card_value("总用时"), "0.1 小时")
-        self.assertEqual(card_value("有效用时"), "0.1 小时")
+        self.assertNotIn("有效用时", page.timing_kpi_cards)
         self.assertEqual(card_value("平均处理效率"), "60 条/小时")
         self.assertEqual(card_value("较纯人工效率提升"), "27.6 %")
-        self.assertEqual(page.timing_scope_label.text(), "完成数据：4 条")
+        self.assertEqual(
+            page.timing_scope_label.text(),
+            "完成数据：4 条 · 当前按总用时计量",
+        )
+        self.assertEqual(page.timing_basis_button.text(), "总用时口径")
+        self.assertFalse(page.timing_basis_button.isChecked())
 
         page.resize(1220, 760)
         page.show()
@@ -3054,9 +3093,9 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             total_card._hover_card.details,
             [
-                ("精确用时", "00:04:00.750"),
-                ("有效用时", "00:03:00.500"),
+                ("精确总用时", "00:04:00.750"),
                 ("暂停等待", "00:01:00.250"),
+                ("完成数据", "4 条"),
             ],
         )
         self.assertEqual(total_card._hover_card._detail_row_count, 3)
@@ -3082,6 +3121,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             average_card._hover_card.details,
             [
+                ("计量口径", "总用时"),
                 ("平均耗时", "60.2 秒/条"),
                 ("精确平均", "00:01:00.188"),
                 ("完成数据", "4 条"),
@@ -3102,9 +3142,9 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             efficiency_card._hover_card.details,
             [
+                ("计量口径", "总用时"),
                 ("总用时", "00:04:00.750"),
                 ("人工预计用时", "00:05:32.308"),
-                ("完成数据", "4 条"),
             ],
         )
 
@@ -3117,6 +3157,7 @@ class ToolAndUiTests(unittest.TestCase):
             for row in range(page.summary_table.rowCount())
         ]
         self.assertNotIn("计时运行", timing_metrics)
+        self.assertNotIn("有效用时", timing_metrics)
         efficiency_row = timing_metrics.index("平均处理效率")
         self.assertEqual(
             page.summary_table.item(efficiency_row, 1).text(),
@@ -3133,6 +3174,75 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertNotIn("260 条", timing_text)
         self.assertNotIn("6 小时", timing_text)
+
+        page.timing_basis_button.click()
+        self.app.processEvents()
+        self.assertTrue(page.timing_basis_button.isChecked())
+        self.assertEqual(page.timing_basis_button.text(), "有效用时口径")
+        self.assertNotIn("总用时", page.timing_kpi_cards)
+        self.assertEqual(card_value("有效用时"), "0.1 小时")
+        self.assertEqual(card_value("平均处理效率"), "80 条/小时")
+        self.assertEqual(card_value("较纯人工效率提升"), "45.7 %")
+        self.assertEqual(
+            page.timing_scope_label.text(),
+            "完成数据：4 条 · 当前按有效用时计量",
+        )
+
+        active_card = page.timing_kpi_cards["有效用时"]
+        active_point = active_card.rect().center()
+        active_event = QMouseEvent(
+            QEvent.MouseMove,
+            active_point,
+            active_card.mapToGlobal(active_point),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        active_card.mouseMoveEvent(active_event)
+        self.assertEqual(
+            active_card._hover_card.details,
+            [
+                ("精确有效用时", "00:03:00.500"),
+                ("暂停等待", "00:01:00.250"),
+                ("完成数据", "4 条"),
+            ],
+        )
+        active_average = page.timing_kpi_cards["平均处理效率"]
+        active_average.enterEvent(QEvent(QEvent.Enter))
+        self.assertEqual(
+            active_average._hover_card.details,
+            [
+                ("计量口径", "有效用时"),
+                ("平均耗时", "45.1 秒/条"),
+                ("精确平均", "00:00:45.125"),
+                ("完成数据", "4 条"),
+            ],
+        )
+        active_gain = page.timing_kpi_cards["较纯人工效率提升"]
+        active_gain.enterEvent(QEvent(QEvent.Enter))
+        self.assertEqual(
+            active_gain._hover_card.details,
+            [
+                ("计量口径", "有效用时"),
+                ("有效用时", "00:03:00.500"),
+                ("人工预计用时", "00:05:32.308"),
+            ],
+        )
+        timing_metrics = [
+            page.summary_table.item(row, 0).text()
+            for row in range(page.summary_table.rowCount())
+        ]
+        self.assertIn("有效用时", timing_metrics)
+        self.assertNotIn("总用时", timing_metrics)
+        efficiency_row = timing_metrics.index("平均处理效率")
+        self.assertEqual(
+            page.summary_table.item(efficiency_row, 1).text(),
+            "80 条/小时",
+        )
+        self.assertEqual(
+            page.summary_table.item(efficiency_row, 2).text(),
+            "完成数据÷有效用时",
+        )
 
         page.close()
         page.deleteLater()
@@ -3493,6 +3603,50 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(service.heartbeat_count, 1)
 
         service.is_active = False
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_step_two_browser_loading_is_excluded_from_active_time(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        station = next(
+            account
+            for account in self.db.list_accounts()
+            if account.username == "luogang"
+        )
+        clock = [1000.0]
+        timing = WorkflowTimingService(
+            self.db,
+            station.id,
+            clock=lambda: clock[0],
+        )
+        dataframe = pd.DataFrame(
+            {
+                "车辆标识": ["粤A12345_黄色"],
+                "已协助补缴": [""],
+                "原因": [""],
+            }
+        )
+        timing.start_run(
+            Path(self.temp_dir.name) / "browser-loading.xlsx",
+            dataframe,
+            run_id="browser-loading-run",
+        )
+        timing.start_step(2)
+        page = WorkflowPage(timing_service=timing)
+        page.pipeline_running = True
+        page.current_step = 2
+
+        page._on_backfill_browser_loading_started()
+        page._on_backfill_browser_loading_started()
+        clock[0] += 95.750
+        page._on_backfill_browser_loading_finished()
+        clock[0] += 4.250
+        snapshot = timing.finish_run("succeeded")
+
+        self.assertEqual(snapshot["run_active_ms"], 4_250)
+        self.assertEqual(snapshot["run_paused_ms"], 95_750)
+        self.assertFalse(page._backfill_browser_loading)
+        self.assertIn("不计入有效用时", page.log_text.toPlainText())
         self.assertTrue(page.shutdown())
         page.close()
 
@@ -3887,13 +4041,29 @@ class ToolAndUiTests(unittest.TestCase):
         chart.resize(1000, 280)
         chart.grab()
         self.app.processEvents()
-        self.assertEqual(len(chart._slice_hitboxes), 4)
+        self.assertEqual(len(chart._slice_hitboxes), 2)
+        self.assertEqual(
+            len(chart._bar_rects),
+            min(7, len(chart._rows)),
+        )
+        self.assertTrue(
+            all(rect.height() == chart.BAR_HEIGHT for rect in chart._bar_rects)
+        )
+        chart.resize(600, 280)
+        chart.grab()
+        self.app.processEvents()
+        self.assertTrue(
+            all(rect.right() <= chart.width() - 20 for rect in chart._bar_rects)
+        )
+        chart.resize(1000, 280)
+        chart.grab()
+        self.app.processEvents()
         self.assertEqual(
             {
                 item["payload"]["series"]
                 for item in chart._slice_hitboxes
             },
-            {"各站总耗时占比", "各站有效耗时占比"},
+            {"各站总耗时占比"},
         )
 
         duration_item = next(
@@ -3903,6 +4073,12 @@ class ToolAndUiTests(unittest.TestCase):
         )
         duration_outer = duration_item["outer"]
         duration_inner = duration_item["inner"]
+        self.assertEqual(duration_outer, QRectF(32, 56, 190, 190))
+        self.assertAlmostEqual(
+            chart._bar_rects[0].left(),
+            duration_outer.right() + 42,
+        )
+        self.assertEqual(chart._bar_rects[0].top(), 70)
         duration_local = QPoint(
             int(
                 duration_outer.center().x()
@@ -3945,24 +4121,54 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             chart._hover_card.details,
             [
-                ("总耗时", "1.7 小时"),
-                ("精确总耗时", "01:40:00.000"),
+                ("总用时", "1.7 小时"),
+                ("精确总用时", "01:40:00.000"),
                 (
-                    "总耗时占比",
+                    "总用时占比",
                     chart._format_share(legend_row["total_time_share"]),
                 ),
-                ("有效耗时", "1.5 小时"),
-                ("精确有效耗时", "01:30:00.000"),
+            ],
+        )
+        self.assertEqual(chart._hover_card.width(), 340)
+        for index in range(chart._hover_card._details_layout.count()):
+            detail_label = chart._hover_card._details_layout.itemAt(index).widget()
+            self.assertGreaterEqual(detail_label.width(), detail_label.sizeHint().width())
+
+        page.timing_basis_button.click()
+        self.app.processEvents()
+        chart.grab()
+        self.app.processEvents()
+        self.assertEqual(chart._timing_basis, "active")
+        self.assertEqual(len(chart._slice_hitboxes), 2)
+        self.assertEqual(
+            {
+                item["payload"]["series"]
+                for item in chart._slice_hitboxes
+            },
+            {"各站有效耗时占比"},
+        )
+        legend_rect, legend_row = chart._legend_hitboxes[0]
+        legend_local = legend_rect.center().toPoint()
+        legend_event = QMouseEvent(
+            QEvent.MouseMove,
+            legend_local,
+            chart.mapToGlobal(legend_local),
+            Qt.NoButton,
+            Qt.NoButton,
+            Qt.NoModifier,
+        )
+        chart.mouseMoveEvent(legend_event)
+        self.assertEqual(
+            chart._hover_card.details,
+            [
+                ("有效用时", "1.5 小时"),
+                ("精确有效用时", "01:30:00.000"),
                 (
-                    "有效耗时占比",
+                    "有效用时占比",
                     chart._format_share(legend_row["active_time_share"]),
                 ),
             ],
         )
-        self.assertEqual(chart._hover_card.width(), 520)
-        for index in range(chart._hover_card._details_layout.count()):
-            detail_label = chart._hover_card._details_layout.itemAt(index).widget()
-            self.assertGreaterEqual(detail_label.width(), detail_label.sizeHint().width())
 
         page.station_combo.setCurrentIndex(
             page.station_combo.findData(luogang.id)
