@@ -18,6 +18,8 @@ jobs:
       - name: Run Windows client tests
         env:
           QT_QPA_PLATFORM: offscreen
+          PYTHONUTF8: "1"
+          PYTHONIOENCODING: utf-8
         run: python -m unittest discover -s tests
 
   client-linux-arm64:

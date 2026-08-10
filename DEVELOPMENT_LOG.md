@@ -1430,3 +1430,11 @@
 - 客户端、服务端、安装器、Docker 镜像和构建脚本版本统一升级为 `1.0.2`。
 - 客户端完整回归 `235/235`、服务端回归 `37/37`、UOS 专项 `27/27`、Python 编译、
   服务端 Ruff、依赖检查、PowerShell/Bash 语法、Docker Compose 配置和差异检查通过。
+
+### 步骤 135：修复双平台客户端 CI 环境差异
+
+- Windows 客户端测试显式启用 Python UTF-8 模式和 UTF-8 标准输出，避免 GitHub
+  Windows runner 的 CP1252 控制台无法输出中文构建日志。
+- 发布器界面测试使用固定的 Gitee 测试仓库地址，不再依赖执行环境是否配置 `gitee`
+  Git remote；GitHub Actions 只有 `origin` 时也能覆盖完整的安全推送确认流程。
+- 原失败用例定向回归 `34/34`、客户端完整回归 `235/235` 和差异检查通过。
