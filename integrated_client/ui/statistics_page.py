@@ -870,6 +870,7 @@ class StationDistributionChart(AnimatedDonutChart):
         title,
         center_label,
         is_duration=False,
+        show_title=True,
     ):
         inner = outer.adjusted(
             outer.width() * 0.28,
@@ -878,13 +879,14 @@ class StationDistributionChart(AnimatedDonutChart):
             -outer.height() * 0.28,
         )
         total = sum(max(0, int(row[value_key])) for row in self._rows)
-        painter.setPen(QColor("#526e6d"))
-        painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
-        painter.drawText(
-            QRectF(outer.left(), outer.top() - 27, outer.width(), 20),
-            Qt.AlignCenter,
-            title,
-        )
+        if show_title:
+            painter.setPen(QColor("#526e6d"))
+            painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+            painter.drawText(
+                QRectF(outer.left(), outer.top() - 27, outer.width(), 20),
+                Qt.AlignCenter,
+                title,
+            )
 
         if total:
             start_degrees = 90.0
@@ -961,7 +963,7 @@ class StationDistributionChart(AnimatedDonutChart):
         panel_title = "各站用时效率分布" if is_timing_mode else "各站业务分布"
         timing_label = "有效用时" if self._timing_basis == "active" else "总用时"
         panel_subtitle = (
-            f"{timing_label}占比，圆环与动态计量条同步展示"
+            f"{timing_label}占比"
             if is_timing_mode
             else "总计数与有电话数占全部站点对应指标的比例"
         )
@@ -977,13 +979,8 @@ class StationDistributionChart(AnimatedDonutChart):
             painter.drawText(self.rect(), Qt.AlignCenter, "暂无站点数据")
             return
 
-        chart_area_width = (
-            min(390, max(210, int(self.width() * 0.38)))
-            if is_timing_mode
-            else min(470, max(350, int(self.width() * 0.43)))
-        )
+        chart_area_width = min(470, max(350, int(self.width() * 0.43)))
         chart_gap = 24
-        chart_top = 82
         if is_timing_mode:
             if self._timing_basis == "active":
                 series = (
@@ -1005,8 +1002,11 @@ class StationDistributionChart(AnimatedDonutChart):
                         True,
                     ),
                 )
-            chart_size = min(176, max(112, self.height() - 112))
-            first_left = max(20, int((chart_area_width - chart_size) / 2))
+            # Match WorkflowDistributionChart: the donut starts at the same
+            # left/top position and the meter list follows it directly.
+            chart_size = min(190, max(150, self.height() - 82))
+            chart_top = 56
+            first_left = 32
         else:
             series = (
                 ("total", "total_share", "各站总计数占比", "总计数", False),
@@ -1017,6 +1017,7 @@ class StationDistributionChart(AnimatedDonutChart):
                 max(112, self.height() - 112),
                 max(112, int((chart_area_width - 44) / 2)),
             )
+            chart_top = 82
             first_left = 20
         for index, (value_key, share_key, title, center_label, is_duration) in enumerate(series):
             left = first_left + index * (chart_size + chart_gap)
@@ -1028,12 +1029,17 @@ class StationDistributionChart(AnimatedDonutChart):
                 title,
                 center_label,
                 is_duration=is_duration,
+                show_title=not is_timing_mode,
             )
 
-        legend_left = chart_area_width + (24 if is_timing_mode else 34)
+        legend_left = (
+            first_left + chart_size + 42
+            if is_timing_mode
+            else chart_area_width + 34
+        )
         legend_width = max(
             180 if is_timing_mode else 270,
-            self.width() - legend_left - 22,
+            self.width() - legend_left - (28 if is_timing_mode else 22),
         )
         if is_timing_mode:
             first_column_width = min(
@@ -1047,23 +1053,15 @@ class StationDistributionChart(AnimatedDonutChart):
             first_column = legend_left + legend_width - 300
             second_column = legend_left + legend_width - 145
         painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
-        painter.setPen(QColor("#718096"))
-        painter.drawText(legend_left + 18, 52, "站点")
-        selected_timing_color = (
-            self.PHONE_COLOR
-            if self._timing_basis == "active"
-            else self.TOTAL_COLOR
-        )
-        painter.setPen(selected_timing_color if is_timing_mode else self.TOTAL_COLOR)
-        painter.drawText(
-            QRectF(first_column, 40, first_column_width, 18),
-            Qt.AlignRight | Qt.AlignVCenter,
-            (
-                f"{timing_label} / 占比"
-                if is_timing_mode
-                else "总计数 / 占比"
-            ),
-        )
+        if not is_timing_mode:
+            painter.setPen(QColor("#718096"))
+            painter.drawText(legend_left + 18, 52, "站点")
+            painter.setPen(self.TOTAL_COLOR)
+            painter.drawText(
+                QRectF(first_column, 40, first_column_width, 18),
+                Qt.AlignRight | Qt.AlignVCenter,
+                "总计数 / 占比",
+            )
         if second_column is not None:
             painter.setPen(self.PHONE_COLOR)
             painter.drawText(
@@ -1073,11 +1071,18 @@ class StationDistributionChart(AnimatedDonutChart):
             )
 
         visible_rows = self._rows[:7]
-        row_height = max(
-            29,
-            min(38, int((self.height() - 58) / max(len(visible_rows), 1))),
-        )
-        top = 59
+        if is_timing_mode:
+            row_height = max(
+                30,
+                min(34, int((self.height() - 54) / max(len(visible_rows), 1))),
+            )
+            top = 50
+        else:
+            row_height = max(
+                29,
+                min(38, int((self.height() - 58) / max(len(visible_rows), 1))),
+            )
+            top = 59
         label_width = max(90, first_column - legend_left - 24)
         painter.setFont(QFont("Microsoft YaHei UI", 9))
 
@@ -1093,11 +1098,7 @@ class StationDistributionChart(AnimatedDonutChart):
                 painter.drawRoundedRect(hitbox, 6, 6)
 
             color = self.COLORS[index % len(self.COLORS)]
-            label_height = (
-                max(17, row_height - int(self.BAR_HEIGHT) - 4)
-                if is_timing_mode
-                else row_height - 2
-            )
+            label_height = 20 if is_timing_mode else row_height - 2
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(
@@ -1131,7 +1132,7 @@ class StationDistributionChart(AnimatedDonutChart):
             if is_timing_mode:
                 bar_rect = QRectF(
                     legend_left,
-                    row_top + row_height - self.BAR_HEIGHT - 2,
+                    row_top + 20,
                     legend_width,
                     self.BAR_HEIGHT,
                 )

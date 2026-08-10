@@ -19,6 +19,7 @@ from PyQt5.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QRectF,
     QSize,
     Qt,
     pyqtSignal,
@@ -4072,6 +4073,12 @@ class ToolAndUiTests(unittest.TestCase):
         )
         duration_outer = duration_item["outer"]
         duration_inner = duration_item["inner"]
+        self.assertEqual(duration_outer, QRectF(32, 56, 190, 190))
+        self.assertAlmostEqual(
+            chart._bar_rects[0].left(),
+            duration_outer.right() + 42,
+        )
+        self.assertEqual(chart._bar_rects[0].top(), 70)
         duration_local = QPoint(
             int(
                 duration_outer.center().x()
