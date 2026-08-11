@@ -25,6 +25,7 @@ from integrated_client.captcha_models import (
 )
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import Database
+from integrated_client.online.api import ApiResponseError
 from integrated_client.online.captcha_learning import CaptchaLearningService
 from integrated_client.tools.transport_tool import (
     BusinessBackfillWorker,
@@ -123,6 +124,7 @@ class _FakeApi:
         self.export_types = []
         self.sample_rows = []
         self.deleted_sample_ids = []
+        self.renamed_model = None
 
     @staticmethod
     def captcha_policy(_token):
@@ -197,6 +199,13 @@ class _FakeApi:
     @staticmethod
     def admin_activate_captcha_model(_token, _model_id):
         return {}
+
+    def admin_rename_captcha_model(self, _token, model_id, display_name):
+        self.renamed_model = (model_id, display_name)
+        return {
+            "id": model_id,
+            "display_name": display_name,
+        }
 
     @staticmethod
     def admin_use_builtin_captcha_model(_token, _captcha_type):
@@ -1539,8 +1548,8 @@ class CaptchaLearningTests(unittest.TestCase):
             self.assertEqual(session.api.export_types, [None])
             self.assertEqual(target_path.read_bytes(), b"dataset-mixed")
             self.assertTrue(page.export_btn.isEnabled())
-            self.assertIn("数字验证码", page.export_btn.toolTip())
-            self.assertIn("文字点选验证码", page.export_btn.toolTip())
+            self.assertIn("numeric", page.export_btn.toolTip())
+            self.assertIn("click", page.export_btn.toolTip())
             self.assertIn("原格式分类包", page.import_btn.toolTip())
 
         page.deleteLater()
@@ -1785,12 +1794,15 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertNotIn("策略修订", page.policy_detail.text())
         self.assertIn("75.0%", page.numeric_current_value.text())
         self.assertIn("50.0%", page.click_current_value.text())
-        self.assertEqual(page.model_table.rowCount(), 3)
+        self.assertEqual(page.model_table.rowCount(), 2)
         self.assertEqual(page.model_table.item(0, 1).text(), "ddddocr-builtin")
         self.assertEqual(page.model_table.item(0, 4).text(), "75.0%")
         self.assertEqual(page.model_table.item(1, 4).text(), "50.0%")
-        self.assertEqual(page.model_table.item(2, 1).text(), "external-ocr-1")
-        self.assertEqual(page.model_table.item(2, 4).text(), "100.0%")
+        versions = [
+            page.model_table.item(row, 1).text()
+            for row in range(page.model_table.rowCount())
+        ]
+        self.assertNotIn("external-ocr-1", versions)
         page.deleteLater()
 
     def test_machine_learning_page_can_delete_selected_samples(self):
@@ -1877,6 +1889,17 @@ class CaptchaLearningTests(unittest.TestCase):
         with patch.object(MachineLearningPage, "refresh"):
             page = MachineLearningPage(session)
         page.refresh_timer.stop()
+        click_model = {
+            "id": "click-model",
+            "captcha_type": "click",
+            "version": "click-knn-1",
+            "status": "archived",
+            "accuracy": 0.6,
+            "sample_count": 30,
+            "test_count": 6,
+            "correct_count": 4,
+            "artifact_size": 1024,
+        }
         overview = {
             "policy": {
                 "upload_mode": "metrics_only",
@@ -1937,6 +1960,7 @@ class CaptchaLearningTests(unittest.TestCase):
                     "correct_count": 1,
                     "artifact_size": 1,
                 },
+                click_model,
             ],
         }
         with patch.object(page, "_refresh_samples"):
@@ -1963,7 +1987,8 @@ class CaptchaLearningTests(unittest.TestCase):
             if page.model_table.item(row, 1).text() == "click-knn-1"
         )
         page.model_table.selectRow(click_row)
-        self.assertIn("50.0%", page.click_current_value.text())
+        self.assertIn("暂无自动识别记录", page.click_current_value.text())
+        self.assertIn("50.0%", page.model_hint.text())
         self.assertTrue(page.recalculate_model_btn.isEnabled())
 
         overview_calls = []
@@ -1980,7 +2005,7 @@ class CaptchaLearningTests(unittest.TestCase):
                         "success_rate": 0.8,
                     }
                 ],
-                "models": [],
+                "models": [click_model],
             }
 
         def immediate(function, completed):
@@ -1999,8 +2024,8 @@ class CaptchaLearningTests(unittest.TestCase):
                 }
             ],
         )
-        self.assertIn("80.0%", page.click_current_value.text())
-        self.assertIn("4 / 5", page.click_current_value.text())
+        self.assertIn("暂无自动识别记录", page.click_current_value.text())
+        self.assertIn("80.0%", page.model_hint.text())
         versions = [
             page.model_table.item(row, 1).text()
             for row in range(page.model_table.rowCount())
@@ -2009,7 +2034,83 @@ class CaptchaLearningTests(unittest.TestCase):
             versions,
             ["ddddocr-builtin", "ddddocr-builtin", "click-knn-1"],
         )
+        click_row = versions.index("click-knn-1")
+        self.assertEqual(page.model_table.item(click_row, 4).text(), "80.0%")
+        self.assertEqual(page.model_table.item(click_row, 5).text(), "4 / 5")
         self.assertEqual(page.model_table.item(0, 4).text(), "75.0%")
+        page.deleteLater()
+
+    def test_machine_learning_page_can_rename_selected_custom_model(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        model = {
+            "id": "numeric-model",
+            "captcha_type": "numeric",
+            "version": "numeric-knn-1",
+            "display_name": None,
+            "status": "candidate",
+            "accuracy": 0.8,
+            "sample_count": 30,
+            "test_count": 6,
+            "correct_count": 5,
+            "artifact_size": 1024,
+        }
+        overview = {
+            "policy": {
+                "upload_mode": "metrics_only",
+                "upload_enabled": False,
+                "active_models": {},
+            },
+            "dataset": {},
+            "attempts": [],
+            "models": [model],
+        }
+        with patch.object(page, "_refresh_samples"):
+            page._overview_loaded(overview, None)
+
+        numeric_row = next(
+            row
+            for row in range(page.model_table.rowCount())
+            if page.model_table.item(row, 1).text() == "numeric-knn-1"
+        )
+        page.model_table.selectRow(numeric_row)
+        self.assertTrue(page.rename_model_btn.isEnabled())
+
+        def immediate(function, completed):
+            completed(function(), None)
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.QInputDialog.getText",
+            return_value=("运输证数字模型", True),
+        ), patch.object(page, "_start", side_effect=immediate), patch.object(
+            page,
+            "refresh",
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.information"
+        ):
+            page._rename_selected_model()
+
+        self.assertEqual(
+            session.api.renamed_model,
+            ("numeric-model", "运输证数字模型"),
+        )
+        page._populate_models(
+            [{**model, "display_name": "运输证数字模型"}],
+            [],
+            {},
+        )
+        renamed_row = next(
+            row
+            for row in range(page.model_table.rowCount())
+            if page.model_table.item(row, 1).text() == "运输证数字模型"
+        )
+        self.assertIn(
+            "numeric-knn-1",
+            page.model_table.item(renamed_row, 1).toolTip(),
+        )
+        self.assertTrue(page.rename_model_btn.isEnabled())
         page.deleteLater()
 
     def test_machine_learning_page_accepts_legacy_sample_list_shape(self):
@@ -2034,6 +2135,25 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(page.sample_table.rowCount(), 1)
         self.assertEqual(page.sample_table.item(0, 2).text(), "1234")
         self.assertNotIn("失败", page.sample_hint.text())
+        page.deleteLater()
+
+    def test_machine_learning_page_explains_missing_sample_api(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._samples_loaded(
+            None,
+            ApiResponseError(
+                "not_found",
+                "Not Found",
+                status_code=404,
+            ),
+        )
+
+        self.assertIn("服务端版本过旧", page.sample_hint.text())
+        self.assertIn("无需删除或重新采集", page.sample_hint.text())
+        self.assertFalse(page.delete_samples_btn.isEnabled())
         page.deleteLater()
 
     def test_admin_main_window_exposes_machine_learning_navigation(self):

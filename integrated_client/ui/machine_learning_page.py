@@ -13,6 +13,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QPushButton,
     QTableWidget,
@@ -26,6 +27,7 @@ from ..captcha_models import (
     CaptchaTrainingError,
     train_candidate,
 )
+from ..online.api import ApiResponseError
 from .announcement_page import start_api_task
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
@@ -167,7 +169,7 @@ class MachineLearningPage(QWidget):
             stats_layout,
             1,
             0,
-            "数字验证码准确率",
+            "数字当前模型准确率",
         )
         self.numeric_candidate_value = self._add_metric(
             stats_layout,
@@ -179,7 +181,7 @@ class MachineLearningPage(QWidget):
             stats_layout,
             1,
             2,
-            "文字点选准确率",
+            "文字点选当前模型准确率",
         )
         self.click_candidate_value = self._add_metric(
             stats_layout,
@@ -192,7 +194,7 @@ class MachineLearningPage(QWidget):
         actions = QHBoxLayout()
         self.export_btn = QPushButton("导出数据集")
         self.export_btn.setToolTip(
-            "导出一个 ZIP，顶层按“数字验证码”和“文字点选验证码”分类"
+            "导出一个 ZIP，顶层按 numeric 和 click 分类"
         )
         self.export_btn.clicked.connect(self._export_dataset)
         self.import_btn = QPushButton("导入数据集")
@@ -283,7 +285,7 @@ class MachineLearningPage(QWidget):
             self._model_filter_changed
         )
         model_header.addWidget(self.model_type_combo)
-        self.recalculate_model_btn = QPushButton("重新统计识别")
+        self.recalculate_model_btn = QPushButton("刷新所选统计")
         self.recalculate_model_btn.setEnabled(False)
         self.recalculate_model_btn.clicked.connect(
             self._recalculate_selected_model
@@ -294,7 +296,7 @@ class MachineLearningPage(QWidget):
         self.model_table.setHorizontalHeaderLabels(
             [
                 "类型",
-                "版本",
+                "模型名称",
                 "状态",
                 "离线准确率",
                 "自动识别准确率",
@@ -329,10 +331,14 @@ class MachineLearningPage(QWidget):
         self.delete_model_btn = QPushButton("删除所选模型")
         self.delete_model_btn.setObjectName("DangerButton")
         self.delete_model_btn.clicked.connect(self._delete_selected_model)
+        self.rename_model_btn = QPushButton("重命名所选模型")
+        self.rename_model_btn.setEnabled(False)
+        self.rename_model_btn.clicked.connect(self._rename_selected_model)
         self.activate_model_btn = QPushButton("应用所选模型")
         self.activate_model_btn.setObjectName("PrimaryButton")
         self.activate_model_btn.clicked.connect(self._activate_selected_model)
         model_actions.addWidget(self.use_builtin_btn)
+        model_actions.addWidget(self.rename_model_btn)
         model_actions.addWidget(self.delete_model_btn)
         model_actions.addWidget(self.activate_model_btn)
         root.addLayout(model_actions)
@@ -503,15 +509,16 @@ class MachineLearningPage(QWidget):
         }
 
     @staticmethod
-    def _metric_text(metric, version):
+    def _metric_text(metric, version, display_name=None):
+        label = str(display_name or version)
         if metric and int(metric.get("attempt_count") or 0):
             return (
                 f"{float(metric.get('success_rate') or 0) * 100:.1f}%\n"
                 f"{int(metric.get('success_count') or 0)} / "
                 f"{int(metric.get('attempt_count') or 0)}\n"
-                f"{version}"
+                f"{label}"
             )
-        return f"--\n暂无自动识别记录\n{version}"
+        return f"--\n暂无自动识别记录\n{label}"
 
     def _set_accuracy_values(self, captcha_type, active, attempts, models):
         active_model = active.get(captcha_type) or {}
@@ -521,7 +528,11 @@ class MachineLearningPage(QWidget):
         if self._is_manual_model_version(current_version):
             current_version = BUILTIN_MODEL_VERSION
         metric = self._attempt_metric(attempts, captcha_type, current_version)
-        current_text = self._metric_text(metric, current_version)
+        current_text = self._metric_text(
+            metric,
+            current_version,
+            active_model.get("display_name"),
+        )
         candidates = [
             model
             for model in models
@@ -534,7 +545,7 @@ class MachineLearningPage(QWidget):
             f"{float(candidate.get('accuracy') or 0) * 100:.1f}%\n"
             f"{int(candidate.get('correct_count') or 0)} / "
             f"{int(candidate.get('test_count') or 0)}\n"
-            f"{candidate.get('version')}"
+            f"{candidate.get('display_name') or candidate.get('version')}"
             if candidate
             else "--\n暂无候选模型"
         )
@@ -573,36 +584,9 @@ class MachineLearningPage(QWidget):
                 }
             )
         managed_rows = list(self._model_source_rows)
-        known_versions = {
-            (str(model.get("captcha_type") or ""), str(model.get("version") or ""))
-            for model in builtin_rows + managed_rows
-        }
-        observed_rows = []
-        for metric in self._model_attempts:
-            if not self._is_automatic_metric(metric):
-                continue
-            key = (
-                str(metric.get("captcha_type") or ""),
-                str(metric.get("model_version") or ""),
-            )
-            if not all(key) or key in known_versions:
-                continue
-            known_versions.add(key)
-            observed_rows.append(
-                {
-                    "id": None,
-                    "captcha_type": key[0],
-                    "version": key[1],
-                    "status": "observed",
-                    "is_runtime_only": True,
-                    "artifact_size": 0,
-                    "sample_count": 0,
-                    "test_count": 0,
-                    "accuracy": None,
-                    "created_at": None,
-                }
-            )
-        self._all_model_rows = builtin_rows + managed_rows + observed_rows
+        # Attempts without a matching model are retained by the server for
+        # auditing, but they are not model files and must not appear as models.
+        self._all_model_rows = builtin_rows + managed_rows
         self._render_models()
 
     def _render_models(self):
@@ -627,11 +611,12 @@ class MachineLearningPage(QWidget):
                 "current": "当前应用",
                 "archived": "历史",
                 "builtin": "内置备用",
-                "observed": "识别记录",
             }
             for row, model in enumerate(self._model_rows):
                 captcha_type = str(model.get("captcha_type") or "")
                 version = str(model.get("version") or "-")
+                display_name = str(model.get("display_name") or "").strip()
+                label = display_name or version
                 metric = self._attempt_metric(
                     self._model_attempts,
                     captcha_type,
@@ -649,10 +634,10 @@ class MachineLearningPage(QWidget):
                     else "--"
                 )
                 builtin = bool(model.get("is_builtin"))
-                managed = not builtin and not model.get("is_runtime_only")
+                managed = not builtin
                 values = [
                     type_labels.get(captcha_type, "-"),
-                    version,
+                    label,
                     status_labels.get(model.get("status"), "-"),
                     (
                         "--"
@@ -688,6 +673,11 @@ class MachineLearningPage(QWidget):
                 ]
                 for column, value in enumerate(values):
                     item = QTableWidgetItem(value)
+                    if column == 1:
+                        tooltip = f"内部版本：{version}"
+                        if display_name:
+                            tooltip = f"显示名称：{display_name}\n{tooltip}"
+                        item.setToolTip(tooltip)
                     if column in {0, 2, 3, 4, 5, 6, 7, 8}:
                         item.setTextAlignment(Qt.AlignCenter)
                     self.model_table.setItem(row, column, item)
@@ -717,6 +707,7 @@ class MachineLearningPage(QWidget):
     def _model_filter_changed(self, _index):
         self._selected_model_key = None
         self.recalculate_model_btn.setEnabled(False)
+        self.rename_model_btn.setEnabled(False)
         self._restore_active_accuracy_values()
         self._render_models()
 
@@ -746,6 +737,7 @@ class MachineLearningPage(QWidget):
         if not model:
             self._selected_model_key = None
             self.recalculate_model_btn.setEnabled(False)
+            self.rename_model_btn.setEnabled(False)
             return
         version = str(model.get("version") or "")
         captcha_type = str(model.get("captcha_type") or "")
@@ -753,24 +745,31 @@ class MachineLearningPage(QWidget):
         self.recalculate_model_btn.setEnabled(
             bool(version) and not self._is_manual_model_version(version)
         )
+        self.rename_model_btn.setEnabled(
+            bool(model.get("id"))
+            and not bool(model.get("is_builtin"))
+            and callable(
+                getattr(
+                    getattr(self.session_manager, "api", None),
+                    "admin_rename_captcha_model",
+                    None,
+                )
+            )
+        )
         self._show_selected_model_metric(model)
 
     def _show_selected_model_metric(self, model):
         captcha_type = str(model.get("captcha_type") or "")
         version = str(model.get("version") or BUILTIN_MODEL_VERSION)
+        label = str(model.get("display_name") or version)
         metric = self._attempt_metric(self._model_attempts, captcha_type, version)
-        text = self._metric_text(metric, version)
-        if captcha_type == "numeric":
-            self.numeric_current_value.setText(text)
-        elif captcha_type == "click":
-            self.click_current_value.setText(text)
         if metric and int(metric.get("attempt_count") or 0):
             self.model_hint.setText(
-                f"已选择 {version}：自动识别 {int(metric.get('attempt_count') or 0)} 次，"
+                f"已选择 {label}：自动识别 {int(metric.get('attempt_count') or 0)} 次，"
                 f"准确率 {float(metric.get('success_rate') or 0) * 100:.1f}%"
             )
         else:
-            self.model_hint.setText(f"已选择 {version}：暂无自动识别记录。")
+            self.model_hint.setText(f"已选择 {label}：暂无自动识别记录。")
 
     def _recalculate_selected_model(self):
         model = self._current_model()
@@ -785,7 +784,9 @@ class MachineLearningPage(QWidget):
         )
         self._selected_model_key = key
         self.recalculate_model_btn.setEnabled(False)
-        self.model_hint.setText(f"正在重新统计 {key[1]} 的自动识别记录…")
+        self.model_hint.setText(
+            f"正在刷新 {model.get('display_name') or key[1]} 的自动识别记录…"
+        )
 
         def load_overview():
             token = self.session_manager.access_token()
@@ -914,7 +915,14 @@ class MachineLearningPage(QWidget):
             self.sample_page_label.setText("0 / 0")
             self.prev_samples_btn.setEnabled(False)
             self.next_samples_btn.setEnabled(False)
-            self.sample_hint.setText(f"样本读取失败：{error}")
+            self.delete_samples_btn.setEnabled(False)
+            if isinstance(error, ApiResponseError) and error.status_code == 404:
+                self.sample_hint.setText(
+                    "样本读取失败：服务端版本过旧，尚未提供样本列表接口；"
+                    "现有样本无需删除或重新采集"
+                )
+            else:
+                self.sample_hint.setText(f"样本读取失败：{error}")
             return
         try:
             if isinstance(result, dict):
@@ -951,6 +959,7 @@ class MachineLearningPage(QWidget):
             return
         self._sample_limit = limit
         self._sample_offset = offset
+        self.delete_samples_btn.setEnabled(True)
         self.sample_table.setRowCount(len(self._sample_rows))
         type_labels = {"numeric": "数字", "click": "文字点选"}
         for row, sample in enumerate(self._sample_rows):
@@ -1147,7 +1156,7 @@ class MachineLearningPage(QWidget):
         QMessageBox.information(
             self,
             "导出完成",
-            "数据集已导出到“数字验证码”和“文字点选验证码”两个目录，"
+            "数据集已导出到 numeric 和 click 两个目录，"
             f"共 {_format_size(size)}。",
         )
 
@@ -1282,6 +1291,79 @@ class MachineLearningPage(QWidget):
             return None
         return model
 
+    def _rename_selected_model(self):
+        model = self._selected_model()
+        if not model:
+            return
+        if model.get("is_builtin") or not model.get("id"):
+            QMessageBox.warning(
+                self,
+                "不能重命名",
+                "内置 ddddocr 没有可编辑的模型名称。",
+            )
+            return
+        version = str(model.get("version") or "")
+        current_name = str(model.get("display_name") or version)
+        display_name, accepted = QInputDialog.getText(
+            self,
+            "重命名模型",
+            f"请输入模型显示名称：\n内部版本：{version}",
+            text=current_name,
+        )
+        if not accepted:
+            return
+        display_name = str(display_name).strip()
+        if not display_name:
+            QMessageBox.warning(self, "重命名失败", "模型显示名称不能为空。")
+            return
+        if len(display_name) > 80:
+            QMessageBox.warning(self, "重命名失败", "模型显示名称不能超过 80 个字符。")
+            return
+        rename_api = getattr(
+            getattr(self.session_manager, "api", None),
+            "admin_rename_captcha_model",
+            None,
+        )
+        if not callable(rename_api):
+            QMessageBox.warning(
+                self,
+                "重命名失败",
+                "当前客户端接口不支持模型重命名，请先升级客户端。",
+            )
+            return
+        self.rename_model_btn.setEnabled(False)
+
+        def rename():
+            token = self.session_manager.access_token()
+            return rename_api(
+                token,
+                str(model["id"]),
+                display_name,
+            )
+
+        self._start(
+            rename,
+            lambda result, error, name=display_name: self._model_renamed(
+                name,
+                result,
+                error,
+            ),
+        )
+
+    def _model_renamed(self, display_name, result, error):
+        if error is not None:
+            self.rename_model_btn.setEnabled(True)
+            if isinstance(error, ApiResponseError) and error.status_code == 404:
+                message = "服务端版本过旧，暂不支持模型重命名。"
+            else:
+                message = str(error)
+            QMessageBox.warning(self, "重命名失败", message)
+            return
+        self.rename_model_btn.setEnabled(True)
+        actual_name = str((result or {}).get("display_name") or display_name)
+        QMessageBox.information(self, "重命名完成", f"模型已重命名为：{actual_name}")
+        self.refresh()
+
     def _activate_selected_model(self):
         model = self._selected_model()
         if not model:
@@ -1295,13 +1377,6 @@ class MachineLearningPage(QWidget):
                 )
                 return
             self._use_builtin_for_selected_type()
-            return
-        if model.get("is_runtime_only"):
-            QMessageBox.warning(
-                self,
-                "不能应用",
-                "该行只有历史自动识别统计，没有可应用的模型文件。",
-            )
             return
         if model.get("status") == "current":
             QMessageBox.information(self, "已经应用", "该模型已经是当前应用版本。")
@@ -1395,13 +1470,6 @@ class MachineLearningPage(QWidget):
             return
         if model.get("is_builtin"):
             QMessageBox.warning(self, "不能删除", "内置 ddddocr 不能删除。")
-            return
-        if model.get("is_runtime_only"):
-            QMessageBox.warning(
-                self,
-                "不能删除",
-                "该行是自动识别统计记录，不是可删除的模型文件。",
-            )
             return
         if model.get("status") == "current":
             QMessageBox.warning(self, "不能删除", "当前正在应用的模型不能删除。")

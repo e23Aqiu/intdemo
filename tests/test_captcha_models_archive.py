@@ -18,6 +18,35 @@ def _archive(entries):
 
 
 class CaptchaDatasetArchiveTests(unittest.TestCase):
+    def test_reads_top_level_english_category_directories(self):
+        samples = [
+            {
+                "captcha_type": "numeric",
+                "image": "numeric/one.png",
+                "answer": {"value": "1234"},
+            },
+            {
+                "captcha_type": "click",
+                "image": "click/two.jpg",
+                "answer": {"prompt": ["A"], "points": [{"x": 0.5, "y": 0.5}]},
+            },
+        ]
+        archive = _archive(
+            [
+                ("numeric/", b""),
+                ("click/", b""),
+                ("manifest.json", json.dumps({"schema_version": 1, "samples": samples})),
+                ("numeric/one.png", b"numeric-image"),
+                ("click/two.jpg", b"click-image"),
+            ]
+        )
+
+        parsed = _safe_dataset_archive(archive)
+
+        self.assertEqual([item["captcha_type"] for item in parsed], ["numeric", "click"])
+        self.assertEqual(parsed[0]["image"], b"numeric-image")
+        self.assertEqual(parsed[1]["image"], b"click-image")
+
     def test_reads_legacy_nested_images_and_explicit_directories(self):
         samples = [
             {

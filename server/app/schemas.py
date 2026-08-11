@@ -303,6 +303,7 @@ class CaptchaModelView(StrictModel):
     id: uuid.UUID
     captcha_type: Literal["numeric", "click"]
     version: str
+    display_name: str | None = None
     algorithm: str
     status: Literal["candidate", "current", "archived"]
     artifact_sha256: str
@@ -478,6 +479,20 @@ class CaptchaModelCreate(StrictModel):
         if self.correct_count > self.test_count:
             raise ValueError("正确数量不能大于测试数量")
         return self
+
+
+class CaptchaModelRename(StrictModel):
+    display_name: str = Field(min_length=1, max_length=80)
+
+    @field_validator("display_name")
+    @classmethod
+    def normalize_display_name(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("模型显示名称不能为空")
+        if any(ord(character) < 32 for character in value):
+            raise ValueError("模型显示名称不能包含控制字符")
+        return value
 
 
 class CaptchaDatasetImportResult(StrictModel):

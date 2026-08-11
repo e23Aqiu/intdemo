@@ -48,10 +48,13 @@
 
 - 数据集数量与占用空间：每 5 秒刷新，并分别显示数字和文字点选样本。
 - 当前模型成功率：真实客户端尝试中，该模型版本的成功次数 / 尝试次数。
-- 数字验证码和文字点选验证码分别统计准确率；内置 `ddddocr`、训练模型以及只有
-  历史识别记录的其他模型版本都会在机器学习页独立展示。
+- 数字验证码和文字点选验证码分别统计准确率；模型表只展示内置 `ddddocr` 和
+  服务端仍保存模型文件的候选、当前及历史版本。没有对应模型文件的孤立识别记录
+  仍保留在服务端审计数据中，但不会伪装成一行可操作模型。
 - `human-manual` 等人工版本不会出现在模型列表或准确率中。模型表可按数字/文字
-  点选筛选；选中任一模型后可从服务端重新聚合该版本的自动识别次数和准确率。
+  点选筛选；顶部准确率始终显示当前应用模型，选中其他模型只在对应表格行和提示区
+  显示其统计。选择“刷新所选统计”可从服务端重新聚合该版本的自动识别次数和准确率，
+  不会删除或清零历史识别记录。
 - 候选模型识别率：训练时固定、确定性的 20% 留出集结果，不包含后续线上尝试。
 - 数字模型按四位数字全部一致才算一次正确。
 - 点选模型按题目文字对应区域的完整序列全部一致才算一次正确；检测框仍由内置
@@ -93,18 +96,23 @@ SHA-256 上传服务端。
 应用或对比。客户端离线重启时可继续加载上次已校验的当前模型；重新连接并发现
 管理员已恢复内置模型后，会清除“当前自定义模型”标记。
 
+候选、当前和历史自定义模型可以单独设置显示名称。重命名只改变管理页面显示的
+别名，不改变内部版本号、模型文件、SHA-256 或历史识别统计；内置 `ddddocr` 没有
+可编辑的模型记录，不能重命名。
+
 ## 数据集导入与导出
 
-管理员一次导出全部数据，ZIP 顶层按验证码类型使用中文目录；即使某一类暂时没有
-样本也保留对应空目录。导出的原 ZIP 可以直接重新导入，旧版英文目录数据集继续
-兼容。训练某一类型时客户端仍可在后台请求该类型的样本子集。压缩包结构：
+管理员一次导出全部数据，ZIP 顶层按验证码类型使用 `numeric` 和 `click` 目录；
+即使某一类暂时没有样本也保留对应空目录。导出的原 ZIP 可以直接重新导入，旧版
+`images/...` 及中文目录数据集继续兼容。训练某一类型时客户端仍可在后台请求该
+类型的样本子集。压缩包结构：
 
 ```text
 manifest.json
-数字验证码/<sample-uuid>.png
-数字验证码/<sample-uuid>.jpg
-文字点选验证码/<sample-uuid>.png
-文字点选验证码/<sample-uuid>.jpg
+numeric/<sample-uuid>.png
+numeric/<sample-uuid>.jpg
+click/<sample-uuid>.png
+click/<sample-uuid>.jpg
 ```
 
 `manifest.json` 的 `schema_version` 当前为 `1`，`categories` 同时记录数字与文字
@@ -115,7 +123,7 @@ manifest.json
   "id": "UUID",
   "captcha_type": "numeric",
   "source": "transport_numeric",
-  "image": "数字验证码/UUID.png",
+  "image": "numeric/UUID.png",
   "image_mime": "image/png",
   "answer": {"value": "1234"},
   "model_version": "human-manual",
@@ -125,9 +133,9 @@ manifest.json
 ```
 
 导入包上限为 100 MB（压缩前请求体及解压后内容均校验），拒绝路径穿越、重复
-路径、超量文件和无效清单。读取器兼容旧版 `images/...`、Windows 反斜杠、
-`./` 前缀及带 UTF-8 BOM 的清单；导入会重新检查图片签名、答案和指纹，不信任
-清单中的原始 ID 或指纹，页面会分别报告新增、重复和跳过数量。
+路径、超量文件和无效清单。读取器兼容旧版 `images/...`、中文目录、Windows
+反斜杠、`./` 前缀及带 UTF-8 BOM 的清单；导入会重新检查图片签名、答案和指纹，
+不信任清单中的原始 ID 或指纹，页面会分别报告新增、重复和跳过数量。
 
 机器学习页的样本表支持按类型筛选、分页以及 Ctrl/Shift 多选删除。删除只影响选中
 样本及后续导出/训练，不删除对应的自动识别准确率历史尝试。
@@ -150,12 +158,14 @@ manifest.json
 - `GET /api/v1/admin/ml/dataset/export`
 - `POST /api/v1/admin/ml/dataset/import`
 - `POST /api/v1/admin/ml/models`
+- `PATCH /api/v1/admin/ml/models/{id}`（仅修改显示名称）
 - `POST /api/v1/admin/ml/models/{id}/activate`
 - `POST /api/v1/admin/ml/models/{numeric|click}/use-builtin`
 - `DELETE /api/v1/admin/ml/models/{id}`
 
 `PATCH /api/v1/admin/ml/policy` 使用
 `{"upload_mode":"off|metrics_only|samples_and_metrics"}`。部署新版本后必须执行
-Alembic `upgrade head`，以创建或升级验证码策略、尝试、样本和模型四张表。
+Alembic `upgrade head`，以创建或升级验证码策略、尝试、样本和模型表（包括模型
+显示名称字段）。
 数据库备份会随现有 PostgreSQL 全量备份流程包含这些数据；导出的 ZIP 仍应按
 敏感授权数据加密保管。

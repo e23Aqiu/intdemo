@@ -33,6 +33,7 @@ from ..schemas import (
     CaptchaLearningPolicyUpdate,
     CaptchaLearningPolicyView,
     CaptchaModelCreate,
+    CaptchaModelRename,
     CaptchaModelView,
     CaptchaSampleDeleteRequest,
     CaptchaSampleDeleteResult,
@@ -62,8 +63,8 @@ CAPTCHA_SOURCE_BY_TYPE = {
     "click": "business_click",
 }
 DATASET_DIRECTORY_BY_TYPE = {
-    "numeric": "数字验证码",
-    "click": "文字点选验证码",
+    "numeric": "numeric",
+    "click": "click",
 }
 MANUAL_MODEL_PREFIXES = ("human-", "human_")
 ARCHIVE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
@@ -157,6 +158,7 @@ def _model_view(model: CaptchaModel) -> dict[str, Any]:
         "id": model.id,
         "captcha_type": model.captcha_type,
         "version": model.version,
+        "display_name": model.display_name,
         "algorithm": model.algorithm,
         "status": model.status,
         "artifact_sha256": model.artifact_sha256,
@@ -857,12 +859,16 @@ def export_captcha_dataset(
             "categories": {
                 "numeric": {
                     "label": "数字验证码",
-                    "image_directory": "数字验证码/",
+                    "image_directory": (
+                        f"{DATASET_DIRECTORY_BY_TYPE['numeric']}/"
+                    ),
                     "sample_count": category_counts["numeric"],
                 },
                 "click": {
                     "label": "文字点选验证码",
-                    "image_directory": "文字点选验证码/",
+                    "image_directory": (
+                        f"{DATASET_DIRECTORY_BY_TYPE['click']}/"
+                    ),
                     "sample_count": category_counts["click"],
                 },
             },
@@ -1164,6 +1170,7 @@ def create_captcha_model(
     model = CaptchaModel(
         captcha_type=payload.captcha_type,
         version=payload.version,
+        display_name=payload.version,
         algorithm=payload.algorithm.strip(),
         status="candidate",
         artifact_sha256=hashlib.sha256(artifact).hexdigest(),
@@ -1199,6 +1206,41 @@ def create_captcha_model(
             "同类型的模型版本已经存在",
             status_code=409,
         ) from exc
+    db.refresh(model)
+    return _model_view(model)
+
+
+@router.patch(
+    "/admin/ml/models/{model_id}",
+    response_model=CaptchaModelView,
+)
+def rename_captcha_model(
+    model_id: uuid.UUID,
+    payload: CaptchaModelRename,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> dict[str, Any]:
+    model = db.get(CaptchaModel, model_id)
+    if model is None:
+        raise ApiError("captcha_model_not_found", "模型不存在", status_code=404)
+    previous_name = model.display_name
+    model.display_name = payload.display_name
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="captcha.model.rename",
+        target_type="captcha_model",
+        target_id=str(model.id),
+        details={
+            "captcha_type": model.captcha_type,
+            "version": model.version,
+            "previous_display_name": previous_name,
+            "display_name": model.display_name,
+        },
+    )
+    db.commit()
     db.refresh(model)
     return _model_view(model)
 

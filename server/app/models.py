@@ -418,6 +418,7 @@ class CaptchaModel(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     captcha_type: Mapped[str] = mapped_column(String(16), index=True)
     version: Mapped[str] = mapped_column(String(80))
+    display_name: Mapped[str | None] = mapped_column(String(80))
     algorithm: Mapped[str] = mapped_column(String(80))
     status: Mapped[str] = mapped_column(String(16), default="candidate")
     artifact_sha256: Mapped[str] = mapped_column(String(64))

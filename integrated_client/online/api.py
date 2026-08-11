@@ -342,6 +342,19 @@ class ApiClient:
             token=access_token,
         )
 
+    def admin_rename_captcha_model(
+        self,
+        access_token: str,
+        model_id: str,
+        display_name: str,
+    ) -> dict:
+        return self._request(
+            "PATCH",
+            f"/admin/ml/models/{model_id}",
+            token=access_token,
+            json_body={"display_name": str(display_name)},
+        )
+
     def admin_use_builtin_captcha_model(
         self,
         access_token: str,

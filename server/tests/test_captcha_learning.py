@@ -255,22 +255,28 @@ def test_dataset_export_import_and_model_activation(client):
             name == "images/" or name.startswith("images/")
             for name in archive.namelist()
         )
-        assert "数字验证码/" in archive.namelist()
-        assert "文字点选验证码/" in archive.namelist()
+        assert "numeric/" in archive.namelist()
+        assert "click/" in archive.namelist()
+        assert manifest["categories"]["numeric"]["image_directory"] == "numeric/"
+        assert manifest["categories"]["click"]["image_directory"] == "click/"
         assert len(
             [
                 name
                 for name in archive.namelist()
-                if name.startswith("数字验证码/") and not name.endswith("/")
+                if name.startswith("numeric/") and not name.endswith("/")
             ]
         ) == 1
         assert len(
             [
                 name
                 for name in archive.namelist()
-                if name.startswith("文字点选验证码/") and not name.endswith("/")
+                if name.startswith("click/") and not name.endswith("/")
             ]
         ) == 1
+        assert {
+            item["captcha_type"]: item["image"].split("/", 1)[0]
+            for item in manifest["samples"]
+        } == {"numeric": "numeric", "click": "click"}
 
     for captcha_type in ("numeric", "click"):
         classified = client.get(
@@ -343,6 +349,40 @@ def test_dataset_export_import_and_model_activation(client):
     model = created.json()
     assert model["status"] == "candidate"
     assert model["accuracy"] == 0.75
+    assert model["display_name"] == "numeric-test-1"
+
+    renamed = client.patch(
+        f"/api/v1/admin/ml/models/{model['id']}",
+        headers=auth_header(admin),
+        json={"display_name": "运输证数字模型"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    renamed_model = renamed.json()
+    assert renamed_model["display_name"] == "运输证数字模型"
+    assert renamed_model["version"] == model["version"]
+    assert renamed_model["artifact_sha256"] == model["artifact_sha256"]
+    assert renamed_model["artifact_size"] == model["artifact_size"]
+
+    blank_name = client.patch(
+        f"/api/v1/admin/ml/models/{model['id']}",
+        headers=auth_header(admin),
+        json={"display_name": "   "},
+    )
+    assert blank_name.status_code == 422
+
+    forbidden = client.patch(
+        f"/api/v1/admin/ml/models/{model['id']}",
+        headers=auth_header(user),
+        json={"display_name": "普通用户不应修改"},
+    )
+    assert forbidden.status_code == 403
+
+    missing = client.patch(
+        "/api/v1/admin/ml/models/00000000-0000-0000-0000-000000000000",
+        headers=auth_header(admin),
+        json={"display_name": "不存在"},
+    )
+    assert missing.status_code == 404
 
     activated = client.post(
         f"/api/v1/admin/ml/models/{model['id']}/activate",
@@ -350,6 +390,7 @@ def test_dataset_export_import_and_model_activation(client):
     )
     assert activated.status_code == 200
     assert activated.json()["status"] == "current"
+    assert activated.json()["display_name"] == "运输证数字模型"
 
     policy = client.get(
         "/api/v1/captcha/policy",
@@ -357,6 +398,10 @@ def test_dataset_export_import_and_model_activation(client):
     )
     assert policy.status_code == 200
     assert policy.json()["active_models"]["numeric"]["version"] == "numeric-test-1"
+    assert (
+        policy.json()["active_models"]["numeric"]["display_name"]
+        == "运输证数字模型"
+    )
 
     downloaded = client.get(
         "/api/v1/captcha/models/numeric/current",
@@ -378,6 +423,24 @@ def test_dataset_export_import_and_model_activation(client):
         headers=auth_header(user),
     )
     assert no_custom_model.status_code == 404
+
+
+def test_empty_dataset_export_keeps_both_category_directories(client):
+    admin = changed_admin(client)
+
+    exported = client.get(
+        "/api/v1/admin/ml/dataset/export",
+        headers=auth_header(admin),
+    )
+
+    assert exported.status_code == 200
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        assert "numeric/" in archive.namelist()
+        assert "click/" in archive.namelist()
+        manifest = json.loads(archive.read("manifest.json"))
+    assert manifest["sample_count"] == 0
+    assert manifest["categories"]["numeric"]["sample_count"] == 0
+    assert manifest["categories"]["click"]["sample_count"] == 0
 
 
 def test_admin_can_list_and_delete_selected_captcha_samples(client):
