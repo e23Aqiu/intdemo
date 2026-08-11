@@ -12,6 +12,10 @@ class Account:
     created_at: str
     last_login: Optional[str]
     must_change_password: bool = False
+    server_account_id: Optional[str] = None
+    stats_scope: str = "own"
+    is_archived: bool = False
+    entitlement_revision: int = 0
 
     @property
     def is_admin(self) -> bool:
@@ -24,3 +28,7 @@ class Account:
     @property
     def name_label(self) -> str:
         return self.display_name or self.username
+
+    @property
+    def can_view_all_stats(self) -> bool:
+        return self.is_admin or self.stats_scope == "all"

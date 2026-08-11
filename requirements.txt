@@ -1,4 +1,5 @@
 PyQt5==5.15.11
+cryptography==45.0.7
 pandas==2.3.3
 openpyxl==3.1.5
 xlrd==2.0.1

@@ -1,0 +1,7 @@
+{
+  "base_url": "https://43.138.177.65",
+  "ca_bundle": "certs/intdemo-caddy-root.crt",
+  "channel": "test",
+  "connect_timeout": 5,
+  "read_timeout": 20
+}

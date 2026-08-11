@@ -1,0 +1,17 @@
+{
+  "appid": "com.e23aqiu.intdemo",
+  "name": "逃费车辆信息智能查询平台",
+  "version": "@UOS_VERSION@",
+  "arch": ["arm64"],
+  "permissions": {
+    "autostart": false,
+    "notification": false,
+    "trayicon": false,
+    "clipboard": true,
+    "account": false,
+    "bluetooth": false,
+    "camera": false,
+    "audio_record": false,
+    "installed_apps": false
+  }
+}

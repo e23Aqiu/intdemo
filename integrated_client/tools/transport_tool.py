@@ -1,5 +1,7 @@
 # 正则表达式：用于解析车牌格式
 import re
+import base64
+import hashlib
 # 操作系统模块：用于文件路径判断
 import os
 # 时间模块：用于延时
@@ -15,6 +17,7 @@ import sys
 import subprocess
 import difflib
 import uuid
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
@@ -24,6 +27,8 @@ from PyQt5.QtGui import QFont
 
 USING_PYQT6 = False
 from ..browser import get_builtin_chromium_path
+from ..platform_support import chromium_launch_args
+from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 from playwright.sync_api import sync_playwright, Page, Browser
 try:
     from ddddocr import DdddOcr
@@ -41,11 +46,43 @@ os.environ["DDDOCR_NO_LOG"] = "1"
 os.environ["PLAYWRIGHT_LOG"] = "none"
 os.environ["PLAYWRIGHT_LOCAL_LOG_DIR"] = os.devnull
 
+ASSISTED_PAYMENT_COLUMNS = ("备注", "已协助补缴")
+
+
+def resolve_assisted_payment_column(columns):
+    """返回当前业务表中的补缴标记列，优先使用新版“备注”。"""
+    available = {
+        str(column).strip()
+        for column in columns
+        if column is not None and str(column).strip()
+    }
+    return next(
+        (name for name in ASSISTED_PAYMENT_COLUMNS if name in available),
+        None,
+    )
+
+
+def has_assisted_payment(row):
+    """新旧列任意一个包含内容时，沿用原规则视为已协助补缴。"""
+    getter = getattr(row, "get", None)
+    if not callable(getter):
+        return False
+    for column_name in ASSISTED_PAYMENT_COLUMNS:
+        value = getter(column_name, None)
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        if str(value).strip():
+            return True
+    return False
+
 
 class TargetedWorkbookWriter:
     """只更新指定结果单元格，并通过同目录原子替换保存工作簿。"""
 
-    RESULT_COLUMN_ANCHOR = "已协助补缴"
+    RESULT_COLUMN_ANCHORS = ASSISTED_PAYMENT_COLUMNS
 
     def __init__(self, file_path, target_columns):
         self.file_path = Path(file_path)
@@ -83,7 +120,7 @@ class TargetedWorkbookWriter:
         return None
 
     def _next_result_column(self):
-        anchor_index = self.column_indexes.get(self.RESULT_COLUMN_ANCHOR)
+        anchor_index = self._result_column_anchor_index()
         last_used_column = max(
             self.sheet.max_column,
             max(self.column_indexes.values(), default=0),
@@ -98,7 +135,7 @@ class TargetedWorkbookWriter:
         return last_used_column + 1
 
     def _move_existing_result_column_left(self, column_name):
-        anchor_index = self.column_indexes.get(self.RESULT_COLUMN_ANCHOR)
+        anchor_index = self._result_column_anchor_index()
         source_column = self.column_indexes[column_name]
         if anchor_index is None or source_column <= anchor_index + 1:
             return
@@ -115,6 +152,16 @@ class TargetedWorkbookWriter:
             source_cell.value = None
         self.column_indexes[column_name] = destination_column
         self.dirty = True
+
+    def _result_column_anchor_index(self):
+        return next(
+            (
+                self.column_indexes[name]
+                for name in self.RESULT_COLUMN_ANCHORS
+                if name in self.column_indexes
+            ),
+            None,
+        )
 
     @staticmethod
     def _cell_value(value):
@@ -295,13 +342,42 @@ def has_nonempty_cell_value(value):
 
 # 普通验证码 OCR（纯数字·自动识别线条+延长补全·全流程可视化版）
 ocr = DdddOcr(show_ad=False) if DdddOcr is not None else None
-def ocr_code(page, selector):
-    if ocr is None:
-        print(f"ddddocr 不可用：{DDDDOCR_IMPORT_ERROR}")
-        return ""
+
+
+def ocr_code(
+    page,
+    selector,
+    model=None,
+    return_details=False,
+    model_failure_callback=None,
+):
+    img_bytes = b""
+
+    def result(code, version):
+        if return_details:
+            return code, img_bytes, version
+        return code
+
     try:
         # 1. 仅截图获取字节流，不保存本地图片
         img_bytes = page.locator(selector).screenshot()
+
+        if model is not None:
+            try:
+                custom_code = str(model.predict_numeric(img_bytes) or "")
+            except Exception:
+                custom_code = ""
+            if re.fullmatch(r"[0-9]{4}", custom_code):
+                return result(custom_code, str(model.version))
+            if callable(model_failure_callback):
+                try:
+                    model_failure_callback(str(model.version))
+                except Exception:
+                    pass
+
+        if ocr is None:
+            print(f"ddddocr 不可用：{DDDDOCR_IMPORT_ERROR}")
+            return result("", "ddddocr-unavailable")
 
         # 2. 转灰度图
         pil_img = Image.open(io.BytesIO(img_bytes)).convert('L')
@@ -395,7 +471,7 @@ def ocr_code(page, selector):
 
         if not results:
             print(f"⚠️ OCR识别失败，原始结果：{raw}")
-            return ""
+            return result("", "ddddocr-builtin")
 
         # 13. 兜底补全
         final_code = ""
@@ -411,11 +487,11 @@ def ocr_code(page, selector):
                 final_code = base + last_digit
 
         print(f"【纯数字验证码·线条延长版】结果：{results} → {final_code}")
-        return final_code
+        return result(final_code, "ddddocr-builtin")
 
     except Exception as e:
         print(f"验证码识别异常：{str(e)}")
-        return ""
+        return result("", "ddddocr-builtin")
 
 
 
@@ -428,11 +504,24 @@ class Worker(QThread):
     input_signal = pyqtSignal(str)
     stat_event = pyqtSignal(str, int)
     retry_signal = pyqtSignal(str, str)
+    captcha_attempt_signal = pyqtSignal(object)
 
     input_result = ""
 
     # 接收所有运行参数
-    def __init__(self, src_path, is_auto_mode, manual_at_captcha, page_retry, auto_continue, captcha_retry, only_yellow_card):
+    def __init__(
+        self,
+        src_path,
+        is_auto_mode,
+        manual_at_captcha,
+        page_retry,
+        auto_continue,
+        captcha_retry,
+        only_yellow_card,
+        captcha_model_manager=None,
+        captcha_collection_enabled=None,
+        captcha_sample_collection_enabled=None,
+    ):
         super().__init__()
         self.src = src_path
         self.auto_mode = is_auto_mode
@@ -452,6 +541,11 @@ class Worker(QThread):
         # 自动继续配置
         self.auto_continue = auto_continue
         self.only_yellow_card = only_yellow_card
+        self.captcha_model_manager = captcha_model_manager
+        self.captcha_collection_enabled = captcha_collection_enabled
+        self.captcha_sample_collection_enabled = (
+            captcha_sample_collection_enabled
+        )
 
     def stop(self):
         self._running = False
@@ -492,6 +586,91 @@ class Worker(QThread):
             pass
         self.playwright = None
 
+    def _collection_enabled(self):
+        callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _sample_collection_enabled(self):
+        callback = self.captcha_sample_collection_enabled
+        if callback is None:
+            callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _active_model(self, captcha_type):
+        manager = self.captcha_model_manager
+        if manager is None:
+            return None
+        try:
+            return manager.get(captcha_type)
+        except Exception:
+            return None
+
+    def _emit_captcha_attempt(
+        self,
+        *,
+        success,
+        model_version,
+        assisted,
+        image_bytes=None,
+        answer=None,
+    ):
+        if not self._collection_enabled():
+            return
+        event = {
+            "captcha_type": "numeric",
+            "source": "transport_numeric",
+            "model_version": str(model_version or "unknown"),
+            "success": bool(success),
+            "assisted": bool(assisted),
+            "occurred_at": datetime.now().astimezone().isoformat(),
+        }
+        if success and image_bytes and isinstance(answer, dict):
+            event.update(
+                {
+                    "image_bytes": bytes(image_bytes),
+                    "image_mime": "image/png",
+                    "answer": answer,
+                }
+            )
+        self.captcha_attempt_signal.emit(event)
+
+    def _report_successful_captcha_attempt(
+        self,
+        *,
+        model_version,
+        assisted,
+        image_bytes=None,
+        answer=None,
+    ):
+        if not self._collection_enabled():
+            return
+        attempt = {
+            "model_version": model_version,
+            "assisted": assisted,
+        }
+        if (
+            self._sample_collection_enabled()
+            and image_bytes
+            and isinstance(answer, dict)
+        ):
+            attempt.update(
+                {
+                    "image_bytes": image_bytes,
+                    "answer": answer,
+                }
+            )
+        self._emit_captcha_attempt(success=True, **attempt)
+
     def _create_new_browser(self):
         self._close_browser()
         try:
@@ -501,6 +680,7 @@ class Worker(QThread):
                 headless=False,
                 slow_mo=600,
                 executable_path=browser_path,
+                args=chromium_launch_args(),
             )
             self.context = self.browser.new_context(
                 viewport={"width": 390, "height": 844},
@@ -511,7 +691,7 @@ class Worker(QThread):
                 ),
             )
             self.page = self.context.new_page()
-            self.log.emit("🔧 使用内置 Chromium 浏览器")
+            self.log.emit(f"🔧 使用 Chromium 浏览器：{browser_path}")
             return True
         except Exception as exc:
             self.log.emit(f"❌ 浏览器启动失败：{str(exc)[:160]}")
@@ -548,8 +728,10 @@ class Worker(QThread):
                 self.finished.emit("失败")
                 return
 
-            required_cols = ["车辆标识", "已协助补缴"]
+            required_cols = ["车辆标识"]
             missing_cols = [col for col in required_cols if col not in df.columns]
+            if resolve_assisted_payment_column(df.columns) is None:
+                missing_cols.append("备注（兼容“已协助补缴”）")
             if missing_cols:
                 self.log.emit(f"❌ 源表格缺少必要列：{','.join(missing_cols)}")
                 self.finished.emit("失败")
@@ -603,7 +785,6 @@ class Worker(QThread):
                 self.progress.emit(progress)
 
                 plate_identifier = str(row["车辆标识"]).strip()
-                has_paid = row["已协助补缴"]
                 self.log.emit(f"\n[{idx + 1}/{total}] 处理：{plate_identifier}")
 
                 # 检查是否已有运输证号（断点续查）
@@ -633,7 +814,7 @@ class Worker(QThread):
                     self.log.emit("↻ 检测到上次浏览器异常，本行重新查询运输证号")
 
                 # 检查是否已补缴
-                if pd.notna(has_paid) and str(has_paid).strip() != "":
+                if has_assisted_payment(row):
                     df.at[idx, "查询状态"] = "已补缴（无需查询）"
                     self.log.emit("✅ 已补缴，无需查询")
                     save_results(idx)
@@ -677,7 +858,6 @@ class Worker(QThread):
                 # 临时变量存储查询结果
                 tr_original = ""
                 tr_clean = ""
-
                 try:
                     self._check_stopped()
                     response = self.page.goto(
@@ -698,6 +878,14 @@ class Worker(QThread):
                     if not self.auto_mode and self.manual_at_captcha:
                         while self._running:
                             self._check_stopped()
+                            manual_image_bytes = b""
+                            if self._sample_collection_enabled():
+                                try:
+                                    manual_image_bytes = self.page.locator(
+                                        CONFIG["CAPT_IMG_SELECTOR"]
+                                    ).screenshot()
+                                except Exception:
+                                    pass
 
                             # 自动继续模式：同时检测【4位输入完成】和【输入框消失】，任一满足即触发提交
                             if self.auto_continue:
@@ -737,6 +925,12 @@ class Worker(QThread):
                                 while self._paused and self._running:
                                     time.sleep(0.2)
                             self._check_stopped()
+                            try:
+                                manual_code = self.page.locator(
+                                    CONFIG["CAPT_INPUT_SELECTOR"]
+                                ).input_value(timeout=2000)
+                            except Exception:
+                                manual_code = ""
 
                             # 把焦点切回浏览器，再提交查询
                             try:
@@ -755,6 +949,11 @@ class Worker(QThread):
                             captcha_input_still_exists = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).count() > 0
 
                             if captcha_input_still_exists:
+                                self._emit_captcha_attempt(
+                                    success=False,
+                                    model_version="human-manual",
+                                    assisted=True,
+                                )
                                 # 错误：刷新验证码，清空输入框，重新回到倒计时
                                 self.log.emit("❌ 验证码错误，将重新刷新验证码...")
                                 try:
@@ -769,6 +968,19 @@ class Worker(QThread):
                                 continue
                             else:
                                 # 正确，退出循环
+                                self._report_successful_captcha_attempt(
+                                    model_version="human-manual",
+                                    assisted=True,
+                                    image_bytes=manual_image_bytes,
+                                    answer=(
+                                        {"value": manual_code}
+                                        if re.fullmatch(
+                                            r"[0-9]{4}",
+                                            manual_code or "",
+                                        )
+                                        else None
+                                    ),
+                                )
                                 self.log.emit("✅ 验证码验证成功")
                                 break
                             self.page.wait_for_selector(
@@ -790,10 +1002,54 @@ class Worker(QThread):
                             # 验证码重试循环
                             while captcha_err < self.CAPTCHA_RETRY and self._running:
                                 self._check_stopped()
+                                captcha_code = ""
+                                captcha_image_bytes = b""
+                                captcha_model_version = "human-manual"
 
                                 if not (not self.auto_mode and self.manual_at_captcha):
-                                    captcha_code = ocr_code(self.page, CONFIG["CAPT_IMG_SELECTOR"])
+                                    captcha_result = ocr_code(
+                                        self.page,
+                                        CONFIG["CAPT_IMG_SELECTOR"],
+                                        model=self._active_model("numeric"),
+                                        return_details=True,
+                                        model_failure_callback=(
+                                            lambda version: self._emit_captcha_attempt(
+                                                success=False,
+                                                model_version=version,
+                                                assisted=False,
+                                            )
+                                        ),
+                                    )
+                                    if (
+                                        isinstance(captcha_result, tuple)
+                                        and len(captcha_result) == 3
+                                    ):
+                                        (
+                                            captcha_code,
+                                            captcha_image_bytes,
+                                            captcha_model_version,
+                                        ) = captcha_result
+                                    else:
+                                        # Keep compatibility with older OCR
+                                        # adapters and test doubles that return
+                                        # only the recognized text.
+                                        captcha_code = str(captcha_result or "")
+                                        captcha_model_version = "ddddocr-builtin"
+                                    if captcha_model_version not in {
+                                        "human-manual",
+                                        "ddddocr-builtin",
+                                        "ddddocr-unavailable",
+                                    }:
+                                        self.log.emit(
+                                            "✅ 已使用当前数字验证码模型："
+                                            f"{captcha_model_version}"
+                                        )
                                     if not captcha_code:
+                                        self._emit_captcha_attempt(
+                                            success=False,
+                                            model_version=captcha_model_version,
+                                            assisted=False,
+                                        )
                                         captcha_err += 1
                                         self.retry_signal.emit(
                                             "transport_captcha_ocr",
@@ -819,6 +1075,11 @@ class Worker(QThread):
                                 captcha_input_still_exists = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).count() > 0
 
                                 if captcha_input_still_exists:
+                                    self._emit_captcha_attempt(
+                                        success=False,
+                                        model_version=captcha_model_version,
+                                        assisted=False,
+                                    )
                                     captcha_err += 1
                                     self.retry_signal.emit(
                                         "transport_captcha",
@@ -833,6 +1094,19 @@ class Worker(QThread):
                                     continue
 
                                 # 3. 正常验证码成功，跳出循环
+                                self._report_successful_captcha_attempt(
+                                    model_version=captcha_model_version,
+                                    assisted=False,
+                                    image_bytes=captcha_image_bytes,
+                                    answer=(
+                                        {"value": captcha_code}
+                                        if re.fullmatch(
+                                            r"[0-9]{4}",
+                                            captcha_code or "",
+                                        )
+                                        else None
+                                    ),
+                                )
                                 self.log.emit("✅ 验证码验证成功")
                                 break
 
@@ -843,6 +1117,14 @@ class Worker(QThread):
                                         self._check_stopped()
                                         self.log.emit(f"⚠️ 自动识别重试耗尽，切换为【人工输入验证码】")
                                         self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).fill("",timeout=2000)
+                                        manual_image_bytes = b""
+                                        if self._sample_collection_enabled():
+                                            try:
+                                                manual_image_bytes = self.page.locator(
+                                                    CONFIG["CAPT_IMG_SELECTOR"]
+                                                ).screenshot()
+                                            except Exception:
+                                                pass
 
                                         if self.auto_continue:
                                             # 自动继续：同时检测【4位输入完成】和【输入框消失】
@@ -852,7 +1134,7 @@ class Worker(QThread):
                                                 # 同时检测两个条件：4位输入 或 输入框消失
                                                 try:
                                                     value = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).input_value(timeout=2000)
-                                                    if len(value) == 4 and value.isdigit():
+                                                    if re.fullmatch(r"[0-9]{4}", value):
                                                         self.log.emit(f"✅ 检测到4位验证码，自动提交...")
                                                         break
                                                 except:
@@ -869,6 +1151,12 @@ class Worker(QThread):
                                             while self._paused and self._running:
                                                 time.sleep(0.2)
                                         self._check_stopped()
+                                        try:
+                                            manual_code = self.page.locator(
+                                                CONFIG["CAPT_INPUT_SELECTOR"]
+                                            ).input_value(timeout=2000)
+                                        except Exception:
+                                            manual_code = ""
 
                                         # 人工输完后自动点击查询
                                         self.log.emit("✅ 已恢复执行，自动提交查询...")
@@ -881,6 +1169,11 @@ class Worker(QThread):
                                         captcha_input_still_exists = self.page.locator(CONFIG["CAPT_INPUT_SELECTOR"]).count() > 0
 
                                         if captcha_input_still_exists:
+                                            self._emit_captcha_attempt(
+                                                success=False,
+                                                model_version="human-fallback",
+                                                assisted=True,
+                                            )
                                             # 人工输错 → 提示错误，清空输入框，刷新验证码，重新循环
                                             self.log.emit("❌ 人工输入验证码错误，请重新输入！")
                                             try:
@@ -894,6 +1187,19 @@ class Worker(QThread):
                                             continue
                                         else:
                                             # 验证码正确，退出循环，继续流程
+                                            self._report_successful_captcha_attempt(
+                                                model_version="human-fallback",
+                                                assisted=True,
+                                                image_bytes=manual_image_bytes,
+                                                answer=(
+                                                    {"value": manual_code}
+                                                    if re.fullmatch(
+                                                        r"[0-9]{4}",
+                                                        manual_code or "",
+                                                    )
+                                                    else None
+                                                ),
+                                            )
                                             self.log.emit("✅ 验证码验证成功")
                                             break
 
@@ -1110,10 +1416,23 @@ class BusinessBackfillWorker(QThread):
     input_signal = pyqtSignal(str)
     stat_event = pyqtSignal(str, int)
     retry_signal = pyqtSignal(str, str)
+    captcha_attempt_signal = pyqtSignal(object)
+    browser_loading_started = pyqtSignal()
+    browser_loading_finished = pyqtSignal()
 
     input_result = ""
 
-    def __init__(self, original_file, auto_continue, auto_mode, captcha_retry, manual_at_captcha):
+    def __init__(
+        self,
+        original_file,
+        auto_continue,
+        auto_mode,
+        captcha_retry,
+        manual_at_captcha,
+        captcha_model_manager=None,
+        captcha_collection_enabled=None,
+        captcha_sample_collection_enabled=None,
+    ):
         super().__init__()
         self.original_file = original_file
         self.auto_continue = auto_continue
@@ -1121,12 +1440,104 @@ class BusinessBackfillWorker(QThread):
         self.web_timeout = CONFIG["BUSINESS_WEB_TIMEOUT_MS"]
         self.captcha_retry = captcha_retry
         self.manual_at_captcha = manual_at_captcha
+        self.captcha_model_manager = captcha_model_manager
+        self.captcha_collection_enabled = captcha_collection_enabled
+        self.captcha_sample_collection_enabled = (
+            captcha_sample_collection_enabled
+        )
         self._running = True
         self._paused = False
         self._global_paused = False
         self.browser = None
         self.playwright = None
         self.page = None
+        self._prefetched_manual_click_capture = None
+
+    def _collection_enabled(self):
+        callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _sample_collection_enabled(self):
+        callback = self.captcha_sample_collection_enabled
+        if callback is None:
+            callback = self.captcha_collection_enabled
+        if not callable(callback):
+            return False
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _active_model(self, captcha_type):
+        manager = self.captcha_model_manager
+        if manager is None:
+            return None
+        try:
+            return manager.get(captcha_type)
+        except Exception:
+            return None
+
+    def _predict_with_active_click_model(
+        self,
+        image_bytes,
+        bboxes,
+        expected_count,
+    ):
+        """使用管理员当前应用的点选模型，失败时交回内置识别结果。"""
+        custom_model = self._active_model("click")
+        if custom_model is None:
+            return None
+        try:
+            positions = custom_model.predict_click_regions(
+                image_bytes,
+                bboxes,
+            )
+        except Exception:
+            positions = {}
+        if len(positions) >= int(expected_count):
+            version = str(custom_model.version)
+            self.log.emit(f"✅ 已使用当前点选验证码模型：{version}")
+            return positions, version
+        self._emit_captcha_attempt(
+            success=False,
+            model_version=custom_model.version,
+            assisted=False,
+        )
+        return None
+
+    def _emit_captcha_attempt(
+        self,
+        *,
+        success,
+        model_version,
+        assisted,
+        image_bytes=None,
+        answer=None,
+    ):
+        if not self._collection_enabled():
+            return
+        event = {
+            "captcha_type": "click",
+            "source": "business_click",
+            "model_version": str(model_version or "unknown"),
+            "success": bool(success),
+            "assisted": bool(assisted),
+            "occurred_at": datetime.now().astimezone().isoformat(),
+        }
+        if success and image_bytes and isinstance(answer, dict):
+            event.update(
+                {
+                    "image_bytes": bytes(image_bytes),
+                    "image_mime": "image/png",
+                    "answer": answer,
+                }
+            )
+        self.captcha_attempt_signal.emit(event)
 
     def stop(self):
         self._running = False
@@ -1169,9 +1580,12 @@ class BusinessBackfillWorker(QThread):
                 "headless": False,
                 "slow_mo": 600,
                 "executable_path": get_builtin_chromium_path(self.playwright),
+                "args": chromium_launch_args(),
             }
             self.browser = self.playwright.chromium.launch(**launch_kwargs)
-            self.log.emit("🔧 使用内置 Chromium 浏览器")
+            self.log.emit(
+                f"🔧 使用 Chromium 浏览器：{launch_kwargs['executable_path']}"
+            )
             self.context = self.browser.new_context(
                 no_viewport=True  # ← 禁用固定视口，窗口可调整
             )
@@ -1184,11 +1598,13 @@ class BusinessBackfillWorker(QThread):
 
     def _create_browser_with_retries(self, retry_type, reason):
         """持续启动浏览器，直到成功或用户主动停止。"""
+        self.browser_loading_started.emit()
         attempt = 0
         while self._running:
             self._check_stopped()
             attempt += 1
             if self._create_new_browser():
+                self.browser_loading_finished.emit()
                 return True
             self.retry_signal.emit(
                 retry_type,
@@ -1201,12 +1617,90 @@ class BusinessBackfillWorker(QThread):
             wait_before_browser_retry(self._check_stopped)
         return False
 
+    def _load_business_query_page(self):
+        """加载步骤 2 业务页，并向主界面标记不可计入的等待区间。"""
+        self.browser_loading_started.emit()
+        try:
+            response = self.page.goto(
+                CONFIG["BUSINESS_QUERY_URL"],
+                timeout=self.web_timeout,
+            )
+            ensure_successful_navigation(response, "营运查询页")
+            self.page.wait_for_selector(
+                "a:has-text('营运车辆')",
+                timeout=self.web_timeout,
+            )
+            self.page.click("a:has-text('营运车辆')")
+            time.sleep(0.5)
+        finally:
+            self.browser_loading_finished.emit()
+
     def _captcha_prompt_is_visible(self):
         try:
             prompt = self.page.locator(".verify-msg")
             return bool(prompt.count() and prompt.first.is_visible())
         except Exception:
             return False
+
+    @staticmethod
+    def _result_field_value(locator):
+        """读取网页结果字段，兼容 input.value 与普通文本节点。"""
+        input_value = getattr(locator, "input_value", None)
+        if callable(input_value):
+            try:
+                # input 的当前值以 DOM property 为准；空值也不能再回退到旧的
+                # value attribute，否则可能误读上一条查询结果。
+                return str(input_value() or "").strip()
+            except Exception:
+                pass
+
+        for method_name in ("text_content", "inner_text"):
+            method = getattr(locator, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _business_owner_name(self, *, visible_only=False):
+        # The current site renders vehicle results as table rows.  Prefer the
+        # visible result table over the legacy input because the old field can
+        # remain in the DOM as a hidden template with stale data.
+        try:
+            result_rows = self.page.locator("#licenseBody > tr")
+            for row_index in range(result_rows.count()):
+                row = result_rows.nth(row_index)
+                if not row.is_visible():
+                    continue
+                cells = row.locator("td")
+                if cells.count() < 2:
+                    # Loading/empty placeholders commonly use one colspan cell.
+                    continue
+                owner_cell = cells.nth(1)
+                if not owner_cell.is_visible():
+                    continue
+                owner_name = self._result_field_value(owner_cell)
+                if owner_name:
+                    return owner_name
+        except Exception:
+            # Retain compatibility with the previous page structure below.
+            pass
+
+        try:
+            owner = self.page.locator("#ownerName2")
+            if not owner.count():
+                return ""
+            field = owner.first
+            if visible_only and not field.is_visible():
+                return ""
+            return self._result_field_value(field)
+        except Exception:
+            return ""
 
     def _captcha_image_is_ready(self):
         """验证码题目和图片均完整加载后才允许开始识别。"""
@@ -1270,14 +1764,8 @@ class BusinessBackfillWorker(QThread):
     def _business_result_is_ready(self):
         if self._captcha_prompt_is_visible():
             return False
-        try:
-            owner = self.page.locator("#ownerName2")
-            if owner.count() and owner.first.is_visible():
-                owner_text = (owner.first.text_content() or "").strip()
-                if owner_text:
-                    return True
-        except Exception:
-            pass
+        if self._business_owner_name(visible_only=True):
+            return True
         try:
             tips = self.page.locator(".layui-layer-content")
             for index in range(tips.count()):
@@ -1298,14 +1786,67 @@ class BusinessBackfillWorker(QThread):
         """等待验证码图片稳定就绪，或等待无需验证码的业务结果。"""
         deadline = time.monotonic() + self.web_timeout / 1000
         wait_logged = False
+        prefetch_attempted = False
+        self._prefetched_manual_click_capture = None
         while time.monotonic() < deadline:
             self._check_stopped()
             if self._business_result_is_ready():
+                if self._prefetched_manual_click_capture is not None:
+                    capture = self._prefetched_manual_click_capture
+                    self._prefetched_manual_click_capture = None
+                    points = self._manual_click_points(capture)
+                    rapid_attempt = self._manual_click_attempt_from_events(
+                        exclude_challenge_id=str(
+                            capture.get("event_challenge_id")
+                            or capture.get("challenge_id")
+                            or ""
+                        )
+                    )
+                    self._clear_manual_click_events(capture)
+                    self.log.emit("✅ 用户已点完验证码")
+                    if rapid_attempt is not None:
+                        self._emit_captcha_attempt(
+                            success=False,
+                            model_version="human-manual",
+                            assisted=True,
+                        )
+                        self._report_successful_click_captcha(
+                            rapid_attempt["capture"],
+                            rapid_attempt["points"],
+                            model_version="human-manual",
+                            assisted=True,
+                        )
+                        self._clear_manual_click_events(
+                            rapid_attempt["capture"]
+                        )
+                    else:
+                        self._report_successful_click_captcha(
+                            capture,
+                            points,
+                            model_version="human-manual",
+                            assisted=True,
+                        )
+                    self.log.emit("✅ 验证码通过，开始获取信息")
                 return "result"
             if self._captcha_image_is_ready():
                 if not wait_logged:
                     self.log.emit("⏳ 验证码已出现，等待图片完整加载...")
                     wait_logged = True
+                if (
+                    not prefetch_attempted
+                    and not self.auto_mode
+                    and self.manual_at_captcha
+                ):
+                    # 验证码首次完整显示就安装点击监听并保存原图，不再等
+                    # 800ms 稳定期结束，避免用户先于采集线程完成点击。
+                    prefetch_attempted = True
+                    self._prefetched_manual_click_capture = (
+                        self._prepare_manual_click_capture(reset_clicks=True)
+                    )
+                    # 人工模式在题图就绪并完成预采集后应立即进入点选状态；
+                    # 继续等待稳定周期反而给快速刷新制造串题窗口。
+                    self.log.emit("✅ 验证码图片加载完成，开始处理")
+                    return "captcha"
                 self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_STABLE_MS"])
                 self._check_stopped()
                 if self._captcha_image_is_ready():
@@ -1330,11 +1871,1016 @@ class BusinessBackfillWorker(QThread):
             self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
         return False
 
+    @staticmethod
+    def _parse_manual_click_prompt(prompt_text):
+        match = re.search(r"【([^】]+)】", str(prompt_text or ""))
+        if not match:
+            return []
+        return [
+            character.strip()
+            for character in re.split(r"[,，、\s]+", match.group(1))
+            if character.strip()
+        ]
+
+    @staticmethod
+    def _normalize_manual_click_points(points, expected_count=0):
+        normalized = []
+        for point in points or []:
+            if not isinstance(point, dict):
+                continue
+            try:
+                x = float(point.get("x"))
+                y = float(point.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                normalized.append({"x": round(x, 6), "y": round(y, 6)})
+        if expected_count:
+            return normalized[:expected_count]
+        return normalized
+
+    @staticmethod
+    def _click_challenge_id(
+        source,
+        image_bytes=None,
+        prompt=None,
+        generation=0,
+        *,
+        use_image=False,
+    ):
+        if use_image and image_bytes:
+            value = bytes(image_bytes)
+        elif source:
+            value = str(source).encode("utf-8", errors="replace")
+        else:
+            value = bytes(image_bytes or b"")
+        if not value:
+            return ""
+        digest = hashlib.sha256()
+        digest.update(value)
+        digest.update(b"\0")
+        digest.update(
+            "\x1f".join(str(item) for item in (prompt or [])).encode("utf-8")
+        )
+        digest.update(b"\0")
+        digest.update(str(generation or 0).encode("ascii", errors="replace"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _decode_click_image_source(source):
+        value = str(source or "")
+        if "," not in value:
+            return None
+        header, encoded_image = value.split(",", 1)
+        if (
+            not header.casefold().startswith("data:image/")
+            or ";base64" not in header.casefold()
+        ):
+            return None
+        try:
+            raw_image = base64.b64decode(encoded_image, validate=False)
+            if not raw_image or len(raw_image) > 4 * 1024 * 1024:
+                return None
+            with Image.open(io.BytesIO(raw_image)) as source_image:
+                if source_image.width * source_image.height > 16_000_000:
+                    return None
+                source_image.load()
+                mode = "RGBA" if "A" in source_image.getbands() else "RGB"
+                normalized_image = source_image.convert(mode)
+            output = io.BytesIO()
+            normalized_image.save(output, format="PNG")
+            return output.getvalue()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _click_captcha_state(image):
+        try:
+            state = image.evaluate(
+                """
+                element => {
+                    const ownerWindow = element.ownerDocument.defaultView || window;
+                    const generationOf = current => {
+                        if (!Number.isInteger(current.__intdemoCaptchaGeneration)) {
+                            ownerWindow.__intdemoCaptchaGenerationCounter =
+                                (ownerWindow.__intdemoCaptchaGenerationCounter || 0) + 1;
+                            current.__intdemoCaptchaGeneration =
+                                ownerWindow.__intdemoCaptchaGenerationCounter;
+                        }
+                        return current.__intdemoCaptchaGeneration;
+                    };
+                    const sourceOf = current => {
+                        const image = current.matches('img')
+                            ? current
+                            : current.querySelector('img');
+                        if (image) {
+                            return image.currentSrc || image.src ||
+                                image.getAttribute('src') || '';
+                        }
+                        const canvas = current.matches('canvas')
+                            ? current
+                            : current.querySelector('canvas');
+                        if (canvas) {
+                            try {
+                                return canvas.toDataURL('image/png');
+                            } catch (_) {
+                                return '';
+                            }
+                        }
+                        const background = getComputedStyle(current).backgroundImage || '';
+                        const match = background.match(/url\\(["']?(.*?)["']?\\)/);
+                        return match && match[1] ? match[1] : '';
+                    };
+                    const prompt = element.ownerDocument.querySelector('.verify-msg');
+                    return {
+                        source: sourceOf(element),
+                        prompt_text: prompt ? (prompt.textContent || '').trim() : '',
+                        generation: generationOf(element)
+                    };
+                }
+                """
+            )
+            return dict(state or {})
+        except Exception:
+            return {}
+
+    def _clean_manual_click_screenshot(self, image):
+        style_id = "__intdemoCaptchaCleanCaptureStyle"
+        image.evaluate(
+            """
+            (element, styleId) => {
+                const documentRoot = element.ownerDocument;
+                let style = documentRoot.getElementById(styleId);
+                if (!style) {
+                    style = documentRoot.createElement('style');
+                    style.id = styleId;
+                    documentRoot.documentElement.appendChild(style);
+                }
+                style.textContent =
+                    '.point-area { visibility: hidden !important; opacity: 0 !important; }';
+            }
+            """,
+            style_id,
+        )
+        try:
+            return image.screenshot()
+        finally:
+            try:
+                self.page.evaluate(
+                    "styleId => document.getElementById(styleId)?.remove()",
+                    style_id,
+                )
+            except Exception:
+                pass
+
+    def _install_manual_click_handler(self, image, *, reset_clicks):
+        return image.evaluate(
+            """
+            (element, resetClicks) => {
+                const documentRoot = element.ownerDocument;
+                const ownerWindow = documentRoot.defaultView || window;
+                const storageKey = '__intdemoCaptchaClickEventsV2';
+
+                const restoreEvents = () => {
+                    try {
+                        const value = JSON.parse(
+                            ownerWindow.sessionStorage.getItem(storageKey) || '[]'
+                        );
+                        return Array.isArray(value) ? value : [];
+                    } catch (_) {
+                        return [];
+                    }
+                };
+                if (resetClicks) {
+                    ownerWindow.__intdemoCaptchaClickEvents = [];
+                } else if (!Array.isArray(ownerWindow.__intdemoCaptchaClickEvents)) {
+                    ownerWindow.__intdemoCaptchaClickEvents = restoreEvents();
+                }
+                try {
+                    ownerWindow.sessionStorage.setItem(
+                        storageKey,
+                        JSON.stringify(ownerWindow.__intdemoCaptchaClickEvents)
+                    );
+                } catch (_) {}
+
+                const sourceOf = current => {
+                    const image = current.matches('img')
+                        ? current
+                        : current.querySelector('img');
+                    if (image) {
+                        return image.currentSrc || image.src ||
+                            image.getAttribute('src') || '';
+                    }
+                    const canvas = current.matches('canvas')
+                        ? current
+                        : current.querySelector('canvas');
+                    if (canvas) {
+                        try {
+                            return canvas.toDataURL('image/png');
+                        } catch (_) {
+                            return '';
+                        }
+                    }
+                    const background = getComputedStyle(current).backgroundImage || '';
+                    const match = background.match(/url\\(["']?(.*?)["']?\\)/);
+                    return match && match[1] ? match[1] : '';
+                };
+                const nextGeneration = current => {
+                    ownerWindow.__intdemoCaptchaGenerationCounter =
+                        (ownerWindow.__intdemoCaptchaGenerationCounter || 0) + 1;
+                    current.__intdemoCaptchaGeneration =
+                        ownerWindow.__intdemoCaptchaGenerationCounter;
+                    return current.__intdemoCaptchaGeneration;
+                };
+                const generationOf = current =>
+                    Number.isInteger(current.__intdemoCaptchaGeneration)
+                        ? current.__intdemoCaptchaGeneration
+                        : nextGeneration(current);
+                generationOf(element);
+
+                if (ownerWindow.__intdemoCaptchaLoadHandler) {
+                    documentRoot.removeEventListener(
+                        'load',
+                        ownerWindow.__intdemoCaptchaLoadHandler,
+                        true
+                    );
+                }
+                const loadHandler = event => {
+                    const target = event.target;
+                    if (!(target instanceof ownerWindow.Element)) return;
+                    const host = target.matches('.back-img')
+                        ? target
+                        : target.closest('.back-img');
+                    if (
+                        host &&
+                        (target === host || target.matches('img,canvas'))
+                    ) nextGeneration(host);
+                };
+                ownerWindow.__intdemoCaptchaLoadHandler = loadHandler;
+                documentRoot.addEventListener('load', loadHandler, true);
+
+                if (ownerWindow.__intdemoCaptchaMutationObserver) {
+                    ownerWindow.__intdemoCaptchaMutationObserver.disconnect();
+                }
+                ownerWindow.__intdemoCaptchaObservedElement = element;
+                const observer = new ownerWindow.MutationObserver(mutations => {
+                    const current = documentRoot.querySelector('.back-img');
+                    if (!current) return;
+                    if (current !== ownerWindow.__intdemoCaptchaObservedElement) {
+                        generationOf(current);
+                        ownerWindow.__intdemoCaptchaObservedElement = current;
+                        return;
+                    }
+                    for (const mutation of mutations) {
+                        if (mutation.type === 'attributes') {
+                            const target = mutation.target;
+                            const host = target.matches('.back-img')
+                                ? target
+                                : target.closest('.back-img');
+                            if (
+                                host === current &&
+                                (target === host || target.matches('img,canvas'))
+                            ) {
+                                nextGeneration(current);
+                                return;
+                            }
+                        }
+                        if (mutation.type === 'childList') {
+                            const changedImage = Array.from(mutation.addedNodes)
+                                .some(node =>
+                                    node instanceof ownerWindow.Element &&
+                                    current.contains(node) &&
+                                    (node.matches('img,canvas') ||
+                                        node.querySelector('img,canvas'))
+                                );
+                            if (changedImage) {
+                                nextGeneration(current);
+                                return;
+                            }
+                        }
+                    }
+                });
+                observer.observe(documentRoot, {
+                    subtree: true,
+                    childList: true,
+                    attributes: true,
+                    attributeFilter: ['src']
+                });
+                ownerWindow.__intdemoCaptchaMutationObserver = observer;
+
+                if (ownerWindow.__intdemoCaptchaCaptureHandler) {
+                    documentRoot.removeEventListener(
+                        'click',
+                        ownerWindow.__intdemoCaptchaCaptureHandler,
+                        true
+                    );
+                }
+                const handler = event => {
+                    const current = documentRoot.querySelector('.back-img');
+                    if (!current) return;
+                    const rect = current.getBoundingClientRect();
+                    if (!rect.width || !rect.height) return;
+                    if (
+                        event.clientX < rect.left || event.clientX > rect.right ||
+                        event.clientY < rect.top || event.clientY > rect.bottom
+                    ) return;
+                    const prompt = documentRoot.querySelector('.verify-msg');
+                    ownerWindow.__intdemoCaptchaClickEvents.push({
+                        x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+                        y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+                        source: sourceOf(current),
+                        prompt_text: prompt ? (prompt.textContent || '').trim() : '',
+                        generation: generationOf(current)
+                    });
+                    ownerWindow.__intdemoCaptchaClickEvents =
+                        ownerWindow.__intdemoCaptchaClickEvents.slice(-12);
+                    try {
+                        ownerWindow.sessionStorage.setItem(
+                            storageKey,
+                            JSON.stringify(ownerWindow.__intdemoCaptchaClickEvents)
+                        );
+                    } catch (_) {}
+                };
+                ownerWindow.__intdemoCaptchaCaptureHandler = handler;
+                documentRoot.addEventListener('click', handler, true);
+
+                const rect = element.getBoundingClientRect();
+                const markerPoints = !rect.width || !rect.height ? [] :
+                    Array.from(documentRoot.querySelectorAll('.point-area'))
+                        .filter(marker => {
+                            const style = ownerWindow.getComputedStyle(marker);
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                markerRect.width > 0 && markerRect.height > 0 &&
+                                clientX >= rect.left && clientX <= rect.right &&
+                                clientY >= rect.top && clientY <= rect.bottom;
+                        })
+                        .map(marker => {
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return {
+                                x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+                                y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
+                            };
+                        });
+                const prompt = documentRoot.querySelector('.verify-msg');
+                return {
+                    source: sourceOf(element),
+                    prompt_text: prompt ? (prompt.textContent || '').trim() : '',
+                    generation: generationOf(element),
+                    marker_points: markerPoints
+                };
+            }
+            """,
+            bool(reset_clicks),
+        )
+
+    def _prepare_manual_click_capture(self, *, reset_clicks=True):
+        if not self._sample_collection_enabled():
+            return None
+        last_error = "题图在采集期间持续刷新"
+        should_reset = bool(reset_clicks)
+        for _attempt in range(3):
+            try:
+                image = self.page.locator(".back-img").first
+
+                # source、题目和现有 marker 必须在同一次 JS 调用中读取，
+                # 防止刷新恰好夹在多个 DOM 调用之间而拼成跨题样本。
+                snapshot = dict(
+                    self._install_manual_click_handler(
+                        image,
+                        reset_clicks=should_reset,
+                    )
+                    or {}
+                )
+                should_reset = False
+                source = str(snapshot.get("source") or "")
+                generation = int(snapshot.get("generation") or 0)
+                prompt_text = str(snapshot.get("prompt_text") or "").strip()
+                prompt = self._parse_manual_click_prompt(prompt_text)
+                if not prompt:
+                    last_error = "无法解析点选验证码题目"
+                    continue
+
+                image_bytes = self._decode_click_image_source(source)
+                identity_uses_image = image_bytes is None
+                if image_bytes is None:
+                    # 非 data URL / canvas 时使用安全截图；临时隐藏编号圆点，
+                    # 避免用户点选图标被合成到训练图片里。
+                    image_bytes = self._clean_manual_click_screenshot(image)
+
+                current_image = self.page.locator(".back-img").first
+                current_state = self._click_captcha_state(current_image)
+                current_source = str(current_state.get("source") or "")
+                current_generation = int(current_state.get("generation") or 0)
+                current_prompt = self._parse_manual_click_prompt(
+                    current_state.get("prompt_text")
+                )
+                if (
+                    current_source != source
+                    or current_prompt != prompt
+                    or current_generation != generation
+                ):
+                    continue
+
+                if identity_uses_image:
+                    verified_image = self._clean_manual_click_screenshot(
+                        current_image
+                    )
+                    if hashlib.sha256(verified_image).digest() != hashlib.sha256(
+                        image_bytes
+                    ).digest():
+                        continue
+                    image_bytes = verified_image
+
+                return {
+                    "image_bytes": image_bytes,
+                    "prompt": prompt,
+                    "prompt_text": prompt_text,
+                    "challenge_id": self._click_challenge_id(
+                        source,
+                        image_bytes,
+                        prompt,
+                        generation,
+                        use_image=identity_uses_image,
+                    ),
+                    "event_challenge_id": self._click_challenge_id(
+                        source,
+                        prompt=prompt,
+                        generation=generation,
+                    ),
+                    "challenge_source": source,
+                    "challenge_generation": generation,
+                    "identity_uses_image": identity_uses_image,
+                    "initial_points": self._normalize_manual_click_points(
+                        snapshot.get("marker_points") or [],
+                        len(prompt),
+                    ),
+                }
+            except Exception as exc:
+                last_error = str(exc)[:80]
+
+        self.log.emit(
+            "⚠️ 点选验证码原图采集失败，本次只能记录成功统计："
+            f"{last_error}"
+        )
+        return None
+
+    def _manual_click_events(self):
+        try:
+            events = self.page.evaluate(
+                """
+                () => {
+                    if (Array.isArray(window.__intdemoCaptchaClickEvents)) {
+                        return window.__intdemoCaptchaClickEvents.slice();
+                    }
+                    try {
+                        const value = JSON.parse(
+                            sessionStorage.getItem('__intdemoCaptchaClickEventsV2') || '[]'
+                        );
+                        return Array.isArray(value) ? value : [];
+                    } catch (_) {
+                        return [];
+                    }
+                }
+                """
+            )
+            return list(events or [])
+        except Exception:
+            return []
+
+    def _clear_manual_click_events(self, capture=None):
+        challenge_source = str((capture or {}).get("challenge_source") or "")
+        challenge_prompt_text = str((capture or {}).get("prompt_text") or "")
+        challenge_generation = int(
+            (capture or {}).get("challenge_generation") or 0
+        )
+        try:
+            self.page.evaluate(
+                """
+                ([challengeSource, challengePromptText, challengeGeneration]) => {
+                    const current = Array.isArray(
+                        window.__intdemoCaptchaClickEvents
+                    ) ? window.__intdemoCaptchaClickEvents : [];
+                    window.__intdemoCaptchaClickEvents = challengeSource
+                        ? current.filter(event =>
+                            event && (
+                                event.source !== challengeSource ||
+                                event.prompt_text !== challengePromptText ||
+                                Number(event.generation || 0) !== challengeGeneration
+                            )
+                        )
+                        : [];
+                    try {
+                        sessionStorage.setItem(
+                            '__intdemoCaptchaClickEventsV2',
+                            JSON.stringify(window.__intdemoCaptchaClickEvents)
+                        );
+                    } catch (_) {}
+                }
+                """,
+                [
+                    challenge_source,
+                    challenge_prompt_text,
+                    challenge_generation,
+                ],
+            )
+        except Exception:
+            pass
+
+    def _manual_click_marker_points(self):
+        try:
+            return self.page.evaluate(
+                """
+                () => {
+                    const image = document.querySelector('.back-img');
+                    if (!image) return [];
+                    const rect = image.getBoundingClientRect();
+                    if (!rect.width || !rect.height) return [];
+                    return Array.from(document.querySelectorAll('.point-area'))
+                        .filter(marker => {
+                            const style = window.getComputedStyle(marker);
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                markerRect.width > 0 && markerRect.height > 0 &&
+                                clientX >= rect.left && clientX <= rect.right &&
+                                clientY >= rect.top && clientY <= rect.bottom;
+                        })
+                        .map(marker => {
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return {
+                                x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+                                y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
+                            };
+                        });
+                }
+                """
+            )
+        except Exception:
+            return []
+
+    def _manual_click_points(self, capture):
+        if not capture:
+            return []
+        expected_count = len(capture.get("prompt") or [])
+        challenge_id = str(capture.get("challenge_id") or "")
+        event_challenge_id = str(
+            capture.get("event_challenge_id") or challenge_id
+        )
+        event_points = []
+        for event in self._manual_click_events():
+            if not isinstance(event, dict):
+                continue
+            event_source = str(event.get("source") or "")
+            if (
+                event_challenge_id
+                and (
+                    not event_source
+                    or self._click_challenge_id(
+                        event_source,
+                        prompt=self._parse_manual_click_prompt(
+                            event.get("prompt_text")
+                        ),
+                        generation=event.get("generation") or 0,
+                    )
+                    != event_challenge_id
+                )
+            ):
+                continue
+            event_points.append(event)
+
+        normalized_events = self._normalize_manual_click_points(event_points)
+        if expected_count and len(normalized_events) >= expected_count:
+            return normalized_events[:expected_count]
+
+        current_challenge_id = self._current_manual_click_challenge_id(capture)
+        marker_points = []
+        if (
+            not challenge_id
+            or (
+                current_challenge_id
+                and current_challenge_id == challenge_id
+            )
+        ):
+            marker_points = self._manual_click_marker_points()
+            normalized_markers = self._normalize_manual_click_points(
+                marker_points
+            )
+            if expected_count and len(normalized_markers) >= expected_count:
+                return normalized_markers[:expected_count]
+
+        sources = (
+            capture.get("initial_points") or [],
+            normalized_events,
+            marker_points,
+        )
+        combined = []
+        for source_points in sources:
+            for point in self._normalize_manual_click_points(source_points):
+                if any(
+                    abs(point["x"] - existing["x"]) <= 0.015
+                    and abs(point["y"] - existing["y"]) <= 0.015
+                    for existing in combined
+                ):
+                    continue
+                combined.append(point)
+                if expected_count and len(combined) >= expected_count:
+                    return combined[:expected_count]
+        return combined[:expected_count] if expected_count else combined
+
+    def _manual_click_attempt_from_events(self, *, exclude_challenge_id=""):
+        groups = {}
+        group_order = []
+        for event in self._manual_click_events():
+            if not isinstance(event, dict):
+                continue
+            source = str(event.get("source") or "")
+            prompt_text = str(event.get("prompt_text") or "")
+            prompt = self._parse_manual_click_prompt(prompt_text)
+            generation = int(event.get("generation") or 0)
+            challenge_id = self._click_challenge_id(
+                source,
+                prompt=prompt,
+                generation=generation,
+            )
+            if not source or not challenge_id or challenge_id == exclude_challenge_id:
+                continue
+            if challenge_id not in groups:
+                groups[challenge_id] = {
+                    "source": source,
+                    "prompt_text": prompt_text,
+                    "prompt": prompt,
+                    "generation": generation,
+                    "events": [],
+                }
+                group_order.append(challenge_id)
+            elif (
+                not self._parse_manual_click_prompt(
+                    groups[challenge_id]["prompt_text"]
+                )
+                and self._parse_manual_click_prompt(prompt_text)
+            ):
+                groups[challenge_id]["prompt_text"] = prompt_text
+                groups[challenge_id]["prompt"] = prompt
+            groups[challenge_id]["events"].append(event)
+
+        for challenge_id in reversed(group_order):
+            group = groups[challenge_id]
+            prompt_text = group["prompt_text"]
+            prompt = group["prompt"]
+            if not prompt:
+                continue
+            points = self._normalize_manual_click_points(
+                group["events"],
+                len(prompt),
+            )
+            if len(points) != len(prompt):
+                continue
+            image_bytes = self._decode_click_image_source(
+                group["source"]
+            )
+            capture = None
+            if image_bytes is not None:
+                capture = {
+                    "image_bytes": image_bytes,
+                    "prompt": prompt,
+                    "prompt_text": prompt_text,
+                    "challenge_id": challenge_id,
+                    "event_challenge_id": challenge_id,
+                    "challenge_source": group["source"],
+                    "challenge_generation": group["generation"],
+                    "identity_uses_image": False,
+                    "initial_points": [],
+                }
+            return {"capture": capture, "points": points}
+        return None
+
+    def _current_manual_click_challenge_id(self, capture=None):
+        try:
+            image = self.page.locator(".back-img").first
+            state = self._click_captcha_state(image)
+            source = str(state.get("source") or "")
+            prompt = self._parse_manual_click_prompt(
+                state.get("prompt_text")
+            )
+            generation = int(state.get("generation") or 0)
+            use_image = bool((capture or {}).get("identity_uses_image"))
+            image_bytes = None
+            if use_image:
+                image_bytes = self._decode_click_image_source(source)
+                if image_bytes is None:
+                    image_bytes = self._clean_manual_click_screenshot(image)
+            return self._click_challenge_id(
+                source,
+                image_bytes,
+                prompt,
+                generation,
+                use_image=use_image,
+            )
+        except Exception:
+            return ""
+
+    def _business_captcha_loading_is_visible(self):
+        try:
+            loaders = self.page.locator(".layui-layer-loading2")
+            for index in range(loaders.count()):
+                if loaders.nth(index).is_visible():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _wait_for_manual_click_outcome(self, capture, expected_count):
+        """等待旧题成功或真正换成新题，期间绝不重拍旧题或清空点位。"""
+        deadline = time.monotonic() + self.web_timeout / 1000
+        old_challenge_id = str((capture or {}).get("challenge_id") or "")
+        old_event_challenge_id = str(
+            (capture or {}).get("event_challenge_id")
+            or old_challenge_id
+        )
+        fallback_retry_since = None
+        fallback_retry_seconds = max(
+            float(CONFIG["CAPTCHA_WAIT_SEC"]),
+            CONFIG["BUSINESS_CAPTCHA_STABLE_MS"] / 1000,
+        )
+
+        while time.monotonic() < deadline:
+            self._check_stopped()
+            rapid_attempt = self._manual_click_attempt_from_events(
+                exclude_challenge_id=old_event_challenge_id,
+            )
+            result_ready = self._business_result_is_ready()
+            if result_ready:
+                if rapid_attempt is not None:
+                    return {"state": "passed_after_retry", **rapid_attempt}
+                return {"state": "passed"}
+            if rapid_attempt is not None:
+                return {"state": "retry", **rapid_attempt}
+
+            if (
+                self._captcha_prompt_is_visible()
+                and self._captcha_image_is_ready()
+                and not self._business_captcha_loading_is_visible()
+            ):
+                current_challenge_id = self._current_manual_click_challenge_id(
+                    capture
+                )
+                if (
+                    old_challenge_id
+                    and current_challenge_id
+                    and current_challenge_id != old_challenge_id
+                ):
+                    return {
+                        "state": "retry",
+                        "capture": self._prepare_manual_click_capture(
+                            reset_clicks=False
+                        ),
+                    }
+
+                # 旧页面若无法提供题图身份，只在点位清空且持续稳定 5 秒后
+                # 才进入重试，避免把成功加载中的短暂 DOM 状态判成失败。
+                marker_count = len(self._manual_click_marker_points())
+                if not old_challenge_id and marker_count < expected_count:
+                    if fallback_retry_since is None:
+                        fallback_retry_since = time.monotonic()
+                    elif (
+                        time.monotonic() - fallback_retry_since
+                        >= fallback_retry_seconds
+                    ):
+                        return {
+                            "state": "retry",
+                            "capture": self._prepare_manual_click_capture(
+                                reset_clicks=False
+                            ),
+                        }
+                else:
+                    fallback_retry_since = None
+
+            self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
+
+        if self._business_result_is_ready():
+            return {"state": "passed"}
+        return {"state": "timeout"}
+
+    def _report_successful_click_captcha(
+        self,
+        capture,
+        points,
+        *,
+        model_version,
+        assisted,
+    ):
+        if not self._collection_enabled():
+            return
+        attempt = {
+            "model_version": model_version,
+            "assisted": assisted,
+        }
+        if not self._sample_collection_enabled() or not capture:
+            self._emit_captcha_attempt(success=True, **attempt)
+            return
+        prompt = list(capture.get("prompt") or [])
+        points = list(points or [])
+        if not prompt or len(prompt) != len(points):
+            self.log.emit(
+                "⚠️ 点选验证码已通过，但采集点位不完整"
+                f"（{len(points)}/{len(prompt)}），本次仅记录成功统计。"
+            )
+            self._emit_captcha_attempt(success=True, **attempt)
+            return
+        attempt.update(
+            {
+                "image_bytes": capture.get("image_bytes"),
+                "answer": {
+                    "prompt": prompt,
+                    "points": points,
+                },
+            }
+        )
+        self._emit_captcha_attempt(success=True, **attempt)
+
+    def _complete_manual_click_captcha(self, model_version):
+        capture = self._prefetched_manual_click_capture
+        self._prefetched_manual_click_capture = None
+        if capture is None:
+            capture = self._prepare_manual_click_capture(reset_clicks=True)
+        elif self._captcha_prompt_is_visible():
+            capture_challenge_id = str(capture.get("challenge_id") or "")
+            current_challenge_id = self._current_manual_click_challenge_id(
+                capture
+            )
+            if (
+                capture_challenge_id
+                and current_challenge_id
+                and capture_challenge_id != current_challenge_id
+            ):
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self._clear_manual_click_events(capture)
+                capture = self._prepare_manual_click_capture(
+                    reset_clicks=False
+                )
+
+        while self._running:
+            self._check_stopped()
+            prompt = list((capture or {}).get("prompt") or [])
+            if prompt:
+                expected_count = len(prompt)
+            else:
+                try:
+                    prompt_text = self.page.locator(
+                        ".verify-msg"
+                    ).first.inner_text().strip()
+                    expected_count = len(
+                        self._parse_manual_click_prompt(prompt_text)
+                    )
+                except Exception:
+                    expected_count = 3
+            if expected_count <= 0:
+                expected_count = 3
+
+            if self.auto_continue:
+                self.log.emit("⏳ 等待用户点完验证码...")
+                while self._running:
+                    self._check_stopped()
+                    buffered_points = self._manual_click_points(capture)
+                    if (
+                        len(buffered_points) >= expected_count
+                        or not self._captcha_prompt_is_visible()
+                    ):
+                        self.log.emit("✅ 用户已点完验证码")
+                        break
+                    time.sleep(0.2)
+                if not self._running:
+                    return False
+            else:
+                self.log.emit("⏸️ 请完成验证码后点击【继续执行】")
+                self._paused = True
+                self.pause_signal.emit()
+                while self._paused and self._running:
+                    time.sleep(0.2)
+                self._check_stopped()
+
+            points = self._manual_click_points(capture)
+            rapid_attempt = self._manual_click_attempt_from_events(
+                exclude_challenge_id=str(
+                    (capture or {}).get("event_challenge_id")
+                    or (capture or {}).get("challenge_id")
+                    or ""
+                )
+            )
+            # 点位立即冻结到 Python；之后网页即使刷新、隐藏或重建 DOM，
+            # 本轮原图与答案也不会丢失。清空的只是下一轮事件缓冲。
+            self._clear_manual_click_events(capture)
+            time.sleep(0.5)
+            if rapid_attempt is None:
+                rapid_attempt = self._manual_click_attempt_from_events(
+                    exclude_challenge_id=str(
+                        (capture or {}).get("event_challenge_id")
+                        or (capture or {}).get("challenge_id")
+                        or ""
+                    )
+                )
+            if self._business_result_is_ready():
+                if rapid_attempt is not None:
+                    self._emit_captcha_attempt(
+                        success=False,
+                        model_version=model_version,
+                        assisted=True,
+                    )
+                    self._report_successful_click_captcha(
+                        rapid_attempt["capture"],
+                        rapid_attempt["points"],
+                        model_version=model_version,
+                        assisted=True,
+                    )
+                    self._clear_manual_click_events(
+                        rapid_attempt["capture"]
+                    )
+                else:
+                    self._report_successful_click_captcha(
+                        capture,
+                        points,
+                        model_version=model_version,
+                        assisted=True,
+                    )
+                self.log.emit("✅ 验证码通过，开始获取信息")
+                return True
+
+            # 保留原有的快速反馈顺序。这条日志只是网页尚未给出成功结果的
+            # 初步状态；真正失败必须等到题图身份发生变化后才能确认。
+            self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
+            outcome = self._wait_for_manual_click_outcome(capture, expected_count)
+            state = outcome.get("state")
+            if state == "passed":
+                self._report_successful_click_captcha(
+                    capture,
+                    points,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self.log.emit("✅ 验证码通过，开始获取信息")
+                return True
+            if state == "passed_after_retry":
+                # 新题已被用户迅速点完并通过，旧题必须明确记为失败，不能
+                # 把旧图/旧坐标误归为成功样本。
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self._report_successful_click_captcha(
+                    outcome.get("capture"),
+                    outcome.get("points") or [],
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self._clear_manual_click_events(outcome.get("capture"))
+                self.log.emit("✅ 验证码通过，开始获取信息")
+                return True
+            if state == "retry":
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                capture = outcome.get("capture")
+                if capture is None and self._captcha_prompt_is_visible():
+                    capture = self._prepare_manual_click_capture(
+                        reset_clicks=False
+                    )
+                continue
+
+            self.log.emit(
+                "⚠️ 等待验证码结果超时，本次结果未确定，不保存错误样本。"
+            )
+            return False
+        return False
+
     # ======================
     # 封装：你的专属验证码识别逻辑（完全未修改，原样封装）
     # ======================
     def solve_captcha(self):
         if DdddOcr is None:
+            custom_model = self._active_model("click")
+            if custom_model is not None:
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=custom_model.version,
+                    assisted=False,
+                )
             self.log.emit(f"❌ ddddocr 不可用，无法自动识别验证码：{DDDDOCR_IMPORT_ERROR}")
             return False
         try:
@@ -1348,6 +2894,7 @@ class BusinessBackfillWorker(QThread):
             self.log.emit(f"🔢 验证码最大重试次数：{captcha_max_retry}次")
             for i in range(captcha_max_retry):
                 self._check_stopped()
+                attempt_model_version = "ddddocr-builtin"
                 try:
                     if i > 0:
                         response_state = self._wait_for_business_response()
@@ -1488,6 +3035,16 @@ class BusinessBackfillWorker(QThread):
 
                     self.log.emit(f"✅ 文字识别完成：{char_position_map}")
 
+                    custom_prediction = self._predict_with_active_click_model(
+                        img_bytes_final,
+                        bboxes,
+                        len(target_chars),
+                    )
+                    if custom_prediction is not None:
+                        char_position_map, attempt_model_version = (
+                            custom_prediction
+                        )
+
                     # 全局匹配+点击
                     self.log.emit("🖱️ 第三步：全局两两对比相似度，开始最优匹配")
                     recog_chars = list(char_position_map.keys())
@@ -1539,14 +3096,40 @@ class BusinessBackfillWorker(QThread):
                     self.page.wait_for_timeout(2000)
 
                     if not prompt_el.is_visible():
+                        normalized_points = [
+                            {
+                                "x": round(x / pil_img_sharpen.width, 6),
+                                "y": round(y / pil_img_sharpen.height, 6),
+                            }
+                            for x, y, _target, _matched in click_list
+                        ]
+                        self._report_successful_click_captcha(
+                            {
+                                "image_bytes": img_bytes,
+                                "prompt": target_chars,
+                            },
+                            normalized_points,
+                            model_version=attempt_model_version,
+                            assisted=False,
+                        )
                         self.log.emit("🎉 验证码验证通过！")
                         return True
                     else:
+                        self._emit_captcha_attempt(
+                            success=False,
+                            model_version=attempt_model_version,
+                            assisted=False,
+                        )
                         self.log.emit("⚠️ 验证码未消失，点击错误，自动重试...")
                         self.page.locator(".verify-refresh").click()
                         time.sleep(2)
 
                 except Exception as e:
+                    self._emit_captcha_attempt(
+                        success=False,
+                        model_version=attempt_model_version,
+                        assisted=False,
+                    )
                     self.retry_signal.emit(
                         "business_captcha",
                         f"营运查询验证码第 {i + 1} 次失败：{str(e)[:80]}",
@@ -1632,7 +3215,6 @@ class BusinessBackfillWorker(QThread):
                 company = ""
                 need_retry = False
                 self.input_result = ""
-
                 try:
                     self._check_stopped()
                 except:
@@ -1642,11 +3224,7 @@ class BusinessBackfillWorker(QThread):
                 car_full = str(row["车辆标识"]).strip()
                 cert_no = plate_to_cert.get(car_full, "")
 
-                try:
-                    repaid = str(row["已协助补缴"]).strip()
-                except:
-                    repaid = ""
-                if repaid not in ("", "nan"):
+                if has_assisted_payment(row):
                     self.log.emit(f"✅ 已补缴，跳过：{car_full}")
                     df_original.at[idx, "车辆所有人/企业"] = "已补缴"
                     df_original.at[idx, "回填状态"] = "已补缴"
@@ -1701,14 +3279,7 @@ class BusinessBackfillWorker(QThread):
                         ):
                             raise BrowserRecoveryError("营运查询浏览器无法重新启动")
 
-                    response = self.page.goto(
-                        CONFIG["BUSINESS_QUERY_URL"],
-                        timeout=self.web_timeout,
-                    )
-                    ensure_successful_navigation(response, "营运查询页")
-                    self.page.wait_for_selector("a:has-text('营运车辆')", timeout=self.web_timeout)
-                    self.page.click("a:has-text('营运车辆')")
-                    time.sleep(0.5)
+                    self._load_business_query_page()
 
                     self.page.fill('input[placeholder="请输入车辆号牌"]', plate)
                     self.page.fill('input[placeholder="请输入道路运输证号"]', cert_no)
@@ -1733,141 +3304,24 @@ class BusinessBackfillWorker(QThread):
                             continue
                         else:
                             is_captcha_fail = False
+                            captcha_passed = True
                     else:
                         if not self.manual_at_captcha:
                             success = not has_captcha or self.solve_captcha()
                             if not success:
                                 self.log.emit(f"❌ 自动识别{self.captcha_retry}次失败，转为人工接管")
-                                if self.auto_continue:
-                                    # OCR失败后人工接管：检测用户点完验证码 + 等加载圈消失 + 检查验证码是否通过
-                                    while self._running:
-                                        self._check_stopped()
-                                        # 1. 从验证码提示文字解析出期望点击数
-                                        try:
-                                            prompt_el = self.page.locator(".verify-msg")
-                                            if prompt_el.count() > 0 and prompt_el.first.is_visible():
-                                                prompt_text = prompt_el.first.inner_text().strip()
-                                                match = re.search(r"【([^】]+)】", prompt_text)
-                                                if match:
-                                                    target_chars = [c.strip() for c in match.group(1).split(",") if c.strip()]
-                                                    expected_count = len(target_chars)
-                                                else:
-                                                    expected_count = 3
-                                            else:
-                                                expected_count = 0
-                                        except:
-                                            expected_count = 3
-
-                                        # 2. 等用户点完验证码
-                                        if expected_count > 0:
-                                            self.log.emit(f"⏳ 等待用户点完验证码...")
-                                            while self._running:
-                                                self._check_stopped()
-                                                try:
-                                                    point_count = self.page.locator(".point-area").count()
-                                                    if point_count >= expected_count:
-                                                        self.log.emit(f"✅ 用户已点完验证码")
-                                                        break
-                                                except:
-                                                    pass
-                                                time.sleep(2)
-
-                                        # 3. 等加载圈消失
-                                        if self.page.locator(".layui-layer-loading2").count() > 0:
-                                            try:
-                                                self.page.wait_for_selector(
-                                                    ".layui-layer-loading2",
-                                                    state="detached",
-                                                    timeout=self.web_timeout,
-                                                )
-                                            except:
-                                                pass
-
-                                        # 4. 等一下让验证码响应
-                                        time.sleep(0.5)
-
-                                        # 5. 检查验证码弹窗是否消失
-                                        prompt_el = self.page.locator(".verify-msg")
-                                        if prompt_el.count() == 0 or not prompt_el.first.is_visible():
-                                            self.log.emit("✅ 验证码通过，开始获取信息")
-                                            captcha_passed = True
-                                            break
-                                        # 弹窗还在，说明点击错误，提示重新点击
-                                        self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
-                                        time.sleep(2)
-                                else:
-                                    self.log.emit("⏸️ 请人工完成验证码，点击【继续执行】")
-                                    self._paused = True
-                                    self.pause_signal.emit()
-                                    while self._paused and self._running:
-                                        time.sleep(0.2)
+                                captcha_passed = self._complete_manual_click_captcha(
+                                    "human-fallback"
+                                )
+                            else:
+                                captcha_passed = True
                         else:
                             if not has_captcha:
                                 captcha_passed = True
-                            elif self.auto_continue:
-                                # 人工点完验证码后：先等用户点完验证码，再等加载圈消失，最后检查验证码是否通过
-                                while self._running:
-                                    self._check_stopped()
-                                    # 1. 从验证码提示文字解析出期望点击数（如"【京,海,北】"→3）
-                                    try:
-                                        prompt_el = self.page.locator(".verify-msg")
-                                        if prompt_el.count() > 0 and prompt_el.first.is_visible():
-                                            prompt_text = prompt_el.first.inner_text().strip()
-                                            match = re.search(r"【([^】]+)】", prompt_text)
-                                            if match:
-                                                target_chars = [c.strip() for c in match.group(1).split(",") if c.strip()]
-                                                expected_count = len(target_chars)
-                                            else:
-                                                expected_count = 3  # 默认3个
-                                        else:
-                                            expected_count = 0
-                                    except:
-                                        expected_count = 3
-
-                                    # 2. 等用户点完验证码：等待 .point-area 元素数量达到期望数量
-                                    # 用户每点一个，html里就会多一个 .point-area（文本为1、2、3...）
-                                    if expected_count > 0:
-                                        self.log.emit(f"⏳ 等待用户点完验证码...")
-                                        while self._running:
-                                            self._check_stopped()
-                                            try:
-                                                point_count = self.page.locator(".point-area").count()
-                                                if point_count >= expected_count:
-                                                    self.log.emit(f"✅ 用户已点完验证码")
-                                                    break
-                                            except:
-                                                pass
-                                            time.sleep(2)
-
-                                    # 3. 等加载圈消失
-                                    if self.page.locator(".layui-layer-loading2").count() > 0:
-                                        try:
-                                            self.page.wait_for_selector(
-                                                ".layui-layer-loading2",
-                                                state="detached",
-                                                timeout=self.web_timeout,
-                                            )
-                                        except:
-                                            pass
-
-                                    # 4. 等一下让验证码响应
-                                    time.sleep(0.5)
-
-                                    # 5. 检查验证码弹窗是否消失
-                                    prompt_el = self.page.locator(".verify-msg")
-                                    if prompt_el.count() == 0 or not prompt_el.first.is_visible():
-                                        self.log.emit("✅ 验证码通过，开始获取信息")
-                                        captcha_passed = True
-                                        break
-                                    # 弹窗还在，说明点击错误，提示重新点击
-                                    self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
-                                    time.sleep(2)
                             else:
-                                self.log.emit("⏸️ 请完成验证码后点击【继续执行】")
-                                self._paused = True
-                                self.pause_signal.emit()
-                                while self._paused and self._running:
-                                    time.sleep(0.2)
+                                captcha_passed = self._complete_manual_click_captcha(
+                                    "human-manual"
+                                )
 
                     self._check_stopped()
                     if is_captcha_fail:
@@ -1882,7 +3336,6 @@ class BusinessBackfillWorker(QThread):
                                 f"⚠️ 网页加载超过 {self.web_timeout // 1000} 秒，"
                                 "仍未获取到营运信息"
                             )
-
                         html = self.page.content().lower()
                         tip_loc = self.page.locator(".layui-layer-content")
                         has_no_data_tip = False
@@ -1906,7 +3359,7 @@ class BusinessBackfillWorker(QThread):
                             self.log.emit(f"ℹ️ 查询结果：个体经营")
                         else:
                             try:
-                                company = self.page.locator("#ownerName2").text_content().strip()
+                                company = self._business_owner_name()
                                 if not company:
                                     company = ""
                                 else:
@@ -2101,7 +3554,7 @@ class MainWindow(QMainWindow):
 
         browser_group = QGroupBox("浏览器")
         browser_layout = QHBoxLayout(browser_group)
-        builtin_label = QLabel("🔧 正在使用内置 Chromium 浏览器")
+        builtin_label = QLabel("🔧 正在使用自动适配的 Chromium 浏览器")
         builtin_label.setStyleSheet("font-weight: bold; color: #2d7d46;")
         browser_layout.addWidget(builtin_label)
         browser_layout.addStretch()

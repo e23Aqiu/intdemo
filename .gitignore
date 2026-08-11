@@ -10,12 +10,16 @@ __pycache__/
 
 # Virtual environments and local environment variables
 .venv/
+.conda-uos-arm64/
+.playwright-uos-arm64/
 venv/
 env/
 ENV/
+Miniforge3-*.sh
 .env
 .env.*
 !.env.example
+/client-online.json
 
 # Test and coverage output
 .coverage
@@ -54,6 +58,9 @@ logs/
 *.sqlite3
 *.sqlite3-shm
 *.sqlite3-wal
+deploy/generated/
+deploy/updates/*
+!deploy/updates/README.md
 
 # Local business inputs and generated exports
 data/

@@ -12,14 +12,16 @@
 import sys
 import os
 import re
+import socket
 import time
 import random
 import threading
 from datetime import datetime
+from pathlib import Path
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
-    QProgressBar, QFileDialog, QMessageBox, QGroupBox, QTextEdit,
+    QProgressBar, QMessageBox, QGroupBox, QTextEdit,
     QSplitter, QFrame, QCheckBox,
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
@@ -29,6 +31,8 @@ import openpyxl
 from DrissionPage import ChromiumPage, ChromiumOptions
 
 from ..browser import get_builtin_chromium_path
+from ..platform_support import chromium_launch_args
+from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 
 
 # ==================== 配置 ====================
@@ -84,13 +88,27 @@ def has_meaningful_value(value):
 
 # ==================== 浏览器控制与信息提取 ====================
 
-def create_browser():
-    """使用项目随 Playwright 安装的内置 Chromium 创建浏览器实例。"""
+def _available_local_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def create_browser(profile_directory=None):
+    """使用自动解析的兼容 Chromium 创建浏览器实例。"""
     co = ChromiumOptions()
     co.set_argument('--disable-blink-features=AutomationControlled')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-infobars')
-    co.auto_port()
+    for argument in chromium_launch_args():
+        co.set_argument(argument)
+    if profile_directory:
+        profile_directory = Path(profile_directory).resolve()
+        profile_directory.mkdir(parents=True, exist_ok=True)
+        co.set_user_data_path(str(profile_directory))
+        co.set_local_port(_available_local_port())
+    else:
+        co.auto_port()
     # Linux 上用 Linux UA，Windows 用 Windows UA
     if sys.platform.startswith("win"):
         ua = (
@@ -375,11 +393,24 @@ class QueryWorker(QThread):
     login_confirmed_signal = pyqtSignal()        # 用户处理完，继续执行
     finished_signal = pyqtSignal(bool)           # 完成(bool=是否有错误)
     retry_signal = pyqtSignal(str, str)           # 重试类型, 原因
+    browser_loading_started = pyqtSignal()        # 浏览器或结果页面开始加载
+    browser_loading_finished = pyqtSignal()       # 浏览器或结果页面加载结束
     
-    def __init__(self, df, company_col):
+    def __init__(
+        self,
+        df,
+        company_col,
+        *,
+        browser_profile_directory=None,
+    ):
         super().__init__()
         self.df = df
         self.company_col = company_col
+        self.browser_profile_directory = (
+            Path(browser_profile_directory).resolve()
+            if browser_profile_directory
+            else None
+        )
         self.page = None
         self._should_stop = False
         self._browser_lock = threading.RLock()
@@ -533,57 +564,130 @@ class QueryWorker(QThread):
                 # 确认按钮与浏览器关闭可能几乎同时发生，返回前再检查一次，
                 # 避免带着已经失效的页面进入正式查询。
                 self._ensure_browser_available()
+                self.login_confirmed_signal.emit()
+                return True
+        return False
+
+    @staticmethod
+    def _has_persisted_login(page):
+        """通过百度账号认证 Cookie 判断爱企查登录会话是否仍可复用。"""
+        cookies_method = getattr(page, "cookies", None)
+        if not callable(cookies_method):
+            return False
+        try:
+            cookies = cookies_method(all_domains=True)
+        except Exception:
+            return False
+        authenticated_cookie_names = {
+            "bduss",
+            "bduss_bfess",
+            "ptoken",
+            "stoken",
+        }
+        for cookie in cookies or ():
+            if not isinstance(cookie, dict):
+                continue
+            name = str(cookie.get("name") or "").casefold()
+            domain = str(cookie.get("domain") or "").casefold()
+            value = str(cookie.get("value") or "")
+            if (
+                name in authenticated_cookie_names
+                and value
+                and (domain == "baidu.com" or domain.endswith(".baidu.com"))
+            ):
                 return True
         return False
 
     def _start_browser_session(self, recovery=False):
         """持续创建爱企查浏览器，直到可用、登录超时或用户主动停止。"""
         attempt = 0
-        while not self._should_stop:
-            attempt += 1
-            try:
-                self.close_browser()
-                is_restart = recovery or attempt > 1
-                self.log_signal.emit(
-                    "♻️ 正在重新启动爱企查浏览器..."
-                    if is_restart
-                    else "🚀 正在启动浏览器..."
-                )
-                page = create_browser()
-                with self._browser_lock:
-                    self.page = page
-                if self._should_stop:
+        loading_active = False
+
+        def begin_loading():
+            nonlocal loading_active
+            if not loading_active:
+                loading_active = True
+                self.browser_loading_started.emit()
+
+        def finish_loading():
+            nonlocal loading_active
+            if loading_active:
+                loading_active = False
+                self.browser_loading_finished.emit()
+
+        begin_loading()
+        try:
+            while not self._should_stop:
+                attempt += 1
+                try:
                     self.close_browser()
-                    return False
-                self.log_signal.emit("✅ 浏览器已启动")
-                self.log_signal.emit("📌 正在打开爱企查首页...")
-                page.get("https://aiqicha.baidu.com")
-                if self._should_stop:
-                    return False
-                if not self._interruptible_sleep(2):
-                    return False
-                self.log_signal.emit(
-                    "⏳ 请在浏览器中登录爱企查，然后点击「继续执行」..."
-                )
-                return self._wait_for_login_confirmation()
-            except Exception as exc:
-                if self._should_stop:
-                    return False
-                reason = str(exc).strip() or exc.__class__.__name__
-                self.retry_signal.emit(
-                    "aiqicha_browser_start",
-                    f"爱企查浏览器启动第 {attempt} 次失败：{reason[:120]}",
-                )
-                self.log_signal.emit(
-                    "⚠️ 爱企查浏览器不可用，将自动重新打开"
-                    f"（已尝试 {attempt} 次，无次数上限）：{reason[:120]}"
-                )
-                self.close_browser()
-                if not self._interruptible_sleep(
-                    AIQICHA_BROWSER_RETRY_DELAY_SECONDS
-                ):
-                    return False
-        return False
+                    is_restart = recovery or attempt > 1
+                    self.log_signal.emit(
+                        "♻️ 正在重新启动爱企查浏览器..."
+                        if is_restart
+                        else "🚀 正在启动浏览器..."
+                    )
+                    page = (
+                        create_browser(self.browser_profile_directory)
+                        if self.browser_profile_directory is not None
+                        else create_browser()
+                    )
+                    with self._browser_lock:
+                        self.page = page
+                    if self._should_stop:
+                        self.close_browser()
+                        return False
+                    self.log_signal.emit("✅ 浏览器已启动")
+                    self.log_signal.emit("📌 正在打开爱企查首页...")
+                    page.get("https://aiqicha.baidu.com")
+                    if self._should_stop:
+                        return False
+                    if not self._interruptible_sleep(2):
+                        return False
+                    # 登录等待有自己的暂停原因，不属于页面加载时间。
+                    finish_loading()
+                    if self._has_persisted_login(page):
+                        self.log_signal.emit(
+                            "✅ 已恢复当前程序账号的爱企查登录状态，无需重复登录。"
+                        )
+                        return True
+                    self.log_signal.emit(
+                        "⏳ 请在浏览器中登录爱企查，然后点击「继续执行」..."
+                    )
+                    return self._wait_for_login_confirmation()
+                except Exception as exc:
+                    if self._should_stop:
+                        return False
+                    # 浏览器在登录阶段关闭时，重新进入页面加载计时区间。
+                    begin_loading()
+                    reason = str(exc).strip() or exc.__class__.__name__
+                    self.retry_signal.emit(
+                        "aiqicha_browser_start",
+                        f"爱企查浏览器启动第 {attempt} 次失败：{reason[:120]}",
+                    )
+                    self.log_signal.emit(
+                        "⚠️ 爱企查浏览器不可用，将自动重新打开"
+                        f"（已尝试 {attempt} 次，无次数上限）：{reason[:120]}"
+                    )
+                    self.close_browser()
+                    if not self._interruptible_sleep(
+                        AIQICHA_BROWSER_RETRY_DELAY_SECONDS
+                    ):
+                        return False
+            return False
+        finally:
+            finish_loading()
+
+    def _load_company_results(self, company_name):
+        """加载单个公司的搜索结果，并标记不计入有效用时的区间。"""
+        self.browser_loading_started.emit()
+        try:
+            search_company(self.page, company_name)
+            return self._wait_for_results(
+                timeout=AIQICHA_RESULT_WAIT_SECONDS
+            )
+        finally:
+            self.browser_loading_finished.emit()
 
     def _ensure_browser_available(self):
         page = self.page
@@ -709,12 +813,8 @@ class QueryWorker(QThread):
                 while not self._should_stop:
                     try:
                         self._ensure_browser_available()
-                        search_company(self.page, company_name)
-
-                        # 搜索结果页面最多等待 2 分钟，可暂停或停止。
-                        loaded = self._wait_for_results(
-                            timeout=AIQICHA_RESULT_WAIT_SECONDS
-                        )
+                        # 同步导航及结果区域等待都属于页面加载时间。
+                        loaded = self._load_company_results(company_name)
                         if not loaded:
                             if self._should_stop:
                                 break
@@ -968,7 +1068,7 @@ class MainWindow(QMainWindow):
 
         # ===== 浏览器信息 =====
         browser_layout = QHBoxLayout()
-        browser_label = QLabel("🌐 使用浏览器：内置 Chromium")
+        browser_label = QLabel("🌐 使用浏览器：兼容 Chromium")
         browser_label.setStyleSheet("font-size: 13px; font-weight: bold; color: #2d7d46;")
         browser_layout.addWidget(browser_label)
         browser_layout.addStretch(1)
@@ -1262,7 +1362,7 @@ class MainWindow(QMainWindow):
         self.status_label.setStyleSheet("color: orange; font-weight: bold;")
         
         # 启动工作线程
-        self._log("🌐 使用浏览器：内置 Chromium")
+        self._log("🌐 使用浏览器：兼容 Chromium")
         self.worker = QueryWorker(self.df.copy(), COMPANY_COL_NAME)
         self.worker.log_signal.connect(self._log)
         self.worker.progress_signal.connect(self._on_progress)

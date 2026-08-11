@@ -6,7 +6,6 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QFrame,
-    QFileDialog,
     QHeaderView,
     QHBoxLayout,
     QLabel,
@@ -26,6 +25,7 @@ from .auth_dialogs import (
     RenameAccountDialog,
 )
 from .date_range import DateRangeSelector
+from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
 
 
@@ -35,7 +35,14 @@ class AccountPage(QWidget):
     account_deleted = pyqtSignal(int)
     station_data_changed = pyqtSignal(int)
 
-    def __init__(self, database: Database, current_account: Account, parent=None):
+    def __init__(
+        self,
+        database: Database,
+        current_account: Account,
+        parent=None,
+        *,
+        defer_refresh: bool = False,
+    ):
         super().__init__(parent)
         self.database = database
         self.current_account = current_account
@@ -47,12 +54,12 @@ class AccountPage(QWidget):
 
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("账号管理")
-        title.setObjectName("PageTitle")
-        title_box.addWidget(title)
-        subtitle = QLabel("集中管理用户身份、登录状态与密码安全。")
-        subtitle.setObjectName("Muted")
-        title_box.addWidget(subtitle)
+        self.page_title = QLabel("账号管理")
+        self.page_title.setObjectName("PageTitle")
+        title_box.addWidget(self.page_title)
+        self.page_subtitle = QLabel("集中管理用户身份、登录状态与密码安全。")
+        self.page_subtitle.setObjectName("Muted")
+        title_box.addWidget(self.page_subtitle)
         header.addLayout(title_box)
         header.addStretch()
         refresh_btn = QPushButton("刷新数据")
@@ -62,6 +69,7 @@ class AccountPage(QWidget):
 
         summary_layout = QHBoxLayout()
         summary_layout.setSpacing(10)
+        self.summary_layout = summary_layout
         self.summary_values = {}
         for key, label, color in (
             ("total", "账号总数", "#1d8178"),
@@ -81,9 +89,12 @@ class AccountPage(QWidget):
         card_layout.setSpacing(12)
 
         list_header = QHBoxLayout()
-        list_title = QLabel("账号列表")
-        list_title.setStyleSheet("font-size:16px;font-weight:700;color:#173a3d;")
-        list_header.addWidget(list_title)
+        self.list_header_layout = list_header
+        self.list_title = QLabel("账号列表")
+        self.list_title.setStyleSheet(
+            "font-size:16px;font-weight:700;color:#173a3d;"
+        )
+        list_header.addWidget(self.list_title)
         list_header.addStretch()
         self.selection_hint = QLabel("请选择一个账号进行管理")
         self.selection_hint.setObjectName("Muted")
@@ -91,6 +102,7 @@ class AccountPage(QWidget):
         card_layout.addLayout(list_header)
 
         action_layout = QHBoxLayout()
+        self.account_action_layout = action_layout
         self.create_btn = QPushButton("＋ 新建账号")
         self.create_btn.setObjectName("PrimaryButton")
         self.create_btn.clicked.connect(self._create_account)
@@ -130,6 +142,7 @@ class AccountPage(QWidget):
             "font-weight:700;color:#315453;}"
         )
         data_layout = QHBoxLayout(data_bar)
+        self.data_action_layout = data_layout
         data_layout.setContentsMargins(12, 8, 10, 8)
         data_layout.setSpacing(8)
         data_title = QLabel("统计数据")
@@ -163,7 +176,8 @@ class AccountPage(QWidget):
         self.table.itemSelectionChanged.connect(self._selection_changed)
         card_layout.addWidget(self.table, 1)
         layout.addWidget(list_card, 1)
-        self.refresh()
+        if not defer_refresh:
+            self.refresh()
 
     @staticmethod
     def _summary_card(label, color):
