@@ -513,7 +513,7 @@ class WorkflowPage(QWidget):
         workflow_root.addWidget(self.progress_bar)
 
         self.timing_label = QLabel(
-            "本次有效用时 00:00:00.000 · 本批次累计 00:00:00.000"
+            "本次有效用时 00:00:00.000 · 本批次总用时 00:00:00.000"
         )
         self.timing_label.setObjectName("WorkflowTimingLabel")
         self.timing_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
@@ -521,7 +521,7 @@ class WorkflowPage(QWidget):
             "color:#526e6d;font-size:12px;font-weight:600;padding:0 2px;"
         )
         self.timing_label.setToolTip(
-            "有效用时不包含暂停等待；停止后再次处理同一份输入数据时会累计前次用时。"
+            "总用时包含有效用时和暂停等待；停止后再次处理同一份输入数据时会累计前次用时。"
         )
         workflow_root.addWidget(self.timing_label)
 
@@ -659,20 +659,26 @@ class WorkflowPage(QWidget):
         service = self._timing_service
         if service is None:
             self.timing_label.setText(
-                "本次有效用时 00:00:00.000 · 本批次累计 00:00:00.000"
+                "本次有效用时 00:00:00.000 · 本批次总用时 00:00:00.000"
             )
             return
         snapshot = snapshot or service.snapshot()
         run_text = service.format_duration(snapshot.get("run_active_ms", 0))
-        batch_text = service.format_duration(snapshot.get("batch_active_ms", 0))
+        batch_total_ms = snapshot.get("batch_total_ms")
+        if batch_total_ms is None:
+            batch_total_ms = snapshot.get("batch_active_ms", 0) + snapshot.get(
+                "batch_paused_ms",
+                0,
+            )
+        batch_text = service.format_duration(batch_total_ms)
         paused_text = service.format_duration(snapshot.get("run_paused_ms", 0))
         prefix = "暂停中 · " if snapshot.get("state") == "paused" else ""
         self.timing_label.setText(
-            f"{prefix}本次有效用时 {run_text} · 本批次累计 {batch_text}"
+            f"{prefix}本次有效用时 {run_text} · 本批次总用时 {batch_text}"
         )
         self.timing_label.setToolTip(
-            f"本次暂停等待 {paused_text}。有效用时不包含暂停；"
-            "停止后再次处理相同输入数据时会累计前次有效用时。"
+            f"本次暂停等待 {paused_text}。总用时包含有效用时和暂停等待；"
+            "停止后再次处理相同输入数据时会累计前次总用时。"
         )
 
     def _timing_tick(self):

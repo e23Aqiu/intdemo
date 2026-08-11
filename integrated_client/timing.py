@@ -198,21 +198,27 @@ class WorkflowTimingService:
                 "state": "idle",
                 "run_active_ms": 0,
                 "run_paused_ms": 0,
+                "run_total_ms": 0,
                 "batch_active_ms": 0,
                 "batch_paused_ms": 0,
+                "batch_total_ms": 0,
                 "current_step": 0,
             }
         run_active, run_paused, step_active, step_paused = self._totals_at(
             self.clock()
         )
+        batch_active = self._previous_active_ms + run_active
+        batch_paused = self._previous_paused_ms + run_paused
         return {
             "state": self.state,
             "batch_id": self.batch_id,
             "run_id": self.run_id,
             "run_active_ms": run_active,
             "run_paused_ms": run_paused,
-            "batch_active_ms": self._previous_active_ms + run_active,
-            "batch_paused_ms": self._previous_paused_ms + run_paused,
+            "run_total_ms": run_active + run_paused,
+            "batch_active_ms": batch_active,
+            "batch_paused_ms": batch_paused,
+            "batch_total_ms": batch_active + batch_paused,
             "step_active_ms": step_active,
             "step_paused_ms": step_paused,
             "current_step": self.current_step,
@@ -324,8 +330,10 @@ class WorkflowTimingService:
             "run_id": self.run_id,
             "run_active_ms": run_active,
             "run_paused_ms": run_paused,
+            "run_total_ms": run_active + run_paused,
             "batch_active_ms": result["active_ms"],
             "batch_paused_ms": result["paused_ms"],
+            "batch_total_ms": result["active_ms"] + result["paused_ms"],
             "current_step": self.current_step,
             "run_count": result["run_count"],
         }

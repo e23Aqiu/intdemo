@@ -1559,6 +1559,43 @@ class BusinessBackfillWorker(QThread):
         except Exception:
             return False
 
+    @staticmethod
+    def _result_field_value(locator):
+        """读取网页结果字段，兼容 input.value 与普通文本节点。"""
+        input_value = getattr(locator, "input_value", None)
+        if callable(input_value):
+            try:
+                # input 的当前值以 DOM property 为准；空值也不能再回退到旧的
+                # value attribute，否则可能误读上一条查询结果。
+                return str(input_value() or "").strip()
+            except Exception:
+                pass
+
+        for method_name in ("text_content", "inner_text"):
+            method = getattr(locator, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _business_owner_name(self, *, visible_only=False):
+        try:
+            owner = self.page.locator("#ownerName2")
+            if not owner.count():
+                return ""
+            field = owner.first
+            if visible_only and not field.is_visible():
+                return ""
+            return self._result_field_value(field)
+        except Exception:
+            return ""
+
     def _captcha_image_is_ready(self):
         """验证码题目和图片均完整加载后才允许开始识别。"""
         try:
@@ -1621,14 +1658,8 @@ class BusinessBackfillWorker(QThread):
     def _business_result_is_ready(self):
         if self._captcha_prompt_is_visible():
             return False
-        try:
-            owner = self.page.locator("#ownerName2")
-            if owner.count() and owner.first.is_visible():
-                owner_text = (owner.first.text_content() or "").strip()
-                if owner_text:
-                    return True
-        except Exception:
-            pass
+        if self._business_owner_name(visible_only=True):
+            return True
         try:
             tips = self.page.locator(".layui-layer-content")
             for index in range(tips.count()):
@@ -2363,7 +2394,7 @@ class BusinessBackfillWorker(QThread):
                             self.log.emit(f"ℹ️ 查询结果：个体经营")
                         else:
                             try:
-                                company = self.page.locator("#ownerName2").text_content().strip()
+                                company = self._business_owner_name()
                                 if not company:
                                     company = ""
                                 else:
