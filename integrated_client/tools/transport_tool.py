@@ -502,7 +502,6 @@ class Worker(QThread):
         self.captcha_sample_collection_enabled = (
             captcha_sample_collection_enabled
         )
-        self._pending_captcha_sample = None
 
     def stop(self):
         self._running = False
@@ -601,7 +600,7 @@ class Worker(QThread):
             )
         self.captcha_attempt_signal.emit(event)
 
-    def _set_pending_captcha_attempt(
+    def _report_successful_captcha_attempt(
         self,
         *,
         model_version,
@@ -611,7 +610,7 @@ class Worker(QThread):
     ):
         if not self._collection_enabled():
             return
-        pending = {
+        attempt = {
             "model_version": model_version,
             "assisted": assisted,
         }
@@ -620,20 +619,13 @@ class Worker(QThread):
             and image_bytes
             and isinstance(answer, dict)
         ):
-            pending.update(
+            attempt.update(
                 {
                     "image_bytes": image_bytes,
                     "answer": answer,
                 }
             )
-        self._pending_captcha_sample = pending
-
-    def _commit_pending_captcha_sample(self):
-        pending = self._pending_captcha_sample
-        self._pending_captcha_sample = None
-        if not pending:
-            return
-        self._emit_captcha_attempt(success=True, **pending)
+        self._emit_captcha_attempt(success=True, **attempt)
 
     def _create_new_browser(self):
         self._close_browser()
@@ -821,8 +813,6 @@ class Worker(QThread):
                 # 临时变量存储查询结果
                 tr_original = ""
                 tr_clean = ""
-                self._pending_captcha_sample = None
-
                 try:
                     self._check_stopped()
                     response = self.page.goto(
@@ -933,7 +923,7 @@ class Worker(QThread):
                                 continue
                             else:
                                 # 正确，退出循环
-                                self._set_pending_captcha_attempt(
+                                self._report_successful_captcha_attempt(
                                     model_version="human-manual",
                                     assisted=True,
                                     image_bytes=manual_image_bytes,
@@ -1050,7 +1040,7 @@ class Worker(QThread):
                                     continue
 
                                 # 3. 正常验证码成功，跳出循环
-                                self._set_pending_captcha_attempt(
+                                self._report_successful_captcha_attempt(
                                     model_version=captcha_model_version,
                                     assisted=False,
                                     image_bytes=captcha_image_bytes,
@@ -1143,7 +1133,7 @@ class Worker(QThread):
                                             continue
                                         else:
                                             # 验证码正确，退出循环，继续流程
-                                            self._set_pending_captcha_attempt(
+                                            self._report_successful_captcha_attempt(
                                                 model_version="human-fallback",
                                                 assisted=True,
                                                 image_bytes=manual_image_bytes,
@@ -1192,16 +1182,6 @@ class Worker(QThread):
                     if self.page.locator(".user_zige").count() > 0:
                         self.log.emit(f"✅ 最后一次检查：列表已加载成功")
                         list_loaded = True
-
-                    try:
-                        captcha_result_confirmed = (
-                            list_loaded
-                            or "查询不到信息" in self.page.content()
-                        )
-                    except Exception:
-                        captcha_result_confirmed = False
-                    if captcha_result_confirmed:
-                        self._commit_pending_captcha_sample()
 
                     # ===================== 如果验证码失败已标记，直接跳过后续所有查询代码 =====================
                     if not list_loaded and str(df.at[idx, "查询状态"]).strip() == "验证码识别失败":
@@ -1411,7 +1391,6 @@ class BusinessBackfillWorker(QThread):
         self.captcha_sample_collection_enabled = (
             captcha_sample_collection_enabled
         )
-        self._pending_captcha_sample = None
         self._running = True
         self._paused = False
         self._global_paused = False
@@ -1476,23 +1455,6 @@ class BusinessBackfillWorker(QThread):
                 }
             )
         self.captcha_attempt_signal.emit(event)
-
-    def _commit_pending_captcha_sample(self):
-        pending = self._pending_captcha_sample
-        self._pending_captcha_sample = None
-        if not pending:
-            return
-        self._emit_captcha_attempt(success=True, **pending)
-
-    def _discard_pending_captcha_sample(self, *, emit_failure=False):
-        pending = self._pending_captcha_sample
-        self._pending_captcha_sample = None
-        if emit_failure and pending:
-            self._emit_captcha_attempt(
-                success=False,
-                model_version=pending.get("model_version"),
-                assisted=pending.get("assisted"),
-            )
 
     def stop(self):
         self._running = False
@@ -1597,6 +1559,43 @@ class BusinessBackfillWorker(QThread):
         except Exception:
             return False
 
+    @staticmethod
+    def _result_field_value(locator):
+        """读取网页结果字段，兼容 input.value 与普通文本节点。"""
+        input_value = getattr(locator, "input_value", None)
+        if callable(input_value):
+            try:
+                # input 的当前值以 DOM property 为准；空值也不能再回退到旧的
+                # value attribute，否则可能误读上一条查询结果。
+                return str(input_value() or "").strip()
+            except Exception:
+                pass
+
+        for method_name in ("text_content", "inner_text"):
+            method = getattr(locator, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                value = method()
+            except Exception:
+                continue
+            value = str(value or "").strip()
+            if value:
+                return value
+        return ""
+
+    def _business_owner_name(self, *, visible_only=False):
+        try:
+            owner = self.page.locator("#ownerName2")
+            if not owner.count():
+                return ""
+            field = owner.first
+            if visible_only and not field.is_visible():
+                return ""
+            return self._result_field_value(field)
+        except Exception:
+            return ""
+
     def _captcha_image_is_ready(self):
         """验证码题目和图片均完整加载后才允许开始识别。"""
         try:
@@ -1659,14 +1658,8 @@ class BusinessBackfillWorker(QThread):
     def _business_result_is_ready(self):
         if self._captcha_prompt_is_visible():
             return False
-        try:
-            owner = self.page.locator("#ownerName2")
-            if owner.count() and owner.first.is_visible():
-                owner_text = (owner.first.text_content() or "").strip()
-                if owner_text:
-                    return True
-        except Exception:
-            pass
+        if self._business_owner_name(visible_only=True):
+            return True
         try:
             tips = self.page.locator(".layui-layer-content")
             for index in range(tips.count()):
@@ -1787,7 +1780,7 @@ class BusinessBackfillWorker(QThread):
                 normalized.append({"x": round(x, 6), "y": round(y, 6)})
         return normalized[: len(capture.get("prompt") or [])]
 
-    def _set_pending_click_sample(
+    def _report_successful_click_captcha(
         self,
         capture,
         points,
@@ -1797,19 +1790,19 @@ class BusinessBackfillWorker(QThread):
     ):
         if not self._collection_enabled():
             return
-        pending = {
+        attempt = {
             "model_version": model_version,
             "assisted": assisted,
         }
         if not self._sample_collection_enabled() or not capture:
-            self._pending_captcha_sample = pending
+            self._emit_captcha_attempt(success=True, **attempt)
             return
         prompt = list(capture.get("prompt") or [])
         points = list(points or [])
         if not prompt or len(prompt) != len(points):
-            self._pending_captcha_sample = pending
+            self._emit_captcha_attempt(success=True, **attempt)
             return
-        pending.update(
+        attempt.update(
             {
                 "image_bytes": capture.get("image_bytes"),
                 "answer": {
@@ -1818,7 +1811,7 @@ class BusinessBackfillWorker(QThread):
                 },
             }
         )
-        self._pending_captcha_sample = pending
+        self._emit_captcha_attempt(success=True, **attempt)
 
     def _complete_manual_click_captcha(self, model_version):
         while self._running:
@@ -1878,7 +1871,7 @@ class BusinessBackfillWorker(QThread):
             prompt_el = self.page.locator(".verify-msg")
             passed = prompt_el.count() == 0 or not prompt_el.first.is_visible()
             if passed:
-                self._set_pending_click_sample(
+                self._report_successful_click_captcha(
                     capture,
                     points,
                     model_version=model_version,
@@ -2141,7 +2134,7 @@ class BusinessBackfillWorker(QThread):
                             }
                             for x, y, _target, _matched in click_list
                         ]
-                        self._set_pending_click_sample(
+                        self._report_successful_click_captcha(
                             {
                                 "image_bytes": img_bytes,
                                 "prompt": target_chars,
@@ -2253,8 +2246,6 @@ class BusinessBackfillWorker(QThread):
                 company = ""
                 need_retry = False
                 self.input_result = ""
-                self._pending_captcha_sample = None
-
                 try:
                     self._check_stopped()
                 except:
@@ -2376,14 +2367,10 @@ class BusinessBackfillWorker(QThread):
                             self.log.emit("⏳ 验证码已通过，继续等待营运信息")
                         result_ready = self._wait_for_business_result()
                         if not result_ready:
-                            self._discard_pending_captcha_sample()
                             self.log.emit(
                                 f"⚠️ 网页加载超过 {self.web_timeout // 1000} 秒，"
                                 "仍未获取到营运信息"
                             )
-                        else:
-                            self._commit_pending_captcha_sample()
-
                         html = self.page.content().lower()
                         tip_loc = self.page.locator(".layui-layer-content")
                         has_no_data_tip = False
@@ -2407,7 +2394,7 @@ class BusinessBackfillWorker(QThread):
                             self.log.emit(f"ℹ️ 查询结果：个体经营")
                         else:
                             try:
-                                company = self.page.locator("#ownerName2").text_content().strip()
+                                company = self._business_owner_name()
                                 if not company:
                                     company = ""
                                 else:

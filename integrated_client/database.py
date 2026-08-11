@@ -317,6 +317,17 @@ class Database:
                     updated_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS captcha_upload_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    server_account_id TEXT NOT NULL,
+                    event_uid TEXT NOT NULL UNIQUE,
+                    payload_json TEXT NOT NULL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS sync_entity_revisions (
                     kind TEXT NOT NULL,
                     entity_id TEXT NOT NULL,
@@ -376,6 +387,8 @@ class Database:
                     ON workflow_step_attempts(run_id, step_no, attempt_no);
                 CREATE INDEX IF NOT EXISTS idx_sync_outbox_due
                     ON sync_outbox(status, next_attempt_at, id);
+                CREATE INDEX IF NOT EXISTS idx_captcha_upload_outbox_account
+                    ON captcha_upload_outbox(server_account_id, id);
                 """
             )
             account_columns = {
@@ -2832,6 +2845,10 @@ class Database:
             (normalized,),
         )
         conn.execute(
+            "DELETE FROM captcha_upload_outbox WHERE server_account_id=?",
+            (normalized,),
+        )
+        conn.execute(
             "DELETE FROM remote_workflow_runs WHERE server_account_id=?",
             (normalized,),
         )
@@ -2938,6 +2955,113 @@ class Database:
                     int(account_changed or scope_expanded),
                     self._now(),
                 ),
+            )
+
+    def enqueue_captcha_upload(
+        self,
+        server_account_id: str,
+        payload: Mapping,
+    ) -> int:
+        """Persist one CAPTCHA sample upload until the server accepts it."""
+        account_id = str(server_account_id or "").strip()
+        if not account_id:
+            raise ValueError("验证码待同步数据缺少服务器账号")
+        if not isinstance(payload, Mapping):
+            raise ValueError("验证码待同步数据格式无效")
+        now = self._now()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO captcha_upload_outbox(
+                    server_account_id, event_uid, payload_json,
+                    created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    account_id,
+                    uuid.uuid4().hex,
+                    json.dumps(
+                        dict(payload),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ),
+                    now,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)
+
+    def get_captcha_upload_pending_count(self, server_account_id: str) -> int:
+        account_id = str(server_account_id or "").strip()
+        if not account_id:
+            return 0
+        with self._connect() as conn:
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*) FROM captcha_upload_outbox
+                    WHERE server_account_id=?
+                    """,
+                    (account_id,),
+                ).fetchone()[0]
+            )
+
+    def get_pending_captcha_uploads(
+        self,
+        server_account_id: str,
+        limit: int = 100,
+    ) -> List[Dict]:
+        account_id = str(server_account_id or "").strip()
+        if not account_id:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, event_uid, payload_json, attempt_count,
+                       last_error, created_at, updated_at
+                FROM captcha_upload_outbox
+                WHERE server_account_id=?
+                ORDER BY id
+                LIMIT ?
+                """,
+                (account_id, max(1, min(int(limit), 500))),
+            ).fetchall()
+        pending = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            pending.append(
+                {
+                    "id": int(row["id"]),
+                    "event_uid": row["event_uid"],
+                    "payload": payload,
+                    "attempt_count": int(row["attempt_count"]),
+                    "last_error": row["last_error"],
+                    "created_at": row["created_at"],
+                    "updated_at": row["updated_at"],
+                }
+            )
+        return pending
+
+    def mark_captcha_upload_sent(self, outbox_id: int) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM captcha_upload_outbox WHERE id=?",
+                (int(outbox_id),),
+            )
+
+    def mark_captcha_upload_failed(self, outbox_id: int, error: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE captcha_upload_outbox
+                SET attempt_count=attempt_count+1,
+                    last_error=?, updated_at=?
+                WHERE id=?
+                """,
+                (str(error)[:500], self._now(), int(outbox_id)),
             )
 
     def get_sync_state(self) -> Dict:

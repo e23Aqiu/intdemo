@@ -305,6 +305,65 @@ class CaptchaLearningTests(unittest.TestCase):
         )
         self.assertEqual(len(session.api.attempts), 3)
 
+    def test_failed_sample_upload_is_persisted_and_can_be_retried(self):
+        session = _FakeSession()
+        should_fail = {"value": True}
+
+        def submit(_token, payload):
+            session.api.attempts.append(payload)
+            if should_fail["value"]:
+                raise OSError("network unavailable")
+            return {"stored": True, "policy_revision": 1}
+
+        session.api.submit_captcha_attempt = submit
+
+        def immediate(function, completed):
+            try:
+                result = function()
+            except Exception as exc:  # noqa: BLE001 - mirrors the QRunnable
+                completed(None, exc)
+            else:
+                completed(result, None)
+            return object()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            database = Database(Path(temp_dir) / "client.db")
+            service = CaptchaLearningService(
+                session,
+                database=database,
+                server_account_id="account-1",
+            )
+            service._stopped = False
+            service.policy = {
+                "upload_mode": "samples_and_metrics",
+                "upload_enabled": True,
+                "revision": 1,
+                "active_models": {},
+            }
+            service._start_task = immediate
+
+            self.assertTrue(
+                service.record_attempt(
+                    {
+                        "captcha_type": "numeric",
+                        "model_version": "human-manual",
+                        "success": True,
+                        "assisted": True,
+                        "image_bytes": _numeric_image("1234"),
+                        "answer": {"value": "1234"},
+                    }
+                )
+            )
+            self.assertEqual(service.pending_upload_count(), 1)
+            pending = database.get_pending_captcha_uploads("account-1")
+            self.assertEqual(pending[0]["attempt_count"], 1)
+            self.assertIn("image_base64", pending[0]["payload"])
+
+            should_fail["value"] = False
+            service.retry_pending()
+            self.assertEqual(service.pending_upload_count(), 0)
+            self.assertEqual(len(session.api.attempts), 2)
+
     def test_model_cache_is_checksum_verified_before_install(self):
         candidate = train_candidate(self.archive, "numeric")
         digest = hashlib.sha256(candidate.artifact).hexdigest()
@@ -371,7 +430,7 @@ class CaptchaLearningTests(unittest.TestCase):
                 "ddddocr-builtin",
             )
 
-    def test_workers_emit_samples_only_after_pending_success_is_committed(self):
+    def test_workers_emit_samples_immediately_after_captcha_passes(self):
         numeric_worker = Worker(
             "unused.xlsx",
             True,
@@ -389,14 +448,12 @@ class CaptchaLearningTests(unittest.TestCase):
             model_version="ddddocr-builtin",
             assisted=False,
         )
-        numeric_worker._pending_captcha_sample = {
-            "model_version": "human-manual",
-            "assisted": True,
-            "image_bytes": _numeric_image("1234"),
-            "answer": {"value": "1234"},
-        }
-        self.assertEqual(len(numeric_events), 1)
-        numeric_worker._commit_pending_captcha_sample()
+        numeric_worker._report_successful_captcha_attempt(
+            model_version="human-manual",
+            assisted=True,
+            image_bytes=_numeric_image("1234"),
+            answer={"value": "1234"},
+        )
         self.assertEqual(len(numeric_events), 2)
         self.assertFalse(numeric_events[0]["success"])
         self.assertNotIn("image_bytes", numeric_events[0])
@@ -412,7 +469,7 @@ class CaptchaLearningTests(unittest.TestCase):
         )
         click_events = []
         click_worker.captcha_attempt_signal.connect(click_events.append)
-        click_worker._set_pending_click_sample(
+        click_worker._report_successful_click_captcha(
             {
                 "image_bytes": _click_image(),
                 "prompt": ["甲", "乙"],
@@ -421,7 +478,6 @@ class CaptchaLearningTests(unittest.TestCase):
             model_version="human-manual",
             assisted=True,
         )
-        click_worker._commit_pending_captcha_sample()
         self.assertEqual(click_events[0]["captcha_type"], "click")
         self.assertEqual(len(click_events[0]["answer"]["points"]), 2)
 
@@ -439,13 +495,12 @@ class CaptchaLearningTests(unittest.TestCase):
         )
         numeric_events = []
         numeric_worker.captcha_attempt_signal.connect(numeric_events.append)
-        numeric_worker._set_pending_captcha_attempt(
+        numeric_worker._report_successful_captcha_attempt(
             model_version="ddddocr-builtin",
             assisted=False,
             image_bytes=_numeric_image("1234"),
             answer={"value": "1234"},
         )
-        numeric_worker._commit_pending_captcha_sample()
         self.assertTrue(numeric_events[0]["success"])
         self.assertNotIn("image_bytes", numeric_events[0])
         self.assertNotIn("answer", numeric_events[0])
@@ -461,7 +516,7 @@ class CaptchaLearningTests(unittest.TestCase):
         )
         click_events = []
         click_worker.captcha_attempt_signal.connect(click_events.append)
-        click_worker._set_pending_click_sample(
+        click_worker._report_successful_click_captcha(
             {
                 "image_bytes": _click_image(),
                 "prompt": ["甲", "乙"],
@@ -470,7 +525,6 @@ class CaptchaLearningTests(unittest.TestCase):
             model_version="ddddocr-builtin",
             assisted=False,
         )
-        click_worker._commit_pending_captcha_sample()
         self.assertTrue(click_events[0]["success"])
         self.assertNotIn("image_bytes", click_events[0])
         self.assertNotIn("answer", click_events[0])
@@ -576,6 +630,18 @@ class CaptchaLearningTests(unittest.TestCase):
                 )
             self.assertIn("machine_learning", window._pages)
             self.assertIn("machine_learning", window._nav_buttons)
+            self.assertTrue(window.captcha_sync_retry_button.isHidden())
+            window._update_captcha_sync_policy(
+                {"upload_mode": "samples_and_metrics"}
+            )
+            self.assertFalse(window.captcha_sync_retry_button.isHidden())
+            window._update_captcha_pending_count(3)
+            self.assertEqual(
+                window.captcha_sync_retry_button.text(),
+                "验证码待同步：3",
+            )
+            window._update_captcha_sync_policy({"upload_mode": "metrics_only"})
+            self.assertTrue(window.captcha_sync_retry_button.isHidden())
             window.show_page("machine_learning")
             self.assertIs(
                 window.stack.currentWidget(),

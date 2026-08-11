@@ -695,6 +695,71 @@ class ToolAndUiTests(unittest.TestCase):
             self.assertTrue(worker._wait_for_business_result())
         self.assertEqual(page.waits, [250, 250])
 
+    def test_business_result_reads_visible_input_value_after_captcha_disappears(self):
+        worker = BusinessBackfillWorker("unused.xlsx", True, True, 2, False)
+
+        class Locator:
+            def __init__(self, page, selector):
+                self.page = page
+                self.selector = selector
+                self.first = self
+
+            def count(self):
+                return 0 if self.selector == ".layui-layer-content" else 1
+
+            def is_visible(self):
+                if self.selector == ".verify-msg":
+                    return self.page.captcha_visible
+                return self.selector == "#ownerName2"
+
+            def input_value(self):
+                if self.selector == "#ownerName2":
+                    return "测试运输有限公司"
+                raise RuntimeError("not an input")
+
+            @staticmethod
+            def text_content():
+                return ""
+
+        class Page:
+            def __init__(self):
+                self.waits = []
+                self.captcha_visible = False
+
+            def locator(self, selector):
+                return Locator(self, selector)
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
+
+        page = Page()
+        worker.page = page
+
+        self.assertFalse(worker._captcha_prompt_is_visible())
+        self.assertEqual(worker._business_owner_name(), "测试运输有限公司")
+        self.assertTrue(worker._business_result_is_ready())
+        self.assertTrue(worker._wait_for_business_result())
+        self.assertEqual(page.waits, [])
+
+        page.captcha_visible = True
+        self.assertTrue(worker._captcha_prompt_is_visible())
+        self.assertFalse(worker._business_result_is_ready())
+
+    def test_business_result_field_falls_back_to_plain_text(self):
+        class TextLocator:
+            @staticmethod
+            def input_value():
+                raise RuntimeError("not an input")
+
+            @staticmethod
+            def text_content():
+                return "  普通文本企业  "
+
+        self.assertEqual(
+            BusinessBackfillWorker._result_field_value(TextLocator()),
+            "普通文本企业",
+        )
+
     def test_business_browser_and_page_loading_emit_wait_boundaries(self):
         worker = BusinessBackfillWorker("unused.xlsx", True, True, 2, False)
         events = []
@@ -1342,7 +1407,7 @@ class ToolAndUiTests(unittest.TestCase):
             window.workflow_page._timing_service,
             window.workflow_timing,
         )
-        self.assertIn("本批次累计", window.workflow_page.timing_label.text())
+        self.assertIn("本批次总用时", window.workflow_page.timing_label.text())
         self.assertIs(window._pages["personal"], window.personal_center_page)
         self.assertNotIn("transport", window._pages)
         self.assertNotIn("aiqicha", window._pages)
@@ -3567,6 +3632,8 @@ class ToolAndUiTests(unittest.TestCase):
                     "run_active_ms": 57,
                     "run_paused_ms": 0,
                     "batch_active_ms": 1_057,
+                    "batch_paused_ms": 43,
+                    "batch_total_ms": 1_100,
                 }
 
             def heartbeat(self):
@@ -3596,7 +3663,7 @@ class ToolAndUiTests(unittest.TestCase):
 
         page._timing_tick()
         self.assertIn("本次有效用时 00:00:00.057", page.timing_label.text())
-        self.assertIn("本批次累计 00:00:01.057", page.timing_label.text())
+        self.assertIn("本批次总用时 00:00:01.100", page.timing_label.text())
         self.assertEqual(service.heartbeat_count, 0)
 
         page._timing_heartbeat()
@@ -3639,12 +3706,26 @@ class ToolAndUiTests(unittest.TestCase):
         page._on_backfill_browser_loading_started()
         page._on_backfill_browser_loading_started()
         clock[0] += 95.750
+        loading_snapshot = timing.snapshot()
+        page._refresh_timing_label(loading_snapshot)
+
+        self.assertEqual(loading_snapshot["run_active_ms"], 0)
+        self.assertEqual(loading_snapshot["run_paused_ms"], 95_750)
+        self.assertEqual(loading_snapshot["run_total_ms"], 95_750)
+        self.assertIn("本次有效用时 00:00:00.000", page.timing_label.text())
+        self.assertIn("本批次总用时 00:01:35.750", page.timing_label.text())
+
         page._on_backfill_browser_loading_finished()
         clock[0] += 4.250
         snapshot = timing.finish_run("succeeded")
+        page._refresh_timing_label(snapshot)
 
         self.assertEqual(snapshot["run_active_ms"], 4_250)
         self.assertEqual(snapshot["run_paused_ms"], 95_750)
+        self.assertEqual(snapshot["run_total_ms"], 100_000)
+        self.assertEqual(snapshot["batch_total_ms"], 100_000)
+        self.assertIn("本次有效用时 00:00:04.250", page.timing_label.text())
+        self.assertIn("本批次总用时 00:01:40.000", page.timing_label.text())
         self.assertFalse(page._backfill_browser_loading)
         self.assertIn("不计入有效用时", page.log_text.toPlainText())
         self.assertTrue(page.shutdown())

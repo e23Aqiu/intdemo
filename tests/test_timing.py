@@ -156,6 +156,8 @@ class WorkflowTimingTests(unittest.TestCase):
 
         self.assertEqual(snapshot["run_active_ms"], 15_000)
         self.assertEqual(snapshot["run_paused_ms"], 30_000)
+        self.assertEqual(snapshot["run_total_ms"], 45_000)
+        self.assertEqual(snapshot["batch_total_ms"], 45_000)
         with self.db._connect() as conn:
             attempt = conn.execute(
                 "SELECT * FROM workflow_step_attempts WHERE attempt_id=?",
@@ -233,6 +235,8 @@ class WorkflowTimingTests(unittest.TestCase):
 
         self.assertEqual(snapshot["run_active_ms"], 3_579)
         self.assertEqual(snapshot["run_paused_ms"], 567)
+        self.assertEqual(snapshot["run_total_ms"], 4_146)
+        self.assertEqual(snapshot["batch_total_ms"], 4_146)
         stored = self.db.get_workflow_run("millisecond-run")
         self.assertEqual(stored["active_ms"], 3_579)
         self.assertEqual(stored["paused_ms"], 567)

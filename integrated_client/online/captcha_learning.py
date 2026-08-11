@@ -51,12 +51,22 @@ class CaptchaLearningService(QObject):
 
     policy_changed = pyqtSignal(object)
     upload_completed = pyqtSignal(object)
+    pending_count_changed = pyqtSignal(int)
     model_changed = pyqtSignal(str, str)
 
-    def __init__(self, session_manager, parent=None, model_manager=None):
+    def __init__(
+        self,
+        session_manager,
+        parent=None,
+        model_manager=None,
+        database=None,
+        server_account_id=None,
+    ):
         super().__init__(parent)
         self.session_manager = session_manager
         self.model_manager = model_manager or CaptchaModelManager()
+        self.database = database
+        self.server_account_id = str(server_account_id or "").strip()
         self.policy = {
             "upload_mode": UPLOAD_MODE_OFF,
             "upload_enabled": False,
@@ -71,6 +81,7 @@ class CaptchaLearningService(QObject):
         self._loading_policy = False
         self._refresh_pending = False
         self._downloading_models = set()
+        self._uploading_outbox_ids = set()
         self._timer = QTimer(self)
         self._timer.setInterval(60_000)
         self._timer.timeout.connect(self.refresh_policy)
@@ -79,6 +90,7 @@ class CaptchaLearningService(QObject):
     def start(self):
         self._stopped = False
         self._timer.start()
+        self._emit_pending_count()
         QTimer.singleShot(0, self.refresh_policy)
 
     def stop(self):
@@ -88,6 +100,7 @@ class CaptchaLearningService(QObject):
         self._loading_policy = False
         self._refresh_pending = False
         self._downloading_models.clear()
+        self._uploading_outbox_ids.clear()
 
     def upload_mode(self) -> str:
         mode = str(self.policy.get("upload_mode") or "")
@@ -160,9 +173,16 @@ class CaptchaLearningService(QObject):
         if error is not None:
             get_logger().warning("Could not refresh CAPTCHA learning policy: %s", error)
         else:
+            previous_mode = self.upload_mode()
             self.policy = dict(result or {})
             self.policy_changed.emit(self.policy)
+            self._emit_pending_count()
             self._sync_active_models()
+            if (
+                previous_mode != UPLOAD_MODE_SAMPLES_AND_METRICS
+                and self.upload_mode() == UPLOAD_MODE_SAMPLES_AND_METRICS
+            ):
+                QTimer.singleShot(0, self.retry_pending)
         if refresh_again:
             QTimer.singleShot(0, self.refresh_policy)
 
@@ -372,13 +392,108 @@ class CaptchaLearningService(QObject):
                 except OSError:
                     pass
 
+    def _resolved_server_account_id(self) -> str:
+        if self.server_account_id:
+            return self.server_account_id
+        state = getattr(self.session_manager, "state", None)
+        account = getattr(state, "account", None)
+        return str(getattr(account, "server_account_id", None) or "").strip()
+
+    def pending_upload_count(self) -> int:
+        account_id = self._resolved_server_account_id()
+        if self.database is None or not account_id:
+            return 0
+        try:
+            return self.database.get_captcha_upload_pending_count(account_id)
+        except Exception as exc:  # noqa: BLE001 - keep the business UI responsive
+            get_logger().warning("Could not count pending CAPTCHA uploads: %s", exc)
+            return 0
+
+    def _emit_pending_count(self) -> None:
+        self.pending_count_changed.emit(self.pending_upload_count())
+
+    def retry_pending(self) -> int:
+        """Retry persisted CAPTCHA samples when collection is currently allowed."""
+        if self._stopped or self.upload_mode() != UPLOAD_MODE_SAMPLES_AND_METRICS:
+            return 0
+        account_id = self._resolved_server_account_id()
+        if self.database is None or not account_id:
+            return 0
+        capacity = max(0, MAX_BACKGROUND_TASKS - len(self._tasks))
+        if capacity <= 0:
+            return 0
+        try:
+            rows = self.database.get_pending_captcha_uploads(account_id, limit=500)
+        except Exception as exc:  # noqa: BLE001 - local persistence failure
+            get_logger().warning("Could not read pending CAPTCHA uploads: %s", exc)
+            return 0
+        started = 0
+        for row in rows:
+            if started >= capacity:
+                break
+            if self._start_queued_upload(row["id"], row["payload"]):
+                started += 1
+        self._emit_pending_count()
+        return started
+
+    def _start_queued_upload(self, outbox_id: int, payload: dict) -> bool:
+        outbox_id = int(outbox_id)
+        if (
+            self._stopped
+            or outbox_id in self._uploading_outbox_ids
+            or len(self._tasks) >= MAX_BACKGROUND_TASKS
+        ):
+            return False
+        self._uploading_outbox_ids.add(outbox_id)
+
+        def upload():
+            token = self.session_manager.access_token()
+            return self.session_manager.api.submit_captcha_attempt(token, payload)
+
+        task = self._start_task(
+            upload,
+            lambda result, error, row_id=outbox_id: self._queued_attempt_uploaded(
+                row_id,
+                result,
+                error,
+            ),
+        )
+        if task is None:
+            self._uploading_outbox_ids.discard(outbox_id)
+            return False
+        return True
+
+    def _queued_attempt_uploaded(self, outbox_id, result, error):
+        self._uploading_outbox_ids.discard(int(outbox_id))
+        try:
+            if error is not None:
+                self.database.mark_captcha_upload_failed(outbox_id, str(error))
+            else:
+                self.database.mark_captcha_upload_sent(outbox_id)
+        except Exception as persistence_error:  # noqa: BLE001 - preserve diagnostics
+            get_logger().warning(
+                "Could not update pending CAPTCHA upload %s: %s",
+                outbox_id,
+                persistence_error,
+            )
+        self._emit_pending_count()
+        if error is not None:
+            get_logger().warning("Could not upload CAPTCHA attempt: %s", error)
+            return
+        self.upload_completed.emit(result or {})
+        if (
+            result
+            and int(result.get("policy_revision") or 0)
+            > int(self.policy.get("revision") or 0)
+        ):
+            self.refresh_policy()
+
     def record_attempt(self, event: dict) -> bool:
         upload_mode = self.upload_mode()
         if (
             self._stopped
             or upload_mode == UPLOAD_MODE_OFF
             or not isinstance(event, dict)
-            or len(self._tasks) >= MAX_BACKGROUND_TASKS
         ):
             return False
         success = bool(event.get("success"))
@@ -409,6 +524,27 @@ class CaptchaLearningService(QObject):
                         "answer": answer,
                     }
                 )
+
+        if "image_base64" in payload:
+            account_id = self._resolved_server_account_id()
+            if self.database is not None and account_id:
+                try:
+                    outbox_id = self.database.enqueue_captcha_upload(
+                        account_id,
+                        payload,
+                    )
+                except Exception as exc:  # noqa: BLE001 - fall back to direct upload
+                    get_logger().warning(
+                        "Could not persist CAPTCHA upload before sending: %s",
+                        exc,
+                    )
+                else:
+                    self._emit_pending_count()
+                    self._start_queued_upload(outbox_id, payload)
+                    return True
+
+        if len(self._tasks) >= MAX_BACKGROUND_TASKS:
+            return False
 
         def upload():
             token = self.session_manager.access_token()
