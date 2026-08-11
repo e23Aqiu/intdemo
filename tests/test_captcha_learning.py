@@ -25,6 +25,7 @@ from integrated_client.database import Database
 from integrated_client.online.captcha_learning import CaptchaLearningService
 from integrated_client.tools.transport_tool import (
     BusinessBackfillWorker,
+    CONFIG,
     Worker,
     ocr_code,
 )
@@ -564,6 +565,104 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0]["image_bytes"], capture["image_bytes"])
         self.assertEqual(events[0]["answer"]["prompt"], ["甲", "乙"])
+
+    def test_manual_click_keeps_sample_while_success_is_still_loading(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        worker.web_timeout = 10_000
+        capture = {
+            "image_bytes": _click_image(),
+            "prompt": ["甲", "乙"],
+        }
+        points = [{"x": 0.25, "y": 0.4}, {"x": 0.75, "y": 0.6}]
+        clock = [0.0]
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(milliseconds):
+                clock[0] += milliseconds / 1000
+
+        worker.page = Page()
+        events = []
+        logs = []
+        worker.captcha_attempt_signal.connect(events.append)
+        worker.log.connect(logs.append)
+
+        with patch(
+            "integrated_client.tools.transport_tool.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), patch.object(
+            worker,
+            "_prepare_manual_click_capture",
+            return_value=capture,
+        ), patch.object(
+            worker,
+            "_manual_click_points",
+            return_value=points,
+        ), patch.object(
+            worker,
+            "_click_marker_count",
+            return_value=2,
+        ), patch.object(
+            worker,
+            "_business_captcha_loading_is_visible",
+            side_effect=lambda: clock[0] < 4.0,
+        ), patch.object(
+            worker,
+            "_captcha_prompt_is_visible",
+            side_effect=lambda: clock[0] < 6.25,
+        ):
+            self.assertTrue(
+                worker._complete_manual_click_captcha("human-manual")
+            )
+
+        self.assertGreaterEqual(clock[0], 6.25)
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["success"])
+        self.assertEqual(events[0]["image_bytes"], capture["image_bytes"])
+        self.assertEqual(events[0]["answer"]["points"], points)
+        self.assertTrue(any("继续保留本次采集数据" in line for line in logs))
+        self.assertFalse(any("验证码点击错误" in line for line in logs))
+
+    def test_click_captcha_retries_only_after_markers_are_cleared(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+        )
+        worker.web_timeout = 10_000
+        clock = [0.0]
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(milliseconds):
+                clock[0] += milliseconds / 1000
+
+        worker.page = Page()
+        with patch(
+            "integrated_client.tools.transport_tool.time.monotonic",
+            side_effect=lambda: clock[0],
+        ), patch.object(
+            worker,
+            "_captcha_prompt_is_visible",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_business_captcha_loading_is_visible",
+            return_value=False,
+        ), patch.object(worker, "_click_marker_count", return_value=0):
+            result = worker._wait_for_click_captcha_result(2)
+
+        self.assertEqual(result, "retry")
+        self.assertGreaterEqual(clock[0], CONFIG["CAPTCHA_WAIT_SEC"])
 
     def test_machine_learning_page_exports_one_classified_dataset(self):
         session = _FakeSession()
