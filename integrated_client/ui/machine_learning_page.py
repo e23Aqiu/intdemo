@@ -69,6 +69,10 @@ class MachineLearningPage(QWidget):
         self._confirmed_upload_mode = "off"
         self._model_rows = []
         self._build_ui()
+        if self.learning_service is not None:
+            self.learning_service.model_changed.connect(
+                self._active_model_ready
+            )
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(self.REFRESH_INTERVAL_MS)
@@ -176,8 +180,14 @@ class MachineLearningPage(QWidget):
 
         actions = QHBoxLayout()
         self.export_btn = QPushButton("导出数据集")
+        self.export_btn.setToolTip(
+            "导出一个 ZIP，并在包内分类保存数字和文字点选验证码"
+        )
         self.export_btn.clicked.connect(self._export_dataset)
         self.import_btn = QPushButton("导入数据集")
+        self.import_btn.setToolTip(
+            "支持重新导入原格式分类包以及旧版数据集 ZIP"
+        )
         self.import_btn.clicked.connect(self._import_dataset)
         self.train_numeric_btn = QPushButton("训练数字候选模型")
         self.train_numeric_btn.setObjectName("PrimaryButton")
@@ -494,7 +504,7 @@ class MachineLearningPage(QWidget):
         QMessageBox.information(
             self,
             "导出完成",
-            f"数据集已导出，共 {_format_size(size)}。",
+            f"数据集已按验证码类型分类导出，共 {_format_size(size)}。",
         )
 
     def _import_dataset(self):
@@ -663,7 +673,20 @@ class MachineLearningPage(QWidget):
         QMessageBox.information(
             self,
             "模型已应用",
-            f"当前模型已切换为 {(result or {}).get('version')}。",
+            f"服务端当前模型已切换为 {(result or {}).get('version')}。\n"
+            "本客户端正在立即下载并校验，完成后业务自动识别会使用该模型。",
+        )
+        self.refresh()
+
+    def _active_model_ready(self, captcha_type, version):
+        type_name = (
+            "数字验证码"
+            if captcha_type == "numeric"
+            else "文字点选验证码"
+        )
+        self.model_hint.setText(
+            f"{type_name}当前模型 {version} 已下载并校验，"
+            "后续业务自动识别将使用该模型。"
         )
         self.refresh()
 

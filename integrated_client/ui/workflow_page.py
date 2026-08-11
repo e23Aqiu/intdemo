@@ -66,9 +66,11 @@ from ..tools.aiqicha_tool import (
     has_meaningful_value,
 )
 from ..tools.transport_tool import (
+    ASSISTED_PAYMENT_COLUMNS,
     BusinessBackfillWorker,
     Worker,
     is_excel_file_open,
+    resolve_assisted_payment_column,
 )
 from .frameless import FramelessMessageBox as QMessageBox
 from .tencent_docs_dialog import (
@@ -212,7 +214,7 @@ class WorkflowPage(QWidget):
     """统一编排运输证、营运回填、爱企查查询的三步流水线。"""
 
     browser_check_completed = pyqtSignal(bool, str, str)
-    REQUIRED_COLUMNS = ("车辆标识", "已协助补缴")
+    REQUIRED_COLUMNS = ("车辆标识",)
     # 约 60 帧/秒刷新计时文本；16 不是 10 的整数倍，可避免毫秒
     # 末位长期只在少数固定数字间变化。
     TIMING_DISPLAY_INTERVAL_MS = 16
@@ -223,6 +225,21 @@ class WorkflowPage(QWidget):
         "正在检测内置浏览器 ··",
         "正在检测内置浏览器 ···",
     )
+
+    @classmethod
+    def missing_required_columns(cls, columns):
+        available = {
+            str(column).strip()
+            for column in columns
+            if column is not None and str(column).strip()
+        }
+        missing = [
+            name for name in cls.REQUIRED_COLUMNS if name not in available
+        ]
+        if resolve_assisted_payment_column(available) is None:
+            aliases = " / ".join(ASSISTED_PAYMENT_COLUMNS)
+            missing.append(aliases)
+        return missing
 
     def __init__(
         self,
@@ -259,6 +276,8 @@ class WorkflowPage(QWidget):
         self.stopping = False
         self.awaiting_login = False
         self._backfill_browser_loading = False
+        self._aiqicha_browser_loading = False
+        self._aiqicha_loading_notice_shown = False
         self._task_id = None
         self._stats_recorded = False
         self._last_file_mtime = None
@@ -1226,7 +1245,7 @@ class WorkflowPage(QWidget):
             return
         if not self._reload_preview(force=True):
             return
-        missing = [name for name in self.REQUIRED_COLUMNS if name not in self.df.columns]
+        missing = self.missing_required_columns(self.df.columns)
         if missing:
             QMessageBox.warning(self, "表格列不完整", f"业务表格缺少：{', '.join(missing)}")
             return
@@ -1243,6 +1262,9 @@ class WorkflowPage(QWidget):
 
         self.stopping = False
         self.awaiting_login = False
+        self._backfill_browser_loading = False
+        self._aiqicha_browser_loading = False
+        self._aiqicha_loading_notice_shown = False
         self._task_id = uuid.uuid4().hex
         self._stats_recorded = False
         self._timing_finished_steps = set()
@@ -1452,10 +1474,49 @@ class WorkflowPage(QWidget):
         worker.login_required_signal.connect(self._on_login_required)
         worker.pause_signal.connect(lambda: self._on_pause_requested(3, "等待完成爱企查验证"))
         worker.resume_signal.connect(self._on_aiqicha_resumed)
+        worker.browser_loading_started.connect(
+            self._on_aiqicha_browser_loading_started
+        )
+        worker.browser_loading_finished.connect(
+            self._on_aiqicha_browser_loading_finished
+        )
         if hasattr(worker, "retry_signal"):
             worker.retry_signal.connect(self._timing_retry)
         worker.finished_signal.connect(lambda success, obj=worker: self._aiqicha_finished(obj, success))
+        self._on_aiqicha_browser_loading_started()
         worker.start()
+
+    def _on_aiqicha_browser_loading_started(self):
+        if (
+            not self.pipeline_running
+            or self.stopping
+            or self.current_step != 3
+        ):
+            return
+        self._aiqicha_browser_loading = True
+        self._timing_pause("等待步骤 3 爱企查页面加载")
+        if not self.continue_btn.isEnabled():
+            self._set_step_status(3, "等待爱企查页面加载", "paused")
+        if not self._aiqicha_loading_notice_shown:
+            self._aiqicha_loading_notice_shown = True
+            self._log(
+                "步骤 3 加载爱企查首页及查询结果页时，不计入有效用时，"
+                "但仍计入本批次总用时。"
+            )
+
+    def _on_aiqicha_browser_loading_finished(self):
+        if not self._aiqicha_browser_loading:
+            return
+        self._aiqicha_browser_loading = False
+        if (
+            not self.pipeline_running
+            or self.stopping
+            or self.current_step != 3
+        ):
+            return
+        if not self.continue_btn.isEnabled() and not self.awaiting_login:
+            self._timing_resume("步骤 3 爱企查页面加载完成")
+            self._set_step_status(3, "正在查询", "running")
 
     def _on_login_required(self):
         self.awaiting_login = True
@@ -1467,10 +1528,13 @@ class WorkflowPage(QWidget):
 
     def _on_aiqicha_resumed(self):
         self.awaiting_login = False
-        self._timing_resume("爱企查登录或验证已完成")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
-        self._set_step_status(3, "正在查询", "running")
+        if self._aiqicha_browser_loading:
+            self._set_step_status(3, "等待爱企查页面加载", "paused")
+        else:
+            self._timing_resume("爱企查登录或验证已完成")
+            self._set_step_status(3, "正在查询", "running")
 
     def _on_aiqicha_row(self, row_index, values):
         self.model.update_row(row_index, values)
@@ -1479,6 +1543,7 @@ class WorkflowPage(QWidget):
     def _aiqicha_finished(self, worker, success):
         if worker is not self.current_worker:
             return
+        self._aiqicha_browser_loading = False
         self._retire_worker(worker)
         saved = self._save_aiqicha_results()
         if self.stopping:
@@ -1702,7 +1767,11 @@ class WorkflowPage(QWidget):
             self.awaiting_login = False
         else:
             worker.resume()
-        if not self._backfill_browser_loading:
+        browser_loading = (
+            self._backfill_browser_loading
+            or self._aiqicha_browser_loading
+        )
+        if not browser_loading:
             self._timing_resume("用户继续执行")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
@@ -1710,10 +1779,10 @@ class WorkflowPage(QWidget):
             self.current_step,
             (
                 "等待浏览器加载"
-                if self._backfill_browser_loading
+                if browser_loading
                 else "正在执行"
             ),
-            "paused" if self._backfill_browser_loading else "running",
+            "paused" if browser_loading else "running",
         )
         self._log("流水线已恢复执行。")
 
@@ -1751,6 +1820,8 @@ class WorkflowPage(QWidget):
         self.current_worker = None
         self.awaiting_login = False
         self._backfill_browser_loading = False
+        self._aiqicha_browser_loading = False
+        self._aiqicha_loading_notice_shown = False
         self._set_controls_running(False)
         self._reload_preview(force=True)
         self._log(("✅ " if success else "⚠️ ") + message)

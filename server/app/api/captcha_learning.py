@@ -548,12 +548,16 @@ def export_captcha_dataset(
         statement = statement.where(CaptchaSample.captcha_type == captcha_type)
     samples = db.scalars(statement).all()
     manifest_samples = []
+    category_counts = {kind: 0 for kind in sorted(CAPTCHA_TYPES)}
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for sample in samples:
             extension = ".png" if sample.image_mime == "image/png" else ".jpg"
-            image_name = f"images/{sample.id}{extension}"
+            image_name = (
+                f"images/{sample.captcha_type}/{sample.id}{extension}"
+            )
             archive.writestr(image_name, sample.image_data)
+            category_counts[sample.captcha_type] += 1
             manifest_samples.append(
                 {
                     "id": str(sample.id),
@@ -569,6 +573,19 @@ def export_captcha_dataset(
             )
         manifest = {
             "schema_version": DATASET_SCHEMA_VERSION,
+            "captcha_type": captcha_type or "mixed",
+            "categories": {
+                "numeric": {
+                    "label": "数字验证码",
+                    "image_directory": "images/numeric/",
+                    "sample_count": category_counts["numeric"],
+                },
+                "click": {
+                    "label": "文字点选验证码",
+                    "image_directory": "images/click/",
+                    "sample_count": category_counts["click"],
+                },
+            },
             "exported_at": utcnow().isoformat(),
             "sample_count": len(manifest_samples),
             "samples": manifest_samples,
@@ -662,6 +679,14 @@ def _safe_archive(archive_bytes: bytes) -> tuple[zipfile.ZipFile, dict[str, Any]
     if (
         not isinstance(manifest, dict)
         or manifest.get("schema_version") != DATASET_SCHEMA_VERSION
+        or (
+            manifest.get("captcha_type") is not None
+            and (
+                not isinstance(manifest.get("captcha_type"), str)
+                or manifest.get("captcha_type")
+                not in CAPTCHA_TYPES | {"mixed"}
+            )
+        )
         or not isinstance(manifest.get("samples"), list)
         or len(manifest.get("samples")) > MAX_ARCHIVE_FILES - 1
     ):
@@ -719,6 +744,7 @@ async def import_captcha_dataset(
             status_code=413,
         )
     archive, manifest = _safe_archive(archive_bytes)
+    declared_captcha_type = manifest.get("captcha_type")
     imported = 0
     duplicates = 0
     skipped = 0
@@ -731,6 +757,11 @@ async def import_captcha_dataset(
                 source = str(item.get("source") or "")
                 model_version = str(item.get("model_version") or "imported")[:80]
                 image_name = str(item.get("image") or "")
+                if (
+                    declared_captcha_type in CAPTCHA_TYPES
+                    and captcha_type != declared_captcha_type
+                ):
+                    raise ValueError("sample type does not match dataset type")
                 if source != CAPTCHA_SOURCE_BY_TYPE.get(captcha_type):
                     raise ValueError("invalid type or source")
                 image_info = archive.getinfo(image_name)

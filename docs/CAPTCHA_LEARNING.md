@@ -78,22 +78,26 @@ SHA-256 上传服务端。
 
 ## 数据集导入与导出
 
-管理员可导出全部数据，训练某一类型时客户端会请求该类型的 ZIP。压缩包结构：
+管理员一次导出全部数据，ZIP 内按验证码类型分目录；导出的原 ZIP 可以直接重新
+导入。训练某一类型时客户端仍可在后台请求该类型的样本子集。压缩包结构：
 
 ```text
 manifest.json
-images/<sample-uuid>.png
-images/<sample-uuid>.jpg
+images/numeric/<sample-uuid>.png
+images/numeric/<sample-uuid>.jpg
+images/click/<sample-uuid>.png
+images/click/<sample-uuid>.jpg
 ```
 
-`manifest.json` 的 `schema_version` 当前为 `1`，每条样本包含：
+`manifest.json` 的 `schema_version` 当前为 `1`，`categories` 同时记录数字与文字
+点选目录、显示名称和样本数量；每条样本包含：
 
 ```json
 {
   "id": "UUID",
   "captcha_type": "numeric",
   "source": "transport_numeric",
-  "image": "images/UUID.png",
+  "image": "images/numeric/UUID.png",
   "image_mime": "image/png",
   "answer": {"value": "1234"},
   "model_version": "human-manual",

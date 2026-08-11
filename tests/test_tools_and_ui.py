@@ -75,10 +75,13 @@ from integrated_client.tools.aiqicha_tool import (
 )
 from integrated_client.tools.aiqicha_tool import MainWindow as AiqichaToolWidget
 from integrated_client.tools.transport_tool import (
+    ASSISTED_PAYMENT_COLUMNS,
     CONFIG,
     BusinessBackfillWorker,
     TargetedWorkbookWriter,
     Worker,
+    has_assisted_payment,
+    resolve_assisted_payment_column,
 )
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
 from integrated_client.ui.dashboard_page import (
@@ -173,6 +176,48 @@ class ToolAndUiTests(unittest.TestCase):
             self.assertIn(name, header)
             self.assertEqual(sheet.cell(1, header[name]).value, name)
 
+    def test_assisted_payment_column_aliases_keep_the_same_rule(self):
+        self.assertEqual(
+            ASSISTED_PAYMENT_COLUMNS,
+            ("备注", "已协助补缴"),
+        )
+        self.assertEqual(
+            resolve_assisted_payment_column(["车辆标识", "备注"]),
+            "备注",
+        )
+        self.assertEqual(
+            resolve_assisted_payment_column(["车辆标识", "已协助补缴"]),
+            "已协助补缴",
+        )
+        self.assertTrue(has_assisted_payment(pd.Series({"备注": "是"})))
+        self.assertTrue(
+            has_assisted_payment(pd.Series({"已协助补缴": "已处理"}))
+        )
+        self.assertTrue(
+            has_assisted_payment(
+                pd.Series({"备注": "", "已协助补缴": "是"})
+            )
+        )
+        self.assertFalse(
+            has_assisted_payment(
+                pd.Series({"备注": "", "已协助补缴": ""})
+            )
+        )
+        self.assertEqual(
+            WorkflowPage.missing_required_columns(["车辆标识", "备注"]),
+            [],
+        )
+        self.assertEqual(
+            WorkflowPage.missing_required_columns(
+                ["车辆标识", "已协助补缴"]
+            ),
+            [],
+        )
+        self.assertIn(
+            "备注 / 已协助补缴",
+            WorkflowPage.missing_required_columns(["车辆标识"]),
+        )
+
     def test_targeted_writer_preserves_rows_below_a_blank_row_and_workbook_layout(self):
         file_path = Path(self.temp_dir.name) / "targeted-write.xlsx"
         workbook = Workbook()
@@ -241,7 +286,7 @@ class ToolAndUiTests(unittest.TestCase):
         sheet["H1"] = "车辆所有人/企业"
         sheet["H2"] = "示例公司"
         sheet["O1"] = "站场"
-        sheet["P1"] = "已协助补缴"
+        sheet["P1"] = "备注"
         for row in range(1, 4):
             for column in range(17, 20):
                 sheet.cell(row, column).fill = PatternFill("solid", fgColor="FFF2CC")
@@ -275,6 +320,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(sheet["R2"].value, "查询成功")
         self.assertEqual(sheet["S1"].value, "回填状态")
         self.assertEqual(sheet["S2"].value, "回填成功")
+        self.assertEqual(sheet["P1"].value, "备注")
         self.assertEqual(sheet["H1"].value, "车辆所有人/企业")
         self.assertEqual(sheet["H2"].value, "示例公司")
         for column in ("T", "U", "V"):
@@ -375,6 +421,62 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(sheet.cell(2, headers["车辆所有人/企业"]).value, "无运输证号")
         self.assertEqual(sheet.cell(2, headers["查询状态"]).value, "已有企业信息（跳过）")
         saved.close()
+
+    def test_transport_worker_accepts_note_as_assisted_payment_column(self):
+        file_path = Path(self.temp_dir.name) / "note-column.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.append(["车辆标识", "备注"])
+        sheet.append(["粤A12345_黄色", "已协助补缴"])
+        workbook.save(file_path)
+        workbook.close()
+
+        class Page:
+            def __init__(self):
+                self.goto_calls = 0
+
+            def goto(self, *_args, **_kwargs):
+                self.goto_calls += 1
+
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        worker = Worker(
+            str(file_path),
+            True,
+            False,
+            2,
+            True,
+            2,
+            False,
+        )
+        page = Page()
+        worker.page = page
+        results = []
+        worker.finished.connect(results.append)
+        with patch.object(
+            worker,
+            "_create_browser_until_ready",
+            return_value=True,
+        ):
+            worker.run()
+
+        self.assertEqual(results, ["完成"])
+        self.assertEqual(page.goto_calls, 1)
+        saved = load_workbook(file_path)
+        try:
+            headers = {
+                cell.value: cell.column
+                for cell in saved.active[1]
+                if cell.value is not None
+            }
+            self.assertEqual(
+                saved.active.cell(2, headers["查询状态"]).value,
+                "已补缴（无需查询）",
+            )
+        finally:
+            saved.close()
 
     def test_transport_worker_restarts_closed_browser_without_limit(self):
         file_path = Path(self.temp_dir.name) / "transport-browser-restart.xlsx"
@@ -705,7 +807,12 @@ class ToolAndUiTests(unittest.TestCase):
                 self.first = self
 
             def count(self):
-                return 0 if self.selector == ".layui-layer-content" else 1
+                return (
+                    0
+                    if self.selector
+                    in {".layui-layer-content", "#licenseBody > tr"}
+                    else 1
+                )
 
             def is_visible(self):
                 if self.selector == ".verify-msg":
@@ -744,6 +851,101 @@ class ToolAndUiTests(unittest.TestCase):
         page.captcha_visible = True
         self.assertTrue(worker._captcha_prompt_is_visible())
         self.assertFalse(worker._business_result_is_ready())
+
+    def test_business_result_reads_updated_license_table(self):
+        worker = BusinessBackfillWorker("unused.xlsx", True, True, 2, False)
+
+        class Cell:
+            def __init__(self, value, visible=True):
+                self.value = value
+                self.visible = visible
+
+            def is_visible(self):
+                return self.visible
+
+            @staticmethod
+            def input_value():
+                raise RuntimeError("table cell is not an input")
+
+            def text_content(self):
+                return self.value
+
+        class Cells:
+            def __init__(self, values):
+                self.values = values
+
+            def count(self):
+                return len(self.values)
+
+            def nth(self, index):
+                return Cell(self.values[index])
+
+        class Row:
+            def __init__(self, values, visible=True):
+                self.values = values
+                self.visible = visible
+
+            def is_visible(self):
+                return self.visible
+
+            def locator(self, selector):
+                if selector != "td":
+                    raise AssertionError(f"unexpected row selector: {selector}")
+                return Cells(self.values)
+
+        class Rows:
+            def __init__(self):
+                self.rows = [
+                    Row(["1", "上一条旧企业"], visible=False),
+                    Row(["暂无数据"]),
+                    Row(
+                        [
+                            "1",
+                            "衡水胜大物流有限公司",
+                            "营业",
+                            "131******996",
+                            "桃城区行政审批局",
+                        ]
+                    ),
+                ]
+
+            def count(self):
+                return len(self.rows)
+
+            def nth(self, index):
+                return self.rows[index]
+
+        class EmptyLocator:
+            first = None
+
+            @staticmethod
+            def count():
+                return 0
+
+        class Page:
+            def __init__(self):
+                self.waits = []
+
+            def locator(self, selector):
+                if selector == "#licenseBody > tr":
+                    return Rows()
+                if selector == "#ownerName2":
+                    raise AssertionError("new result table should take priority")
+                return EmptyLocator()
+
+            def wait_for_timeout(self, milliseconds):
+                self.waits.append(milliseconds)
+
+        page = Page()
+        worker.page = page
+
+        self.assertEqual(
+            worker._business_owner_name(),
+            "衡水胜大物流有限公司",
+        )
+        self.assertTrue(worker._business_result_is_ready())
+        self.assertTrue(worker._wait_for_business_result())
+        self.assertEqual(page.waits, [])
 
     def test_business_result_field_falls_back_to_plain_text(self):
         class TextLocator:
@@ -987,8 +1189,15 @@ class ToolAndUiTests(unittest.TestCase):
         )
         login_requests = []
         logs = []
+        loading_events = []
         worker.login_required_signal.connect(lambda: login_requests.append(True))
         worker.log_signal.connect(logs.append)
+        worker.browser_loading_started.connect(
+            lambda: loading_events.append("start")
+        )
+        worker.browser_loading_finished.connect(
+            lambda: loading_events.append("finish")
+        )
         with patch(
             "integrated_client.tools.aiqicha_tool.create_browser",
             return_value=page,
@@ -1003,6 +1212,25 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(page.home_calls, 1)
         self.assertEqual(login_requests, [])
         self.assertTrue(any("无需重复登录" in message for message in logs))
+        self.assertEqual(loading_events, ["start", "finish"])
+
+        with patch(
+            "integrated_client.tools.aiqicha_tool.search_company"
+        ) as search, patch.object(
+            worker,
+            "_wait_for_results",
+            return_value=True,
+        ) as wait_for_results:
+            self.assertTrue(worker._load_company_results("测试运输有限公司"))
+
+        search.assert_called_once_with(page, "测试运输有限公司")
+        wait_for_results.assert_called_once_with(
+            timeout=AIQICHA_RESULT_WAIT_SECONDS
+        )
+        self.assertEqual(
+            loading_events,
+            ["start", "finish", "start", "finish"],
+        )
 
     def test_aiqicha_persisted_login_requires_baidu_auth_cookie(self):
         class Page:
@@ -3773,6 +4001,63 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(page.awaiting_login)
         self.assertEqual(timing.resume_reasons, ["用户继续执行"])
         page.current_worker = None
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_step_three_page_loading_is_excluded_from_active_time(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        station = next(
+            account
+            for account in self.db.list_accounts()
+            if account.username == "luogang"
+        )
+        clock = [2000.0]
+        timing = WorkflowTimingService(
+            self.db,
+            station.id,
+            clock=lambda: clock[0],
+        )
+        dataframe = pd.DataFrame(
+            {
+                "车辆标识": ["粤A12345_黄色"],
+                "已协助补缴": [""],
+                "原因": [""],
+            }
+        )
+        timing.start_run(
+            Path(self.temp_dir.name) / "aiqicha-loading.xlsx",
+            dataframe,
+            run_id="aiqicha-loading-run",
+        )
+        timing.start_step(3)
+        page = WorkflowPage(timing_service=timing)
+        page.pipeline_running = True
+        page.current_step = 3
+
+        page._on_aiqicha_browser_loading_started()
+        page._on_aiqicha_browser_loading_started()
+        clock[0] += 73.625
+        loading_snapshot = timing.snapshot()
+        page._refresh_timing_label(loading_snapshot)
+
+        self.assertEqual(loading_snapshot["run_active_ms"], 0)
+        self.assertEqual(loading_snapshot["run_paused_ms"], 73_625)
+        self.assertEqual(loading_snapshot["run_total_ms"], 73_625)
+        self.assertIn("本次有效用时 00:00:00.000", page.timing_label.text())
+        self.assertIn("本批次总用时 00:01:13.625", page.timing_label.text())
+
+        page._on_aiqicha_browser_loading_finished()
+        clock[0] += 6.375
+        snapshot = timing.finish_run("succeeded")
+        page._refresh_timing_label(snapshot)
+
+        self.assertEqual(snapshot["run_active_ms"], 6_375)
+        self.assertEqual(snapshot["run_paused_ms"], 73_625)
+        self.assertEqual(snapshot["run_total_ms"], 80_000)
+        self.assertIn("本次有效用时 00:00:06.375", page.timing_label.text())
+        self.assertIn("本批次总用时 00:01:20.000", page.timing_label.text())
+        self.assertFalse(page._aiqicha_browser_loading)
+        self.assertIn("仍计入本批次总用时", page.log_text.toPlainText())
         self.assertTrue(page.shutdown())
         page.close()
 

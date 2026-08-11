@@ -44,11 +44,43 @@ os.environ["DDDOCR_NO_LOG"] = "1"
 os.environ["PLAYWRIGHT_LOG"] = "none"
 os.environ["PLAYWRIGHT_LOCAL_LOG_DIR"] = os.devnull
 
+ASSISTED_PAYMENT_COLUMNS = ("备注", "已协助补缴")
+
+
+def resolve_assisted_payment_column(columns):
+    """返回当前业务表中的补缴标记列，优先使用新版“备注”。"""
+    available = {
+        str(column).strip()
+        for column in columns
+        if column is not None and str(column).strip()
+    }
+    return next(
+        (name for name in ASSISTED_PAYMENT_COLUMNS if name in available),
+        None,
+    )
+
+
+def has_assisted_payment(row):
+    """新旧列任意一个包含内容时，沿用原规则视为已协助补缴。"""
+    getter = getattr(row, "get", None)
+    if not callable(getter):
+        return False
+    for column_name in ASSISTED_PAYMENT_COLUMNS:
+        value = getter(column_name, None)
+        try:
+            if pd.isna(value):
+                continue
+        except (TypeError, ValueError):
+            pass
+        if str(value).strip():
+            return True
+    return False
+
 
 class TargetedWorkbookWriter:
     """只更新指定结果单元格，并通过同目录原子替换保存工作簿。"""
 
-    RESULT_COLUMN_ANCHOR = "已协助补缴"
+    RESULT_COLUMN_ANCHORS = ASSISTED_PAYMENT_COLUMNS
 
     def __init__(self, file_path, target_columns):
         self.file_path = Path(file_path)
@@ -86,7 +118,7 @@ class TargetedWorkbookWriter:
         return None
 
     def _next_result_column(self):
-        anchor_index = self.column_indexes.get(self.RESULT_COLUMN_ANCHOR)
+        anchor_index = self._result_column_anchor_index()
         last_used_column = max(
             self.sheet.max_column,
             max(self.column_indexes.values(), default=0),
@@ -101,7 +133,7 @@ class TargetedWorkbookWriter:
         return last_used_column + 1
 
     def _move_existing_result_column_left(self, column_name):
-        anchor_index = self.column_indexes.get(self.RESULT_COLUMN_ANCHOR)
+        anchor_index = self._result_column_anchor_index()
         source_column = self.column_indexes[column_name]
         if anchor_index is None or source_column <= anchor_index + 1:
             return
@@ -118,6 +150,16 @@ class TargetedWorkbookWriter:
             source_cell.value = None
         self.column_indexes[column_name] = destination_column
         self.dirty = True
+
+    def _result_column_anchor_index(self):
+        return next(
+            (
+                self.column_indexes[name]
+                for name in self.RESULT_COLUMN_ANCHORS
+                if name in self.column_indexes
+            ),
+            None,
+        )
 
     @staticmethod
     def _cell_value(value):
@@ -684,8 +726,10 @@ class Worker(QThread):
                 self.finished.emit("失败")
                 return
 
-            required_cols = ["车辆标识", "已协助补缴"]
+            required_cols = ["车辆标识"]
             missing_cols = [col for col in required_cols if col not in df.columns]
+            if resolve_assisted_payment_column(df.columns) is None:
+                missing_cols.append("备注（兼容“已协助补缴”）")
             if missing_cols:
                 self.log.emit(f"❌ 源表格缺少必要列：{','.join(missing_cols)}")
                 self.finished.emit("失败")
@@ -739,7 +783,6 @@ class Worker(QThread):
                 self.progress.emit(progress)
 
                 plate_identifier = str(row["车辆标识"]).strip()
-                has_paid = row["已协助补缴"]
                 self.log.emit(f"\n[{idx + 1}/{total}] 处理：{plate_identifier}")
 
                 # 检查是否已有运输证号（断点续查）
@@ -769,7 +812,7 @@ class Worker(QThread):
                     self.log.emit("↻ 检测到上次浏览器异常，本行重新查询运输证号")
 
                 # 检查是否已补缴
-                if pd.notna(has_paid) and str(has_paid).strip() != "":
+                if has_assisted_payment(row):
                     df.at[idx, "查询状态"] = "已补缴（无需查询）"
                     self.log.emit("✅ 已补缴，无需查询")
                     save_results(idx)
@@ -990,6 +1033,15 @@ class Worker(QThread):
                                         # only the recognized text.
                                         captcha_code = str(captcha_result or "")
                                         captcha_model_version = "ddddocr-builtin"
+                                    if captcha_model_version not in {
+                                        "human-manual",
+                                        "ddddocr-builtin",
+                                        "ddddocr-unavailable",
+                                    }:
+                                        self.log.emit(
+                                            "✅ 已使用当前数字验证码模型："
+                                            f"{captcha_model_version}"
+                                        )
                                     if not captcha_code:
                                         self._emit_captcha_attempt(
                                             success=False,
@@ -1427,6 +1479,34 @@ class BusinessBackfillWorker(QThread):
         except Exception:
             return None
 
+    def _predict_with_active_click_model(
+        self,
+        image_bytes,
+        bboxes,
+        expected_count,
+    ):
+        """使用管理员当前应用的点选模型，失败时交回内置识别结果。"""
+        custom_model = self._active_model("click")
+        if custom_model is None:
+            return None
+        try:
+            positions = custom_model.predict_click_regions(
+                image_bytes,
+                bboxes,
+            )
+        except Exception:
+            positions = {}
+        if len(positions) >= int(expected_count):
+            version = str(custom_model.version)
+            self.log.emit(f"✅ 已使用当前点选验证码模型：{version}")
+            return positions, version
+        self._emit_captcha_attempt(
+            success=False,
+            model_version=custom_model.version,
+            assisted=False,
+        )
+        return None
+
     def _emit_captcha_attempt(
         self,
         *,
@@ -1585,6 +1665,29 @@ class BusinessBackfillWorker(QThread):
         return ""
 
     def _business_owner_name(self, *, visible_only=False):
+        # The current site renders vehicle results as table rows.  Prefer the
+        # visible result table over the legacy input because the old field can
+        # remain in the DOM as a hidden template with stale data.
+        try:
+            result_rows = self.page.locator("#licenseBody > tr")
+            for row_index in range(result_rows.count()):
+                row = result_rows.nth(row_index)
+                if not row.is_visible():
+                    continue
+                cells = row.locator("td")
+                if cells.count() < 2:
+                    # Loading/empty placeholders commonly use one colspan cell.
+                    continue
+                owner_cell = cells.nth(1)
+                if not owner_cell.is_visible():
+                    continue
+                owner_name = self._result_field_value(owner_cell)
+                if owner_name:
+                    return owner_name
+        except Exception:
+            # Retain compatibility with the previous page structure below.
+            pass
+
         try:
             owner = self.page.locator("#ownerName2")
             if not owner.count():
@@ -1730,24 +1833,32 @@ class BusinessBackfillWorker(QThread):
             image.evaluate(
                 """
                 element => {
-                    window.__intdemoCaptchaClicks = [];
-                    if (element.__intdemoCaptureHandler) {
-                        element.removeEventListener(
+                    const documentRoot = element.ownerDocument;
+                    const ownerWindow = documentRoot.defaultView || window;
+                    ownerWindow.__intdemoCaptchaClicks = [];
+                    if (ownerWindow.__intdemoCaptchaCaptureHandler) {
+                        documentRoot.removeEventListener(
                             'click',
-                            element.__intdemoCaptureHandler,
+                            ownerWindow.__intdemoCaptchaCaptureHandler,
                             true
                         );
                     }
                     const handler = event => {
                         const rect = element.getBoundingClientRect();
                         if (!rect.width || !rect.height) return;
-                        window.__intdemoCaptchaClicks.push({
+                        if (
+                            event.clientX < rect.left ||
+                            event.clientX > rect.right ||
+                            event.clientY < rect.top ||
+                            event.clientY > rect.bottom
+                        ) return;
+                        ownerWindow.__intdemoCaptchaClicks.push({
                             x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
                             y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
                         });
                     };
-                    element.__intdemoCaptureHandler = handler;
-                    element.addEventListener('click', handler, true);
+                    ownerWindow.__intdemoCaptchaCaptureHandler = handler;
+                    documentRoot.addEventListener('click', handler, true);
                 }
                 """
             )
@@ -1761,24 +1872,75 @@ class BusinessBackfillWorker(QThread):
     def _manual_click_points(self, capture):
         if not capture:
             return []
+
+        expected_count = len(capture.get("prompt") or [])
+
+        def normalize(points):
+            normalized = []
+            for point in points or []:
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    x = float(point.get("x"))
+                    y = float(point.get("y"))
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= x <= 1 and 0 <= y <= 1:
+                    normalized.append(
+                        {"x": round(x, 6), "y": round(y, 6)}
+                    )
+            return normalized[:expected_count]
+
         try:
             points = self.page.evaluate(
                 "() => (window.__intdemoCaptchaClicks || []).slice()"
             )
         except Exception:
-            return []
-        normalized = []
-        for point in points or []:
-            if not isinstance(point, dict):
-                continue
-            try:
-                x = float(point.get("x"))
-                y = float(point.get("y"))
-            except (TypeError, ValueError):
-                continue
-            if 0 <= x <= 1 and 0 <= y <= 1:
-                normalized.append({"x": round(x, 6), "y": round(y, 6)})
-        return normalized[: len(capture.get("prompt") or [])]
+            points = []
+        normalized = normalize(points)
+        if expected_count and len(normalized) == expected_count:
+            return normalized
+
+        # The site places the actual click target above `.back-img`, so older
+        # builds often missed every event.  The numbered `.point-area` markers
+        # are rendered before the captcha closes and provide a reliable second
+        # source for the same normalized coordinates.
+        try:
+            marker_points = self.page.evaluate(
+                """
+                () => {
+                    const image = document.querySelector('.back-img');
+                    if (!image) return [];
+                    const rect = image.getBoundingClientRect();
+                    if (!rect.width || !rect.height) return [];
+                    return Array.from(document.querySelectorAll('.point-area'))
+                        .filter(marker => {
+                            const style = window.getComputedStyle(marker);
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                markerRect.width > 0 && markerRect.height > 0 &&
+                                clientX >= rect.left && clientX <= rect.right &&
+                                clientY >= rect.top && clientY <= rect.bottom;
+                        })
+                        .map(marker => {
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return {
+                                x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+                                y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
+                            };
+                        });
+                }
+                """
+            )
+        except Exception:
+            marker_points = []
+        marker_points = normalize(marker_points)
+        return marker_points if marker_points else normalized
 
     def _report_successful_click_captcha(
         self,
@@ -1800,6 +1962,10 @@ class BusinessBackfillWorker(QThread):
         prompt = list(capture.get("prompt") or [])
         points = list(points or [])
         if not prompt or len(prompt) != len(points):
+            self.log.emit(
+                "⚠️ 点选验证码已通过，但采集点位不完整"
+                f"（{len(points)}/{len(prompt)}），本次仅记录成功统计。"
+            )
             self._emit_captcha_attempt(success=True, **attempt)
             return
         attempt.update(
@@ -2054,27 +2220,15 @@ class BusinessBackfillWorker(QThread):
 
                     self.log.emit(f"✅ 文字识别完成：{char_position_map}")
 
-                    custom_model = self._active_model("click")
-                    if custom_model is not None:
-                        try:
-                            custom_positions = custom_model.predict_click_regions(
-                                img_bytes_final,
-                                bboxes,
-                            )
-                        except Exception:
-                            custom_positions = {}
-                        if len(custom_positions) >= len(target_chars):
-                            char_position_map = custom_positions
-                            attempt_model_version = custom_model.version
-                            self.log.emit(
-                                f"✅ 已使用候选点选模型：{attempt_model_version}"
-                            )
-                        else:
-                            self._emit_captcha_attempt(
-                                success=False,
-                                model_version=custom_model.version,
-                                assisted=False,
-                            )
+                    custom_prediction = self._predict_with_active_click_model(
+                        img_bytes_final,
+                        bboxes,
+                        len(target_chars),
+                    )
+                    if custom_prediction is not None:
+                        char_position_map, attempt_model_version = (
+                            custom_prediction
+                        )
 
                     # 全局匹配+点击
                     self.log.emit("🖱️ 第三步：全局两两对比相似度，开始最优匹配")
@@ -2255,11 +2409,7 @@ class BusinessBackfillWorker(QThread):
                 car_full = str(row["车辆标识"]).strip()
                 cert_no = plate_to_cert.get(car_full, "")
 
-                try:
-                    repaid = str(row["已协助补缴"]).strip()
-                except:
-                    repaid = ""
-                if repaid not in ("", "nan"):
+                if has_assisted_payment(row):
                     self.log.emit(f"✅ 已补缴，跳过：{car_full}")
                     df_original.at[idx, "车辆所有人/企业"] = "已补缴"
                     df_original.at[idx, "回填状态"] = "已补缴"

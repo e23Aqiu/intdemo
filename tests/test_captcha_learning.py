@@ -117,6 +117,7 @@ def _dataset_archive(numeric_count=25, click_count=35):
 class _FakeApi:
     def __init__(self):
         self.attempts = []
+        self.export_types = []
 
     @staticmethod
     def captcha_policy(_token):
@@ -143,9 +144,9 @@ class _FakeApi:
     def admin_update_captcha_policy(_token, _mode):
         return {}
 
-    @staticmethod
-    def admin_export_captcha_dataset(_token, _captcha_type=None):
-        return b""
+    def admin_export_captcha_dataset(self, _token, captcha_type=None):
+        self.export_types.append(captcha_type)
+        return f"dataset-{captcha_type or 'mixed'}".encode("ascii")
 
     @staticmethod
     def admin_import_captcha_dataset(_token, _archive):
@@ -481,6 +482,121 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(click_events[0]["captcha_type"], "click")
         self.assertEqual(len(click_events[0]["answer"]["points"]), 2)
 
+    def test_manual_click_capture_observes_overlay_and_falls_back_to_markers(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            True,
+            2,
+            False,
+            captcha_collection_enabled=lambda: True,
+        )
+        capture_scripts = []
+        page_scripts = []
+
+        class Prompt:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            @staticmethod
+            def inner_text():
+                return "请依次点击【甲,乙】"
+
+        class CaptchaImage:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            @staticmethod
+            def screenshot():
+                return _click_image()
+
+            @staticmethod
+            def evaluate(script):
+                capture_scripts.append(script)
+
+        class Page:
+            @staticmethod
+            def locator(selector):
+                if selector == ".verify-msg":
+                    return Prompt()
+                if selector == ".back-img":
+                    return CaptchaImage()
+                raise AssertionError(f"unexpected selector: {selector}")
+
+            @staticmethod
+            def evaluate(script):
+                page_scripts.append(script)
+                if "__intdemoCaptchaClicks" in script:
+                    return []
+                if "point-area" in script:
+                    return [
+                        {"x": 0.25, "y": 0.4},
+                        {"x": 0.75, "y": 0.6},
+                    ]
+                raise AssertionError("unexpected evaluation script")
+
+        worker.page = Page()
+        capture = worker._prepare_manual_click_capture()
+        self.assertEqual(capture["prompt"], ["甲", "乙"])
+        self.assertEqual(len(capture_scripts), 1)
+        self.assertIn("documentRoot.addEventListener", capture_scripts[0])
+        self.assertIn("ownerWindow.__intdemoCaptchaCaptureHandler", capture_scripts[0])
+
+        points = worker._manual_click_points(capture)
+        self.assertEqual(
+            points,
+            [{"x": 0.25, "y": 0.4}, {"x": 0.75, "y": 0.6}],
+        )
+        self.assertTrue(any("point-area" in script for script in page_scripts))
+
+        events = []
+        worker.captcha_attempt_signal.connect(events.append)
+        worker._report_successful_click_captcha(
+            capture,
+            points,
+            model_version="human-manual",
+            assisted=True,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["image_bytes"], capture["image_bytes"])
+        self.assertEqual(events[0]["answer"]["prompt"], ["甲", "乙"])
+
+    def test_machine_learning_page_exports_one_classified_dataset(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target_path = Path(temp_dir) / "captcha-dataset.zip"
+
+            def immediate(function, completed):
+                completed(function(), None)
+
+            with patch.object(
+                page,
+                "_start",
+                side_effect=immediate,
+            ), patch(
+                "integrated_client.ui.machine_learning_page.QFileDialog.getSaveFileName",
+                return_value=(str(target_path), "ZIP 数据集 (*.zip)"),
+            ), patch(
+                "integrated_client.ui.machine_learning_page.QMessageBox.information"
+            ):
+                page._export_dataset()
+
+            self.assertEqual(session.api.export_types, [None])
+            self.assertEqual(target_path.read_bytes(), b"dataset-mixed")
+            self.assertTrue(page.export_btn.isEnabled())
+            self.assertIn("包内分类", page.export_btn.toolTip())
+            self.assertIn("原格式分类包", page.import_btn.toolTip())
+
+        page.deleteLater()
+
     def test_workers_emit_success_metrics_without_sample_data(self):
         numeric_worker = Worker(
             "unused.xlsx",
@@ -528,6 +644,92 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertTrue(click_events[0]["success"])
         self.assertNotIn("image_bytes", click_events[0])
         self.assertNotIn("answer", click_events[0])
+
+    def test_business_workers_use_the_current_custom_models(self):
+        class NumericModel:
+            version = "numeric-current-1"
+
+            @staticmethod
+            def predict_numeric(_image):
+                return "4826"
+
+        class ClickModel:
+            version = "click-current-1"
+
+            def __init__(self):
+                self.calls = []
+
+            def predict_click_regions(self, image, bboxes):
+                self.calls.append((image, bboxes))
+                return {
+                    "甲": (20, 20),
+                    "乙": (80, 40),
+                }
+
+        numeric_model = NumericModel()
+        click_model = ClickModel()
+
+        class Manager:
+            @staticmethod
+            def get(captcha_type):
+                return {
+                    "numeric": numeric_model,
+                    "click": click_model,
+                }.get(captcha_type)
+
+        class Locator:
+            @staticmethod
+            def screenshot():
+                return _numeric_image("4826")
+
+        class Page:
+            @staticmethod
+            def locator(_selector):
+                return Locator()
+
+        numeric_worker = Worker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            2,
+            False,
+            captcha_model_manager=Manager(),
+        )
+        code, _image, version = ocr_code(
+            Page(),
+            ".captcha",
+            model=numeric_worker._active_model("numeric"),
+            return_details=True,
+        )
+        self.assertEqual((code, version), ("4826", "numeric-current-1"))
+
+        click_worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            True,
+            2,
+            False,
+            captcha_model_manager=Manager(),
+        )
+        logs = []
+        click_worker.log.connect(logs.append)
+        prediction = click_worker._predict_with_active_click_model(
+            b"click-image",
+            [(0, 0, 40, 40), (60, 20, 100, 60)],
+            2,
+        )
+
+        self.assertEqual(
+            prediction,
+            (
+                {"甲": (20, 20), "乙": (80, 40)},
+                "click-current-1",
+            ),
+        )
+        self.assertEqual(len(click_model.calls), 1)
+        self.assertTrue(any("当前点选验证码模型" in line for line in logs))
 
     def test_numeric_custom_model_failure_is_counted_before_builtin_fallback(self):
         class Locator:

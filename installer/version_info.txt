@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 0, 4, 0),
-    prodvers=(1, 0, 4, 0),
+    filevers=(1, 0, 5, 0),
+    prodvers=(1, 0, 5, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -17,12 +17,12 @@ VSVersionInfo(
         [
           StringStruct(u'CompanyName', u'IntDemo'),
           StringStruct(u'FileDescription', u'逃费车辆信息智能查询平台'),
-          StringStruct(u'FileVersion', u'1.0.4'),
+          StringStruct(u'FileVersion', u'1.0.5'),
           StringStruct(u'InternalName', u'IntDemoOnline'),
           StringStruct(u'LegalCopyright', u'Copyright © 2026'),
           StringStruct(u'OriginalFilename', u'逃费车辆信息智能查询平台.exe'),
           StringStruct(u'ProductName', u'逃费车辆信息智能查询平台'),
-          StringStruct(u'ProductVersion', u'1.0.4')
+          StringStruct(u'ProductVersion', u'1.0.5')
         ]
       )
     ]),

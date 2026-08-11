@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import zipfile
 from datetime import UTC, datetime
 
@@ -159,6 +160,11 @@ def test_dataset_export_import_and_model_activation(client):
         headers=auth_header(user),
         json=_numeric_attempt(success=True),
     )
+    client.post(
+        "/api/v1/captcha/attempts",
+        headers=auth_header(user),
+        json=_click_attempt(),
+    )
 
     exported = client.get(
         "/api/v1/admin/ml/dataset/export",
@@ -167,7 +173,61 @@ def test_dataset_export_import_and_model_activation(client):
     assert exported.status_code == 200
     with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
         assert "manifest.json" in archive.namelist()
-        assert len([name for name in archive.namelist() if name.startswith("images/")]) == 1
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["captcha_type"] == "mixed"
+        assert manifest["categories"]["numeric"]["sample_count"] == 1
+        assert manifest["categories"]["click"]["sample_count"] == 1
+        assert len(
+            [
+                name
+                for name in archive.namelist()
+                if name.startswith("images/numeric/")
+            ]
+        ) == 1
+        assert len(
+            [
+                name
+                for name in archive.namelist()
+                if name.startswith("images/click/")
+            ]
+        ) == 1
+
+    for captcha_type in ("numeric", "click"):
+        classified = client.get(
+            "/api/v1/admin/ml/dataset/export",
+            headers=auth_header(admin),
+            params={"captcha_type": captcha_type},
+        )
+        assert classified.status_code == 200
+        with zipfile.ZipFile(io.BytesIO(classified.content)) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            assert manifest["captcha_type"] == captcha_type
+            assert manifest["sample_count"] == 1
+            assert {
+                item["captcha_type"] for item in manifest["samples"]
+            } == {captcha_type}
+
+        classified_import = client.post(
+            "/api/v1/admin/ml/dataset/import",
+            headers={
+                **auth_header(admin),
+                "Content-Type": "application/zip",
+            },
+            content=classified.content,
+        )
+        assert classified_import.status_code == 200
+        assert classified_import.json() == {
+            "imported_count": 0,
+            "duplicate_count": 1,
+            "skipped_count": 0,
+        }
+
+    invalid_export = client.get(
+        "/api/v1/admin/ml/dataset/export",
+        headers=auth_header(admin),
+        params={"captcha_type": "unsupported"},
+    )
+    assert invalid_export.status_code == 422
 
     imported = client.post(
         "/api/v1/admin/ml/dataset/import",
@@ -180,7 +240,7 @@ def test_dataset_export_import_and_model_activation(client):
     assert imported.status_code == 200
     assert imported.json() == {
         "imported_count": 0,
-        "duplicate_count": 1,
+        "duplicate_count": 2,
         "skipped_count": 0,
     }
 

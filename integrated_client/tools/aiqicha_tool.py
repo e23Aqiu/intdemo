@@ -393,6 +393,8 @@ class QueryWorker(QThread):
     login_confirmed_signal = pyqtSignal()        # 用户处理完，继续执行
     finished_signal = pyqtSignal(bool)           # 完成(bool=是否有错误)
     retry_signal = pyqtSignal(str, str)           # 重试类型, 原因
+    browser_loading_started = pyqtSignal()        # 浏览器或结果页面开始加载
+    browser_loading_finished = pyqtSignal()       # 浏览器或结果页面加载结束
     
     def __init__(
         self,
@@ -599,60 +601,93 @@ class QueryWorker(QThread):
     def _start_browser_session(self, recovery=False):
         """持续创建爱企查浏览器，直到可用、登录超时或用户主动停止。"""
         attempt = 0
-        while not self._should_stop:
-            attempt += 1
-            try:
-                self.close_browser()
-                is_restart = recovery or attempt > 1
-                self.log_signal.emit(
-                    "♻️ 正在重新启动爱企查浏览器..."
-                    if is_restart
-                    else "🚀 正在启动浏览器..."
-                )
-                page = (
-                    create_browser(self.browser_profile_directory)
-                    if self.browser_profile_directory is not None
-                    else create_browser()
-                )
-                with self._browser_lock:
-                    self.page = page
-                if self._should_stop:
+        loading_active = False
+
+        def begin_loading():
+            nonlocal loading_active
+            if not loading_active:
+                loading_active = True
+                self.browser_loading_started.emit()
+
+        def finish_loading():
+            nonlocal loading_active
+            if loading_active:
+                loading_active = False
+                self.browser_loading_finished.emit()
+
+        begin_loading()
+        try:
+            while not self._should_stop:
+                attempt += 1
+                try:
                     self.close_browser()
-                    return False
-                self.log_signal.emit("✅ 浏览器已启动")
-                self.log_signal.emit("📌 正在打开爱企查首页...")
-                page.get("https://aiqicha.baidu.com")
-                if self._should_stop:
-                    return False
-                if not self._interruptible_sleep(2):
-                    return False
-                if self._has_persisted_login(page):
+                    is_restart = recovery or attempt > 1
                     self.log_signal.emit(
-                        "✅ 已恢复当前程序账号的爱企查登录状态，无需重复登录。"
+                        "♻️ 正在重新启动爱企查浏览器..."
+                        if is_restart
+                        else "🚀 正在启动浏览器..."
                     )
-                    return True
-                self.log_signal.emit(
-                    "⏳ 请在浏览器中登录爱企查，然后点击「继续执行」..."
-                )
-                return self._wait_for_login_confirmation()
-            except Exception as exc:
-                if self._should_stop:
-                    return False
-                reason = str(exc).strip() or exc.__class__.__name__
-                self.retry_signal.emit(
-                    "aiqicha_browser_start",
-                    f"爱企查浏览器启动第 {attempt} 次失败：{reason[:120]}",
-                )
-                self.log_signal.emit(
-                    "⚠️ 爱企查浏览器不可用，将自动重新打开"
-                    f"（已尝试 {attempt} 次，无次数上限）：{reason[:120]}"
-                )
-                self.close_browser()
-                if not self._interruptible_sleep(
-                    AIQICHA_BROWSER_RETRY_DELAY_SECONDS
-                ):
-                    return False
-        return False
+                    page = (
+                        create_browser(self.browser_profile_directory)
+                        if self.browser_profile_directory is not None
+                        else create_browser()
+                    )
+                    with self._browser_lock:
+                        self.page = page
+                    if self._should_stop:
+                        self.close_browser()
+                        return False
+                    self.log_signal.emit("✅ 浏览器已启动")
+                    self.log_signal.emit("📌 正在打开爱企查首页...")
+                    page.get("https://aiqicha.baidu.com")
+                    if self._should_stop:
+                        return False
+                    if not self._interruptible_sleep(2):
+                        return False
+                    # 登录等待有自己的暂停原因，不属于页面加载时间。
+                    finish_loading()
+                    if self._has_persisted_login(page):
+                        self.log_signal.emit(
+                            "✅ 已恢复当前程序账号的爱企查登录状态，无需重复登录。"
+                        )
+                        return True
+                    self.log_signal.emit(
+                        "⏳ 请在浏览器中登录爱企查，然后点击「继续执行」..."
+                    )
+                    return self._wait_for_login_confirmation()
+                except Exception as exc:
+                    if self._should_stop:
+                        return False
+                    # 浏览器在登录阶段关闭时，重新进入页面加载计时区间。
+                    begin_loading()
+                    reason = str(exc).strip() or exc.__class__.__name__
+                    self.retry_signal.emit(
+                        "aiqicha_browser_start",
+                        f"爱企查浏览器启动第 {attempt} 次失败：{reason[:120]}",
+                    )
+                    self.log_signal.emit(
+                        "⚠️ 爱企查浏览器不可用，将自动重新打开"
+                        f"（已尝试 {attempt} 次，无次数上限）：{reason[:120]}"
+                    )
+                    self.close_browser()
+                    if not self._interruptible_sleep(
+                        AIQICHA_BROWSER_RETRY_DELAY_SECONDS
+                    ):
+                        return False
+            return False
+        finally:
+            finish_loading()
+
+    def _load_company_results(self, company_name):
+        """加载单个公司的搜索结果，并标记不计入有效用时的区间。"""
+        self.browser_loading_started.emit()
+        try:
+            search_company(self.page, company_name)
+            return self._wait_for_results(
+                timeout=AIQICHA_RESULT_WAIT_SECONDS
+            )
+        finally:
+            self.browser_loading_finished.emit()
 
     def _ensure_browser_available(self):
         page = self.page
@@ -778,12 +813,8 @@ class QueryWorker(QThread):
                 while not self._should_stop:
                     try:
                         self._ensure_browser_available()
-                        search_company(self.page, company_name)
-
-                        # 搜索结果页面最多等待 2 分钟，可暂停或停止。
-                        loaded = self._wait_for_results(
-                            timeout=AIQICHA_RESULT_WAIT_SECONDS
-                        )
+                        # 同步导航及结果区域等待都属于页面加载时间。
+                        loaded = self._load_company_results(company_name)
                         if not loaded:
                             if self._should_stop:
                                 break
