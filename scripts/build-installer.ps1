@@ -9,7 +9,7 @@ param(
     [string]$Channel = "test",
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.0.5",
+    [string]$Version = "1.0.6",
     [string]$InnoCompiler = "",
 
     [ValidatePattern('^$|^\d+\.\d+\.\d+$')]

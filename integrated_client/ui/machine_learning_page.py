@@ -36,7 +36,7 @@ UPLOAD_MODES = (
     ("仅统计", "metrics_only"),
     ("采集样本并统计", "samples_and_metrics"),
 )
-UPLOAD_MODE_LABELS = dict((mode, label) for label, mode in UPLOAD_MODES)
+UPLOAD_MODE_LABELS = {mode: label for label, mode in UPLOAD_MODES}
 
 
 def _format_size(size):
@@ -56,6 +56,7 @@ def _display_time(value):
 
 class MachineLearningPage(QWidget):
     REFRESH_INTERVAL_MS = 5_000
+    MANUAL_MODEL_PREFIXES = ("human-", "human_")
 
     def __init__(self, session_manager, learning_service=None, parent=None):
         super().__init__(parent)
@@ -65,10 +66,16 @@ class MachineLearningPage(QWidget):
         self._task_callbacks = {}
         self._refresh_task = None
         self._sample_refresh_task = None
+        self._sample_refresh_pending = False
         self._shutting_down = False
         self._loading_policy = False
         self._confirmed_upload_mode = "off"
         self._model_rows = []
+        self._all_model_rows = []
+        self._model_source_rows = []
+        self._model_attempts = []
+        self._model_active = {}
+        self._selected_model_key = None
         self._sample_rows = []
         self._sample_offset = 0
         self._sample_limit = 100
@@ -263,9 +270,26 @@ class MachineLearningPage(QWidget):
         self.sample_table.setMaximumHeight(260)
         root.addWidget(self.sample_table)
 
+        model_header = QHBoxLayout()
         table_title = QLabel("模型版本")
         table_title.setObjectName("SectionTitle")
-        root.addWidget(table_title)
+        model_header.addWidget(table_title)
+        model_header.addStretch()
+        self.model_type_combo = QComboBox()
+        self.model_type_combo.addItem("全部类型", None)
+        self.model_type_combo.addItem("数字验证码", "numeric")
+        self.model_type_combo.addItem("文字点选验证码", "click")
+        self.model_type_combo.currentIndexChanged.connect(
+            self._model_filter_changed
+        )
+        model_header.addWidget(self.model_type_combo)
+        self.recalculate_model_btn = QPushButton("重新统计识别")
+        self.recalculate_model_btn.setEnabled(False)
+        self.recalculate_model_btn.clicked.connect(
+            self._recalculate_selected_model
+        )
+        model_header.addWidget(self.recalculate_model_btn)
+        root.addLayout(model_header)
         self.model_table = QTableWidget(0, 10)
         self.model_table.setHorizontalHeaderLabels(
             [
@@ -284,6 +308,9 @@ class MachineLearningPage(QWidget):
         self.model_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.model_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.model_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.model_table.itemSelectionChanged.connect(
+            self._model_selection_changed
+        )
         self.model_table.verticalHeader().setVisible(False)
         header = self.model_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -353,6 +380,7 @@ class MachineLearningPage(QWidget):
         self.refresh_timer.stop()
         self._refresh_task = None
         self._sample_refresh_task = None
+        self._sample_refresh_pending = False
         self._task_callbacks.clear()
         self._tasks.clear()
 
@@ -394,7 +422,10 @@ class MachineLearningPage(QWidget):
         self._loading_policy = False
         state = {
             "off": "已关闭：不上传任何验证码数据",
-            "metrics_only": "仅统计：不上传图片和答案",
+            "metrics_only": (
+                "仅统计：只统计自动模型的识别次数和准确率；"
+                "人工操作不计入，不上传图片和答案"
+            ),
             "samples_and_metrics": "采集样本并统计：成功时上传图片和答案",
         }[upload_mode]
         self.policy_detail.setText(
@@ -418,34 +449,85 @@ class MachineLearningPage(QWidget):
         self._populate_models(models, attempts, active)
         self._refresh_samples()
 
+    @classmethod
+    def _is_manual_model_version(cls, version):
+        normalized = str(version or "").strip().lower()
+        return normalized == "human" or normalized.startswith(
+            cls.MANUAL_MODEL_PREFIXES
+        )
+
+    @classmethod
+    def _is_automatic_metric(cls, metric):
+        if not isinstance(metric, dict):
+            return False
+        return not bool(metric.get("assisted")) and not cls._is_manual_model_version(
+            metric.get("model_version")
+        )
+
+    @classmethod
+    def _attempt_metric(cls, attempts, captcha_type, model_version):
+        """Aggregate automatic attempts for one type/version pair.
+
+        The service normally returns one grouped row. Aggregating here also
+        handles older deployments that returned multiple rows and makes the
+        model selection action a real re-count instead of displaying a stale
+        first match.
+        """
+        if cls._is_manual_model_version(model_version):
+            return None
+        total = 0
+        success = 0
+        found = False
+        for item in attempts or []:
+            if not cls._is_automatic_metric(item):
+                continue
+            if (
+                str(item.get("captcha_type") or "") != str(captcha_type)
+                or str(item.get("model_version") or "") != str(model_version)
+            ):
+                continue
+            found = True
+            item_total = max(0, int(item.get("attempt_count") or 0))
+            item_success = max(
+                0,
+                min(item_total, int(item.get("success_count") or 0)),
+            )
+            total += item_total
+            success += item_success
+        if not found:
+            return None
+        return {
+            "attempt_count": total,
+            "success_count": success,
+            "success_rate": success / total if total else 0.0,
+        }
+
+    @staticmethod
+    def _metric_text(metric, version):
+        if metric and int(metric.get("attempt_count") or 0):
+            return (
+                f"{float(metric.get('success_rate') or 0) * 100:.1f}%\n"
+                f"{int(metric.get('success_count') or 0)} / "
+                f"{int(metric.get('attempt_count') or 0)}\n"
+                f"{version}"
+            )
+        return f"--\n暂无自动识别记录\n{version}"
+
     def _set_accuracy_values(self, captcha_type, active, attempts, models):
         active_model = active.get(captcha_type) or {}
         current_version = str(
             active_model.get("version") or BUILTIN_MODEL_VERSION
         )
-        metric = next(
-            (
-                item
-                for item in attempts
-                if item.get("captcha_type") == captcha_type
-                and item.get("model_version") == current_version
-            ),
-            None,
-        )
-        if metric and int(metric.get("attempt_count") or 0):
-            current_text = (
-                f"{float(metric.get('success_rate') or 0) * 100:.1f}%\n"
-                f"{int(metric.get('success_count') or 0)} / "
-                f"{int(metric.get('attempt_count') or 0)}\n"
-                f"{current_version}"
-            )
-        else:
-            current_text = f"--\n暂无自动识别记录\n{current_version}"
+        if self._is_manual_model_version(current_version):
+            current_version = BUILTIN_MODEL_VERSION
+        metric = self._attempt_metric(attempts, captcha_type, current_version)
+        current_text = self._metric_text(metric, current_version)
         candidates = [
             model
             for model in models
             if model.get("captcha_type") == captcha_type
             and model.get("status") == "candidate"
+            and not self._is_manual_model_version(model.get("version"))
         ]
         candidate = candidates[0] if candidates else None
         candidate_text = (
@@ -463,22 +545,17 @@ class MachineLearningPage(QWidget):
             self.click_current_value.setText(current_text)
             self.click_candidate_value.setText(candidate_text)
 
-    @staticmethod
-    def _attempt_metric(attempts, captcha_type, model_version):
-        return next(
-            (
-                item
-                for item in attempts
-                if item.get("captcha_type") == captcha_type
-                and item.get("model_version") == model_version
-            ),
-            None,
-        )
-
     def _populate_models(self, models, attempts, active):
+        self._model_attempts = list(attempts or [])
+        self._model_active = dict(active or {})
+        self._model_source_rows = [
+            dict(model)
+            for model in (models or [])
+            if not self._is_manual_model_version(model.get("version"))
+        ]
         builtin_rows = []
         for captcha_type in ("numeric", "click"):
-            active_model = active.get(captcha_type) or {}
+            active_model = self._model_active.get(captcha_type) or {}
             builtin_rows.append(
                 {
                     "id": None,
@@ -495,13 +572,15 @@ class MachineLearningPage(QWidget):
                     "created_at": None,
                 }
             )
-        managed_rows = list(models)
+        managed_rows = list(self._model_source_rows)
         known_versions = {
             (str(model.get("captcha_type") or ""), str(model.get("version") or ""))
             for model in builtin_rows + managed_rows
         }
         observed_rows = []
-        for metric in attempts:
+        for metric in self._model_attempts:
+            if not self._is_automatic_metric(metric):
+                continue
             key = (
                 str(metric.get("captcha_type") or ""),
                 str(metric.get("model_version") or ""),
@@ -523,62 +602,271 @@ class MachineLearningPage(QWidget):
                     "created_at": None,
                 }
             )
-        self._model_rows = builtin_rows + managed_rows + observed_rows
-        self.model_table.setRowCount(len(self._model_rows))
-        type_labels = {"numeric": "数字", "click": "文字点选"}
-        status_labels = {
-            "candidate": "候选",
-            "current": "当前应用",
-            "archived": "历史",
-            "builtin": "内置备用",
-            "observed": "识别记录",
-        }
-        for row, model in enumerate(self._model_rows):
-            captcha_type = str(model.get("captcha_type") or "")
-            version = str(model.get("version") or "-")
-            metric = self._attempt_metric(attempts, captcha_type, version)
-            automatic_total = int((metric or {}).get("attempt_count") or 0)
-            automatic_success = int((metric or {}).get("success_count") or 0)
-            automatic_accuracy = (
-                f"{float(metric.get('success_rate') or 0) * 100:.1f}%"
-                if metric and automatic_total
-                else "--"
-            )
-            builtin = bool(model.get("is_builtin"))
-            managed = not builtin and not model.get("is_runtime_only")
-            values = [
-                type_labels.get(captcha_type, "-"),
-                version,
-                status_labels.get(model.get("status"), "-"),
-                (
-                    "--"
-                    if not managed
-                    else f"{float(model.get('accuracy') or 0) * 100:.1f}%"
-                ),
-                automatic_accuracy,
-                (
-                    f"{automatic_success} / {automatic_total}"
-                    if automatic_total
-                    else "0"
-                ),
-                "--" if not managed else str(int(model.get("sample_count") or 0)),
-                "--" if not managed else str(int(model.get("test_count") or 0)),
-                (
-                    "内置"
-                    if builtin
-                    else (
+        self._all_model_rows = builtin_rows + managed_rows + observed_rows
+        self._render_models()
+
+    def _render_models(self):
+        selected_key = self._selected_model_key
+        filter_type = self.model_type_combo.currentData()
+        if filter_type:
+            rows = [
+                model
+                for model in self._all_model_rows
+                if model.get("captcha_type") == filter_type
+            ]
+        else:
+            rows = list(self._all_model_rows)
+        self._model_rows = rows
+        previous_signals = self.model_table.blockSignals(True)
+        try:
+            self.model_table.clearContents()
+            self.model_table.setRowCount(len(self._model_rows))
+            type_labels = {"numeric": "数字", "click": "文字点选"}
+            status_labels = {
+                "candidate": "候选",
+                "current": "当前应用",
+                "archived": "历史",
+                "builtin": "内置备用",
+                "observed": "识别记录",
+            }
+            for row, model in enumerate(self._model_rows):
+                captcha_type = str(model.get("captcha_type") or "")
+                version = str(model.get("version") or "-")
+                metric = self._attempt_metric(
+                    self._model_attempts,
+                    captcha_type,
+                    version,
+                )
+                automatic_total = int(
+                    (metric or {}).get("attempt_count") or 0
+                )
+                automatic_success = int(
+                    (metric or {}).get("success_count") or 0
+                )
+                automatic_accuracy = (
+                    f"{float(metric.get('success_rate') or 0) * 100:.1f}%"
+                    if metric and automatic_total
+                    else "--"
+                )
+                builtin = bool(model.get("is_builtin"))
+                managed = not builtin and not model.get("is_runtime_only")
+                values = [
+                    type_labels.get(captcha_type, "-"),
+                    version,
+                    status_labels.get(model.get("status"), "-"),
+                    (
                         "--"
                         if not managed
-                        else _format_size(model.get("artifact_size"))
-                    )
-                ),
-                _display_time(model.get("created_at")),
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column in {0, 2, 3, 4, 5, 6, 7, 8}:
-                    item.setTextAlignment(Qt.AlignCenter)
-                self.model_table.setItem(row, column, item)
+                        else f"{float(model.get('accuracy') or 0) * 100:.1f}%"
+                    ),
+                    automatic_accuracy,
+                    (
+                        f"{automatic_success} / {automatic_total}"
+                        if automatic_total
+                        else "0"
+                    ),
+                    (
+                        "--"
+                        if not managed
+                        else str(int(model.get("sample_count") or 0))
+                    ),
+                    (
+                        "--"
+                        if not managed
+                        else str(int(model.get("test_count") or 0))
+                    ),
+                    (
+                        "内置"
+                        if builtin
+                        else (
+                            "--"
+                            if not managed
+                            else _format_size(model.get("artifact_size"))
+                        )
+                    ),
+                    _display_time(model.get("created_at")),
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(value)
+                    if column in {0, 2, 3, 4, 5, 6, 7, 8}:
+                        item.setTextAlignment(Qt.AlignCenter)
+                    self.model_table.setItem(row, column, item)
+        finally:
+            self.model_table.blockSignals(previous_signals)
+        if selected_key and any(
+            (
+                str(model.get("captcha_type") or ""),
+                str(model.get("version") or ""),
+            )
+            == selected_key
+            for model in self._model_rows
+        ):
+            for row, model in enumerate(self._model_rows):
+                key = (
+                    str(model.get("captcha_type") or ""),
+                    str(model.get("version") or ""),
+                )
+                if key == selected_key:
+                    self.model_table.selectRow(row)
+                    break
+        else:
+            self._selected_model_key = None
+            self.model_table.clearSelection()
+        self._model_selection_changed()
+
+    def _model_filter_changed(self, _index):
+        self._selected_model_key = None
+        self.recalculate_model_btn.setEnabled(False)
+        self._restore_active_accuracy_values()
+        self._render_models()
+
+    def _restore_active_accuracy_values(self):
+        self._set_accuracy_values(
+            "numeric",
+            self._model_active,
+            self._model_attempts,
+            self._all_model_rows,
+        )
+        self._set_accuracy_values(
+            "click",
+            self._model_active,
+            self._model_attempts,
+            self._all_model_rows,
+        )
+
+    def _current_model(self):
+        row = self.model_table.currentRow()
+        if 0 <= row < len(self._model_rows):
+            return self._model_rows[row]
+        return None
+
+    def _model_selection_changed(self):
+        self._restore_active_accuracy_values()
+        model = self._current_model()
+        if not model:
+            self._selected_model_key = None
+            self.recalculate_model_btn.setEnabled(False)
+            return
+        version = str(model.get("version") or "")
+        captcha_type = str(model.get("captcha_type") or "")
+        self._selected_model_key = (captcha_type, version)
+        self.recalculate_model_btn.setEnabled(
+            bool(version) and not self._is_manual_model_version(version)
+        )
+        self._show_selected_model_metric(model)
+
+    def _show_selected_model_metric(self, model):
+        captcha_type = str(model.get("captcha_type") or "")
+        version = str(model.get("version") or BUILTIN_MODEL_VERSION)
+        metric = self._attempt_metric(self._model_attempts, captcha_type, version)
+        text = self._metric_text(metric, version)
+        if captcha_type == "numeric":
+            self.numeric_current_value.setText(text)
+        elif captcha_type == "click":
+            self.click_current_value.setText(text)
+        if metric and int(metric.get("attempt_count") or 0):
+            self.model_hint.setText(
+                f"已选择 {version}：自动识别 {int(metric.get('attempt_count') or 0)} 次，"
+                f"准确率 {float(metric.get('success_rate') or 0) * 100:.1f}%"
+            )
+        else:
+            self.model_hint.setText(f"已选择 {version}：暂无自动识别记录。")
+
+    def _recalculate_selected_model(self):
+        model = self._current_model()
+        if not model:
+            QMessageBox.warning(self, "未选择模型", "请先选择一个模型版本。")
+            return
+        if self._refresh_task is not None:
+            return
+        key = (
+            str(model.get("captcha_type") or ""),
+            str(model.get("version") or ""),
+        )
+        self._selected_model_key = key
+        self.recalculate_model_btn.setEnabled(False)
+        self.model_hint.setText(f"正在重新统计 {key[1]} 的自动识别记录…")
+
+        def load_overview():
+            token = self.session_manager.access_token()
+            overview = self.session_manager.api.admin_captcha_learning_overview
+            try:
+                return overview(
+                    token,
+                    captcha_type=key[0],
+                    model_version=key[1],
+                )
+            except TypeError:
+                # Keep compatibility with a 1.0.5 API test double or an
+                # older client adapter that has not added the optional query
+                # parameters yet.
+                return overview(token)
+
+        self._refresh_task = self._start(
+            load_overview,
+            lambda result, error, selected_key=key: self._model_recalculated(
+                selected_key,
+                result,
+                error,
+            ),
+        )
+
+    def _model_recalculated(self, selected_key, result, error):
+        self.recalculate_model_btn.setEnabled(True)
+        self._refresh_task = None
+        if error is not None:
+            QMessageBox.warning(self, "统计失败", str(error))
+            return
+        overview = result if isinstance(result, dict) else {}
+        filtered_attempts = overview.get("attempts")
+        if not isinstance(filtered_attempts, list):
+            QMessageBox.warning(self, "统计失败", "服务器返回的统计结果格式无效。")
+            return
+        selected_metric = self._attempt_metric(
+            filtered_attempts,
+            selected_key[0],
+            selected_key[1],
+        )
+        # Replace only the selected version's aggregate so the other model
+        # rows remain populated while the selected model is re-counted.
+        merged_attempts = [
+            item
+            for item in self._model_attempts
+            if not (
+                str(item.get("captcha_type") or "") == selected_key[0]
+                and str(item.get("model_version") or "") == selected_key[1]
+            )
+        ]
+        if selected_metric is not None:
+            merged_attempts.append(
+                {
+                    "captcha_type": selected_key[0],
+                    "model_version": selected_key[1],
+                    **selected_metric,
+                }
+            )
+        self._model_attempts = merged_attempts
+        policy = overview.get("policy")
+        if isinstance(policy, dict) and isinstance(
+            policy.get("active_models"), dict
+        ):
+            self._model_active = dict(policy.get("active_models") or {})
+        models = overview.get("models")
+        model_rows = models if isinstance(models, list) else self._model_source_rows
+        self._selected_model_key = selected_key
+        self._set_accuracy_values(
+            "numeric",
+            self._model_active,
+            merged_attempts,
+            model_rows,
+        )
+        self._set_accuracy_values(
+            "click",
+            self._model_active,
+            merged_attempts,
+            model_rows,
+        )
+        self._populate_models(model_rows, merged_attempts, self._model_active)
 
     def _refresh_samples(self):
         if self._shutting_down or self._sample_refresh_task is not None:
@@ -599,6 +887,12 @@ class MachineLearningPage(QWidget):
             self._samples_loaded,
         )
 
+    def _request_sample_refresh(self):
+        if self._sample_refresh_task is not None:
+            self._sample_refresh_pending = True
+            return
+        self._refresh_samples()
+
     @staticmethod
     def _sample_answer_text(sample):
         answer = sample.get("answer") or {}
@@ -609,14 +903,52 @@ class MachineLearningPage(QWidget):
 
     def _samples_loaded(self, result, error):
         self._sample_refresh_task = None
+        if self._sample_refresh_pending:
+            self._sample_refresh_pending = False
+            self._refresh_samples()
+            return
         if error is not None:
+            self._sample_rows = []
+            self.sample_table.clearContents()
+            self.sample_table.setRowCount(0)
+            self.sample_page_label.setText("0 / 0")
+            self.prev_samples_btn.setEnabled(False)
+            self.next_samples_btn.setEnabled(False)
             self.sample_hint.setText(f"样本读取失败：{error}")
             return
-        page = result or {}
-        self._sample_rows = list(page.get("items") or [])
-        total = int(page.get("total") or 0)
-        limit = max(1, int(page.get("limit") or self._sample_limit))
-        offset = max(0, int(page.get("offset") or 0))
+        try:
+            if isinstance(result, dict):
+                page = result
+                raw_items = page.get("items") or []
+                total = int(page.get("total") or len(raw_items))
+                limit = max(
+                    1,
+                    int(page.get("limit") or self._sample_limit),
+                )
+                offset = max(0, int(page.get("offset") or 0))
+            elif isinstance(result, list):
+                # A few pre-v1.0.5 deployments returned a bare list. Keep the
+                # page usable while those servers are being upgraded.
+                raw_items = result
+                total = len(raw_items)
+                limit = max(1, self._sample_limit)
+                offset = 0
+            else:
+                raise TypeError("服务器返回的样本列表格式无效")
+            if not isinstance(raw_items, list):
+                raise TypeError("服务器返回的样本列表格式无效")
+            self._sample_rows = [
+                item for item in raw_items if isinstance(item, dict)
+            ]
+        except (TypeError, ValueError, OverflowError) as exc:
+            self._sample_rows = []
+            self.sample_table.clearContents()
+            self.sample_table.setRowCount(0)
+            self.sample_page_label.setText("0 / 0")
+            self.prev_samples_btn.setEnabled(False)
+            self.next_samples_btn.setEnabled(False)
+            self.sample_hint.setText(f"样本读取失败：{exc}")
+            return
         self._sample_limit = limit
         self._sample_offset = offset
         self.sample_table.setRowCount(len(self._sample_rows))
@@ -626,10 +958,13 @@ class MachineLearningPage(QWidget):
             model_version = str(sample.get("model_version") or "-")
             if str(sample.get("origin") or "") == "import":
                 collection_mode = "导入"
-            elif model_version.startswith("human-"):
+            elif self._is_manual_model_version(model_version):
                 collection_mode = "人工"
             else:
                 collection_mode = "自动"
+            image_available = sample.get("image_available", True) is not False
+            if not image_available:
+                collection_mode = f"{collection_mode}（图片缺失）"
             values = [
                 sample_id[:8] or "-",
                 type_labels.get(sample.get("captcha_type"), "-"),
@@ -643,6 +978,11 @@ class MachineLearningPage(QWidget):
                 item = QTableWidgetItem(value)
                 if sample_id:
                     item.setToolTip(f"样本 ID：{sample_id}")
+                if not image_available:
+                    item.setToolTip(
+                        "该样本记录存在，但服务器没有可读取的图片；"
+                        "不会参与导出或模型训练。"
+                    )
                 if column in {0, 1, 3, 5, 6}:
                     item.setTextAlignment(Qt.AlignCenter)
                 self.sample_table.setItem(row, column, item)
@@ -658,15 +998,15 @@ class MachineLearningPage(QWidget):
 
     def _sample_filter_changed(self, _index):
         self._sample_offset = 0
-        self._refresh_samples()
+        self._request_sample_refresh()
 
     def _previous_samples_page(self):
         self._sample_offset = max(0, self._sample_offset - self._sample_limit)
-        self._refresh_samples()
+        self._request_sample_refresh()
 
     def _next_samples_page(self):
         self._sample_offset += self._sample_limit
-        self._refresh_samples()
+        self._request_sample_refresh()
 
     def _delete_selected_samples(self):
         rows = sorted(
@@ -727,7 +1067,7 @@ class MachineLearningPage(QWidget):
                 0,
                 self._sample_offset - self._sample_limit,
             )
-        self._refresh_samples()
+        self._request_sample_refresh()
         self.refresh()
 
     def _change_policy(self, _index):
@@ -936,11 +1276,11 @@ class MachineLearningPage(QWidget):
         self.refresh()
 
     def _selected_model(self):
-        row = self.model_table.currentRow()
-        if not 0 <= row < len(self._model_rows):
+        model = self._current_model()
+        if model is None:
             QMessageBox.warning(self, "未选择模型", "请先选择一个模型版本。")
             return None
-        return self._model_rows[row]
+        return model
 
     def _activate_selected_model(self):
         model = self._selected_model()

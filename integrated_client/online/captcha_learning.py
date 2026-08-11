@@ -17,6 +17,7 @@ MAX_MODEL_CACHE_BYTES = 20 * 1024 * 1024
 MAX_SAMPLE_UPLOAD_BYTES = 1 * 1024 * 1024
 MODEL_CACHE_SCHEMA_VERSION = 1
 MAX_BACKGROUND_TASKS = 64
+MANUAL_MODEL_PREFIXES = ("human-", "human_")
 UPLOAD_MODE_OFF = "off"
 UPLOAD_MODE_METRICS_ONLY = "metrics_only"
 UPLOAD_MODE_SAMPLES_AND_METRICS = "samples_and_metrics"
@@ -497,11 +498,19 @@ class CaptchaLearningService(QObject):
         ):
             return False
         success = bool(event.get("success"))
+        assisted = bool(event.get("assisted"))
+        model_version = str(event.get("model_version") or "unknown")[:80]
+        normalized_version = model_version.strip().lower()
+        manual = assisted or normalized_version == "human" or (
+            normalized_version.startswith(MANUAL_MODEL_PREFIXES)
+        )
+        if upload_mode == UPLOAD_MODE_METRICS_ONLY and manual:
+            return False
         payload = {
             "captcha_type": str(event.get("captcha_type") or ""),
-            "model_version": str(event.get("model_version") or "unknown")[:80],
+            "model_version": model_version,
             "success": success,
-            "assisted": bool(event.get("assisted")),
+            "assisted": assisted,
             "occurred_at": str(
                 event.get("occurred_at")
                 or datetime.now().astimezone().isoformat()

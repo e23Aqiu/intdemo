@@ -3,11 +3,12 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import re
 import threading
+import unicodedata
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import PurePosixPath
 
 import cv2
 import numpy as np
@@ -24,6 +25,9 @@ MAX_MODEL_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 MIN_NUMERIC_SAMPLES = 20
 MIN_CLICK_SAMPLES = 30
 MAX_TRAINING_SAMPLES = 5_000
+
+
+_ARCHIVE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 
 
 class CaptchaTrainingError(RuntimeError):
@@ -126,22 +130,46 @@ def _safe_dataset_archive(archive_bytes: bytes) -> list[dict]:
         if len(infos) > MAX_DATASET_FILES:
             raise CaptchaTrainingError("数据集文件数量超出限制")
         total_size = 0
+        members = {}
         for info in infos:
-            path = PurePosixPath(info.filename)
+            try:
+                member_name = _normalize_archive_member(info.filename)
+            except ValueError:
+                member_name = ""
             if (
-                path.is_absolute()
-                or ".." in path.parts
+                not member_name
                 or info.flag_bits & 0x1
                 or info.compress_type
                 not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
             ):
                 raise CaptchaTrainingError("数据集包含不安全路径")
+            if member_name.endswith("/"):
+                # Explicit directory entries are emitted by the v1.0.6
+                # exporter; they do not participate in manifest lookups.
+                continue
+            if member_name in members:
+                # ZIP allows duplicate names, but accepting one arbitrarily
+                # would make manifest references platform-dependent.
+                raise CaptchaTrainingError("数据集包含重复文件路径")
+            members[member_name] = info
             total_size += int(info.file_size)
             if total_size > MAX_DATASET_BYTES:
                 raise CaptchaTrainingError("数据集解压后大小超出限制")
         try:
-            manifest = json.loads(archive.read("manifest.json").decode("utf-8"))
-        except (KeyError, UnicodeError, json.JSONDecodeError) as exc:
+            manifest_info = members.get("manifest.json")
+            if manifest_info is None:
+                raise KeyError("manifest.json")
+            manifest = json.loads(
+                archive.read(manifest_info).decode("utf-8-sig")
+            )
+        except (
+            KeyError,
+            UnicodeError,
+            json.JSONDecodeError,
+            OSError,
+            RuntimeError,
+            zipfile.BadZipFile,
+        ) as exc:
             raise CaptchaTrainingError("数据集清单无效") from exc
         if (
             not isinstance(manifest, dict)
@@ -161,7 +189,10 @@ def _safe_dataset_archive(archive_bytes: bytes) -> list[dict]:
             if captcha_type not in {"numeric", "click"} or not isinstance(answer, dict):
                 continue
             try:
-                image_info = archive.getinfo(image_name)
+                image_name = _normalize_archive_member(image_name)
+                image_info = members.get(image_name)
+                if image_info is None:
+                    raise KeyError(image_name)
                 if (
                     image_info.file_size <= 0
                     or image_info.file_size > MAX_SAMPLE_IMAGE_BYTES
@@ -170,7 +201,7 @@ def _safe_dataset_archive(archive_bytes: bytes) -> list[dict]:
                 if image_name not in image_cache:
                     image_cache[image_name] = archive.read(image_info)
                 image = image_cache[image_name]
-            except (KeyError, OSError):
+            except (KeyError, OSError, RuntimeError, zipfile.BadZipFile):
                 continue
             fingerprint = str(item.get("fingerprint") or "")
             if not fingerprint:
@@ -186,6 +217,32 @@ def _safe_dataset_archive(archive_bytes: bytes) -> list[dict]:
         return samples
     finally:
         archive.close()
+
+
+def _normalize_archive_member(name: str) -> str:
+    """Return a canonical, safe ZIP member name.
+
+    ZIP producers on Windows occasionally emit backslashes or a leading
+    ``./``.  Normalizing those forms lets old exports and new exports share
+    the same reader while retaining traversal and absolute-path protection.
+    """
+    text = unicodedata.normalize("NFC", str(name or "")).replace("\\", "/")
+    if not text or "\x00" in text or text.startswith("/"):
+        raise ValueError("unsafe archive path")
+    if _ARCHIVE_DRIVE_PREFIX.match(text):
+        raise ValueError("unsafe archive path")
+    directory = text.endswith("/")
+    parts = []
+    for part in text.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError("unsafe archive path")
+        parts.append(part)
+    if not parts:
+        raise ValueError("empty archive path")
+    normalized = "/".join(parts)
+    return normalized + ("/" if directory else "")
 
 
 def _split_samples(samples: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -308,16 +365,21 @@ class KnnCaptchaModel:
                 if len(infos) > 16:
                     raise ValueError("too many model members")
                 total_size = 0
+                members = set()
                 for info in infos:
-                    path = PurePosixPath(info.filename)
                     if (
-                        path.is_absolute()
-                        or ".." in path.parts
-                        or info.flag_bits & 0x1
+                        info.flag_bits & 0x1
                         or info.compress_type
                         not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
                     ):
                         raise ValueError("unsafe model path")
+                    try:
+                        member_name = _normalize_archive_member(info.filename)
+                    except ValueError as exc:
+                        raise ValueError("unsafe model path") from exc
+                    if member_name.endswith("/") or member_name in members:
+                        raise ValueError("duplicate or empty model path")
+                    members.add(member_name)
                     total_size += int(info.file_size)
                     if total_size > MAX_MODEL_UNCOMPRESSED_BYTES:
                         raise ValueError("model expands beyond limit")

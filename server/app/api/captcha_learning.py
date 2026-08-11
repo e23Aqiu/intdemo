@@ -6,10 +6,10 @@ import hashlib
 import io
 import json
 import re
+import unicodedata
 import uuid
 import zipfile
 from datetime import UTC, datetime
-from pathlib import PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Query, Request, Response
@@ -65,6 +65,72 @@ DATASET_DIRECTORY_BY_TYPE = {
     "numeric": "数字验证码",
     "click": "文字点选验证码",
 }
+MANUAL_MODEL_PREFIXES = ("human-", "human_")
+ARCHIVE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+
+
+def _is_manual_model_version(value: Any) -> bool:
+    """Return whether a model label represents a human-assisted operation.
+
+    ``assisted`` is the authoritative flag for new clients, but older clients
+    have emitted ``human-manual`` as a model version without setting it.  Keep
+    those records out of automatic recognition metrics as well.
+    """
+
+    normalized = str(value or "").strip().lower()
+    return normalized == "human" or normalized.startswith(MANUAL_MODEL_PREFIXES)
+
+
+def _validate_captcha_filters(
+    captcha_type: str | None,
+    model_version: str | None,
+) -> tuple[str | None, str | None]:
+    if captcha_type is not None:
+        captcha_type = str(captcha_type).strip().lower()
+        if captcha_type not in CAPTCHA_TYPES:
+            raise ApiError(
+                "invalid_captcha_type",
+                "验证码类型无效",
+                status_code=422,
+            )
+    if model_version is not None:
+        model_version = str(model_version).strip()
+        if not model_version:
+            raise ApiError(
+                "invalid_model_version",
+                "模型版本不能为空",
+                status_code=422,
+            )
+        if len(model_version) > 80:
+            raise ApiError(
+                "invalid_model_version",
+                "模型版本长度超出限制",
+                status_code=422,
+            )
+    return captcha_type, model_version
+
+
+def _normalize_archive_member(value: Any) -> str:
+    text = unicodedata.normalize("NFC", str(value or "")).replace("\\", "/")
+    if (
+        not text
+        or "\x00" in text
+        or text.startswith("/")
+        or ARCHIVE_DRIVE_PREFIX.match(text)
+    ):
+        raise ValueError("unsafe archive path")
+    directory = text.endswith("/")
+    parts = []
+    for part in text.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError("unsafe archive path")
+        parts.append(part)
+    if not parts:
+        raise ValueError("empty archive path")
+    normalized = "/".join(parts)
+    return normalized + ("/" if directory else "")
 
 
 def _policy(db: Db) -> CaptchaLearningPolicy:
@@ -106,16 +172,31 @@ def _model_view(model: CaptchaModel) -> dict[str, Any]:
 
 
 def _sample_view(sample: CaptchaSample) -> dict[str, Any]:
+    captcha_type = str(sample.captcha_type or "")
+    image_data = bytes(sample.image_data or b"")
+    try:
+        image_mime = _image_mime(image_data) if image_data else None
+    except ApiError:
+        image_mime = None
+    source = str(
+        sample.source
+        or CAPTCHA_SOURCE_BY_TYPE.get(captcha_type, "")
+    )
+    answer = sample.answer if isinstance(sample.answer, dict) else {}
+    captured_at = sample.captured_at or sample.created_at or utcnow()
+    created_at = sample.created_at or captured_at
     return {
         "id": sample.id,
-        "captcha_type": sample.captcha_type,
-        "source": sample.source,
-        "answer": sample.answer or {},
-        "model_version": sample.model_version,
-        "origin": sample.origin,
-        "image_size": sample.image_size,
-        "captured_at": sample.captured_at,
-        "created_at": sample.created_at,
+        "captcha_type": captcha_type,
+        "source": source,
+        "answer": answer,
+        "model_version": str(sample.model_version or "imported"),
+        "origin": str(sample.origin or "import"),
+        "image_size": int(sample.image_size or len(image_data)),
+        "image_mime": image_mime,
+        "image_available": bool(image_data),
+        "captured_at": captured_at,
+        "created_at": created_at,
     }
 
 
@@ -123,7 +204,11 @@ def _active_models(db: Db) -> dict[str, dict[str, Any]]:
     rows = db.scalars(
         select(CaptchaModel).where(CaptchaModel.status == "current")
     ).all()
-    return {row.captcha_type: _model_view(row) for row in rows}
+    return {
+        row.captcha_type: _model_view(row)
+        for row in rows
+        if not _is_manual_model_version(row.version)
+    }
 
 
 def _policy_view(db: Db, row: CaptchaLearningPolicy) -> dict[str, Any]:
@@ -322,6 +407,17 @@ def record_captcha_attempt(
             "policy_revision": policy.revision,
         }
 
+    if mode == UPLOAD_MODE_METRICS_ONLY and (
+        payload.assisted or _is_manual_model_version(payload.model_version)
+    ):
+        db.commit()
+        return {
+            "stored": False,
+            "sample_stored": False,
+            "sample_id": None,
+            "policy_revision": policy.revision,
+        }
+
     attempt = CaptchaAttempt(
         captcha_type=payload.captcha_type,
         source=CAPTCHA_SOURCE_BY_TYPE[payload.captcha_type],
@@ -476,7 +572,26 @@ def _dataset_stats(db: Db) -> dict[str, int]:
     }
 
 
-def _attempt_metrics(db: Db) -> list[dict[str, Any]]:
+def _attempt_metrics(
+    db: Db,
+    *,
+    captcha_type: str | None = None,
+    model_version: str | None = None,
+) -> list[dict[str, Any]]:
+    # Keep the aggregation in SQL so filtering a selected model remains cheap
+    # on PostgreSQL installations with a large attempt history.  The explicit
+    # human-version guard covers old clients that forgot ``assisted=true``.
+    normalized_version = func.lower(func.trim(CaptchaAttempt.model_version))
+    filters = [
+        CaptchaAttempt.assisted.is_(False),
+        normalized_version != "human",
+        ~normalized_version.like("human-%"),
+        ~normalized_version.like("human\\_%", escape="\\"),
+    ]
+    if captcha_type is not None:
+        filters.append(CaptchaAttempt.captcha_type == captcha_type)
+    if model_version is not None:
+        filters.append(func.trim(CaptchaAttempt.model_version) == model_version)
     rows = db.execute(
         select(
             CaptchaAttempt.captcha_type,
@@ -487,7 +602,7 @@ def _attempt_metrics(db: Db) -> list[dict[str, Any]]:
                 0,
             ),
         )
-        .where(CaptchaAttempt.assisted.is_(False))
+        .where(*filters)
         .group_by(CaptchaAttempt.captcha_type, CaptchaAttempt.model_version)
         .order_by(CaptchaAttempt.captcha_type, CaptchaAttempt.model_version)
     ).all()
@@ -511,17 +626,32 @@ def _attempt_metrics(db: Db) -> list[dict[str, Any]]:
 def learning_overview(
     context: AdminContext,
     db: Db,
+    captcha_type: str | None = Query(default=None),
+    model_version: str | None = Query(default=None, max_length=80),
 ) -> dict[str, Any]:
     del context
+    captcha_type, model_version = _validate_captcha_filters(
+        captcha_type,
+        model_version,
+    )
     policy = _policy(db)
     models = db.scalars(
         select(CaptchaModel).order_by(CaptchaModel.created_at.desc())
     ).all()
+    models = [
+        model
+        for model in models
+        if not _is_manual_model_version(model.version)
+    ]
     db.commit()
     return {
         "policy": _policy_view(db, policy),
         "dataset": _dataset_stats(db),
-        "attempts": _attempt_metrics(db),
+        "attempts": _attempt_metrics(
+            db,
+            captcha_type=captcha_type,
+            model_version=model_version,
+        ),
         "models": [_model_view(model) for model in models],
     }
 
@@ -531,15 +661,21 @@ def list_captcha_samples(
     context: AdminContext,
     db: Db,
     captcha_type: str | None = Query(default=None),
+    model_version: str | None = Query(default=None, max_length=80),
     limit: int = Query(default=200, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     del context
-    if captcha_type is not None and captcha_type not in CAPTCHA_TYPES:
-        raise ApiError("invalid_captcha_type", "验证码类型无效", status_code=422)
+    captcha_type, model_version = _validate_captcha_filters(
+        captcha_type,
+        model_version,
+    )
     filters = []
     if captcha_type:
         filters.append(CaptchaSample.captcha_type == captcha_type)
+    if model_version:
+        filters.append(func.trim(CaptchaSample.model_version) == model_version)
+    filters.append(CaptchaSample.captcha_type.in_(CAPTCHA_TYPES))
     count_statement = select(func.count(CaptchaSample.id))
     statement = select(CaptchaSample)
     if filters:
@@ -561,6 +697,40 @@ def list_captcha_samples(
         "limit": limit,
         "offset": offset,
     }
+
+
+@router.get("/admin/ml/samples/{sample_id}/image")
+def download_captcha_sample_image(
+    sample_id: uuid.UUID,
+    context: AdminContext,
+    db: Db,
+) -> Response:
+    """Read one stored sample image without putting binary data in listings."""
+
+    del context
+    sample = db.get(CaptchaSample, sample_id)
+    if sample is None:
+        raise ApiError(
+            "captcha_sample_not_found",
+            "验证码样本不存在",
+            status_code=404,
+        )
+    image = bytes(sample.image_data or b"")
+    if not image:
+        raise ApiError(
+            "captcha_sample_image_missing",
+            "验证码样本图片不可用",
+            status_code=404,
+        )
+    image_mime = _image_mime(image)
+    return Response(
+        content=image,
+        media_type=image_mime,
+        headers={
+            "Cache-Control": "no-store",
+            "X-Captcha-Sample-ID": str(sample.id),
+        },
+    )
 
 
 @router.delete(
@@ -636,8 +806,7 @@ def export_captcha_dataset(
     db: Db,
     captcha_type: str | None = Query(default=None),
 ) -> Response:
-    if captcha_type is not None and captcha_type not in CAPTCHA_TYPES:
-        raise ApiError("invalid_captcha_type", "验证码类型无效", status_code=422)
+    captcha_type, _ = _validate_captcha_filters(captcha_type, None)
     statement = select(CaptchaSample).order_by(CaptchaSample.created_at)
     if captcha_type:
         statement = statement.where(CaptchaSample.captcha_type == captcha_type)
@@ -649,22 +818,37 @@ def export_captcha_dataset(
         for directory in DATASET_DIRECTORY_BY_TYPE.values():
             archive.writestr(f"{directory}/", b"")
         for sample in samples:
-            extension = ".png" if sample.image_mime == "image/png" else ".jpg"
+            if sample.captcha_type not in CAPTCHA_TYPES:
+                continue
+            image = bytes(sample.image_data or b"")
+            if not image:
+                # A partially migrated row must not make the complete export
+                # unreadable.  It remains visible in the sample list with
+                # ``image_available=false`` and can be removed or re-uploaded.
+                continue
+            try:
+                detected_mime = _image_mime(image)
+            except ApiError:
+                continue
+            extension = ".png" if detected_mime == "image/png" else ".jpg"
             directory = DATASET_DIRECTORY_BY_TYPE[sample.captcha_type]
             image_name = f"{directory}/{sample.id}{extension}"
-            archive.writestr(image_name, sample.image_data)
+            archive.writestr(image_name, image)
             category_counts[sample.captcha_type] += 1
+            captured_at = sample.captured_at or sample.created_at or utcnow()
+            answer = sample.answer if isinstance(sample.answer, dict) else {}
             manifest_samples.append(
                 {
                     "id": str(sample.id),
                     "captcha_type": sample.captcha_type,
                     "source": sample.source,
                     "image": image_name,
-                    "image_mime": sample.image_mime,
-                    "answer": sample.answer,
-                    "model_version": sample.model_version,
-                    "captured_at": _iso_utc(sample.captured_at),
-                    "fingerprint": sample.sample_fingerprint,
+                    "image_mime": detected_mime,
+                    "answer": answer,
+                    "model_version": str(sample.model_version or "imported"),
+                    "captured_at": _iso_utc(captured_at),
+                    "fingerprint": sample.sample_fingerprint
+                    or _fingerprint(sample.captcha_type, image, answer),
                 }
             )
         manifest = {
@@ -720,7 +904,9 @@ def export_captcha_dataset(
     )
 
 
-def _safe_archive(archive_bytes: bytes) -> tuple[zipfile.ZipFile, dict[str, Any]]:
+def _safe_archive(
+    archive_bytes: bytes,
+) -> tuple[zipfile.ZipFile, dict[str, Any], dict[str, zipfile.ZipInfo]]:
     try:
         archive = zipfile.ZipFile(io.BytesIO(archive_bytes), "r")
     except (OSError, zipfile.BadZipFile) as exc:
@@ -738,12 +924,10 @@ def _safe_archive(archive_bytes: bytes) -> tuple[zipfile.ZipFile, dict[str, Any]
             status_code=413,
         )
     total_size = 0
+    members: dict[str, zipfile.ZipInfo] = {}
     for info in infos:
-        path = PurePosixPath(info.filename)
         if (
-            path.is_absolute()
-            or ".." in path.parts
-            or info.flag_bits & 0x1
+            info.flag_bits & 0x1
             or info.compress_type not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
         ):
             archive.close()
@@ -752,6 +936,24 @@ def _safe_archive(archive_bytes: bytes) -> tuple[zipfile.ZipFile, dict[str, Any]
                 "数据集压缩包包含不安全路径",
                 status_code=422,
             )
+        try:
+            member_name = _normalize_archive_member(info.filename)
+        except ValueError as exc:
+            archive.close()
+            raise ApiError(
+                "invalid_dataset_archive",
+                "数据集压缩包包含不安全路径",
+                status_code=422,
+            ) from exc
+        if not member_name.endswith("/"):
+            if member_name in members:
+                archive.close()
+                raise ApiError(
+                    "invalid_dataset_archive",
+                    "数据集压缩包包含重复路径",
+                    status_code=422,
+                )
+            members[member_name] = info
         total_size += int(info.file_size)
         if total_size > MAX_ARCHIVE_BYTES:
             archive.close()
@@ -761,11 +963,21 @@ def _safe_archive(archive_bytes: bytes) -> tuple[zipfile.ZipFile, dict[str, Any]
                 status_code=413,
             )
     try:
-        manifest_info = archive.getinfo("manifest.json")
+        manifest_info = members["manifest.json"]
         if manifest_info.file_size > MAX_MANIFEST_BYTES:
             raise ValueError("manifest too large")
-        manifest = json.loads(archive.read(manifest_info).decode("utf-8"))
-    except (KeyError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+        manifest = json.loads(
+            archive.read(manifest_info).decode("utf-8-sig")
+        )
+    except (
+        KeyError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        OSError,
+        RuntimeError,
+        zipfile.BadZipFile,
+    ) as exc:
         archive.close()
         raise ApiError(
             "invalid_dataset_manifest",
@@ -792,7 +1004,7 @@ def _safe_archive(archive_bytes: bytes) -> tuple[zipfile.ZipFile, dict[str, Any]
             "数据集清单版本或样本列表无效",
             status_code=422,
         )
-    return archive, manifest
+    return archive, manifest, members
 
 
 @router.post(
@@ -839,7 +1051,7 @@ async def import_captcha_dataset(
             "数据集压缩包不能为空",
             status_code=413,
         )
-    archive, manifest = _safe_archive(archive_bytes)
+    archive, manifest, members = _safe_archive(archive_bytes)
     declared_captcha_type = manifest.get("captcha_type")
     imported = 0
     duplicates = 0
@@ -852,7 +1064,7 @@ async def import_captcha_dataset(
                 captcha_type = str(item.get("captcha_type") or "")
                 source = str(item.get("source") or "")
                 model_version = str(item.get("model_version") or "imported")[:80]
-                image_name = str(item.get("image") or "")
+                image_name = _normalize_archive_member(item.get("image"))
                 if (
                     declared_captcha_type in CAPTCHA_TYPES
                     and captcha_type != declared_captcha_type
@@ -860,7 +1072,7 @@ async def import_captcha_dataset(
                     raise ValueError("sample type does not match dataset type")
                 if source != CAPTCHA_SOURCE_BY_TYPE.get(captcha_type):
                     raise ValueError("invalid type or source")
-                image_info = archive.getinfo(image_name)
+                image_info = members[image_name]
                 if image_info.file_size <= 0 or image_info.file_size > MAX_IMAGE_BYTES:
                     raise ValueError("invalid image size")
                 image = archive.read(image_info)

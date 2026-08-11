@@ -331,6 +331,23 @@ class CaptchaLearningTests(unittest.TestCase):
                 "occurred_at",
             },
         )
+        self.assertFalse(
+            service.record_attempt(
+                {
+                    "captcha_type": "click",
+                    "source": "business_click",
+                    "model_version": "human-manual",
+                    "success": True,
+                    "assisted": True,
+                    "image_bytes": image,
+                    "answer": {
+                        "prompt": ["甲"],
+                        "points": [{"x": 0.5, "y": 0.5}],
+                    },
+                }
+            )
+        )
+        self.assertEqual(len(session.api.attempts), 3)
 
         service.policy["upload_mode"] = "off"
         self.assertFalse(
@@ -1853,6 +1870,170 @@ class CaptchaLearningTests(unittest.TestCase):
             ],
         )
         self.assertTrue(page.delete_samples_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_filters_manual_models_and_recounts_selection(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        overview = {
+            "policy": {
+                "upload_mode": "metrics_only",
+                "upload_enabled": False,
+                "active_models": {},
+            },
+            "dataset": {},
+            "attempts": [
+                {
+                    "captcha_type": "numeric",
+                    "model_version": "ddddocr-builtin",
+                    "attempt_count": 4,
+                    "success_count": 3,
+                    "success_rate": 0.75,
+                },
+                {
+                    "captcha_type": "click",
+                    "model_version": "human-manual",
+                    "attempt_count": 12,
+                    "success_count": 12,
+                    "success_rate": 1.0,
+                },
+                {
+                    "captcha_type": "numeric",
+                    "model_version": "human_legacy",
+                    "attempt_count": 7,
+                    "success_count": 7,
+                    "success_rate": 1.0,
+                },
+                {
+                    "captcha_type": "click",
+                    "model_version": "click-knn-1",
+                    "attempt_count": 2,
+                    "success_count": 1,
+                    "success_rate": 0.5,
+                },
+            ],
+            "models": [
+                {
+                    "id": "manual",
+                    "captcha_type": "click",
+                    "version": "human-manual",
+                    "status": "candidate",
+                    "accuracy": 1.0,
+                    "sample_count": 1,
+                    "test_count": 1,
+                    "correct_count": 1,
+                    "artifact_size": 1,
+                },
+                {
+                    "id": "legacy-manual",
+                    "captcha_type": "numeric",
+                    "version": "human_legacy",
+                    "status": "candidate",
+                    "accuracy": 1.0,
+                    "sample_count": 1,
+                    "test_count": 1,
+                    "correct_count": 1,
+                    "artifact_size": 1,
+                },
+            ],
+        }
+        with patch.object(page, "_refresh_samples"):
+            page._overview_loaded(overview, None)
+
+        versions = [
+            page.model_table.item(row, 1).text()
+            for row in range(page.model_table.rowCount())
+        ]
+        self.assertNotIn("human-manual", versions)
+        self.assertNotIn("human_legacy", versions)
+        self.assertEqual(page.model_table.rowCount(), 3)
+
+        page.model_type_combo.setCurrentIndex(
+            page.model_type_combo.findData("numeric")
+        )
+        self.assertEqual(page.model_table.rowCount(), 1)
+        self.assertEqual(page.model_table.item(0, 0).text(), "数字")
+        page.model_type_combo.setCurrentIndex(0)
+
+        click_row = next(
+            row
+            for row in range(page.model_table.rowCount())
+            if page.model_table.item(row, 1).text() == "click-knn-1"
+        )
+        page.model_table.selectRow(click_row)
+        self.assertIn("50.0%", page.click_current_value.text())
+        self.assertTrue(page.recalculate_model_btn.isEnabled())
+
+        overview_calls = []
+
+        def filtered_overview(_token, **filters):
+            overview_calls.append(filters)
+            return {
+                "attempts": [
+                    {
+                        "captcha_type": "click",
+                        "model_version": "click-knn-1",
+                        "attempt_count": 5,
+                        "success_count": 4,
+                        "success_rate": 0.8,
+                    }
+                ],
+                "models": [],
+            }
+
+        def immediate(function, completed):
+            completed(function(), None)
+
+        session.api.admin_captcha_learning_overview = filtered_overview
+        with patch.object(page, "_start", side_effect=immediate):
+            page._recalculate_selected_model()
+
+        self.assertEqual(
+            overview_calls,
+            [
+                {
+                    "captcha_type": "click",
+                    "model_version": "click-knn-1",
+                }
+            ],
+        )
+        self.assertIn("80.0%", page.click_current_value.text())
+        self.assertIn("4 / 5", page.click_current_value.text())
+        versions = [
+            page.model_table.item(row, 1).text()
+            for row in range(page.model_table.rowCount())
+        ]
+        self.assertEqual(
+            versions,
+            ["ddddocr-builtin", "ddddocr-builtin", "click-knn-1"],
+        )
+        self.assertEqual(page.model_table.item(0, 4).text(), "75.0%")
+        page.deleteLater()
+
+    def test_machine_learning_page_accepts_legacy_sample_list_shape(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._samples_loaded(
+            [
+                {
+                    "id": "legacy",
+                    "captcha_type": "numeric",
+                    "answer": {"value": "1234"},
+                    "model_version": "ddddocr-builtin",
+                    "origin": "client",
+                    "image_size": 10,
+                    "captured_at": "2026-08-11T10:00:00+08:00",
+                }
+            ],
+            None,
+        )
+        self.assertEqual(page.sample_table.rowCount(), 1)
+        self.assertEqual(page.sample_table.item(0, 2).text(), "1234")
+        self.assertNotIn("失败", page.sample_hint.text())
         page.deleteLater()
 
     def test_admin_main_window_exposes_machine_learning_navigation(self):

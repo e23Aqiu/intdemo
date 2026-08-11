@@ -44,7 +44,7 @@ class LoginRequest(StrictModel):
     password: str = Field(min_length=1, max_length=256)
     device_uid: uuid.UUID
     device_name: str = Field(default="Windows device", min_length=1, max_length=160)
-    client_version: str = Field(default="1.0.5", min_length=1, max_length=40)
+    client_version: str = Field(default="1.0.6", min_length=1, max_length=40)
     control_client: bool = False
 
     @field_validator("username")
@@ -412,13 +412,18 @@ class CaptchaDatasetStats(StrictModel):
 class CaptchaSampleSummary(StrictModel):
     id: uuid.UUID
     captcha_type: Literal["numeric", "click"]
-    source: Literal["transport_numeric", "business_click"]
+    # Older deployments may have persisted a source alias.  Keep the sample
+    # listing readable even when such a row is encountered; ingestion still
+    # validates the canonical source for new records.
+    source: str
     answer: dict[str, Any]
     model_version: str
     origin: str
     image_size: int
     captured_at: datetime
     created_at: datetime
+    image_mime: Literal["image/png", "image/jpeg"] | None = None
+    image_available: bool = True
 
 
 class CaptchaSamplePage(StrictModel):

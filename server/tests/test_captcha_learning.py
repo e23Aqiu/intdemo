@@ -157,6 +157,70 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert metric["success_rate"] == 3 / 4
 
 
+def test_metrics_filter_selected_model_and_hide_human_manual_records(client):
+    admin = changed_admin(client)
+    user = _changed_user(client)
+    policy = client.patch(
+        "/api/v1/admin/ml/policy",
+        headers=auth_header(admin),
+        json={"upload_mode": "metrics_only"},
+    )
+    assert policy.status_code == 200
+
+    first = _numeric_attempt(success=True)
+    first["model_version"] = "numeric-v1"
+    second = _numeric_attempt(success=False)
+    second["model_version"] = "numeric-v1"
+    other = _numeric_attempt(success=True)
+    other["model_version"] = "numeric-v2"
+    manual = _numeric_attempt(success=True, assisted=False)
+    manual["model_version"] = "human-manual"
+    for payload in (first, second, other, manual):
+        response = client.post(
+            "/api/v1/captcha/attempts",
+            headers=auth_header(user),
+            json=payload,
+        )
+        assert response.status_code == 200, response.text
+        if payload is manual:
+            assert response.json()["stored"] is False
+
+    overview = client.get(
+        "/api/v1/admin/ml/overview",
+        headers=auth_header(admin),
+    )
+    assert overview.status_code == 200
+    metrics = overview.json()["attempts"]
+    assert {
+        (item["captcha_type"], item["model_version"])
+        for item in metrics
+    } == {("numeric", "numeric-v1"), ("numeric", "numeric-v2")}
+
+    selected = client.get(
+        "/api/v1/admin/ml/overview",
+        headers=auth_header(admin),
+        params={"captcha_type": "numeric", "model_version": "numeric-v1"},
+    )
+    assert selected.status_code == 200
+    assert selected.json()["attempts"] == [
+        {
+            "captcha_type": "numeric",
+            "model_version": "numeric-v1",
+            "attempt_count": 2,
+            "success_count": 1,
+            "success_rate": 0.5,
+        }
+    ]
+
+    human_selected = client.get(
+        "/api/v1/admin/ml/overview",
+        headers=auth_header(admin),
+        params={"model_version": "human-manual"},
+    )
+    assert human_selected.status_code == 200
+    assert human_selected.json()["attempts"] == []
+
+
 def test_dataset_export_import_and_model_activation(client):
     admin = changed_admin(client)
     user = _changed_user(client)
@@ -187,6 +251,10 @@ def test_dataset_export_import_and_model_activation(client):
         assert manifest["captcha_type"] == "mixed"
         assert manifest["categories"]["numeric"]["sample_count"] == 1
         assert manifest["categories"]["click"]["sample_count"] == 1
+        assert not any(
+            name == "images/" or name.startswith("images/")
+            for name in archive.namelist()
+        )
         assert "数字验证码/" in archive.namelist()
         assert "文字点选验证码/" in archive.namelist()
         assert len(
@@ -377,6 +445,149 @@ def test_admin_can_list_and_delete_selected_captcha_samples(client):
     assert overview.json()["dataset"]["total_count"] == 1
     assert overview.json()["dataset"]["numeric_count"] == 0
     assert overview.json()["dataset"]["click_count"] == 1
+
+
+def test_sample_listing_filters_model_and_image_can_be_read(client):
+    admin = changed_admin(client)
+    user = _changed_user(client)
+    enabled = client.patch(
+        "/api/v1/admin/ml/policy",
+        headers=auth_header(admin),
+        json={"upload_mode": "samples_and_metrics"},
+    )
+    assert enabled.status_code == 200
+    payload = _numeric_attempt(success=True)
+    payload["model_version"] = "numeric-sample-v1"
+    created = client.post(
+        "/api/v1/captcha/attempts",
+        headers=auth_header(user),
+        json=payload,
+    )
+    assert created.status_code == 200, created.text
+    sample_id = created.json()["sample_id"]
+
+    listed = client.get(
+        "/api/v1/admin/ml/samples",
+        headers=auth_header(admin),
+        params={"captcha_type": "numeric", "model_version": "numeric-sample-v1"},
+    )
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    assert body["total"] == 1
+    assert body["items"][0]["image_mime"] == "image/png"
+    assert body["items"][0]["image_available"] is True
+
+    image = client.get(
+        f"/api/v1/admin/ml/samples/{sample_id}/image",
+        headers=auth_header(admin),
+    )
+    assert image.status_code == 200, image.text
+    assert image.headers["content-type"].startswith("image/png")
+    assert image.content == PNG_1X1
+
+
+def test_dataset_import_accepts_legacy_images_directory(client):
+    admin = changed_admin(client)
+    manifest = {
+        "schema_version": 1,
+        "captcha_type": "numeric",
+        "sample_count": 1,
+        "samples": [
+            {
+                "id": "legacy-id",
+                "captcha_type": "numeric",
+                "source": "transport_numeric",
+                "image": "images/numeric/legacy.png",
+                "image_mime": "image/png",
+                "answer": {"value": "9876"},
+                "model_version": "legacy-model",
+                "captured_at": datetime.now(UTC).isoformat(),
+                "fingerprint": "legacy-fingerprint",
+            }
+        ],
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("images/numeric/legacy.png", PNG_1X1)
+        archive.writestr(
+            "manifest.json",
+            json.dumps(manifest).encode("utf-8"),
+        )
+    imported = client.post(
+        "/api/v1/admin/ml/dataset/import",
+        headers={
+            **auth_header(admin),
+            "Content-Type": "application/zip",
+        },
+        content=output.getvalue(),
+    )
+    assert imported.status_code == 200, imported.text
+    assert imported.json() == {
+        "imported_count": 1,
+        "duplicate_count": 0,
+        "skipped_count": 0,
+    }
+
+
+def test_dataset_import_normalizes_windows_members_and_rejects_traversal(client):
+    admin = changed_admin(client)
+    manifest = {
+        "schema_version": 1,
+        "captcha_type": "numeric",
+        "samples": [
+            {
+                "captcha_type": "numeric",
+                "source": "transport_numeric",
+                "image": ".\\images\\numeric\\windows.png",
+                "answer": {"value": "1357"},
+                "model_version": "windows-model",
+                "captured_at": datetime.now(UTC).isoformat(),
+            }
+        ],
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            ".\\manifest.json",
+            b"\xef\xbb\xbf" + json.dumps(manifest).encode("utf-8"),
+        )
+        archive.writestr("images\\numeric\\windows.png", PNG_1X1)
+    imported = client.post(
+        "/api/v1/admin/ml/dataset/import",
+        headers={
+            **auth_header(admin),
+            "Content-Type": "application/zip",
+        },
+        content=output.getvalue(),
+    )
+    assert imported.status_code == 200, imported.text
+    assert imported.json() == {
+        "imported_count": 1,
+        "duplicate_count": 0,
+        "skipped_count": 0,
+    }
+
+    unsafe = io.BytesIO()
+    with zipfile.ZipFile(unsafe, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(
+            "manifest.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "samples": [],
+                }
+            ),
+        )
+        archive.writestr(r"..\outside.png", PNG_1X1)
+    rejected = client.post(
+        "/api/v1/admin/ml/dataset/import",
+        headers={
+            **auth_header(admin),
+            "Content-Type": "application/zip",
+        },
+        content=unsafe.getvalue(),
+    )
+    assert rejected.status_code == 422
 
 
 def test_failed_attempt_rejects_image_and_non_admin_cannot_manage_dataset(client):

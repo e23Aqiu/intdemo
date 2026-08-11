@@ -212,11 +212,23 @@ class ApiClient:
         )
         return bytes(response.content)
 
-    def admin_captcha_learning_overview(self, access_token: str) -> dict:
+    def admin_captcha_learning_overview(
+        self,
+        access_token: str,
+        *,
+        captcha_type: str | None = None,
+        model_version: str | None = None,
+    ) -> dict:
+        params = {}
+        if captcha_type:
+            params["captcha_type"] = str(captcha_type)
+        if model_version:
+            params["model_version"] = str(model_version)
         return self._request(
             "GET",
             "/admin/ml/overview",
             token=access_token,
+            params=params or None,
         )
 
     def admin_update_captcha_policy(
@@ -263,6 +275,7 @@ class ApiClient:
         access_token: str,
         *,
         captcha_type: str | None = None,
+        model_version: str | None = None,
         limit: int = 200,
         offset: int = 0,
     ) -> dict:
@@ -272,12 +285,27 @@ class ApiClient:
         }
         if captcha_type:
             params["captcha_type"] = str(captcha_type)
+        if model_version:
+            params["model_version"] = str(model_version)
         return self._request(
             "GET",
             "/admin/ml/samples",
             token=access_token,
             params=params,
         )
+
+    def admin_download_captcha_sample_image(
+        self,
+        access_token: str,
+        sample_id: str,
+    ) -> bytes:
+        response = self._request(
+            "GET",
+            f"/admin/ml/samples/{sample_id}/image",
+            token=access_token,
+            raw_response=True,
+        )
+        return bytes(response.content)
 
     def admin_delete_captcha_samples(
         self,
