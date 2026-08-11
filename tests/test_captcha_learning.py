@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import io
 import json
@@ -12,6 +13,7 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image, ImageDraw
+from playwright.sync_api import sync_playwright
 from PyQt5.QtCore import QItemSelectionModel
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
@@ -518,7 +520,7 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(click_events[0]["captcha_type"], "click")
         self.assertEqual(len(click_events[0]["answer"]["points"]), 2)
 
-    def test_manual_click_capture_observes_overlay_and_falls_back_to_markers(self):
+    def test_manual_click_capture_uses_clean_source_and_installs_handler_first(self):
         worker = BusinessBackfillWorker(
             "unused.xlsx",
             True,
@@ -527,8 +529,11 @@ class CaptchaLearningTests(unittest.TestCase):
             False,
             captcha_collection_enabled=lambda: True,
         )
-        capture_scripts = []
-        page_scripts = []
+        clean_image = _click_image()
+        source = "data:image/png;base64," + base64.b64encode(
+            clean_image
+        ).decode("ascii")
+        call_order = []
 
         class Prompt:
             first = None
@@ -548,11 +553,24 @@ class CaptchaLearningTests(unittest.TestCase):
 
             @staticmethod
             def screenshot():
-                return _click_image()
+                raise AssertionError("data URL 原图可用时不应截取带覆盖层的页面")
 
             @staticmethod
-            def evaluate(script):
-                capture_scripts.append(script)
+            def evaluate(script, *args):
+                if "resetClicks" in script:
+                    call_order.append("handler")
+                    return {
+                        "source": source,
+                        "prompt_text": "请依次点击【甲,乙】",
+                        "marker_points": [],
+                    }
+                if "currentSrc" in script:
+                    call_order.append("state")
+                    return {
+                        "source": source,
+                        "prompt_text": "请依次点击【甲,乙】",
+                    }
+                raise AssertionError("unexpected image evaluation script")
 
         class Page:
             @staticmethod
@@ -564,9 +582,8 @@ class CaptchaLearningTests(unittest.TestCase):
                 raise AssertionError(f"unexpected selector: {selector}")
 
             @staticmethod
-            def evaluate(script):
-                page_scripts.append(script)
-                if "__intdemoCaptchaClicks" in script:
+            def evaluate(script, *args):
+                if "__intdemoCaptchaClickEvents" in script:
                     return []
                 if "point-area" in script:
                     return [
@@ -578,16 +595,21 @@ class CaptchaLearningTests(unittest.TestCase):
         worker.page = Page()
         capture = worker._prepare_manual_click_capture()
         self.assertEqual(capture["prompt"], ["甲", "乙"])
-        self.assertEqual(len(capture_scripts), 1)
-        self.assertIn("documentRoot.addEventListener", capture_scripts[0])
-        self.assertIn("ownerWindow.__intdemoCaptchaCaptureHandler", capture_scripts[0])
+        self.assertEqual(call_order[:2], ["handler", "state"])
+        with Image.open(io.BytesIO(capture["image_bytes"])) as actual, Image.open(
+            io.BytesIO(clean_image)
+        ) as expected:
+            self.assertEqual(actual.size, expected.size)
+            self.assertEqual(
+                actual.convert("RGB").tobytes(),
+                expected.convert("RGB").tobytes(),
+            )
 
         points = worker._manual_click_points(capture)
         self.assertEqual(
             points,
             [{"x": 0.25, "y": 0.4}, {"x": 0.75, "y": 0.6}],
         )
-        self.assertTrue(any("point-area" in script for script in page_scripts))
 
         events = []
         worker.captcha_attempt_signal.connect(events.append)
@@ -601,7 +623,249 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(events[0]["image_bytes"], capture["image_bytes"])
         self.assertEqual(events[0]["answer"]["prompt"], ["甲", "乙"])
 
-    def test_manual_click_collects_pending_sample_when_success_follows_error_log(self):
+    def test_manual_click_prompt_accepts_common_separators(self):
+        for text in (
+            "请依次点击【甲,乙】",
+            "请依次点击【甲，乙】",
+            "请依次点击【甲、乙】",
+            "请依次点击【甲 乙】",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    BusinessBackfillWorker._parse_manual_click_prompt(text),
+                    ["甲", "乙"],
+                )
+
+    def test_manual_click_fallback_screenshot_hides_and_restores_markers(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        clean_image = _click_image()
+        marker_hidden = {"value": False}
+
+        class Prompt:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            @staticmethod
+            def inner_text():
+                return "请依次点击【甲,乙】"
+
+        class CaptchaImage:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            @staticmethod
+            def screenshot():
+                if not marker_hidden["value"]:
+                    raise AssertionError("截图时必须先隐藏点选图标")
+                return clean_image
+
+            @staticmethod
+            def evaluate(script, *args):
+                if "resetClicks" in script:
+                    return {
+                        "source": "https://example.invalid/captcha.png",
+                        "prompt_text": "请依次点击【甲,乙】",
+                        "marker_points": [],
+                    }
+                if "currentSrc" in script:
+                    return {
+                        "source": "https://example.invalid/captcha.png",
+                        "prompt_text": "请依次点击【甲,乙】",
+                    }
+                if "styleId" in script:
+                    marker_hidden["value"] = True
+                    return None
+                raise AssertionError("unexpected image evaluation script")
+
+        class Page:
+            @staticmethod
+            def locator(selector):
+                if selector == ".verify-msg":
+                    return Prompt()
+                if selector == ".back-img":
+                    return CaptchaImage()
+                raise AssertionError(f"unexpected selector: {selector}")
+
+            @staticmethod
+            def evaluate(script, *args):
+                if "getElementById" in script:
+                    marker_hidden["value"] = False
+                    return None
+                raise AssertionError("unexpected page evaluation script")
+
+        worker.page = Page()
+        capture = worker._prepare_manual_click_capture()
+
+        self.assertEqual(capture["image_bytes"], clean_image)
+        self.assertFalse(marker_hidden["value"])
+
+    def test_manual_click_capture_restarts_when_atomic_snapshot_changes(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        first_source = "data:image/png;base64," + base64.b64encode(
+            _click_image(5)
+        ).decode("ascii")
+        second_image = _click_image(6)
+        second_source = "data:image/png;base64," + base64.b64encode(
+            second_image
+        ).decode("ascii")
+        snapshots = [
+            {
+                "source": first_source,
+                "prompt_text": "请依次点击【甲,乙】",
+                "generation": 1,
+                "marker_points": [],
+            },
+            {
+                "source": second_source,
+                "prompt_text": "请依次点击【丙,丁】",
+                "generation": 2,
+                "marker_points": [],
+            },
+        ]
+        states = [
+            {
+                "source": second_source,
+                "prompt_text": "请依次点击【丙,丁】",
+                "generation": 2,
+            },
+            {
+                "source": second_source,
+                "prompt_text": "请依次点击【丙,丁】",
+                "generation": 2,
+            },
+        ]
+        reset_values = []
+
+        class CaptchaImage:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+            @staticmethod
+            def evaluate(script, *args):
+                if "resetClicks" in script:
+                    reset_values.append(args[0])
+                    return snapshots.pop(0)
+                if "currentSrc" in script:
+                    return states.pop(0)
+                raise AssertionError("unexpected image evaluation script")
+
+        class Page:
+            @staticmethod
+            def locator(selector):
+                if selector == ".back-img":
+                    return CaptchaImage()
+                raise AssertionError(f"unexpected selector: {selector}")
+
+        worker.page = Page()
+        capture = worker._prepare_manual_click_capture()
+
+        self.assertEqual(reset_values, [True, False])
+        self.assertEqual(capture["prompt"], ["丙", "丁"])
+        with Image.open(io.BytesIO(capture["image_bytes"])) as actual, Image.open(
+            io.BytesIO(second_image)
+        ) as expected:
+            self.assertEqual(
+                actual.convert("RGB").tobytes(),
+                expected.convert("RGB").tobytes(),
+            )
+
+    def test_manual_click_fixed_url_identity_uses_clean_pixels(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        source = "https://example.invalid/captcha.png"
+        prompt = ["甲", "乙"]
+        first_image = _click_image(7)
+        second_image = _click_image(8)
+        capture = {
+            "image_bytes": first_image,
+            "prompt": prompt,
+            "prompt_text": "请依次点击【甲,乙】",
+            "challenge_id": worker._click_challenge_id(
+                source,
+                first_image,
+                prompt,
+                1,
+                use_image=True,
+            ),
+            "challenge_source": source,
+            "challenge_generation": 1,
+            "identity_uses_image": True,
+        }
+
+        class CaptchaImage:
+            first = None
+
+            def __init__(self):
+                self.first = self
+
+        class Page:
+            @staticmethod
+            def locator(selector):
+                if selector == ".back-img":
+                    return CaptchaImage()
+                raise AssertionError(f"unexpected selector: {selector}")
+
+        worker.page = Page()
+        state = {
+            "source": source,
+            "prompt_text": "请依次点击【甲,乙】",
+            "generation": 1,
+        }
+        with patch.object(
+            worker,
+            "_click_captcha_state",
+            return_value=state,
+        ), patch.object(
+            worker,
+            "_clean_manual_click_screenshot",
+            return_value=first_image,
+        ):
+            self.assertEqual(
+                worker._current_manual_click_challenge_id(capture),
+                capture["challenge_id"],
+            )
+
+        with patch.object(
+            worker,
+            "_click_captcha_state",
+            return_value=state,
+        ), patch.object(
+            worker,
+            "_clean_manual_click_screenshot",
+            return_value=second_image,
+        ):
+            self.assertNotEqual(
+                worker._current_manual_click_challenge_id(capture),
+                capture["challenge_id"],
+            )
+
+    def test_manual_click_capture_is_prefetched_before_stability_wait(self):
         worker = BusinessBackfillWorker(
             "unused.xlsx",
             True,
@@ -613,6 +877,53 @@ class CaptchaLearningTests(unittest.TestCase):
         capture = {
             "image_bytes": _click_image(),
             "prompt": ["甲", "乙"],
+            "challenge_id": "challenge-1",
+        }
+        order = []
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(milliseconds):
+                order.append(("wait", milliseconds))
+
+        worker.page = Page()
+
+        def prepare(*, reset_clicks):
+            order.append(("capture", reset_clicks))
+            return capture
+
+        with patch.object(
+            worker,
+            "_business_result_is_ready",
+            return_value=False,
+        ), patch.object(
+            worker,
+            "_captcha_image_is_ready",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_prepare_manual_click_capture",
+            side_effect=prepare,
+        ):
+            self.assertEqual(worker._wait_for_business_response(), "captcha")
+
+        self.assertEqual(order[0], ("capture", True))
+        self.assertEqual(order, [("capture", True)])
+        self.assertIs(worker._prefetched_manual_click_capture, capture)
+
+    def test_manual_click_success_after_preliminary_error_saves_original_capture(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        capture = {
+            "image_bytes": _click_image(),
+            "prompt": ["甲", "乙"],
+            "challenge_id": "challenge-1",
         }
         points = [{"x": 0.25, "y": 0.4}, {"x": 0.75, "y": 0.6}]
 
@@ -651,19 +962,28 @@ class CaptchaLearningTests(unittest.TestCase):
             worker,
             "_prepare_manual_click_capture",
             return_value=capture,
-        ), patch.object(
+        ) as prepare_capture, patch.object(
             worker,
             "_manual_click_points",
             return_value=points,
         ), patch.object(
             worker,
             "_captcha_prompt_is_visible",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_business_result_is_ready",
             return_value=False,
+        ), patch.object(
+            worker,
+            "_wait_for_manual_click_outcome",
+            return_value={"state": "passed"},
         ), patch("integrated_client.tools.transport_tool.time.sleep"):
             self.assertTrue(
                 worker._complete_manual_click_captcha("human-manual")
             )
 
+        prepare_capture.assert_called_once_with(reset_clicks=True)
         self.assertEqual(len(events), 1)
         self.assertTrue(events[0]["success"])
         self.assertEqual(events[0]["image_bytes"], capture["image_bytes"])
@@ -691,7 +1011,7 @@ class CaptchaLearningTests(unittest.TestCase):
             ],
         )
 
-    def test_manual_click_discards_pending_sample_before_waiting_for_retry(self):
+    def test_manual_click_failure_waits_for_fresh_challenge_before_next_wait(self):
         worker = BusinessBackfillWorker(
             "unused.xlsx",
             True,
@@ -700,9 +1020,15 @@ class CaptchaLearningTests(unittest.TestCase):
             True,
             captcha_collection_enabled=lambda: True,
         )
-        capture = {
+        first_capture = {
             "image_bytes": _click_image(),
             "prompt": ["甲", "乙"],
+            "challenge_id": "challenge-1",
+        }
+        second_capture = {
+            "image_bytes": _click_image(1),
+            "prompt": ["丙", "丁"],
+            "challenge_id": "challenge-2",
         }
         points = [{"x": 0.25, "y": 0.4}, {"x": 0.75, "y": 0.6}]
 
@@ -750,8 +1076,8 @@ class CaptchaLearningTests(unittest.TestCase):
         with patch.object(
             worker,
             "_prepare_manual_click_capture",
-            return_value=capture,
-        ), patch.object(
+            return_value=first_capture,
+        ) as prepare_capture, patch.object(
             worker,
             "_manual_click_points",
             return_value=points,
@@ -759,11 +1085,20 @@ class CaptchaLearningTests(unittest.TestCase):
             worker,
             "_captcha_prompt_is_visible",
             return_value=True,
+        ), patch.object(
+            worker,
+            "_business_result_is_ready",
+            return_value=False,
+        ), patch.object(
+            worker,
+            "_wait_for_manual_click_outcome",
+            return_value={"state": "retry", "capture": second_capture},
         ), patch("integrated_client.tools.transport_tool.time.sleep"):
             self.assertFalse(
                 worker._complete_manual_click_captcha("human-manual")
             )
 
+        prepare_capture.assert_called_once_with(reset_clicks=True)
         failure_indexes = [
             index
             for index, (kind, value) in enumerate(timeline)
@@ -783,12 +1118,382 @@ class CaptchaLearningTests(unittest.TestCase):
         )
         self.assertEqual(len(failure_indexes), 1)
         self.assertLess(failure_indexes[0], retry_wait_index)
+        relevant_logs = [
+            value
+            for kind, value in timeline
+            if kind == "log"
+            and any(
+                marker in value
+                for marker in (
+                    "等待用户点完验证码",
+                    "用户已点完验证码",
+                    "验证码点击错误",
+                    "验证码通过",
+                )
+            )
+        ]
+        self.assertEqual(
+            relevant_logs,
+            [
+                "⏳ 等待用户点完验证码...",
+                "✅ 用户已点完验证码",
+                "❌ 验证码点击错误，请重新点击验证码...",
+                "⏳ 等待用户点完验证码...",
+            ],
+        )
         self.assertFalse(
             any(
                 kind == "event" and value["success"]
                 for kind, value in timeline
             )
         )
+
+    def test_manual_click_outcome_only_retries_after_challenge_changes(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        first_capture = {
+            "image_bytes": _click_image(),
+            "prompt": ["甲", "乙"],
+            "challenge_id": "challenge-1",
+        }
+        second_capture = {
+            "image_bytes": _click_image(1),
+            "prompt": ["丙", "丁"],
+            "challenge_id": "challenge-2",
+        }
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        worker.page = Page()
+        with patch.object(
+            worker,
+            "_manual_click_attempt_from_events",
+            return_value=None,
+        ), patch.object(
+            worker,
+            "_business_result_is_ready",
+            return_value=False,
+        ), patch.object(
+            worker,
+            "_captcha_prompt_is_visible",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_captcha_image_is_ready",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_business_captcha_loading_is_visible",
+            return_value=False,
+        ), patch.object(
+            worker,
+            "_current_manual_click_challenge_id",
+            side_effect=["challenge-1", "challenge-2"],
+        ), patch.object(
+            worker,
+            "_manual_click_marker_points",
+            return_value=[{"x": 0.25, "y": 0.4}, {"x": 0.75, "y": 0.6}],
+        ), patch.object(
+            worker,
+            "_prepare_manual_click_capture",
+            return_value=second_capture,
+        ) as prepare_capture:
+            outcome = worker._wait_for_manual_click_outcome(first_capture, 2)
+
+        self.assertEqual(outcome["state"], "retry")
+        self.assertIs(outcome["capture"], second_capture)
+        prepare_capture.assert_called_once_with(reset_clicks=False)
+
+    def test_manual_click_outcome_waits_for_delayed_result_on_same_challenge(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        capture = {
+            "image_bytes": _click_image(),
+            "prompt": ["甲", "乙"],
+            "challenge_id": "challenge-1",
+            "event_challenge_id": "challenge-1",
+        }
+
+        class Page:
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        worker.page = Page()
+        with patch.object(
+            worker,
+            "_manual_click_attempt_from_events",
+            return_value=None,
+        ), patch.object(
+            worker,
+            "_business_result_is_ready",
+            side_effect=[False, False, True],
+        ), patch.object(
+            worker,
+            "_captcha_prompt_is_visible",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_captcha_image_is_ready",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_business_captcha_loading_is_visible",
+            return_value=False,
+        ), patch.object(
+            worker,
+            "_current_manual_click_challenge_id",
+            return_value="challenge-1",
+        ), patch.object(
+            worker,
+            "_prepare_manual_click_capture",
+        ) as prepare_capture:
+            outcome = worker._wait_for_manual_click_outcome(capture, 2)
+
+        self.assertEqual(outcome, {"state": "passed"})
+        prepare_capture.assert_not_called()
+
+    def test_manual_click_rapid_retry_uses_new_clean_source_and_points(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        clean_image = _click_image(2)
+        source = "data:image/png;base64," + base64.b64encode(
+            clean_image
+        ).decode("ascii")
+        events = [
+            {
+                "x": 0.2,
+                "y": 0.3,
+                "source": source,
+                "prompt_text": "请依次点击【丙，丁】",
+            },
+            {
+                "x": 0.8,
+                "y": 0.7,
+                "source": source,
+                "prompt_text": "请依次点击【丙，丁】",
+            },
+        ]
+        with patch.object(worker, "_manual_click_events", return_value=events):
+            attempt = worker._manual_click_attempt_from_events(
+                exclude_challenge_id="challenge-1"
+            )
+
+        self.assertEqual(attempt["capture"]["prompt"], ["丙", "丁"])
+        self.assertEqual(
+            attempt["points"],
+            [{"x": 0.2, "y": 0.3}, {"x": 0.8, "y": 0.7}],
+        )
+        with Image.open(io.BytesIO(attempt["capture"]["image_bytes"])) as actual:
+            self.assertEqual(actual.size, (120, 60))
+
+    def test_manual_click_remote_retry_is_evidence_even_without_image_bytes(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        events = [
+            {
+                "x": 0.2,
+                "y": 0.3,
+                "source": "https://example.invalid/captcha.png",
+                "prompt_text": "请依次点击【丙，丁】",
+                "generation": 2,
+            },
+            {
+                "x": 0.8,
+                "y": 0.7,
+                "source": "https://example.invalid/captcha.png",
+                "prompt_text": "请依次点击【丙，丁】",
+                "generation": 2,
+            },
+        ]
+        with patch.object(worker, "_manual_click_events", return_value=events):
+            attempt = worker._manual_click_attempt_from_events(
+                exclude_challenge_id="challenge-1"
+            )
+
+        self.assertIsNone(attempt["capture"])
+        self.assertEqual(len(attempt["points"]), 2)
+
+    def test_manual_click_remote_rapid_success_never_saves_old_image(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        old_image = _click_image(9)
+        capture = {
+            "image_bytes": old_image,
+            "prompt": ["甲", "乙"],
+            "prompt_text": "请依次点击【甲,乙】",
+            "challenge_id": "old-visual",
+            "event_challenge_id": "old-event",
+            "challenge_source": "https://example.invalid/captcha.png",
+            "challenge_generation": 1,
+        }
+        old_points = [{"x": 0.2, "y": 0.3}, {"x": 0.8, "y": 0.7}]
+        rapid_attempt = {
+            "capture": None,
+            "points": [{"x": 0.3, "y": 0.2}, {"x": 0.7, "y": 0.8}],
+        }
+
+        class Page:
+            pass
+
+        worker.page = Page()
+        events = []
+        worker.captcha_attempt_signal.connect(events.append)
+        with patch.object(
+            worker,
+            "_prepare_manual_click_capture",
+            return_value=capture,
+        ), patch.object(
+            worker,
+            "_captcha_prompt_is_visible",
+            return_value=True,
+        ), patch.object(
+            worker,
+            "_current_manual_click_challenge_id",
+            return_value="old-visual",
+        ), patch.object(
+            worker,
+            "_manual_click_points",
+            return_value=old_points,
+        ), patch.object(
+            worker,
+            "_manual_click_attempt_from_events",
+            return_value=rapid_attempt,
+        ), patch.object(
+            worker,
+            "_clear_manual_click_events",
+        ), patch.object(
+            worker,
+            "_business_result_is_ready",
+            return_value=True,
+        ), patch("integrated_client.tools.transport_tool.time.sleep"):
+            self.assertTrue(
+                worker._complete_manual_click_captcha("human-manual")
+            )
+
+        self.assertEqual([event["success"] for event in events], [False, True])
+        self.assertTrue(all("image_bytes" not in event for event in events))
+
+    def test_manual_click_real_chromium_keeps_same_source_retry_events(self):
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            False,
+            2,
+            True,
+            captcha_collection_enabled=lambda: True,
+        )
+        first_image = _click_image(3)
+        first_source = "data:image/png;base64," + base64.b64encode(
+            first_image
+        ).decode("ascii")
+
+        with sync_playwright() as runtime:
+            try:
+                browser = runtime.chromium.launch(headless=True)
+            except Exception as exc:
+                self.skipTest(f"Chromium unavailable: {exc}")
+            try:
+                page = browser.new_page(viewport={"width": 500, "height": 300})
+                page.set_content(
+                    f"""
+                    <div class="verify-msg">请依次点击【甲,乙】</div>
+                    <img class="back-img" src="{first_source}"
+                         style="display:block;width:120px;height:60px">
+                    <script>
+                    document.querySelector('.back-img').addEventListener('click', event => {{
+                        const marker = document.createElement('span');
+                        marker.className = 'point-area';
+                        marker.style.cssText = `position:fixed;pointer-events:none;
+                            width:12px;height:12px;border-radius:6px;background:red;
+                            left:${{event.clientX - 6}}px;top:${{event.clientY - 6}}px`;
+                        document.body.appendChild(marker);
+                    }});
+                    </script>
+                    """
+                )
+                worker.page = page
+                first_capture = worker._prepare_manual_click_capture()
+
+                image = page.locator(".back-img")
+                image.click(position={"x": 24, "y": 24})
+                image.click(position={"x": 90, "y": 42})
+
+                page.evaluate(
+                    """
+                    source => {
+                        document.querySelectorAll('.point-area').forEach(
+                            marker => marker.remove()
+                        );
+                        document.querySelector('.back-img').setAttribute(
+                            'src', source
+                        );
+                    }
+                    """,
+                    first_source,
+                )
+                page.wait_for_function(
+                    "() => document.querySelector('.back-img').complete"
+                )
+                image.click(position={"x": 30, "y": 20})
+                image.click(position={"x": 96, "y": 40})
+
+                first_points = worker._manual_click_points(first_capture)
+                worker._clear_manual_click_events(first_capture)
+                retry_attempt = worker._manual_click_attempt_from_events(
+                    exclude_challenge_id=first_capture["event_challenge_id"]
+                )
+            finally:
+                browser.close()
+
+        self.assertEqual(len(first_points), 2)
+        self.assertIsNotNone(retry_attempt)
+        self.assertEqual(retry_attempt["capture"]["prompt"], ["甲", "乙"])
+        self.assertEqual(len(retry_attempt["points"]), 2)
+        self.assertNotEqual(
+            retry_attempt["capture"]["challenge_id"],
+            first_capture["challenge_id"],
+        )
+        with Image.open(
+            io.BytesIO(retry_attempt["capture"]["image_bytes"])
+        ) as actual, Image.open(io.BytesIO(first_image)) as expected:
+            self.assertEqual(
+                actual.convert("RGB").tobytes(),
+                expected.convert("RGB").tobytes(),
+            )
 
     def test_machine_learning_page_exports_one_classified_dataset(self):
         session = _FakeSession()

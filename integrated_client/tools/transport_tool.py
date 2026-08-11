@@ -1,5 +1,7 @@
 # 正则表达式：用于解析车牌格式
 import re
+import base64
+import hashlib
 # 操作系统模块：用于文件路径判断
 import os
 # 时间模块：用于延时
@@ -1449,6 +1451,7 @@ class BusinessBackfillWorker(QThread):
         self.browser = None
         self.playwright = None
         self.page = None
+        self._prefetched_manual_click_capture = None
 
     def _collection_enabled(self):
         callback = self.captcha_collection_enabled
@@ -1783,14 +1786,67 @@ class BusinessBackfillWorker(QThread):
         """等待验证码图片稳定就绪，或等待无需验证码的业务结果。"""
         deadline = time.monotonic() + self.web_timeout / 1000
         wait_logged = False
+        prefetch_attempted = False
+        self._prefetched_manual_click_capture = None
         while time.monotonic() < deadline:
             self._check_stopped()
             if self._business_result_is_ready():
+                if self._prefetched_manual_click_capture is not None:
+                    capture = self._prefetched_manual_click_capture
+                    self._prefetched_manual_click_capture = None
+                    points = self._manual_click_points(capture)
+                    rapid_attempt = self._manual_click_attempt_from_events(
+                        exclude_challenge_id=str(
+                            capture.get("event_challenge_id")
+                            or capture.get("challenge_id")
+                            or ""
+                        )
+                    )
+                    self._clear_manual_click_events(capture)
+                    self.log.emit("✅ 用户已点完验证码")
+                    if rapid_attempt is not None:
+                        self._emit_captcha_attempt(
+                            success=False,
+                            model_version="human-manual",
+                            assisted=True,
+                        )
+                        self._report_successful_click_captcha(
+                            rapid_attempt["capture"],
+                            rapid_attempt["points"],
+                            model_version="human-manual",
+                            assisted=True,
+                        )
+                        self._clear_manual_click_events(
+                            rapid_attempt["capture"]
+                        )
+                    else:
+                        self._report_successful_click_captcha(
+                            capture,
+                            points,
+                            model_version="human-manual",
+                            assisted=True,
+                        )
+                    self.log.emit("✅ 验证码通过，开始获取信息")
                 return "result"
             if self._captcha_image_is_ready():
                 if not wait_logged:
                     self.log.emit("⏳ 验证码已出现，等待图片完整加载...")
                     wait_logged = True
+                if (
+                    not prefetch_attempted
+                    and not self.auto_mode
+                    and self.manual_at_captcha
+                ):
+                    # 验证码首次完整显示就安装点击监听并保存原图，不再等
+                    # 800ms 稳定期结束，避免用户先于采集线程完成点击。
+                    prefetch_attempted = True
+                    self._prefetched_manual_click_capture = (
+                        self._prepare_manual_click_capture(reset_clicks=True)
+                    )
+                    # 人工模式在题图就绪并完成预采集后应立即进入点选状态；
+                    # 继续等待稳定周期反而给快速刷新制造串题窗口。
+                    self.log.emit("✅ 验证码图片加载完成，开始处理")
+                    return "captcha"
                 self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_STABLE_MS"])
                 self._check_stopped()
                 if self._captcha_image_is_ready():
@@ -1815,98 +1871,530 @@ class BusinessBackfillWorker(QThread):
             self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
         return False
 
-    def _prepare_manual_click_capture(self):
-        if not self._sample_collection_enabled():
+    @staticmethod
+    def _parse_manual_click_prompt(prompt_text):
+        match = re.search(r"【([^】]+)】", str(prompt_text or ""))
+        if not match:
+            return []
+        return [
+            character.strip()
+            for character in re.split(r"[,，、\s]+", match.group(1))
+            if character.strip()
+        ]
+
+    @staticmethod
+    def _normalize_manual_click_points(points, expected_count=0):
+        normalized = []
+        for point in points or []:
+            if not isinstance(point, dict):
+                continue
+            try:
+                x = float(point.get("x"))
+                y = float(point.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= x <= 1 and 0 <= y <= 1:
+                normalized.append({"x": round(x, 6), "y": round(y, 6)})
+        if expected_count:
+            return normalized[:expected_count]
+        return normalized
+
+    @staticmethod
+    def _click_challenge_id(
+        source,
+        image_bytes=None,
+        prompt=None,
+        generation=0,
+        *,
+        use_image=False,
+    ):
+        if use_image and image_bytes:
+            value = bytes(image_bytes)
+        elif source:
+            value = str(source).encode("utf-8", errors="replace")
+        else:
+            value = bytes(image_bytes or b"")
+        if not value:
+            return ""
+        digest = hashlib.sha256()
+        digest.update(value)
+        digest.update(b"\0")
+        digest.update(
+            "\x1f".join(str(item) for item in (prompt or [])).encode("utf-8")
+        )
+        digest.update(b"\0")
+        digest.update(str(generation or 0).encode("ascii", errors="replace"))
+        return digest.hexdigest()
+
+    @staticmethod
+    def _decode_click_image_source(source):
+        value = str(source or "")
+        if "," not in value:
+            return None
+        header, encoded_image = value.split(",", 1)
+        if (
+            not header.casefold().startswith("data:image/")
+            or ";base64" not in header.casefold()
+        ):
             return None
         try:
-            prompt_text = self.page.locator(".verify-msg").first.inner_text().strip()
-            match = re.search(r"【([^】]+)】", prompt_text)
-            if not match:
+            raw_image = base64.b64decode(encoded_image, validate=False)
+            if not raw_image or len(raw_image) > 4 * 1024 * 1024:
                 return None
-            prompt = [
-                character.strip()
-                for character in match.group(1).split(",")
-                if character.strip()
-            ]
-            image = self.page.locator(".back-img").first
-            image_bytes = image.screenshot()
-            image.evaluate(
+            with Image.open(io.BytesIO(raw_image)) as source_image:
+                if source_image.width * source_image.height > 16_000_000:
+                    return None
+                source_image.load()
+                mode = "RGBA" if "A" in source_image.getbands() else "RGB"
+                normalized_image = source_image.convert(mode)
+            output = io.BytesIO()
+            normalized_image.save(output, format="PNG")
+            return output.getvalue()
+        except Exception:
+            return None
+
+    @staticmethod
+    def _click_captcha_state(image):
+        try:
+            state = image.evaluate(
                 """
                 element => {
-                    const documentRoot = element.ownerDocument;
-                    const ownerWindow = documentRoot.defaultView || window;
-                    ownerWindow.__intdemoCaptchaClicks = [];
-                    if (ownerWindow.__intdemoCaptchaCaptureHandler) {
-                        documentRoot.removeEventListener(
-                            'click',
-                            ownerWindow.__intdemoCaptchaCaptureHandler,
-                            true
-                        );
-                    }
-                    const handler = event => {
-                        const rect = element.getBoundingClientRect();
-                        if (!rect.width || !rect.height) return;
-                        if (
-                            event.clientX < rect.left ||
-                            event.clientX > rect.right ||
-                            event.clientY < rect.top ||
-                            event.clientY > rect.bottom
-                        ) return;
-                        ownerWindow.__intdemoCaptchaClicks.push({
-                            x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
-                            y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height))
-                        });
+                    const ownerWindow = element.ownerDocument.defaultView || window;
+                    const generationOf = current => {
+                        if (!Number.isInteger(current.__intdemoCaptchaGeneration)) {
+                            ownerWindow.__intdemoCaptchaGenerationCounter =
+                                (ownerWindow.__intdemoCaptchaGenerationCounter || 0) + 1;
+                            current.__intdemoCaptchaGeneration =
+                                ownerWindow.__intdemoCaptchaGenerationCounter;
+                        }
+                        return current.__intdemoCaptchaGeneration;
                     };
-                    ownerWindow.__intdemoCaptchaCaptureHandler = handler;
-                    documentRoot.addEventListener('click', handler, true);
+                    const sourceOf = current => {
+                        const image = current.matches('img')
+                            ? current
+                            : current.querySelector('img');
+                        if (image) {
+                            return image.currentSrc || image.src ||
+                                image.getAttribute('src') || '';
+                        }
+                        const canvas = current.matches('canvas')
+                            ? current
+                            : current.querySelector('canvas');
+                        if (canvas) {
+                            try {
+                                return canvas.toDataURL('image/png');
+                            } catch (_) {
+                                return '';
+                            }
+                        }
+                        const background = getComputedStyle(current).backgroundImage || '';
+                        const match = background.match(/url\\(["']?(.*?)["']?\\)/);
+                        return match && match[1] ? match[1] : '';
+                    };
+                    const prompt = element.ownerDocument.querySelector('.verify-msg');
+                    return {
+                        source: sourceOf(element),
+                        prompt_text: prompt ? (prompt.textContent || '').trim() : '',
+                        generation: generationOf(element)
+                    };
                 }
                 """
             )
-            return {
-                "image_bytes": image_bytes,
-                "prompt": prompt,
-            }
+            return dict(state or {})
         except Exception:
-            return None
+            return {}
 
-    def _manual_click_points(self, capture):
-        if not capture:
+    def _clean_manual_click_screenshot(self, image):
+        style_id = "__intdemoCaptchaCleanCaptureStyle"
+        image.evaluate(
+            """
+            (element, styleId) => {
+                const documentRoot = element.ownerDocument;
+                let style = documentRoot.getElementById(styleId);
+                if (!style) {
+                    style = documentRoot.createElement('style');
+                    style.id = styleId;
+                    documentRoot.documentElement.appendChild(style);
+                }
+                style.textContent =
+                    '.point-area { visibility: hidden !important; opacity: 0 !important; }';
+            }
+            """,
+            style_id,
+        )
+        try:
+            return image.screenshot()
+        finally:
+            try:
+                self.page.evaluate(
+                    "styleId => document.getElementById(styleId)?.remove()",
+                    style_id,
+                )
+            except Exception:
+                pass
+
+    def _install_manual_click_handler(self, image, *, reset_clicks):
+        return image.evaluate(
+            """
+            (element, resetClicks) => {
+                const documentRoot = element.ownerDocument;
+                const ownerWindow = documentRoot.defaultView || window;
+                const storageKey = '__intdemoCaptchaClickEventsV2';
+
+                const restoreEvents = () => {
+                    try {
+                        const value = JSON.parse(
+                            ownerWindow.sessionStorage.getItem(storageKey) || '[]'
+                        );
+                        return Array.isArray(value) ? value : [];
+                    } catch (_) {
+                        return [];
+                    }
+                };
+                if (resetClicks) {
+                    ownerWindow.__intdemoCaptchaClickEvents = [];
+                } else if (!Array.isArray(ownerWindow.__intdemoCaptchaClickEvents)) {
+                    ownerWindow.__intdemoCaptchaClickEvents = restoreEvents();
+                }
+                try {
+                    ownerWindow.sessionStorage.setItem(
+                        storageKey,
+                        JSON.stringify(ownerWindow.__intdemoCaptchaClickEvents)
+                    );
+                } catch (_) {}
+
+                const sourceOf = current => {
+                    const image = current.matches('img')
+                        ? current
+                        : current.querySelector('img');
+                    if (image) {
+                        return image.currentSrc || image.src ||
+                            image.getAttribute('src') || '';
+                    }
+                    const canvas = current.matches('canvas')
+                        ? current
+                        : current.querySelector('canvas');
+                    if (canvas) {
+                        try {
+                            return canvas.toDataURL('image/png');
+                        } catch (_) {
+                            return '';
+                        }
+                    }
+                    const background = getComputedStyle(current).backgroundImage || '';
+                    const match = background.match(/url\\(["']?(.*?)["']?\\)/);
+                    return match && match[1] ? match[1] : '';
+                };
+                const nextGeneration = current => {
+                    ownerWindow.__intdemoCaptchaGenerationCounter =
+                        (ownerWindow.__intdemoCaptchaGenerationCounter || 0) + 1;
+                    current.__intdemoCaptchaGeneration =
+                        ownerWindow.__intdemoCaptchaGenerationCounter;
+                    return current.__intdemoCaptchaGeneration;
+                };
+                const generationOf = current =>
+                    Number.isInteger(current.__intdemoCaptchaGeneration)
+                        ? current.__intdemoCaptchaGeneration
+                        : nextGeneration(current);
+                generationOf(element);
+
+                if (ownerWindow.__intdemoCaptchaLoadHandler) {
+                    documentRoot.removeEventListener(
+                        'load',
+                        ownerWindow.__intdemoCaptchaLoadHandler,
+                        true
+                    );
+                }
+                const loadHandler = event => {
+                    const target = event.target;
+                    if (!(target instanceof ownerWindow.Element)) return;
+                    const host = target.matches('.back-img')
+                        ? target
+                        : target.closest('.back-img');
+                    if (
+                        host &&
+                        (target === host || target.matches('img,canvas'))
+                    ) nextGeneration(host);
+                };
+                ownerWindow.__intdemoCaptchaLoadHandler = loadHandler;
+                documentRoot.addEventListener('load', loadHandler, true);
+
+                if (ownerWindow.__intdemoCaptchaMutationObserver) {
+                    ownerWindow.__intdemoCaptchaMutationObserver.disconnect();
+                }
+                ownerWindow.__intdemoCaptchaObservedElement = element;
+                const observer = new ownerWindow.MutationObserver(mutations => {
+                    const current = documentRoot.querySelector('.back-img');
+                    if (!current) return;
+                    if (current !== ownerWindow.__intdemoCaptchaObservedElement) {
+                        generationOf(current);
+                        ownerWindow.__intdemoCaptchaObservedElement = current;
+                        return;
+                    }
+                    for (const mutation of mutations) {
+                        if (mutation.type === 'attributes') {
+                            const target = mutation.target;
+                            const host = target.matches('.back-img')
+                                ? target
+                                : target.closest('.back-img');
+                            if (
+                                host === current &&
+                                (target === host || target.matches('img,canvas'))
+                            ) {
+                                nextGeneration(current);
+                                return;
+                            }
+                        }
+                        if (mutation.type === 'childList') {
+                            const changedImage = Array.from(mutation.addedNodes)
+                                .some(node =>
+                                    node instanceof ownerWindow.Element &&
+                                    current.contains(node) &&
+                                    (node.matches('img,canvas') ||
+                                        node.querySelector('img,canvas'))
+                                );
+                            if (changedImage) {
+                                nextGeneration(current);
+                                return;
+                            }
+                        }
+                    }
+                });
+                observer.observe(documentRoot, {
+                    subtree: true,
+                    childList: true,
+                    attributes: true,
+                    attributeFilter: ['src']
+                });
+                ownerWindow.__intdemoCaptchaMutationObserver = observer;
+
+                if (ownerWindow.__intdemoCaptchaCaptureHandler) {
+                    documentRoot.removeEventListener(
+                        'click',
+                        ownerWindow.__intdemoCaptchaCaptureHandler,
+                        true
+                    );
+                }
+                const handler = event => {
+                    const current = documentRoot.querySelector('.back-img');
+                    if (!current) return;
+                    const rect = current.getBoundingClientRect();
+                    if (!rect.width || !rect.height) return;
+                    if (
+                        event.clientX < rect.left || event.clientX > rect.right ||
+                        event.clientY < rect.top || event.clientY > rect.bottom
+                    ) return;
+                    const prompt = documentRoot.querySelector('.verify-msg');
+                    ownerWindow.__intdemoCaptchaClickEvents.push({
+                        x: Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)),
+                        y: Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height)),
+                        source: sourceOf(current),
+                        prompt_text: prompt ? (prompt.textContent || '').trim() : '',
+                        generation: generationOf(current)
+                    });
+                    ownerWindow.__intdemoCaptchaClickEvents =
+                        ownerWindow.__intdemoCaptchaClickEvents.slice(-12);
+                    try {
+                        ownerWindow.sessionStorage.setItem(
+                            storageKey,
+                            JSON.stringify(ownerWindow.__intdemoCaptchaClickEvents)
+                        );
+                    } catch (_) {}
+                };
+                ownerWindow.__intdemoCaptchaCaptureHandler = handler;
+                documentRoot.addEventListener('click', handler, true);
+
+                const rect = element.getBoundingClientRect();
+                const markerPoints = !rect.width || !rect.height ? [] :
+                    Array.from(documentRoot.querySelectorAll('.point-area'))
+                        .filter(marker => {
+                            const style = ownerWindow.getComputedStyle(marker);
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return style.display !== 'none' &&
+                                style.visibility !== 'hidden' &&
+                                markerRect.width > 0 && markerRect.height > 0 &&
+                                clientX >= rect.left && clientX <= rect.right &&
+                                clientY >= rect.top && clientY <= rect.bottom;
+                        })
+                        .map(marker => {
+                            const markerRect = marker.getBoundingClientRect();
+                            const clientX = markerRect.left + markerRect.width / 2;
+                            const clientY = markerRect.top + markerRect.height / 2;
+                            return {
+                                x: Math.max(0, Math.min(1, (clientX - rect.left) / rect.width)),
+                                y: Math.max(0, Math.min(1, (clientY - rect.top) / rect.height))
+                            };
+                        });
+                const prompt = documentRoot.querySelector('.verify-msg');
+                return {
+                    source: sourceOf(element),
+                    prompt_text: prompt ? (prompt.textContent || '').trim() : '',
+                    generation: generationOf(element),
+                    marker_points: markerPoints
+                };
+            }
+            """,
+            bool(reset_clicks),
+        )
+
+    def _prepare_manual_click_capture(self, *, reset_clicks=True):
+        if not self._sample_collection_enabled():
+            return None
+        last_error = "题图在采集期间持续刷新"
+        should_reset = bool(reset_clicks)
+        for _attempt in range(3):
+            try:
+                image = self.page.locator(".back-img").first
+
+                # source、题目和现有 marker 必须在同一次 JS 调用中读取，
+                # 防止刷新恰好夹在多个 DOM 调用之间而拼成跨题样本。
+                snapshot = dict(
+                    self._install_manual_click_handler(
+                        image,
+                        reset_clicks=should_reset,
+                    )
+                    or {}
+                )
+                should_reset = False
+                source = str(snapshot.get("source") or "")
+                generation = int(snapshot.get("generation") or 0)
+                prompt_text = str(snapshot.get("prompt_text") or "").strip()
+                prompt = self._parse_manual_click_prompt(prompt_text)
+                if not prompt:
+                    last_error = "无法解析点选验证码题目"
+                    continue
+
+                image_bytes = self._decode_click_image_source(source)
+                identity_uses_image = image_bytes is None
+                if image_bytes is None:
+                    # 非 data URL / canvas 时使用安全截图；临时隐藏编号圆点，
+                    # 避免用户点选图标被合成到训练图片里。
+                    image_bytes = self._clean_manual_click_screenshot(image)
+
+                current_image = self.page.locator(".back-img").first
+                current_state = self._click_captcha_state(current_image)
+                current_source = str(current_state.get("source") or "")
+                current_generation = int(current_state.get("generation") or 0)
+                current_prompt = self._parse_manual_click_prompt(
+                    current_state.get("prompt_text")
+                )
+                if (
+                    current_source != source
+                    or current_prompt != prompt
+                    or current_generation != generation
+                ):
+                    continue
+
+                if identity_uses_image:
+                    verified_image = self._clean_manual_click_screenshot(
+                        current_image
+                    )
+                    if hashlib.sha256(verified_image).digest() != hashlib.sha256(
+                        image_bytes
+                    ).digest():
+                        continue
+                    image_bytes = verified_image
+
+                return {
+                    "image_bytes": image_bytes,
+                    "prompt": prompt,
+                    "prompt_text": prompt_text,
+                    "challenge_id": self._click_challenge_id(
+                        source,
+                        image_bytes,
+                        prompt,
+                        generation,
+                        use_image=identity_uses_image,
+                    ),
+                    "event_challenge_id": self._click_challenge_id(
+                        source,
+                        prompt=prompt,
+                        generation=generation,
+                    ),
+                    "challenge_source": source,
+                    "challenge_generation": generation,
+                    "identity_uses_image": identity_uses_image,
+                    "initial_points": self._normalize_manual_click_points(
+                        snapshot.get("marker_points") or [],
+                        len(prompt),
+                    ),
+                }
+            except Exception as exc:
+                last_error = str(exc)[:80]
+
+        self.log.emit(
+            "⚠️ 点选验证码原图采集失败，本次只能记录成功统计："
+            f"{last_error}"
+        )
+        return None
+
+    def _manual_click_events(self):
+        try:
+            events = self.page.evaluate(
+                """
+                () => {
+                    if (Array.isArray(window.__intdemoCaptchaClickEvents)) {
+                        return window.__intdemoCaptchaClickEvents.slice();
+                    }
+                    try {
+                        const value = JSON.parse(
+                            sessionStorage.getItem('__intdemoCaptchaClickEventsV2') || '[]'
+                        );
+                        return Array.isArray(value) ? value : [];
+                    } catch (_) {
+                        return [];
+                    }
+                }
+                """
+            )
+            return list(events or [])
+        except Exception:
             return []
 
-        expected_count = len(capture.get("prompt") or [])
-
-        def normalize(points):
-            normalized = []
-            for point in points or []:
-                if not isinstance(point, dict):
-                    continue
-                try:
-                    x = float(point.get("x"))
-                    y = float(point.get("y"))
-                except (TypeError, ValueError):
-                    continue
-                if 0 <= x <= 1 and 0 <= y <= 1:
-                    normalized.append(
-                        {"x": round(x, 6), "y": round(y, 6)}
-                    )
-            return normalized[:expected_count]
-
+    def _clear_manual_click_events(self, capture=None):
+        challenge_source = str((capture or {}).get("challenge_source") or "")
+        challenge_prompt_text = str((capture or {}).get("prompt_text") or "")
+        challenge_generation = int(
+            (capture or {}).get("challenge_generation") or 0
+        )
         try:
-            points = self.page.evaluate(
-                "() => (window.__intdemoCaptchaClicks || []).slice()"
+            self.page.evaluate(
+                """
+                ([challengeSource, challengePromptText, challengeGeneration]) => {
+                    const current = Array.isArray(
+                        window.__intdemoCaptchaClickEvents
+                    ) ? window.__intdemoCaptchaClickEvents : [];
+                    window.__intdemoCaptchaClickEvents = challengeSource
+                        ? current.filter(event =>
+                            event && (
+                                event.source !== challengeSource ||
+                                event.prompt_text !== challengePromptText ||
+                                Number(event.generation || 0) !== challengeGeneration
+                            )
+                        )
+                        : [];
+                    try {
+                        sessionStorage.setItem(
+                            '__intdemoCaptchaClickEventsV2',
+                            JSON.stringify(window.__intdemoCaptchaClickEvents)
+                        );
+                    } catch (_) {}
+                }
+                """,
+                [
+                    challenge_source,
+                    challenge_prompt_text,
+                    challenge_generation,
+                ],
             )
         except Exception:
-            points = []
-        normalized = normalize(points)
-        if expected_count and len(normalized) == expected_count:
-            return normalized
+            pass
 
-        # The site places the actual click target above `.back-img`, so older
-        # builds often missed every event.  The numbered `.point-area` markers
-        # are rendered before the captcha closes and provide a reliable second
-        # source for the same normalized coordinates.
+    def _manual_click_marker_points(self):
         try:
-            marker_points = self.page.evaluate(
+            return self.page.evaluate(
                 """
                 () => {
                     const image = document.querySelector('.back-img');
@@ -1938,9 +2426,250 @@ class BusinessBackfillWorker(QThread):
                 """
             )
         except Exception:
-            marker_points = []
-        marker_points = normalize(marker_points)
-        return marker_points if marker_points else normalized
+            return []
+
+    def _manual_click_points(self, capture):
+        if not capture:
+            return []
+        expected_count = len(capture.get("prompt") or [])
+        challenge_id = str(capture.get("challenge_id") or "")
+        event_challenge_id = str(
+            capture.get("event_challenge_id") or challenge_id
+        )
+        event_points = []
+        for event in self._manual_click_events():
+            if not isinstance(event, dict):
+                continue
+            event_source = str(event.get("source") or "")
+            if (
+                event_challenge_id
+                and (
+                    not event_source
+                    or self._click_challenge_id(
+                        event_source,
+                        prompt=self._parse_manual_click_prompt(
+                            event.get("prompt_text")
+                        ),
+                        generation=event.get("generation") or 0,
+                    )
+                    != event_challenge_id
+                )
+            ):
+                continue
+            event_points.append(event)
+
+        normalized_events = self._normalize_manual_click_points(event_points)
+        if expected_count and len(normalized_events) >= expected_count:
+            return normalized_events[:expected_count]
+
+        current_challenge_id = self._current_manual_click_challenge_id(capture)
+        marker_points = []
+        if (
+            not challenge_id
+            or (
+                current_challenge_id
+                and current_challenge_id == challenge_id
+            )
+        ):
+            marker_points = self._manual_click_marker_points()
+            normalized_markers = self._normalize_manual_click_points(
+                marker_points
+            )
+            if expected_count and len(normalized_markers) >= expected_count:
+                return normalized_markers[:expected_count]
+
+        sources = (
+            capture.get("initial_points") or [],
+            normalized_events,
+            marker_points,
+        )
+        combined = []
+        for source_points in sources:
+            for point in self._normalize_manual_click_points(source_points):
+                if any(
+                    abs(point["x"] - existing["x"]) <= 0.015
+                    and abs(point["y"] - existing["y"]) <= 0.015
+                    for existing in combined
+                ):
+                    continue
+                combined.append(point)
+                if expected_count and len(combined) >= expected_count:
+                    return combined[:expected_count]
+        return combined[:expected_count] if expected_count else combined
+
+    def _manual_click_attempt_from_events(self, *, exclude_challenge_id=""):
+        groups = {}
+        group_order = []
+        for event in self._manual_click_events():
+            if not isinstance(event, dict):
+                continue
+            source = str(event.get("source") or "")
+            prompt_text = str(event.get("prompt_text") or "")
+            prompt = self._parse_manual_click_prompt(prompt_text)
+            generation = int(event.get("generation") or 0)
+            challenge_id = self._click_challenge_id(
+                source,
+                prompt=prompt,
+                generation=generation,
+            )
+            if not source or not challenge_id or challenge_id == exclude_challenge_id:
+                continue
+            if challenge_id not in groups:
+                groups[challenge_id] = {
+                    "source": source,
+                    "prompt_text": prompt_text,
+                    "prompt": prompt,
+                    "generation": generation,
+                    "events": [],
+                }
+                group_order.append(challenge_id)
+            elif (
+                not self._parse_manual_click_prompt(
+                    groups[challenge_id]["prompt_text"]
+                )
+                and self._parse_manual_click_prompt(prompt_text)
+            ):
+                groups[challenge_id]["prompt_text"] = prompt_text
+                groups[challenge_id]["prompt"] = prompt
+            groups[challenge_id]["events"].append(event)
+
+        for challenge_id in reversed(group_order):
+            group = groups[challenge_id]
+            prompt_text = group["prompt_text"]
+            prompt = group["prompt"]
+            if not prompt:
+                continue
+            points = self._normalize_manual_click_points(
+                group["events"],
+                len(prompt),
+            )
+            if len(points) != len(prompt):
+                continue
+            image_bytes = self._decode_click_image_source(
+                group["source"]
+            )
+            capture = None
+            if image_bytes is not None:
+                capture = {
+                    "image_bytes": image_bytes,
+                    "prompt": prompt,
+                    "prompt_text": prompt_text,
+                    "challenge_id": challenge_id,
+                    "event_challenge_id": challenge_id,
+                    "challenge_source": group["source"],
+                    "challenge_generation": group["generation"],
+                    "identity_uses_image": False,
+                    "initial_points": [],
+                }
+            return {"capture": capture, "points": points}
+        return None
+
+    def _current_manual_click_challenge_id(self, capture=None):
+        try:
+            image = self.page.locator(".back-img").first
+            state = self._click_captcha_state(image)
+            source = str(state.get("source") or "")
+            prompt = self._parse_manual_click_prompt(
+                state.get("prompt_text")
+            )
+            generation = int(state.get("generation") or 0)
+            use_image = bool((capture or {}).get("identity_uses_image"))
+            image_bytes = None
+            if use_image:
+                image_bytes = self._decode_click_image_source(source)
+                if image_bytes is None:
+                    image_bytes = self._clean_manual_click_screenshot(image)
+            return self._click_challenge_id(
+                source,
+                image_bytes,
+                prompt,
+                generation,
+                use_image=use_image,
+            )
+        except Exception:
+            return ""
+
+    def _business_captcha_loading_is_visible(self):
+        try:
+            loaders = self.page.locator(".layui-layer-loading2")
+            for index in range(loaders.count()):
+                if loaders.nth(index).is_visible():
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _wait_for_manual_click_outcome(self, capture, expected_count):
+        """等待旧题成功或真正换成新题，期间绝不重拍旧题或清空点位。"""
+        deadline = time.monotonic() + self.web_timeout / 1000
+        old_challenge_id = str((capture or {}).get("challenge_id") or "")
+        old_event_challenge_id = str(
+            (capture or {}).get("event_challenge_id")
+            or old_challenge_id
+        )
+        fallback_retry_since = None
+        fallback_retry_seconds = max(
+            float(CONFIG["CAPTCHA_WAIT_SEC"]),
+            CONFIG["BUSINESS_CAPTCHA_STABLE_MS"] / 1000,
+        )
+
+        while time.monotonic() < deadline:
+            self._check_stopped()
+            rapid_attempt = self._manual_click_attempt_from_events(
+                exclude_challenge_id=old_event_challenge_id,
+            )
+            result_ready = self._business_result_is_ready()
+            if result_ready:
+                if rapid_attempt is not None:
+                    return {"state": "passed_after_retry", **rapid_attempt}
+                return {"state": "passed"}
+            if rapid_attempt is not None:
+                return {"state": "retry", **rapid_attempt}
+
+            if (
+                self._captcha_prompt_is_visible()
+                and self._captcha_image_is_ready()
+                and not self._business_captcha_loading_is_visible()
+            ):
+                current_challenge_id = self._current_manual_click_challenge_id(
+                    capture
+                )
+                if (
+                    old_challenge_id
+                    and current_challenge_id
+                    and current_challenge_id != old_challenge_id
+                ):
+                    return {
+                        "state": "retry",
+                        "capture": self._prepare_manual_click_capture(
+                            reset_clicks=False
+                        ),
+                    }
+
+                # 旧页面若无法提供题图身份，只在点位清空且持续稳定 5 秒后
+                # 才进入重试，避免把成功加载中的短暂 DOM 状态判成失败。
+                marker_count = len(self._manual_click_marker_points())
+                if not old_challenge_id and marker_count < expected_count:
+                    if fallback_retry_since is None:
+                        fallback_retry_since = time.monotonic()
+                    elif (
+                        time.monotonic() - fallback_retry_since
+                        >= fallback_retry_seconds
+                    ):
+                        return {
+                            "state": "retry",
+                            "capture": self._prepare_manual_click_capture(
+                                reset_clicks=False
+                            ),
+                        }
+                else:
+                    fallback_retry_since = None
+
+            self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
+
+        if self._business_result_is_ready():
+            return {"state": "passed"}
+        return {"state": "timeout"}
 
     def _report_successful_click_captcha(
         self,
@@ -1980,23 +2709,32 @@ class BusinessBackfillWorker(QThread):
         self._emit_captcha_attempt(success=True, **attempt)
 
     def _complete_manual_click_captcha(self, model_version):
-        pending_attempt = None
-        while self._running:
-            self._check_stopped()
-
-            # 网页的成功响应可能晚于第一次可见性检查。此时保留的仍是
-            # 上一次提交前的原图和点位，直接用它上报成功，不能重新截图。
-            if pending_attempt is not None and not self._captcha_prompt_is_visible():
-                self._report_successful_click_captcha(
-                    pending_attempt["capture"],
-                    pending_attempt["points"],
+        capture = self._prefetched_manual_click_capture
+        self._prefetched_manual_click_capture = None
+        if capture is None:
+            capture = self._prepare_manual_click_capture(reset_clicks=True)
+        elif self._captcha_prompt_is_visible():
+            capture_challenge_id = str(capture.get("challenge_id") or "")
+            current_challenge_id = self._current_manual_click_challenge_id(
+                capture
+            )
+            if (
+                capture_challenge_id
+                and current_challenge_id
+                and capture_challenge_id != current_challenge_id
+            ):
+                self._emit_captcha_attempt(
+                    success=False,
                     model_version=model_version,
                     assisted=True,
                 )
-                self.log.emit("✅ 验证码通过，开始获取信息")
-                return True
+                self._clear_manual_click_events(capture)
+                capture = self._prepare_manual_click_capture(
+                    reset_clicks=False
+                )
 
-            capture = self._prepare_manual_click_capture()
+        while self._running:
+            self._check_stopped()
             prompt = list((capture or {}).get("prompt") or [])
             if prompt:
                 expected_count = len(prompt)
@@ -2005,50 +2743,28 @@ class BusinessBackfillWorker(QThread):
                     prompt_text = self.page.locator(
                         ".verify-msg"
                     ).first.inner_text().strip()
-                    match = re.search(r"【([^】]+)】", prompt_text)
                     expected_count = len(
-                        [
-                            value.strip()
-                            for value in (match.group(1) if match else "").split(",")
-                            if value.strip()
-                        ]
+                        self._parse_manual_click_prompt(prompt_text)
                     )
                 except Exception:
                     expected_count = 3
-
-            if pending_attempt is not None:
-                # 截取下一张验证码期间，上一张也可能刚好完成成功响应。
-                if not self._captcha_prompt_is_visible():
-                    self._report_successful_click_captcha(
-                        pending_attempt["capture"],
-                        pending_attempt["points"],
-                        model_version=model_version,
-                        assisted=True,
-                    )
-                    self.log.emit("✅ 验证码通过，开始获取信息")
-                    return True
-
-                # 已经进入下一轮“等待用户点选”，至此才能确认上一份样本失败。
-                self._emit_captcha_attempt(
-                    success=False,
-                    model_version=model_version,
-                    assisted=True,
-                )
-                pending_attempt = None
+            if expected_count <= 0:
+                expected_count = 3
 
             if self.auto_continue:
-                if expected_count > 0:
-                    self.log.emit("⏳ 等待用户点完验证码...")
-                    while self._running:
-                        self._check_stopped()
-                        try:
-                            point_count = self.page.locator(".point-area").count()
-                            if point_count >= expected_count:
-                                self.log.emit("✅ 用户已点完验证码")
-                                break
-                        except Exception:
-                            pass
-                        time.sleep(0.2)
+                self.log.emit("⏳ 等待用户点完验证码...")
+                while self._running:
+                    self._check_stopped()
+                    buffered_points = self._manual_click_points(capture)
+                    if (
+                        len(buffered_points) >= expected_count
+                        or not self._captcha_prompt_is_visible()
+                    ):
+                        self.log.emit("✅ 用户已点完验证码")
+                        break
+                    time.sleep(0.2)
+                if not self._running:
+                    return False
             else:
                 self.log.emit("⏸️ 请完成验证码后点击【继续执行】")
                 self._paused = True
@@ -2058,19 +2774,57 @@ class BusinessBackfillWorker(QThread):
                 self._check_stopped()
 
             points = self._manual_click_points(capture)
-            if self.page.locator(".layui-layer-loading2").count() > 0:
-                try:
-                    self.page.wait_for_selector(
-                        ".layui-layer-loading2",
-                        state="detached",
-                        timeout=self.web_timeout,
-                    )
-                except Exception:
-                    pass
+            rapid_attempt = self._manual_click_attempt_from_events(
+                exclude_challenge_id=str(
+                    (capture or {}).get("event_challenge_id")
+                    or (capture or {}).get("challenge_id")
+                    or ""
+                )
+            )
+            # 点位立即冻结到 Python；之后网页即使刷新、隐藏或重建 DOM，
+            # 本轮原图与答案也不会丢失。清空的只是下一轮事件缓冲。
+            self._clear_manual_click_events(capture)
             time.sleep(0.5)
-            prompt_el = self.page.locator(".verify-msg")
-            passed = prompt_el.count() == 0 or not prompt_el.first.is_visible()
-            if passed:
+            if rapid_attempt is None:
+                rapid_attempt = self._manual_click_attempt_from_events(
+                    exclude_challenge_id=str(
+                        (capture or {}).get("event_challenge_id")
+                        or (capture or {}).get("challenge_id")
+                        or ""
+                    )
+                )
+            if self._business_result_is_ready():
+                if rapid_attempt is not None:
+                    self._emit_captcha_attempt(
+                        success=False,
+                        model_version=model_version,
+                        assisted=True,
+                    )
+                    self._report_successful_click_captcha(
+                        rapid_attempt["capture"],
+                        rapid_attempt["points"],
+                        model_version=model_version,
+                        assisted=True,
+                    )
+                    self._clear_manual_click_events(
+                        rapid_attempt["capture"]
+                    )
+                else:
+                    self._report_successful_click_captcha(
+                        capture,
+                        points,
+                        model_version=model_version,
+                        assisted=True,
+                    )
+                self.log.emit("✅ 验证码通过，开始获取信息")
+                return True
+
+            # 保留原有的快速反馈顺序。这条日志只是网页尚未给出成功结果的
+            # 初步状态；真正失败必须等到题图身份发生变化后才能确认。
+            self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
+            outcome = self._wait_for_manual_click_outcome(capture, expected_count)
+            state = outcome.get("state")
+            if state == "passed":
                 self._report_successful_click_captcha(
                     capture,
                     points,
@@ -2079,12 +2833,40 @@ class BusinessBackfillWorker(QThread):
                 )
                 self.log.emit("✅ 验证码通过，开始获取信息")
                 return True
-            self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
-            pending_attempt = {
-                "capture": capture,
-                "points": points,
-            }
-            time.sleep(0.5)
+            if state == "passed_after_retry":
+                # 新题已被用户迅速点完并通过，旧题必须明确记为失败，不能
+                # 把旧图/旧坐标误归为成功样本。
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self._report_successful_click_captcha(
+                    outcome.get("capture"),
+                    outcome.get("points") or [],
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self._clear_manual_click_events(outcome.get("capture"))
+                self.log.emit("✅ 验证码通过，开始获取信息")
+                return True
+            if state == "retry":
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                capture = outcome.get("capture")
+                if capture is None and self._captcha_prompt_is_visible():
+                    capture = self._prepare_manual_click_capture(
+                        reset_clicks=False
+                    )
+                continue
+
+            self.log.emit(
+                "⚠️ 等待验证码结果超时，本次结果未确定，不保存错误样本。"
+            )
+            return False
         return False
 
     # ======================
