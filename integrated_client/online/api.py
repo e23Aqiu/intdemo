@@ -258,6 +258,39 @@ class ApiClient:
             content_type="application/zip",
         )
 
+    def admin_captcha_samples(
+        self,
+        access_token: str,
+        *,
+        captcha_type: str | None = None,
+        limit: int = 200,
+        offset: int = 0,
+    ) -> dict:
+        params = {
+            "limit": int(limit),
+            "offset": int(offset),
+        }
+        if captcha_type:
+            params["captcha_type"] = str(captcha_type)
+        return self._request(
+            "GET",
+            "/admin/ml/samples",
+            token=access_token,
+            params=params,
+        )
+
+    def admin_delete_captcha_samples(
+        self,
+        access_token: str,
+        sample_ids: list[str],
+    ) -> dict:
+        return self._request(
+            "DELETE",
+            "/admin/ml/samples",
+            token=access_token,
+            json_body={"sample_ids": [str(sample_id) for sample_id in sample_ids]},
+        )
+
     def admin_create_captcha_model(
         self,
         access_token: str,

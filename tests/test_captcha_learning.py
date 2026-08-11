@@ -12,7 +12,8 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image, ImageDraw
-from PyQt5.QtWidgets import QApplication
+from PyQt5.QtCore import QItemSelectionModel
+from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from integrated_client.captcha_models import (
     CaptchaModelManager,
@@ -118,6 +119,8 @@ class _FakeApi:
     def __init__(self):
         self.attempts = []
         self.export_types = []
+        self.sample_rows = []
+        self.deleted_sample_ids = []
 
     @staticmethod
     def captcha_policy(_token):
@@ -151,6 +154,39 @@ class _FakeApi:
     @staticmethod
     def admin_import_captcha_dataset(_token, _archive):
         return {}
+
+    def admin_captcha_samples(
+        self,
+        _token,
+        *,
+        captcha_type=None,
+        limit=200,
+        offset=0,
+    ):
+        rows = [
+            row
+            for row in self.sample_rows
+            if not captcha_type or row.get("captcha_type") == captcha_type
+        ]
+        return {
+            "items": rows[offset : offset + limit],
+            "total": len(rows),
+            "limit": limit,
+            "offset": offset,
+        }
+
+    def admin_delete_captcha_samples(self, _token, sample_ids):
+        self.deleted_sample_ids.extend(sample_ids)
+        before = len(self.sample_rows)
+        selected = set(sample_ids)
+        self.sample_rows = [
+            row for row in self.sample_rows if str(row.get("id")) not in selected
+        ]
+        deleted = before - len(self.sample_rows)
+        return {
+            "deleted_count": deleted,
+            "missing_count": len(sample_ids) - deleted,
+        }
 
     @staticmethod
     def admin_create_captcha_model(_token, _payload):
@@ -781,7 +817,8 @@ class CaptchaLearningTests(unittest.TestCase):
             self.assertEqual(session.api.export_types, [None])
             self.assertEqual(target_path.read_bytes(), b"dataset-mixed")
             self.assertTrue(page.export_btn.isEnabled())
-            self.assertIn("包内分类", page.export_btn.toolTip())
+            self.assertIn("数字验证码", page.export_btn.toolTip())
+            self.assertIn("文字点选验证码", page.export_btn.toolTip())
             self.assertIn("原格式分类包", page.import_btn.toolTip())
 
         page.deleteLater()
@@ -972,34 +1009,145 @@ class CaptchaLearningTests(unittest.TestCase):
         with patch.object(MachineLearningPage, "refresh"):
             page = MachineLearningPage(session)
         page.refresh_timer.stop()
-        page._overview_loaded(
-            {
-                "policy": {
-                    "upload_mode": "samples_and_metrics",
-                    "upload_enabled": True,
-                    "revision": 4,
-                    "updated_at": "2026-07-30T10:00:00+08:00",
-                    "active_models": {},
+        with patch.object(page, "_refresh_samples"):
+            page._overview_loaded(
+                {
+                    "policy": {
+                        "upload_mode": "samples_and_metrics",
+                        "upload_enabled": True,
+                        "revision": 4,
+                        "updated_at": "2026-07-30T10:00:00+08:00",
+                        "active_models": {},
+                    },
+                    "dataset": {
+                        "total_count": 12,
+                        "total_bytes": 2048,
+                        "numeric_count": 8,
+                        "numeric_bytes": 1024,
+                        "click_count": 4,
+                        "click_bytes": 1024,
+                    },
+                    "attempts": [
+                        {
+                            "captcha_type": "numeric",
+                            "model_version": "ddddocr-builtin",
+                            "attempt_count": 4,
+                            "success_count": 3,
+                            "success_rate": 0.75,
+                        },
+                        {
+                            "captcha_type": "click",
+                            "model_version": "ddddocr-builtin",
+                            "attempt_count": 2,
+                            "success_count": 1,
+                            "success_rate": 0.5,
+                        },
+                        {
+                            "captcha_type": "numeric",
+                            "model_version": "external-ocr-1",
+                            "attempt_count": 1,
+                            "success_count": 1,
+                            "success_rate": 1.0,
+                        },
+                    ],
+                    "models": [],
                 },
-                "dataset": {
-                    "total_count": 12,
-                    "total_bytes": 2048,
-                    "numeric_count": 8,
-                    "numeric_bytes": 1024,
-                    "click_count": 4,
-                    "click_bytes": 1024,
-                },
-                "attempts": [],
-                "models": [],
-            },
-            None,
-        )
+                None,
+            )
         self.assertEqual(
             page.upload_mode_combo.currentData(),
             "samples_and_metrics",
         )
         self.assertEqual(page.total_count_value.text(), "12")
         self.assertIn("2.0 KB", page.total_size_value.text())
+        self.assertNotIn("策略修订", page.policy_detail.text())
+        self.assertIn("75.0%", page.numeric_current_value.text())
+        self.assertIn("50.0%", page.click_current_value.text())
+        self.assertEqual(page.model_table.rowCount(), 3)
+        self.assertEqual(page.model_table.item(0, 1).text(), "ddddocr-builtin")
+        self.assertEqual(page.model_table.item(0, 4).text(), "75.0%")
+        self.assertEqual(page.model_table.item(1, 4).text(), "50.0%")
+        self.assertEqual(page.model_table.item(2, 1).text(), "external-ocr-1")
+        self.assertEqual(page.model_table.item(2, 4).text(), "100.0%")
+        page.deleteLater()
+
+    def test_machine_learning_page_can_delete_selected_samples(self):
+        session = _FakeSession()
+        session.api.sample_rows = [
+            {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "captcha_type": "numeric",
+                "answer": {"value": "4826"},
+                "model_version": "ddddocr-builtin",
+                "origin": "client",
+                "image_size": 1024,
+                "captured_at": "2026-08-11T10:00:00+08:00",
+            },
+            {
+                "id": "22222222-2222-2222-2222-222222222222",
+                "captcha_type": "click",
+                "answer": {
+                    "prompt": ["甲", "乙"],
+                    "points": [
+                        {"x": 0.2, "y": 0.3},
+                        {"x": 0.7, "y": 0.6},
+                    ],
+                },
+                "model_version": "human-manual",
+                "origin": "client",
+                "image_size": 2048,
+                "captured_at": "2026-08-11T10:01:00+08:00",
+            },
+        ]
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._samples_loaded(
+            session.api.admin_captcha_samples("token", limit=100, offset=0),
+            None,
+        )
+        self.assertEqual(page.sample_table.rowCount(), 2)
+        self.assertEqual(page.sample_table.item(0, 2).text(), "4826")
+        self.assertEqual(page.sample_table.item(1, 2).text(), "甲、乙")
+        self.assertEqual(page.sample_table.item(0, 3).text(), "自动")
+        self.assertEqual(page.sample_table.item(1, 3).text(), "人工")
+
+        selection = page.sample_table.selectionModel()
+        for row in (0, 1):
+            selection.select(
+                page.sample_table.model().index(row, 0),
+                QItemSelectionModel.Select | QItemSelectionModel.Rows,
+            )
+
+        def immediate(function, completed):
+            completed(function(), None)
+
+        with patch.object(
+            page,
+            "_start",
+            side_effect=immediate,
+        ), patch.object(
+            page,
+            "_refresh_samples",
+        ), patch.object(
+            page,
+            "refresh",
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.question",
+            return_value=QMessageBox.Yes,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.information"
+        ):
+            page._delete_selected_samples()
+
+        self.assertEqual(
+            session.api.deleted_sample_ids,
+            [
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+            ],
+        )
+        self.assertTrue(page.delete_samples_btn.isEnabled())
         page.deleteLater()
 
     def test_admin_main_window_exposes_machine_learning_navigation(self):

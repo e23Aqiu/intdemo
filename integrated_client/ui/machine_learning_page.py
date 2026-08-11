@@ -64,10 +64,14 @@ class MachineLearningPage(QWidget):
         self._tasks = []
         self._task_callbacks = {}
         self._refresh_task = None
+        self._sample_refresh_task = None
         self._shutting_down = False
         self._loading_policy = False
         self._confirmed_upload_mode = "off"
         self._model_rows = []
+        self._sample_rows = []
+        self._sample_offset = 0
+        self._sample_limit = 100
         self._build_ui()
         if self.learning_service is not None:
             self.learning_service.model_changed.connect(
@@ -156,7 +160,7 @@ class MachineLearningPage(QWidget):
             stats_layout,
             1,
             0,
-            "数字当前模型",
+            "数字验证码准确率",
         )
         self.numeric_candidate_value = self._add_metric(
             stats_layout,
@@ -168,7 +172,7 @@ class MachineLearningPage(QWidget):
             stats_layout,
             1,
             2,
-            "点选当前模型",
+            "文字点选准确率",
         )
         self.click_candidate_value = self._add_metric(
             stats_layout,
@@ -181,7 +185,7 @@ class MachineLearningPage(QWidget):
         actions = QHBoxLayout()
         self.export_btn = QPushButton("导出数据集")
         self.export_btn.setToolTip(
-            "导出一个 ZIP，并在包内分类保存数字和文字点选验证码"
+            "导出一个 ZIP，顶层按“数字验证码”和“文字点选验证码”分类"
         )
         self.export_btn.clicked.connect(self._export_dataset)
         self.import_btn = QPushButton("导入数据集")
@@ -204,16 +208,73 @@ class MachineLearningPage(QWidget):
         actions.addWidget(self.train_click_btn)
         root.addLayout(actions)
 
+        sample_header = QHBoxLayout()
+        sample_title = QLabel("已采集样本")
+        sample_title.setObjectName("SectionTitle")
+        sample_header.addWidget(sample_title)
+        self.sample_hint = QLabel("可用 Ctrl 或 Shift 多选后删除")
+        self.sample_hint.setObjectName("Muted")
+        sample_header.addWidget(self.sample_hint)
+        sample_header.addStretch()
+        self.sample_type_combo = QComboBox()
+        self.sample_type_combo.addItem("全部类型", None)
+        self.sample_type_combo.addItem("数字验证码", "numeric")
+        self.sample_type_combo.addItem("文字点选验证码", "click")
+        self.sample_type_combo.currentIndexChanged.connect(
+            self._sample_filter_changed
+        )
+        self.prev_samples_btn = QPushButton("上一页")
+        self.prev_samples_btn.clicked.connect(self._previous_samples_page)
+        self.next_samples_btn = QPushButton("下一页")
+        self.next_samples_btn.clicked.connect(self._next_samples_page)
+        self.sample_page_label = QLabel("--")
+        self.sample_page_label.setObjectName("Muted")
+        self.delete_samples_btn = QPushButton("删除所选样本")
+        self.delete_samples_btn.setObjectName("DangerButton")
+        self.delete_samples_btn.clicked.connect(self._delete_selected_samples)
+        sample_header.addWidget(self.sample_type_combo)
+        sample_header.addWidget(self.prev_samples_btn)
+        sample_header.addWidget(self.sample_page_label)
+        sample_header.addWidget(self.next_samples_btn)
+        sample_header.addWidget(self.delete_samples_btn)
+        root.addLayout(sample_header)
+
+        self.sample_table = QTableWidget(0, 7)
+        self.sample_table.setHorizontalHeaderLabels(
+            [
+                "样本 ID",
+                "类型",
+                "答案",
+                "采集方式",
+                "识别模型",
+                "大小",
+                "采集时间",
+            ]
+        )
+        self.sample_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.sample_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.sample_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.sample_table.verticalHeader().setVisible(False)
+        sample_table_header = self.sample_table.horizontalHeader()
+        sample_table_header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        sample_table_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        sample_table_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        self.sample_table.setMinimumHeight(170)
+        self.sample_table.setMaximumHeight(260)
+        root.addWidget(self.sample_table)
+
         table_title = QLabel("模型版本")
         table_title.setObjectName("SectionTitle")
         root.addWidget(table_title)
-        self.model_table = QTableWidget(0, 8)
+        self.model_table = QTableWidget(0, 10)
         self.model_table.setHorizontalHeaderLabels(
             [
                 "类型",
                 "版本",
                 "状态",
                 "离线准确率",
+                "自动识别准确率",
+                "自动识别次数",
                 "训练样本",
                 "测试样本",
                 "模型大小",
@@ -291,6 +352,7 @@ class MachineLearningPage(QWidget):
         self._shutting_down = True
         self.refresh_timer.stop()
         self._refresh_task = None
+        self._sample_refresh_task = None
         self._task_callbacks.clear()
         self._tasks.clear()
 
@@ -336,8 +398,7 @@ class MachineLearningPage(QWidget):
             "samples_and_metrics": "采集样本并统计：成功时上传图片和答案",
         }[upload_mode]
         self.policy_detail.setText(
-            f"{state} · 策略修订 {int(policy.get('revision') or 0)} · "
-            f"更新时间 {_display_time(policy.get('updated_at'))}"
+            f"{state} · 更新时间 {_display_time(policy.get('updated_at'))}"
         )
 
         self.total_count_value.setText(str(int(dataset.get("total_count") or 0)))
@@ -354,7 +415,8 @@ class MachineLearningPage(QWidget):
         active = policy.get("active_models") or {}
         self._set_accuracy_values("numeric", active, attempts, models)
         self._set_accuracy_values("click", active, attempts, models)
-        self._populate_models(models)
+        self._populate_models(models, attempts, active)
+        self._refresh_samples()
 
     def _set_accuracy_values(self, captcha_type, active, attempts, models):
         active_model = active.get(captcha_type) or {}
@@ -378,7 +440,7 @@ class MachineLearningPage(QWidget):
                 f"{current_version}"
             )
         else:
-            current_text = f"--\n暂无线上尝试\n{current_version}"
+            current_text = f"--\n暂无自动识别记录\n{current_version}"
         candidates = [
             model
             for model in models
@@ -401,31 +463,272 @@ class MachineLearningPage(QWidget):
             self.click_current_value.setText(current_text)
             self.click_candidate_value.setText(candidate_text)
 
-    def _populate_models(self, models):
-        self._model_rows = list(models)
+    @staticmethod
+    def _attempt_metric(attempts, captcha_type, model_version):
+        return next(
+            (
+                item
+                for item in attempts
+                if item.get("captcha_type") == captcha_type
+                and item.get("model_version") == model_version
+            ),
+            None,
+        )
+
+    def _populate_models(self, models, attempts, active):
+        builtin_rows = []
+        for captcha_type in ("numeric", "click"):
+            active_model = active.get(captcha_type) or {}
+            builtin_rows.append(
+                {
+                    "id": None,
+                    "captcha_type": captcha_type,
+                    "version": BUILTIN_MODEL_VERSION,
+                    "algorithm": "ddddocr",
+                    "status": "builtin" if active_model else "current",
+                    "is_builtin": True,
+                    "artifact_size": 0,
+                    "sample_count": 0,
+                    "test_count": 0,
+                    "correct_count": 0,
+                    "accuracy": None,
+                    "created_at": None,
+                }
+            )
+        managed_rows = list(models)
+        known_versions = {
+            (str(model.get("captcha_type") or ""), str(model.get("version") or ""))
+            for model in builtin_rows + managed_rows
+        }
+        observed_rows = []
+        for metric in attempts:
+            key = (
+                str(metric.get("captcha_type") or ""),
+                str(metric.get("model_version") or ""),
+            )
+            if not all(key) or key in known_versions:
+                continue
+            known_versions.add(key)
+            observed_rows.append(
+                {
+                    "id": None,
+                    "captcha_type": key[0],
+                    "version": key[1],
+                    "status": "observed",
+                    "is_runtime_only": True,
+                    "artifact_size": 0,
+                    "sample_count": 0,
+                    "test_count": 0,
+                    "accuracy": None,
+                    "created_at": None,
+                }
+            )
+        self._model_rows = builtin_rows + managed_rows + observed_rows
         self.model_table.setRowCount(len(self._model_rows))
         type_labels = {"numeric": "数字", "click": "文字点选"}
         status_labels = {
             "candidate": "候选",
             "current": "当前应用",
             "archived": "历史",
+            "builtin": "内置备用",
+            "observed": "识别记录",
         }
         for row, model in enumerate(self._model_rows):
+            captcha_type = str(model.get("captcha_type") or "")
+            version = str(model.get("version") or "-")
+            metric = self._attempt_metric(attempts, captcha_type, version)
+            automatic_total = int((metric or {}).get("attempt_count") or 0)
+            automatic_success = int((metric or {}).get("success_count") or 0)
+            automatic_accuracy = (
+                f"{float(metric.get('success_rate') or 0) * 100:.1f}%"
+                if metric and automatic_total
+                else "--"
+            )
+            builtin = bool(model.get("is_builtin"))
+            managed = not builtin and not model.get("is_runtime_only")
             values = [
-                type_labels.get(model.get("captcha_type"), "-"),
-                str(model.get("version") or "-"),
+                type_labels.get(captcha_type, "-"),
+                version,
                 status_labels.get(model.get("status"), "-"),
-                f"{float(model.get('accuracy') or 0) * 100:.1f}%",
-                str(int(model.get("sample_count") or 0)),
-                str(int(model.get("test_count") or 0)),
-                _format_size(model.get("artifact_size")),
+                (
+                    "--"
+                    if not managed
+                    else f"{float(model.get('accuracy') or 0) * 100:.1f}%"
+                ),
+                automatic_accuracy,
+                (
+                    f"{automatic_success} / {automatic_total}"
+                    if automatic_total
+                    else "0"
+                ),
+                "--" if not managed else str(int(model.get("sample_count") or 0)),
+                "--" if not managed else str(int(model.get("test_count") or 0)),
+                (
+                    "内置"
+                    if builtin
+                    else (
+                        "--"
+                        if not managed
+                        else _format_size(model.get("artifact_size"))
+                    )
+                ),
                 _display_time(model.get("created_at")),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
-                if column in {0, 2, 3, 4, 5, 6}:
+                if column in {0, 2, 3, 4, 5, 6, 7, 8}:
                     item.setTextAlignment(Qt.AlignCenter)
                 self.model_table.setItem(row, column, item)
+
+    def _refresh_samples(self):
+        if self._shutting_down or self._sample_refresh_task is not None:
+            return
+        captcha_type = self.sample_type_combo.currentData()
+
+        def load_samples():
+            token = self.session_manager.access_token()
+            return self.session_manager.api.admin_captcha_samples(
+                token,
+                captcha_type=str(captcha_type) if captcha_type else None,
+                limit=self._sample_limit,
+                offset=self._sample_offset,
+            )
+
+        self._sample_refresh_task = self._start(
+            load_samples,
+            self._samples_loaded,
+        )
+
+    @staticmethod
+    def _sample_answer_text(sample):
+        answer = sample.get("answer") or {}
+        if sample.get("captcha_type") == "numeric":
+            return str(answer.get("value") or "-")
+        prompt = [str(value) for value in (answer.get("prompt") or [])]
+        return "、".join(prompt) or "-"
+
+    def _samples_loaded(self, result, error):
+        self._sample_refresh_task = None
+        if error is not None:
+            self.sample_hint.setText(f"样本读取失败：{error}")
+            return
+        page = result or {}
+        self._sample_rows = list(page.get("items") or [])
+        total = int(page.get("total") or 0)
+        limit = max(1, int(page.get("limit") or self._sample_limit))
+        offset = max(0, int(page.get("offset") or 0))
+        self._sample_limit = limit
+        self._sample_offset = offset
+        self.sample_table.setRowCount(len(self._sample_rows))
+        type_labels = {"numeric": "数字", "click": "文字点选"}
+        for row, sample in enumerate(self._sample_rows):
+            sample_id = str(sample.get("id") or "")
+            model_version = str(sample.get("model_version") or "-")
+            if str(sample.get("origin") or "") == "import":
+                collection_mode = "导入"
+            elif model_version.startswith("human-"):
+                collection_mode = "人工"
+            else:
+                collection_mode = "自动"
+            values = [
+                sample_id[:8] or "-",
+                type_labels.get(sample.get("captcha_type"), "-"),
+                self._sample_answer_text(sample),
+                collection_mode,
+                model_version,
+                _format_size(sample.get("image_size")),
+                _display_time(sample.get("captured_at")),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if sample_id:
+                    item.setToolTip(f"样本 ID：{sample_id}")
+                if column in {0, 1, 3, 5, 6}:
+                    item.setTextAlignment(Qt.AlignCenter)
+                self.sample_table.setItem(row, column, item)
+
+        first = offset + 1 if self._sample_rows else 0
+        last = offset + len(self._sample_rows)
+        self.sample_page_label.setText(f"{first}-{last} / {total}")
+        self.sample_hint.setText(
+            f"共 {total} 条；可用 Ctrl 或 Shift 多选后删除"
+        )
+        self.prev_samples_btn.setEnabled(offset > 0)
+        self.next_samples_btn.setEnabled(offset + limit < total)
+
+    def _sample_filter_changed(self, _index):
+        self._sample_offset = 0
+        self._refresh_samples()
+
+    def _previous_samples_page(self):
+        self._sample_offset = max(0, self._sample_offset - self._sample_limit)
+        self._refresh_samples()
+
+    def _next_samples_page(self):
+        self._sample_offset += self._sample_limit
+        self._refresh_samples()
+
+    def _delete_selected_samples(self):
+        rows = sorted(
+            {
+                index.row()
+                for index in self.sample_table.selectionModel().selectedRows()
+            }
+        )
+        samples = [
+            self._sample_rows[row]
+            for row in rows
+            if 0 <= row < len(self._sample_rows)
+        ]
+        sample_ids = [str(sample.get("id") or "") for sample in samples]
+        sample_ids = [sample_id for sample_id in sample_ids if sample_id]
+        if not sample_ids:
+            QMessageBox.warning(self, "未选择样本", "请先选择要删除的样本。")
+            return
+        reply = QMessageBox.question(
+            self,
+            "删除采集样本",
+            f"确定永久删除选中的 {len(sample_ids)} 个验证码样本吗？\n\n"
+            "删除后将不再参与导出和后续模型训练。",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.delete_samples_btn.setEnabled(False)
+
+        def delete_samples():
+            token = self.session_manager.access_token()
+            return self.session_manager.api.admin_delete_captcha_samples(
+                token,
+                sample_ids,
+            )
+
+        self._start(delete_samples, self._samples_deleted)
+
+    def _samples_deleted(self, result, error):
+        self.delete_samples_btn.setEnabled(True)
+        if error is not None:
+            QMessageBox.warning(self, "删除失败", str(error))
+            return
+        result = result or {}
+        deleted = int(result.get("deleted_count") or 0)
+        missing = int(result.get("missing_count") or 0)
+        QMessageBox.information(
+            self,
+            "删除完成",
+            f"已删除 {deleted} 个样本，未找到 {missing} 个。",
+        )
+        if (
+            deleted >= len(self._sample_rows)
+            and self._sample_rows
+            and self._sample_offset
+        ):
+            self._sample_offset = max(
+                0,
+                self._sample_offset - self._sample_limit,
+            )
+        self._refresh_samples()
+        self.refresh()
 
     def _change_policy(self, _index):
         if self._loading_policy:
@@ -504,7 +807,8 @@ class MachineLearningPage(QWidget):
         QMessageBox.information(
             self,
             "导出完成",
-            f"数据集已按验证码类型分类导出，共 {_format_size(size)}。",
+            "数据集已导出到“数字验证码”和“文字点选验证码”两个目录，"
+            f"共 {_format_size(size)}。",
         )
 
     def _import_dataset(self):
@@ -642,6 +946,23 @@ class MachineLearningPage(QWidget):
         model = self._selected_model()
         if not model:
             return
+        if model.get("is_builtin"):
+            if model.get("status") == "current":
+                QMessageBox.information(
+                    self,
+                    "已经应用",
+                    "该类型当前已经使用内置 ddddocr。",
+                )
+                return
+            self._use_builtin_for_selected_type()
+            return
+        if model.get("is_runtime_only"):
+            QMessageBox.warning(
+                self,
+                "不能应用",
+                "该行只有历史自动识别统计，没有可应用的模型文件。",
+            )
+            return
         if model.get("status") == "current":
             QMessageBox.information(self, "已经应用", "该模型已经是当前应用版本。")
             return
@@ -731,6 +1052,16 @@ class MachineLearningPage(QWidget):
     def _delete_selected_model(self):
         model = self._selected_model()
         if not model:
+            return
+        if model.get("is_builtin"):
+            QMessageBox.warning(self, "不能删除", "内置 ddddocr 不能删除。")
+            return
+        if model.get("is_runtime_only"):
+            QMessageBox.warning(
+                self,
+                "不能删除",
+                "该行是自动识别统计记录，不是可删除的模型文件。",
+            )
             return
         if model.get("status") == "current":
             QMessageBox.warning(self, "不能删除", "当前正在应用的模型不能删除。")

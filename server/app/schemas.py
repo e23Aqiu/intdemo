@@ -409,6 +409,44 @@ class CaptchaDatasetStats(StrictModel):
     click_bytes: int
 
 
+class CaptchaSampleSummary(StrictModel):
+    id: uuid.UUID
+    captcha_type: Literal["numeric", "click"]
+    source: Literal["transport_numeric", "business_click"]
+    answer: dict[str, Any]
+    model_version: str
+    origin: str
+    image_size: int
+    captured_at: datetime
+    created_at: datetime
+
+
+class CaptchaSamplePage(StrictModel):
+    items: list[CaptchaSampleSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+class CaptchaSampleDeleteRequest(StrictModel):
+    sample_ids: list[uuid.UUID] = Field(min_length=1, max_length=200)
+
+    @field_validator("sample_ids")
+    @classmethod
+    def validate_unique_sample_ids(
+        cls,
+        value: list[uuid.UUID],
+    ) -> list[uuid.UUID]:
+        if len(set(value)) != len(value):
+            raise ValueError("待删除样本不能重复")
+        return value
+
+
+class CaptchaSampleDeleteResult(StrictModel):
+    deleted_count: int
+    missing_count: int
+
+
 class CaptchaLearningOverview(StrictModel):
     policy: CaptchaLearningPolicyView
     dataset: CaptchaDatasetStats

@@ -28,7 +28,8 @@
 - 数字验证码：PNG/JPEG 图片及四位数字 `{"value": "1234"}`。
 - 文字点选验证码：PNG/JPEG 图片、题目文字顺序和相对坐标（`x/y` 均为
   `0..1`），坐标不依赖客户端窗口尺寸。
-- 自动识别和人工接管分别记录模型版本及 `assisted` 标记。
+- 自动识别和人工接管分别记录模型版本及 `assisted` 标记；线上准确率只聚合
+  `assisted=false` 的自动识别尝试，人工输入或人工点选不进入准确率分母、分子。
 - “仅统计”不会为成功或失败尝试采集、编码或上传图片和答案。服务端根据验证码
   类型推导内部来源，仅保存类型、模型版本、是否人工、发生时间和成功/失败标记，
   不关联账号或设备，用于计算当前模型的线上成功率。
@@ -47,6 +48,8 @@
 
 - 数据集数量与占用空间：每 5 秒刷新，并分别显示数字和文字点选样本。
 - 当前模型成功率：真实客户端尝试中，该模型版本的成功次数 / 尝试次数。
+- 数字验证码和文字点选验证码分别统计准确率；内置 `ddddocr`、训练模型以及只有
+  历史识别记录的其他模型版本都会在机器学习页独立展示。
 - 候选模型识别率：训练时固定、确定性的 20% 留出集结果，不包含后续线上尝试。
 - 数字模型按四位数字全部一致才算一次正确。
 - 点选模型按题目文字对应区域的完整序列全部一致才算一次正确；检测框仍由内置
@@ -78,15 +81,16 @@ SHA-256 上传服务端。
 
 ## 数据集导入与导出
 
-管理员一次导出全部数据，ZIP 内按验证码类型分目录；导出的原 ZIP 可以直接重新
-导入。训练某一类型时客户端仍可在后台请求该类型的样本子集。压缩包结构：
+管理员一次导出全部数据，ZIP 顶层按验证码类型使用中文目录；即使某一类暂时没有
+样本也保留对应空目录。导出的原 ZIP 可以直接重新导入，旧版英文目录数据集继续
+兼容。训练某一类型时客户端仍可在后台请求该类型的样本子集。压缩包结构：
 
 ```text
 manifest.json
-images/numeric/<sample-uuid>.png
-images/numeric/<sample-uuid>.jpg
-images/click/<sample-uuid>.png
-images/click/<sample-uuid>.jpg
+数字验证码/<sample-uuid>.png
+数字验证码/<sample-uuid>.jpg
+文字点选验证码/<sample-uuid>.png
+文字点选验证码/<sample-uuid>.jpg
 ```
 
 `manifest.json` 的 `schema_version` 当前为 `1`，`categories` 同时记录数字与文字
@@ -97,7 +101,7 @@ images/click/<sample-uuid>.jpg
   "id": "UUID",
   "captcha_type": "numeric",
   "source": "transport_numeric",
-  "image": "images/numeric/UUID.png",
+  "image": "数字验证码/UUID.png",
   "image_mime": "image/png",
   "answer": {"value": "1234"},
   "model_version": "human-manual",
@@ -110,6 +114,9 @@ images/click/<sample-uuid>.jpg
 文件和无效清单。导入会重新检查图片签名、答案和指纹，不信任清单中的原始 ID
 或指纹；页面会分别报告新增、重复和跳过数量。
 
+机器学习页的样本表支持按类型筛选、分页以及 Ctrl/Shift 多选删除。删除只影响选中
+样本及后续导出/训练，不删除对应的自动识别准确率历史尝试。
+
 ## 接口
 
 普通在线账号：
@@ -121,6 +128,8 @@ images/click/<sample-uuid>.jpg
 管理员：
 
 - `GET /api/v1/admin/ml/overview`
+- `GET /api/v1/admin/ml/samples`
+- `DELETE /api/v1/admin/ml/samples`
 - `PATCH /api/v1/admin/ml/policy`
 - `GET /api/v1/admin/ml/dataset/export`
 - `POST /api/v1/admin/ml/dataset/import`

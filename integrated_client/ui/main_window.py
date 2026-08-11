@@ -386,6 +386,8 @@ class MainWindow(FramelessMainWindow):
             "admin_update_captcha_policy",
             "admin_export_captcha_dataset",
             "admin_import_captcha_dataset",
+            "admin_captcha_samples",
+            "admin_delete_captcha_samples",
             "admin_create_captcha_model",
             "admin_activate_captcha_model",
             "admin_use_builtin_captcha_model",

@@ -28,13 +28,13 @@ def _changed_user(client):
     return response.json()
 
 
-def _numeric_attempt(*, success: bool) -> dict:
+def _numeric_attempt(*, success: bool, assisted: bool = False) -> dict:
     payload = {
         "captcha_type": "numeric",
         "source": "transport_numeric",
         "model_version": "ddddocr-builtin",
         "success": success,
-        "assisted": True,
+        "assisted": assisted,
         "occurred_at": datetime.now(UTC).isoformat(),
     }
     if success:
@@ -132,6 +132,15 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert duplicate.json()["sample_stored"] is False
     assert duplicate.json()["sample_id"] == first.json()["sample_id"]
 
+    manual = _numeric_attempt(success=True, assisted=True)
+    manual["model_version"] = "human-manual"
+    manual_attempt = client.post(
+        "/api/v1/captcha/attempts",
+        headers=auth_header(user),
+        json=manual,
+    )
+    assert manual_attempt.status_code == 200
+
     overview = client.get(
         "/api/v1/admin/ml/overview",
         headers=auth_header(admin),
@@ -141,6 +150,7 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert body["dataset"]["total_count"] == 1
     assert body["dataset"]["numeric_count"] == 1
     assert body["dataset"]["total_bytes"] == len(PNG_1X1)
+    assert len(body["attempts"]) == 1
     metric = body["attempts"][0]
     assert metric["attempt_count"] == 4
     assert metric["success_count"] == 3
@@ -177,18 +187,20 @@ def test_dataset_export_import_and_model_activation(client):
         assert manifest["captcha_type"] == "mixed"
         assert manifest["categories"]["numeric"]["sample_count"] == 1
         assert manifest["categories"]["click"]["sample_count"] == 1
+        assert "数字验证码/" in archive.namelist()
+        assert "文字点选验证码/" in archive.namelist()
         assert len(
             [
                 name
                 for name in archive.namelist()
-                if name.startswith("images/numeric/")
+                if name.startswith("数字验证码/") and not name.endswith("/")
             ]
         ) == 1
         assert len(
             [
                 name
                 for name in archive.namelist()
-                if name.startswith("images/click/")
+                if name.startswith("文字点选验证码/") and not name.endswith("/")
             ]
         ) == 1
 
@@ -298,6 +310,73 @@ def test_dataset_export_import_and_model_activation(client):
         headers=auth_header(user),
     )
     assert no_custom_model.status_code == 404
+
+
+def test_admin_can_list_and_delete_selected_captcha_samples(client):
+    admin = changed_admin(client)
+    user = _changed_user(client)
+    client.patch(
+        "/api/v1/admin/ml/policy",
+        headers=auth_header(admin),
+        json={"upload_mode": "samples_and_metrics"},
+    )
+    numeric = client.post(
+        "/api/v1/captcha/attempts",
+        headers=auth_header(user),
+        json=_numeric_attempt(success=True),
+    )
+    click = client.post(
+        "/api/v1/captcha/attempts",
+        headers=auth_header(user),
+        json=_click_attempt(),
+    )
+    assert numeric.status_code == click.status_code == 200
+
+    listed = client.get(
+        "/api/v1/admin/ml/samples",
+        headers=auth_header(admin),
+        params={"limit": 1, "offset": 0},
+    )
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["total"] == 2
+    assert len(listed.json()["items"]) == 1
+    assert listed.json()["items"][0]["answer"]
+
+    numeric_only = client.get(
+        "/api/v1/admin/ml/samples",
+        headers=auth_header(admin),
+        params={"captcha_type": "numeric"},
+    )
+    assert numeric_only.status_code == 200
+    assert numeric_only.json()["total"] == 1
+    numeric_id = numeric_only.json()["items"][0]["id"]
+
+    deleted = client.request(
+        "DELETE",
+        "/api/v1/admin/ml/samples",
+        headers=auth_header(admin),
+        json={"sample_ids": [numeric_id]},
+    )
+    assert deleted.status_code == 200, deleted.text
+    assert deleted.json() == {"deleted_count": 1, "missing_count": 0}
+
+    deleted_again = client.request(
+        "DELETE",
+        "/api/v1/admin/ml/samples",
+        headers=auth_header(admin),
+        json={"sample_ids": [numeric_id]},
+    )
+    assert deleted_again.status_code == 200
+    assert deleted_again.json() == {"deleted_count": 0, "missing_count": 1}
+
+    overview = client.get(
+        "/api/v1/admin/ml/overview",
+        headers=auth_header(admin),
+    )
+    assert overview.status_code == 200
+    assert overview.json()["dataset"]["total_count"] == 1
+    assert overview.json()["dataset"]["numeric_count"] == 0
+    assert overview.json()["dataset"]["click_count"] == 1
 
 
 def test_failed_attempt_rejects_image_and_non_admin_cannot_manage_dataset(client):

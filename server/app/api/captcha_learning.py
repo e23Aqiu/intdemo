@@ -34,6 +34,9 @@ from ..schemas import (
     CaptchaLearningPolicyView,
     CaptchaModelCreate,
     CaptchaModelView,
+    CaptchaSampleDeleteRequest,
+    CaptchaSampleDeleteResult,
+    CaptchaSamplePage,
 )
 from ..services import audit
 
@@ -41,7 +44,7 @@ router = APIRouter(tags=["captcha-learning"])
 
 MAX_IMAGE_BYTES = 1 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
-MAX_ARCHIVE_FILES = 50_001
+MAX_ARCHIVE_FILES = 50_003
 MAX_MANIFEST_BYTES = 10 * 1024 * 1024
 MAX_MODEL_BYTES = 20 * 1024 * 1024
 DATASET_SCHEMA_VERSION = 1
@@ -57,6 +60,10 @@ UPLOAD_MODES = {
 CAPTCHA_SOURCE_BY_TYPE = {
     "numeric": "transport_numeric",
     "click": "business_click",
+}
+DATASET_DIRECTORY_BY_TYPE = {
+    "numeric": "数字验证码",
+    "click": "文字点选验证码",
 }
 
 
@@ -95,6 +102,20 @@ def _model_view(model: CaptchaModel) -> dict[str, Any]:
         "metrics": model.metrics or {},
         "created_at": model.created_at,
         "activated_at": model.activated_at,
+    }
+
+
+def _sample_view(sample: CaptchaSample) -> dict[str, Any]:
+    return {
+        "id": sample.id,
+        "captcha_type": sample.captcha_type,
+        "source": sample.source,
+        "answer": sample.answer or {},
+        "model_version": sample.model_version,
+        "origin": sample.origin,
+        "image_size": sample.image_size,
+        "captured_at": sample.captured_at,
+        "created_at": sample.created_at,
     }
 
 
@@ -466,6 +487,7 @@ def _attempt_metrics(db: Db) -> list[dict[str, Any]]:
                 0,
             ),
         )
+        .where(CaptchaAttempt.assisted.is_(False))
         .group_by(CaptchaAttempt.captcha_type, CaptchaAttempt.model_version)
         .order_by(CaptchaAttempt.captcha_type, CaptchaAttempt.model_version)
     ).all()
@@ -501,6 +523,79 @@ def learning_overview(
         "dataset": _dataset_stats(db),
         "attempts": _attempt_metrics(db),
         "models": [_model_view(model) for model in models],
+    }
+
+
+@router.get("/admin/ml/samples", response_model=CaptchaSamplePage)
+def list_captcha_samples(
+    context: AdminContext,
+    db: Db,
+    captcha_type: str | None = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    del context
+    if captcha_type is not None and captcha_type not in CAPTCHA_TYPES:
+        raise ApiError("invalid_captcha_type", "验证码类型无效", status_code=422)
+    filters = []
+    if captcha_type:
+        filters.append(CaptchaSample.captcha_type == captcha_type)
+    count_statement = select(func.count(CaptchaSample.id))
+    statement = select(CaptchaSample)
+    if filters:
+        count_statement = count_statement.where(*filters)
+        statement = statement.where(*filters)
+    total = int(db.scalar(count_statement) or 0)
+    samples = db.scalars(
+        statement.order_by(
+            CaptchaSample.captured_at.desc(),
+            CaptchaSample.created_at.desc(),
+            CaptchaSample.id.desc(),
+        )
+        .offset(offset)
+        .limit(limit)
+    ).all()
+    return {
+        "items": [_sample_view(sample) for sample in samples],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@router.delete(
+    "/admin/ml/samples",
+    response_model=CaptchaSampleDeleteResult,
+)
+def delete_captcha_samples(
+    payload: CaptchaSampleDeleteRequest,
+    request: Request,
+    context: AdminContext,
+    db: Db,
+) -> dict[str, int]:
+    samples = db.scalars(
+        select(CaptchaSample).where(CaptchaSample.id.in_(payload.sample_ids))
+    ).all()
+    found_ids = {sample.id for sample in samples}
+    for sample in samples:
+        db.delete(sample)
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="captcha.sample.delete",
+        target_type="captcha_sample",
+        target_id="multiple",
+        details={
+            "sample_ids": [str(sample_id) for sample_id in payload.sample_ids],
+            "deleted_count": len(samples),
+            "missing_count": len(payload.sample_ids) - len(found_ids),
+        },
+    )
+    db.commit()
+    return {
+        "deleted_count": len(samples),
+        "missing_count": len(payload.sample_ids) - len(found_ids),
     }
 
 
@@ -551,11 +646,12 @@ def export_captcha_dataset(
     category_counts = {kind: 0 for kind in sorted(CAPTCHA_TYPES)}
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for directory in DATASET_DIRECTORY_BY_TYPE.values():
+            archive.writestr(f"{directory}/", b"")
         for sample in samples:
             extension = ".png" if sample.image_mime == "image/png" else ".jpg"
-            image_name = (
-                f"images/{sample.captcha_type}/{sample.id}{extension}"
-            )
+            directory = DATASET_DIRECTORY_BY_TYPE[sample.captcha_type]
+            image_name = f"{directory}/{sample.id}{extension}"
             archive.writestr(image_name, sample.image_data)
             category_counts[sample.captcha_type] += 1
             manifest_samples.append(
@@ -577,12 +673,12 @@ def export_captcha_dataset(
             "categories": {
                 "numeric": {
                     "label": "数字验证码",
-                    "image_directory": "images/numeric/",
+                    "image_directory": "数字验证码/",
                     "sample_count": category_counts["numeric"],
                 },
                 "click": {
                     "label": "文字点选验证码",
-                    "image_directory": "images/click/",
+                    "image_directory": "文字点选验证码/",
                     "sample_count": category_counts["click"],
                 },
             },
