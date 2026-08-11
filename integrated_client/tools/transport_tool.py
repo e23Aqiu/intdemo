@@ -1815,74 +1815,6 @@ class BusinessBackfillWorker(QThread):
             self.page.wait_for_timeout(CONFIG["BUSINESS_CAPTCHA_POLL_MS"])
         return False
 
-    def _business_captcha_loading_is_visible(self):
-        try:
-            loaders = self.page.locator(".layui-layer-loading2")
-            for index in range(loaders.count()):
-                if loaders.nth(index).is_visible():
-                    return True
-        except Exception:
-            pass
-        return False
-
-    def _click_marker_count(self):
-        try:
-            return int(self.page.locator(".point-area").count())
-        except Exception:
-            return 0
-
-    def _wait_for_click_captcha_result(self, expected_count):
-        """等待点选验证码得到明确结果，避免把页面加载中误判为失败。"""
-        poll_ms = CONFIG["BUSINESS_CAPTCHA_POLL_MS"]
-        stable_seconds = CONFIG["BUSINESS_CAPTCHA_STABLE_MS"] / 1000
-        grace_seconds = max(float(CONFIG["CAPTCHA_WAIT_SEC"]), stable_seconds)
-        deadline = time.monotonic() + self.web_timeout / 1000
-        retry_check_at = min(deadline, time.monotonic() + grace_seconds)
-        loading_was_visible = False
-        pending_logged = False
-
-        while time.monotonic() < deadline:
-            self._check_stopped()
-            if not self._captcha_prompt_is_visible():
-                return "passed"
-
-            now = time.monotonic()
-            loading_visible = self._business_captcha_loading_is_visible()
-            if loading_visible:
-                loading_was_visible = True
-                retry_check_at = min(
-                    deadline,
-                    max(retry_check_at, now + stable_seconds),
-                )
-            elif loading_was_visible:
-                # 加载层刚消失时，DOM 仍可能需要一个稳定周期才能隐藏验证码。
-                loading_was_visible = False
-                retry_check_at = min(
-                    deadline,
-                    max(retry_check_at, now + stable_seconds),
-                )
-
-            if now >= retry_check_at and not loading_visible:
-                marker_count = self._click_marker_count()
-                if expected_count > 0 and marker_count >= expected_count:
-                    # 已点完的编号标记仍属于本次提交，说明结果尚未确定。
-                    # 保留原截图和坐标，不能重新开始采集或记录失败。
-                    if not pending_logged:
-                        self.log.emit(
-                            "⏳ 网页仍在确认验证码，继续保留本次采集数据..."
-                        )
-                        pending_logged = True
-                    retry_check_at = min(deadline, now + stable_seconds)
-                else:
-                    # 验证码仍可见且点选标记已被网页清空，页面已恢复为可重试状态。
-                    return "retry"
-
-            self.page.wait_for_timeout(poll_ms)
-
-        if not self._captcha_prompt_is_visible():
-            return "passed"
-        return "timeout"
-
     def _prepare_manual_click_capture(self):
         if not self._sample_collection_enabled():
             return None
@@ -2048,8 +1980,22 @@ class BusinessBackfillWorker(QThread):
         self._emit_captcha_attempt(success=True, **attempt)
 
     def _complete_manual_click_captcha(self, model_version):
+        pending_attempt = None
         while self._running:
             self._check_stopped()
+
+            # 网页的成功响应可能晚于第一次可见性检查。此时保留的仍是
+            # 上一次提交前的原图和点位，直接用它上报成功，不能重新截图。
+            if pending_attempt is not None and not self._captcha_prompt_is_visible():
+                self._report_successful_click_captcha(
+                    pending_attempt["capture"],
+                    pending_attempt["points"],
+                    model_version=model_version,
+                    assisted=True,
+                )
+                self.log.emit("✅ 验证码通过，开始获取信息")
+                return True
+
             capture = self._prepare_manual_click_capture()
             prompt = list((capture or {}).get("prompt") or [])
             if prompt:
@@ -2070,18 +2016,38 @@ class BusinessBackfillWorker(QThread):
                 except Exception:
                     expected_count = 3
 
+            if pending_attempt is not None:
+                # 截取下一张验证码期间，上一张也可能刚好完成成功响应。
+                if not self._captcha_prompt_is_visible():
+                    self._report_successful_click_captcha(
+                        pending_attempt["capture"],
+                        pending_attempt["points"],
+                        model_version=model_version,
+                        assisted=True,
+                    )
+                    self.log.emit("✅ 验证码通过，开始获取信息")
+                    return True
+
+                # 已经进入下一轮“等待用户点选”，至此才能确认上一份样本失败。
+                self._emit_captcha_attempt(
+                    success=False,
+                    model_version=model_version,
+                    assisted=True,
+                )
+                pending_attempt = None
+
             if self.auto_continue:
                 if expected_count > 0:
                     self.log.emit("⏳ 等待用户点完验证码...")
                     while self._running:
                         self._check_stopped()
-                        if self._click_marker_count() >= expected_count:
-                            self.log.emit("✅ 用户已点完验证码")
-                            break
-                        if not self._captcha_prompt_is_visible():
-                            # 最后一次点击后网页可能立即关闭验证码，编号标记会先被移除。
-                            self.log.emit("✅ 用户已点完验证码")
-                            break
+                        try:
+                            point_count = self.page.locator(".point-area").count()
+                            if point_count >= expected_count:
+                                self.log.emit("✅ 用户已点完验证码")
+                                break
+                        except Exception:
+                            pass
                         time.sleep(0.2)
             else:
                 self.log.emit("⏸️ 请完成验证码后点击【继续执行】")
@@ -2092,9 +2058,19 @@ class BusinessBackfillWorker(QThread):
                 self._check_stopped()
 
             points = self._manual_click_points(capture)
-            self.log.emit("⏳ 验证码已提交，等待网页确认...")
-            result = self._wait_for_click_captcha_result(expected_count)
-            if result == "passed":
+            if self.page.locator(".layui-layer-loading2").count() > 0:
+                try:
+                    self.page.wait_for_selector(
+                        ".layui-layer-loading2",
+                        state="detached",
+                        timeout=self.web_timeout,
+                    )
+                except Exception:
+                    pass
+            time.sleep(0.5)
+            prompt_el = self.page.locator(".verify-msg")
+            passed = prompt_el.count() == 0 or not prompt_el.first.is_visible()
+            if passed:
                 self._report_successful_click_captcha(
                     capture,
                     points,
@@ -2103,17 +2079,11 @@ class BusinessBackfillWorker(QThread):
                 )
                 self.log.emit("✅ 验证码通过，开始获取信息")
                 return True
-            if result == "timeout":
-                self.log.emit(
-                    "⚠️ 等待验证码确认超时，本次结果未确定，不记录为点击错误"
-                )
-                return False
-            self._emit_captcha_attempt(
-                success=False,
-                model_version=model_version,
-                assisted=True,
-            )
             self.log.emit("❌ 验证码点击错误，请重新点击验证码...")
+            pending_attempt = {
+                "capture": capture,
+                "points": points,
+            }
             time.sleep(0.5)
         return False
 
@@ -2340,11 +2310,10 @@ class BusinessBackfillWorker(QThread):
                         time.sleep(0.4)
 
                     self.log.emit("⏳ 等待页面响应，校验验证码结果...")
-                    result = self._wait_for_click_captcha_result(
-                        len(target_chars)
-                    )
+                    self._check_stopped()
+                    self.page.wait_for_timeout(2000)
 
-                    if result == "passed":
+                    if not prompt_el.is_visible():
                         normalized_points = [
                             {
                                 "x": round(x / pil_img_sharpen.width, 6),
@@ -2363,12 +2332,6 @@ class BusinessBackfillWorker(QThread):
                         )
                         self.log.emit("🎉 验证码验证通过！")
                         return True
-                    if result == "timeout":
-                        self.log.emit(
-                            "⚠️ 等待验证码确认超时，本次结果未确定，"
-                            "不记录为识别错误"
-                        )
-                        return False
                     else:
                         self._emit_captcha_attempt(
                             success=False,
