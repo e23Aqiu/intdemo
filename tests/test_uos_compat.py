@@ -155,7 +155,11 @@ class UosCompatibilityTests(unittest.TestCase):
     def test_compatible_browser_missing_explains_disabling_mode(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             browser.sys, "platform", "linux"
-        ), patch.object(browser.shutil, "which", return_value=None), self.assertRaisesRegex(
+        ), patch.object(browser.shutil, "which", return_value=None), patch.object(
+            browser,
+            "_linux_desktop_file_candidates",
+            return_value=(),
+        ), self.assertRaisesRegex(
             browser.CompatibleBrowserUnavailableError,
             "关闭.*爱企查兼容模式",
         ):
