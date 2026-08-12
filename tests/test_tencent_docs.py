@@ -13,6 +13,7 @@ from integrated_client.tencent_docs import (
     _TencentDocsBrowserCapture,
     _TencentDocsLoginRequired,
     select_pending_tencent_rows,
+    tencent_docs_import_directory,
     validate_tencent_docs_url,
     write_tencent_import_workbook,
 )
@@ -223,6 +224,22 @@ class TencentDocsImportTests(unittest.TestCase):
         self.assertEqual(progress, [0, 84, 92, 100])
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].copied_rows, 1)
+        self.assertEqual(
+            results[0].path.parent,
+            tencent_docs_import_directory("admin", self.temp_dir.name),
+        )
+
+    def test_import_directory_is_scoped_to_program_account(self):
+        self.assertEqual(
+            tencent_docs_import_directory(
+                "Station User",
+                self.temp_dir.name,
+            ),
+            Path(self.temp_dir.name)
+            / "imports"
+            / "tencent-docs"
+            / "station-user",
+        )
 
     def test_tencent_document_links_are_persisted_per_program_account(self):
         preferences = ClientPreferences(self.temp_dir.name)

@@ -58,6 +58,7 @@ from ..database import (
 from ..tencent_docs import (
     TencentDocsImportResult,
     TencentDocsImportWorker,
+    tencent_docs_import_directory,
     validate_tencent_docs_url,
 )
 from ..tools.aiqicha_tool import (
@@ -356,14 +357,23 @@ class WorkflowPage(QWidget):
         choose_btn.clicked.connect(self._choose_file)
         tencent_docs_btn = QPushButton("导入腾讯文档")
         tencent_docs_btn.clicked.connect(self._prompt_tencent_docs_import)
+        open_tencent_docs_folder_btn = QPushButton("打开导入文件夹")
+        open_tencent_docs_folder_btn.setToolTip(
+            "打开当前账号通过腾讯文档生成的 Excel 表格存放文件夹"
+        )
+        open_tencent_docs_folder_btn.clicked.connect(
+            self._open_tencent_docs_import_folder
+        )
         reload_btn = QPushButton("刷新预览")
         reload_btn.clicked.connect(lambda: self._reload_preview(force=True))
         self.choose_btn = choose_btn
         self.tencent_docs_btn = tencent_docs_btn
+        self.open_tencent_docs_folder_btn = open_tencent_docs_folder_btn
         self.reload_btn = reload_btn
         file_layout.addWidget(self.file_edit, 1)
         file_layout.addWidget(choose_btn)
         file_layout.addWidget(tencent_docs_btn)
+        file_layout.addWidget(open_tencent_docs_folder_btn)
         file_layout.addWidget(reload_btn)
         workflow_root.addWidget(file_group)
 
@@ -948,6 +958,33 @@ class WorkflowPage(QWidget):
             return ""
         return self.client_preferences.tencent_document_url(self.account_key)
 
+    def _tencent_docs_data_directory(self):
+        if self.client_preferences is None:
+            return None
+        return self.client_preferences.path.parent
+
+    def _open_tencent_docs_import_folder(self):
+        folder = tencent_docs_import_directory(
+            self.account_key,
+            self._tencent_docs_data_directory(),
+        )
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            folder = folder.resolve()
+        except OSError as exc:
+            QMessageBox.warning(
+                self,
+                "无法打开腾讯文档文件夹",
+                f"无法创建或访问文件夹：\n{folder}\n\n{exc}",
+            )
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            QMessageBox.warning(
+                self,
+                "无法打开腾讯文档文件夹",
+                f"系统无法打开文件夹：\n{folder}",
+            )
+
     def _aiqicha_profile_directory(self):
         if self.client_preferences is None or not self.account_key:
             return None
@@ -991,15 +1028,10 @@ class WorkflowPage(QWidget):
         self._start_tencent_docs_import(url)
 
     def _start_tencent_docs_import(self, url):
-        data_directory = (
-            self.client_preferences.path.parent
-            if self.client_preferences is not None
-            else None
-        )
         worker = TencentDocsImportWorker(
             url,
             self.account_key,
-            data_directory=data_directory,
+            data_directory=self._tencent_docs_data_directory(),
             parent=self,
         )
         dialog = TencentDocsProgressDialog(self)

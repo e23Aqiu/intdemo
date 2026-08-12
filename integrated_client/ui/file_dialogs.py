@@ -54,7 +54,14 @@ def _uos_file_selection(
     if not program:
         return None
 
-    arguments = [program, "--file-selection", f"--title={caption or '选择文件'}"]
+    # Keep the native chooser modal so the Qt parent cannot cover it while
+    # the synchronous selection call is waiting for a result.
+    arguments = [
+        program,
+        "--file-selection",
+        "--modal",
+        f"--title={caption or '选择文件'}",
+    ]
     start = _initial_path(directory)
     if start:
         arguments.append(f"--filename={start}")

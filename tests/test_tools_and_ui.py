@@ -3959,6 +3959,37 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.shutdown())
         page.close()
 
+    def test_tencent_docs_import_folder_button_opens_account_directory(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        page = WorkflowPage(
+            client_preferences=preferences,
+            account_key="Station User",
+        )
+        self.assertEqual(
+            page.open_tencent_docs_folder_btn.text(),
+            "打开导入文件夹",
+        )
+        import_directory = (
+            Path(self.temp_dir.name)
+            / "imports"
+            / "tencent-docs"
+            / "station-user"
+        )
+        self.assertFalse(import_directory.exists())
+        with patch(
+            "integrated_client.ui.workflow_page.QDesktopServices.openUrl",
+            return_value=True,
+        ) as open_url:
+            page.open_tencent_docs_folder_btn.click()
+        self.assertTrue(import_directory.is_dir())
+        open_url.assert_called_once()
+        self.assertEqual(
+            Path(open_url.call_args.args[0].toLocalFile()).resolve(),
+            import_directory.resolve(),
+        )
+        self.assertTrue(page.shutdown())
+        page.close()
+
     def test_step_two_browser_loading_is_excluded_from_active_time(self):
         self.assertEqual(self.db.ensure_default_station_users(), 5)
         station = next(

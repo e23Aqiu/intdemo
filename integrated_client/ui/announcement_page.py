@@ -556,7 +556,7 @@ class ContactAdminDialog(FramelessDialog):
 
 
 class ImagePreviewDialog(FramelessDialog):
-    def __init__(self, data, file_name, parent=None):
+    def __init__(self, data, file_name, parent=None, *, save_caption="保存公告图片"):
         super().__init__(
             parent,
             resizable=True,
@@ -565,6 +565,7 @@ class ImagePreviewDialog(FramelessDialog):
         )
         self.data = bytes(data)
         self.file_name = str(file_name or "公告图片")
+        self.save_caption = str(save_caption or "保存图片")
         self.setWindowTitle(self.file_name)
         self.resize(900, 700)
         self.setMinimumSize(620, 460)
@@ -603,7 +604,7 @@ class ImagePreviewDialog(FramelessDialog):
     def _save(self):
         target, _ = QFileDialog.getSaveFileName(
             self,
-            "保存公告图片",
+            self.save_caption,
             self.file_name,
             "所有文件 (*.*)",
         )

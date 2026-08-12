@@ -124,6 +124,8 @@ class _FakeApi:
         self.export_types = []
         self.sample_rows = []
         self.deleted_sample_ids = []
+        self.downloaded_sample_ids = []
+        self.sample_images = {}
         self.renamed_model = None
 
     @staticmethod
@@ -191,6 +193,10 @@ class _FakeApi:
             "deleted_count": deleted,
             "missing_count": len(sample_ids) - deleted,
         }
+
+    def admin_download_captcha_sample_image(self, _token, sample_id):
+        self.downloaded_sample_ids.append(str(sample_id))
+        return self.sample_images.get(str(sample_id), b"")
 
     @staticmethod
     def admin_create_captcha_model(_token, _payload):
@@ -1882,6 +1888,243 @@ class CaptchaLearningTests(unittest.TestCase):
             ],
         )
         self.assertTrue(page.delete_samples_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_double_click_opens_sample_image(self):
+        session = _FakeSession()
+        sample_id = "11111111-1111-1111-1111-111111111111"
+        image = _numeric_image("4826")
+        session.api.sample_rows = [
+            {
+                "id": sample_id,
+                "captcha_type": "numeric",
+                "answer": {"value": "4826"},
+                "model_version": "ddddocr-builtin",
+                "origin": "client",
+                "image_size": len(image),
+                "image_mime": "image/png",
+                "image_available": True,
+                "captured_at": "2026-08-11T10:00:00+08:00",
+            }
+        ]
+        session.api.sample_images[sample_id] = image
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._samples_loaded(
+            session.api.admin_captcha_samples("token", limit=100, offset=0),
+            None,
+        )
+
+        def immediate(function, completed):
+            completed(function(), None)
+            return object()
+
+        with patch.object(
+            page,
+            "_start",
+            side_effect=immediate,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.ImagePreviewDialog"
+        ) as preview_dialog:
+            page.sample_table.cellDoubleClicked.emit(0, 2)
+
+        self.assertEqual(session.api.downloaded_sample_ids, [sample_id])
+        preview_dialog.assert_called_once_with(
+            image,
+            f"captcha-sample-{sample_id}.png",
+            page,
+            save_caption="保存样本图片",
+        )
+        preview_dialog.return_value.exec_.assert_called_once_with()
+        self.assertFalse(page._sample_image_loading)
+        self.assertTrue(page.sample_table.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_explains_unavailable_sample_image(self):
+        session = _FakeSession()
+        session.api.sample_rows = [
+            {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "captcha_type": "numeric",
+                "answer": {"value": "4826"},
+                "model_version": "ddddocr-builtin",
+                "origin": "client",
+                "image_size": 0,
+                "image_available": False,
+                "captured_at": "2026-08-11T10:00:00+08:00",
+            }
+        ]
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._samples_loaded(
+            session.api.admin_captcha_samples("token", limit=100, offset=0),
+            None,
+        )
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning:
+            page.sample_table.cellDoubleClicked.emit(0, 0)
+
+        warning.assert_called_once()
+        self.assertEqual(warning.call_args.args[1], "图片不可用")
+        self.assertEqual(session.api.downloaded_sample_ids, [])
+        page.deleteLater()
+
+    def test_machine_learning_page_uses_image_header_when_mime_is_missing(self):
+        session = _FakeSession()
+        sample_id = "33333333-3333-3333-3333-333333333333"
+        image = b"\xff\xd8\xff" + b"jpeg-data"
+        session.api.sample_rows = [
+            {
+                "id": sample_id,
+                "captcha_type": "numeric",
+                "answer": {"value": "4826"},
+                "model_version": "legacy",
+                "origin": "import",
+                "image_size": len(image),
+                "image_available": True,
+                "captured_at": "2026-08-11T10:00:00+08:00",
+            }
+        ]
+        session.api.sample_images[sample_id] = image
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._samples_loaded(
+            session.api.admin_captcha_samples("token", limit=100, offset=0),
+            None,
+        )
+
+        def immediate(function, completed):
+            completed(function(), None)
+            return object()
+
+        with patch.object(page, "_start", side_effect=immediate), patch(
+            "integrated_client.ui.machine_learning_page.ImagePreviewDialog"
+        ) as preview_dialog:
+            page.sample_table.cellDoubleClicked.emit(0, 0)
+
+        self.assertTrue(
+            preview_dialog.call_args.args[1].endswith(".jpg")
+        )
+        page.deleteLater()
+
+    def test_machine_learning_page_restores_table_when_image_task_submit_fails(self):
+        session = _FakeSession()
+        session.api.sample_rows = [
+            {
+                "id": "44444444-4444-4444-4444-444444444444",
+                "captcha_type": "numeric",
+                "answer": {"value": "4826"},
+                "image_available": True,
+            }
+        ]
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._samples_loaded(
+            session.api.admin_captcha_samples("token", limit=100, offset=0),
+            None,
+        )
+
+        with patch.object(
+            page,
+            "_start",
+            side_effect=RuntimeError("submit failed"),
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning:
+            page.sample_table.cellDoubleClicked.emit(0, 0)
+
+        self.assertFalse(page._sample_image_loading)
+        self.assertTrue(page.sample_table.isEnabled())
+        self.assertIn("submit failed", warning.call_args.args[2])
+        page.deleteLater()
+
+    def test_machine_learning_page_ignores_image_result_after_shutdown(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        sample = {
+            "id": "55555555-5555-5555-5555-555555555555",
+            "image_mime": "image/png",
+        }
+        page._sample_image_loading = True
+        page.shutdown()
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.ImagePreviewDialog"
+        ) as preview_dialog, patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning:
+            page._sample_image_loaded(sample, _numeric_image("4826"), None)
+
+        self.assertFalse(page._sample_image_loading)
+        preview_dialog.assert_not_called()
+        warning.assert_not_called()
+        page.deleteLater()
+
+    def test_machine_learning_page_rejects_non_binary_image_response(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        sample = {"id": "66666666-6666-6666-6666-666666666666"}
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.ImagePreviewDialog"
+        ) as preview_dialog, patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning:
+            page._sample_image_loaded(sample, {"content": "not-bytes"}, None)
+
+        self.assertIn("格式无效", warning.call_args.args[2])
+        preview_dialog.assert_not_called()
+        self.assertTrue(page.sample_table.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_ignores_double_click_after_shutdown(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._sample_rows = [{"id": "77777777-7777-7777-7777-777777777777"}]
+        page.shutdown()
+
+        with patch.object(page, "_start") as start, patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning:
+            page._view_sample_image(0, 0)
+
+        start.assert_not_called()
+        warning.assert_not_called()
+        page.deleteLater()
+
+    def test_machine_learning_page_explains_missing_image_download_api(self):
+        session = _FakeSession()
+        session.api.admin_download_captcha_sample_image = None
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._sample_rows = [
+            {
+                "id": "88888888-8888-8888-8888-888888888888",
+                "image_available": True,
+            }
+        ]
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning:
+            page._view_sample_image(0, 0)
+
+        self.assertEqual(warning.call_args.args[1], "图片加载失败")
+        self.assertIn("接口不支持", warning.call_args.args[2])
+        self.assertFalse(page._sample_image_loading)
         page.deleteLater()
 
     def test_machine_learning_page_filters_manual_models_and_recounts_selection(self):

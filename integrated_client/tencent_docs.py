@@ -289,6 +289,18 @@ def _safe_account_directory(account_key: str) -> str:
     return normalized[:80] or "local"
 
 
+def tencent_docs_import_directory(
+    account_key: str,
+    data_directory: str | Path | None = None,
+) -> Path:
+    return (
+        Path(data_directory or get_data_dir())
+        / "imports"
+        / "tencent-docs"
+        / _safe_account_directory(account_key)
+    )
+
+
 class _TencentDocsBrowserCapture:
     def __init__(
         self,
@@ -790,10 +802,10 @@ class TencentDocsImportWorker(QThread):
             selection = select_pending_tencent_rows(clipboard_text)
             timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
             destination = (
-                self.data_directory
-                / "imports"
-                / "tencent-docs"
-                / account_directory
+                tencent_docs_import_directory(
+                    self.account_key,
+                    self.data_directory,
+                )
                 / f"腾讯文档待处理-{timestamp}-{uuid.uuid4().hex[:6]}.xlsx"
             )
             self._check_interruption()

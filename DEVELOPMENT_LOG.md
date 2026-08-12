@@ -1635,14 +1635,19 @@
 - 在运行设置的“运行模式”中增加“爱企查兼容模式”复选框，默认勾选，并按程序登录
   账号分别保存；勾选时步骤 3 使用本机浏览器，取消勾选时继续使用项目内置 Chromium。
 - Windows 按 Microsoft Edge、360 浏览器的顺序探测，兼容系统安装目录、用户目录和
-  `PATH`；统信 UOS 仅探测 `deepin-browser`/`deepin-browser-stable`，不改变步骤 1、2
-  的项目内置 Chromium 路径。各程序账号继续使用独立的爱企查浏览器 profile。
+  `PATH`；统信 UOS 除 `deepin-browser`/`deepin-browser-stable` 外，还会扫描系统应用目录、
+  用户桌面中的 `org.deepin.browser.desktop` 等启动项并解析 `Exec`/`TryExec`，不改变步骤
+  1、2 的项目内置 Chromium 路径。各程序账号继续使用独立的爱企查浏览器 profile。
 - 运行前仍会检查三步流程所需的内置 Chromium；兼容模式开启时另外检查本机浏览器。
   本机浏览器缺失会提示关闭兼容模式后重试；工作线程启动期间若浏览器被卸载或路径
   失效，也会通过界面提示同样的恢复方式并结束当前步骤。
 - 本机浏览器由客户端先独立启动后再接入自动化控制：UOS 会恢复系统
   `LD_LIBRARY_PATH` 并移除包内 Qt/WebEngine 路径，避免 PyInstaller 运行库污染
   Deepin 浏览器；Windows 打包版启动 Edge/360 时临时恢复系统 DLL 搜索方式。
+- 根据 UOS 真机反馈，默认浏览器可能只在桌面保留
+  `/home/user/Desktop/org.deepin.browser.desktop`，而不把 `deepin-browser` 暴露到
+  `PATH`。兼容模式现已扫描用户/系统应用目录和桌面启动项，并读取 `.desktop` 中的
+  `Exec`/`TryExec` 解析真实可执行文件；因此不会再因仅存在桌面入口而误报浏览器缺失。
 - 新增 Windows Edge/360 优先级、UOS Deepin 探测、开关路径、账号设置持久化和缺失
   浏览器提示测试；项目 Python 3.9 完整客户端回归 `279/279`、专项测试 `35/35`、
   Python 编译和差异检查通过。当前 Windows 已真实启动 Edge 并访问 `about:blank` 后

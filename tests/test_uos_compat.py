@@ -126,6 +126,32 @@ class UosCompatibilityTests(unittest.TestCase):
             self.assertEqual(path, str(executable.resolve()))
             self.assertEqual(name, "统信 Deepin 浏览器")
 
+    def test_uos_compatible_browser_resolves_desktop_launcher_exec(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            executable = self._make_executable(root / "opt" / "deepin-browser")
+            desktop_file = (
+                root / "data" / "applications" / "org.deepin.browser.desktop"
+            )
+            desktop_file.parent.mkdir(parents=True, exist_ok=True)
+            desktop_file.write_text(
+                "[Desktop Entry]\n"
+                "Name=浏览器\n"
+                f"TryExec={executable}\n"
+                f"Exec=\"{executable}\" %U\n",
+                encoding="utf-8",
+            )
+            with patch.dict(
+                os.environ,
+                {"XDG_DATA_HOME": str(root / "data")},
+                clear=True,
+            ), patch.object(browser.sys, "platform", "linux"), patch.object(
+                browser.shutil, "which", return_value=None
+            ):
+                path, name = browser.get_compatible_browser_path()
+            self.assertEqual(path, str(executable.resolve()))
+            self.assertEqual(name, "统信 Deepin 浏览器")
+
     def test_compatible_browser_missing_explains_disabling_mode(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(
             browser.sys, "platform", "linux"
@@ -255,6 +281,7 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertEqual(selected_filter, "")
         arguments = runner.call_args.args[0]
         self.assertIn("--multiple", arguments)
+        self.assertIn("--modal", arguments)
         self.assertIn("--file-filter=Excel | *.xlsx", arguments)
         self.assertEqual(runner.call_args.kwargs["env"]["GTK_USE_PORTAL"], "1")
 

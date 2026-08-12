@@ -1,4 +1,6 @@
 import os
+import configparser
+import shlex
 import shutil
 import sys
 from pathlib import Path
@@ -23,6 +25,14 @@ _WINDOWS_COMPATIBLE_BROWSER_NAMES = (
     "360 浏览器",
 )
 
+_UOS_BROWSER_DESKTOP_FILES = (
+    "org.deepin.browser.desktop",
+    "deepin-browser.desktop",
+    "deepin-browser-stable.desktop",
+    "uos-browser.desktop",
+    "uos-browser-stable.desktop",
+)
+
 
 class CompatibleBrowserUnavailableError(RuntimeError):
     """Raised when 爱企查兼容模式 has no usable system browser."""
@@ -37,6 +47,123 @@ def _candidate_paths(*values):
                 continue
             candidate = _usable_browser(candidate_path)
             if candidate is not None:
+                yield candidate
+
+
+def _linux_desktop_file_candidates():
+    """Yield likely user/system desktop launchers for the UOS browser."""
+    data_home = os.environ.get("XDG_DATA_HOME", "").strip()
+    try:
+        home = Path.home()
+    except RuntimeError:
+        home = None
+    roots = [Path("/usr/local/share"), Path("/usr/share"), Path("/var/lib"), Path("/opt/apps")]
+    if data_home:
+        try:
+            roots.insert(0, Path(data_home).expanduser())
+        except RuntimeError:
+            pass
+    elif home is not None:
+        roots.insert(0, home / ".local" / "share")
+    relative_paths = tuple(
+        relative
+        for name in _UOS_BROWSER_DESKTOP_FILES
+        for relative in (
+            Path("applications") / name,
+            Path("desktop-directories") / name,
+            Path("entries") / "applications" / name,
+        )
+    )
+    seen = set()
+    for root in roots:
+        for relative in relative_paths:
+            candidate = root / relative
+            if candidate.is_file() and str(candidate) not in seen:
+                seen.add(str(candidate))
+                yield candidate
+    if home is None:
+        return
+    for desktop_dir in (home / "Desktop", home / "桌面"):
+        for name in _UOS_BROWSER_DESKTOP_FILES:
+            candidate = desktop_dir / name
+            if candidate.is_file() and str(candidate) not in seen:
+                seen.add(str(candidate))
+                yield candidate
+
+    opt_apps = Path("/opt/apps")
+    if opt_apps.is_dir():
+        for name in _UOS_BROWSER_DESKTOP_FILES:
+            try:
+                nested = opt_apps.glob(f"*/entries/applications/{name}")
+            except OSError:
+                continue
+            for candidate in nested:
+                if candidate.is_file() and str(candidate) not in seen:
+                    seen.add(str(candidate))
+                    yield candidate
+
+
+def _desktop_exec_candidates(desktop_file):
+    """Resolve executable tokens from a freedesktop ``.desktop`` launcher."""
+    try:
+        content = Path(desktop_file).read_text(
+            encoding="utf-8", errors="replace"
+        )
+    except OSError:
+        return
+    values = []
+    parser = configparser.RawConfigParser(interpolation=None, strict=False)
+    try:
+        parser.read_string(content)
+        if parser.has_section("Desktop Entry"):
+            values.extend(
+                parser.get("Desktop Entry", key, fallback="")
+                for key in ("TryExec", "Exec")
+            )
+    except configparser.Error:
+        for line in content.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key.strip() in {"Exec", "TryExec"}:
+                values.append(value.strip())
+    for value in values:
+        try:
+            tokens = shlex.split(value, posix=True)
+        except ValueError:
+            tokens = value.split()
+        if not tokens:
+            continue
+        executable_index = 0
+        if tokens[0] == "env":
+            executable_index = 1
+            while executable_index < len(tokens) and "=" in tokens[executable_index]:
+                executable_index += 1
+        if executable_index >= len(tokens):
+            continue
+        executable = tokens[executable_index]
+        if executable.startswith("%"):
+            continue
+        candidate = _usable_browser(executable)
+        if candidate is not None:
+            yield candidate
+            continue
+        resolved = shutil.which(executable)
+        candidate = _usable_browser(resolved)
+        if candidate is not None:
+            yield candidate
+
+
+def _uos_browser_candidates():
+    """Find UOS Deepin browser binaries, including desktop-launcher installs."""
+    seen = set()
+    for command in ("deepin-browser", "deepin-browser-stable"):
+        candidate = _usable_browser(shutil.which(command))
+        if candidate is not None and str(candidate) not in seen:
+            seen.add(str(candidate))
+            yield candidate
+    for desktop_file in _linux_desktop_file_candidates():
+        for candidate in _desktop_exec_candidates(desktop_file):
+            if str(candidate) not in seen:
+                seen.add(str(candidate))
                 yield candidate
 
 
@@ -107,13 +234,8 @@ def get_compatible_browser_path() -> tuple[str, str]:
         )
 
     if sys.platform.startswith("linux"):
-        for command in (
-            "deepin-browser",
-            "deepin-browser-stable",
-        ):
-            candidate = _usable_browser(shutil.which(command))
-            if candidate is not None:
-                return str(candidate), "统信 Deepin 浏览器"
+        for candidate in _uos_browser_candidates():
+            return str(candidate), "统信 Deepin 浏览器"
         raise CompatibleBrowserUnavailableError(
             "未找到统信 Deepin 浏览器。请关闭“爱企查兼容模式”后重试。"
         )

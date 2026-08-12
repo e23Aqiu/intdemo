@@ -28,7 +28,7 @@ from ..captcha_models import (
     train_candidate,
 )
 from ..online.api import ApiResponseError
-from .announcement_page import start_api_task
+from .announcement_page import ImagePreviewDialog, start_api_task
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
 
@@ -56,6 +56,21 @@ def _display_time(value):
     return str(value or "").replace("T", " ")[:19] or "-"
 
 
+def _sample_image_extension(sample, image_data):
+    """Choose a useful save-dialog extension for current and legacy rows."""
+    if image_data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return ".png"
+    if image_data.startswith(b"\xff\xd8\xff"):
+        return ".jpg"
+    mime = str(sample.get("image_mime") or "")
+    mime = mime.split(";", 1)[0].strip().lower()
+    if mime in {"image/jpeg", "image/jpg"}:
+        return ".jpg"
+    if mime == "image/png":
+        return ".png"
+    return ".png"
+
+
 class MachineLearningPage(QWidget):
     REFRESH_INTERVAL_MS = 5_000
     MANUAL_MODEL_PREFIXES = ("human-", "human_")
@@ -69,6 +84,7 @@ class MachineLearningPage(QWidget):
         self._refresh_task = None
         self._sample_refresh_task = None
         self._sample_refresh_pending = False
+        self._sample_image_loading = False
         self._shutting_down = False
         self._loading_policy = False
         self._confirmed_upload_mode = "off"
@@ -221,7 +237,9 @@ class MachineLearningPage(QWidget):
         sample_title = QLabel("已采集样本")
         sample_title.setObjectName("SectionTitle")
         sample_header.addWidget(sample_title)
-        self.sample_hint = QLabel("可用 Ctrl 或 Shift 多选后删除")
+        self.sample_hint = QLabel(
+            "双击样本可查看图片；可用 Ctrl 或 Shift 多选后删除"
+        )
         self.sample_hint.setObjectName("Muted")
         sample_header.addWidget(self.sample_hint)
         sample_header.addStretch()
@@ -270,6 +288,7 @@ class MachineLearningPage(QWidget):
         sample_table_header.setSectionResizeMode(4, QHeaderView.Stretch)
         self.sample_table.setMinimumHeight(170)
         self.sample_table.setMaximumHeight(260)
+        self.sample_table.cellDoubleClicked.connect(self._view_sample_image)
         root.addWidget(self.sample_table)
 
         model_header = QHBoxLayout()
@@ -387,6 +406,7 @@ class MachineLearningPage(QWidget):
         self._refresh_task = None
         self._sample_refresh_task = None
         self._sample_refresh_pending = False
+        self._sample_image_loading = False
         self._task_callbacks.clear()
         self._tasks.clear()
 
@@ -1000,7 +1020,8 @@ class MachineLearningPage(QWidget):
         last = offset + len(self._sample_rows)
         self.sample_page_label.setText(f"{first}-{last} / {total}")
         self.sample_hint.setText(
-            f"共 {total} 条；可用 Ctrl 或 Shift 多选后删除"
+            f"共 {total} 条；双击可查看图片；"
+            "可用 Ctrl 或 Shift 多选后删除"
         )
         self.prev_samples_btn.setEnabled(offset > 0)
         self.next_samples_btn.setEnabled(offset + limit < total)
@@ -1016,6 +1037,112 @@ class MachineLearningPage(QWidget):
     def _next_samples_page(self):
         self._sample_offset += self._sample_limit
         self._request_sample_refresh()
+
+    def _view_sample_image(self, row, _column):
+        if (
+            self._shutting_down
+            or self._sample_image_loading
+            or not 0 <= row < len(self._sample_rows)
+        ):
+            return
+        sample = self._sample_rows[row]
+        sample_id = str(sample.get("id") or "")
+        if not sample_id:
+            QMessageBox.warning(
+                self,
+                "无法查看图片",
+                "该样本没有有效的样本 ID。",
+            )
+            return
+        if sample.get("image_available", True) is False:
+            QMessageBox.warning(
+                self,
+                "图片不可用",
+                "该样本记录存在，但服务器没有可读取的图片。",
+            )
+            return
+        api = getattr(self.session_manager, "api", None)
+        download = getattr(api, "admin_download_captcha_sample_image", None)
+        if not callable(download):
+            QMessageBox.warning(
+                self,
+                "图片加载失败",
+                "当前客户端接口不支持读取样本图片，请升级后重试。",
+            )
+            return
+
+        self._sample_image_loading = True
+        self.sample_table.setEnabled(False)
+
+        def download_image():
+            token = self.session_manager.access_token()
+            return download(
+                token,
+                sample_id,
+            )
+
+        try:
+            task = self._start(
+                download_image,
+                lambda result, error, current=sample: self._sample_image_loaded(
+                    current,
+                    result,
+                    error,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - restore UI after submit failure
+            self._sample_image_loading = False
+            self.sample_table.setEnabled(True)
+            QMessageBox.warning(self, "图片加载失败", str(exc))
+            return
+        if task is None:
+            self._sample_image_loading = False
+            self.sample_table.setEnabled(True)
+
+    def _sample_image_loaded(self, sample, result, error):
+        self._sample_image_loading = False
+        if self._shutting_down:
+            return
+        self.sample_table.setEnabled(True)
+        if error is not None:
+            message = str(error)
+            if isinstance(error, ApiResponseError) and error.status_code == 404:
+                if error.code == "captcha_sample_image_missing":
+                    message = "该样本记录存在，但服务器没有可读取的图片。"
+                elif error.code == "captcha_sample_not_found":
+                    message = "该样本已不存在，请刷新样本列表后重试。"
+                else:
+                    message = "服务端版本过旧，尚未提供样本图片读取接口。"
+            QMessageBox.warning(self, "图片加载失败", message)
+            return
+        if result is None:
+            QMessageBox.warning(self, "图片加载失败", "服务器返回的图片为空。")
+            return
+        if not isinstance(result, (bytes, bytearray, memoryview)):
+            QMessageBox.warning(
+                self,
+                "图片加载失败",
+                "服务器返回的图片数据格式无效。",
+            )
+            return
+        try:
+            image_data = bytes(result)
+        except (TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "图片加载失败", str(exc))
+            return
+        if not image_data:
+            QMessageBox.warning(self, "图片加载失败", "服务器返回的图片为空。")
+            return
+
+        sample_id = str(sample.get("id") or "")
+        extension = _sample_image_extension(sample, image_data)
+        file_name = f"captcha-sample-{sample_id or 'image'}{extension}"
+        ImagePreviewDialog(
+            image_data,
+            file_name,
+            self,
+            save_caption="保存样本图片",
+        ).exec_()
 
     def _delete_selected_samples(self):
         rows = sorted(
