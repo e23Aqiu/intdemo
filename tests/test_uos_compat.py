@@ -289,6 +289,181 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("--file-filter=Excel | *.xlsx", arguments)
         self.assertEqual(runner.call_args.kwargs["env"]["GTK_USE_PORTAL"], "1")
 
+    def test_uos_file_selection_attaches_to_parent_and_uses_nested_runner(self):
+        parent = Mock()
+        parent.window.return_value.winId.return_value = 4082
+        with patch.dict(os.environ, {"DISPLAY": ":0"}, clear=True), patch.object(
+            file_dialogs,
+            "is_uos",
+            return_value=True,
+        ), patch.object(
+            file_dialogs.shutil,
+            "which",
+            return_value="/usr/bin/zenity",
+        ), patch.object(
+            file_dialogs,
+            "system_application_environment",
+            return_value={"DISPLAY": ":0"},
+        ), patch.object(
+            file_dialogs,
+            "_run_process_blocking",
+            return_value=(0, "/tmp/result.xlsx\n"),
+        ) as run_process:
+            selected = file_dialogs._uos_file_selection(
+                parent,
+                "选择表格",
+                "",
+                "Excel (*.xlsx)",
+            )
+
+        self.assertEqual(selected, ["/tmp/result.xlsx"])
+        arguments, environment = run_process.call_args.args
+        self.assertIn("--modal", arguments)
+        self.assertIn("--attach=4082", arguments)
+        self.assertTrue(run_process.call_args.kwargs["nested"])
+        self.assertEqual(environment["GDK_BACKEND"], "x11")
+        self.assertEqual(environment["GTK_USE_PORTAL"], "0")
+
+    def test_uos_file_selection_without_parent_handle_uses_qt_modal_fallback(self):
+        parent = Mock()
+        parent.window.return_value.winId.return_value = 0
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            file_dialogs,
+            "is_uos",
+            return_value=True,
+        ), patch.object(
+            file_dialogs.shutil,
+            "which",
+            return_value="/usr/bin/zenity",
+        ), patch.object(
+            file_dialogs,
+            "_qt_uos_file_selection",
+            return_value=(["/tmp/result.xlsx"], "Excel (*.xlsx)"),
+        ) as qt_dialog:
+            selected = file_dialogs.SystemFileDialog.getOpenFileName(
+                parent,
+                "选择表格",
+                "",
+                "Excel (*.xlsx)",
+            )
+
+        self.assertEqual(selected, ("/tmp/result.xlsx", "Excel (*.xlsx)"))
+        qt_dialog.assert_called_once()
+
+    def test_uos_qt_fallback_is_application_modal_and_always_on_top(self):
+        dialog = Mock()
+        dialog.exec_.return_value = 1
+        dialog.selectedFiles.return_value = ["/tmp/result.zip"]
+        dialog.selectedNameFilter.return_value = "ZIP (*.zip)"
+        dialog.windowFlags.return_value = file_dialogs.Qt.Window
+        dialog_class = Mock(return_value=dialog)
+        dialog_class.DontUseNativeDialog = file_dialogs.QtFileDialog.DontUseNativeDialog
+        dialog_class.ExistingFile = file_dialogs.QtFileDialog.ExistingFile
+        dialog_class.ExistingFiles = file_dialogs.QtFileDialog.ExistingFiles
+        dialog_class.AnyFile = file_dialogs.QtFileDialog.AnyFile
+        dialog_class.AcceptSave = file_dialogs.QtFileDialog.AcceptSave
+
+        with patch.object(file_dialogs, "QtFileDialog", dialog_class):
+            selected = file_dialogs._qt_uos_file_selection(
+                Mock(),
+                "导入验证码数据集",
+                "",
+                "ZIP (*.zip)",
+            )
+
+        self.assertEqual(selected, (["/tmp/result.zip"], "ZIP (*.zip)"))
+        dialog.setOption.assert_called_once_with(
+            dialog_class.DontUseNativeDialog,
+            True,
+        )
+        dialog.setWindowModality.assert_called_once_with(
+            file_dialogs.Qt.ApplicationModal
+        )
+        dialog.setModal.assert_called_once_with(True)
+        dialog.setWindowFlags.assert_called_once_with(
+            dialog.windowFlags.return_value
+            | file_dialogs.Qt.Dialog
+            | file_dialogs.Qt.WindowStaysOnTopHint
+        )
+        dialog.setFileMode.assert_called_once_with(dialog_class.ExistingFile)
+
+    def test_external_chooser_blocks_and_restores_client_windows(self):
+        signal = Mock()
+        process = Mock()
+        process.finished = signal
+        process.errorOccurred = Mock()
+        process.waitForStarted.return_value = True
+        process.state.return_value = 0
+        process.exitStatus.return_value = 0
+        process.exitCode.return_value = 0
+        process.readAllStandardOutput.return_value = b"/tmp/result.xlsx\n"
+
+        process_class = Mock(return_value=process)
+        process_class.NotRunning = 0
+        process_class.NormalExit = 0
+        window = Mock()
+        window.isVisible.return_value = True
+        window.isEnabled.return_value = True
+        application = Mock()
+        application.topLevelWidgets.return_value = [window]
+        application_thread = object()
+        application.thread.return_value = application_thread
+        blocker = Mock()
+
+        with patch.object(
+            file_dialogs.QApplication,
+            "instance",
+            return_value=application,
+        ), patch.object(
+            file_dialogs.QThread,
+            "currentThread",
+            return_value=application_thread,
+        ), patch.object(
+            file_dialogs,
+            "QProcess",
+            process_class,
+        ), patch.object(
+            file_dialogs,
+            "_ApplicationInputBlocker",
+            return_value=blocker,
+        ), patch.object(
+            file_dialogs.QCoreApplication,
+            "sendPostedEvents",
+        ):
+            result = file_dialogs._run_process_blocking(
+                ["/usr/bin/zenity", "--file-selection"],
+                {"DISPLAY": ":0"},
+            )
+
+        self.assertEqual(result, (0, "/tmp/result.xlsx\n"))
+        self.assertEqual(
+            [call.args for call in window.setEnabled.call_args_list],
+            [(False,), (True,)],
+        )
+        application.installEventFilter.assert_called_once_with(blocker)
+        application.removeEventFilter.assert_called_once_with(blocker)
+
+    def test_file_dialog_input_blocker_discards_delayed_clicks(self):
+        blocker = file_dialogs._ApplicationInputBlocker()
+        self.assertTrue(
+            blocker.eventFilter(
+                None,
+                file_dialogs.QEvent(file_dialogs.QEvent.MouseButtonPress),
+            )
+        )
+        self.assertTrue(
+            blocker.eventFilter(
+                None,
+                file_dialogs.QEvent(file_dialogs.QEvent.Close),
+            )
+        )
+        self.assertFalse(
+            blocker.eventFilter(
+                None,
+                file_dialogs.QEvent(file_dialogs.QEvent.User),
+            )
+        )
+
     def test_non_uos_file_selection_keeps_qt_native_dialog(self):
         with patch.object(file_dialogs, "is_uos", return_value=False), patch.object(
             file_dialogs.QtFileDialog,

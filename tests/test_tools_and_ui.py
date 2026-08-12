@@ -17,14 +17,17 @@ from PyQt5.QtCore import (
     QCoreApplication,
     QDate,
     QEvent,
+    QMimeData,
     QObject,
     QPoint,
+    QPointF,
     QRectF,
     QSize,
     Qt,
+    QUrl,
     pyqtSignal,
 )
-from PyQt5.QtGui import QMouseEvent, QPalette
+from PyQt5.QtGui import QDropEvent, QMouseEvent, QPalette
 from PyQt5.QtTest import QTest
 from PyQt5.QtWidgets import (
     QApplication,
@@ -2522,17 +2525,6 @@ class ToolAndUiTests(unittest.TestCase):
             window.workflow_page._saved_tencent_document_url(),
             saved_url,
         )
-        workbook_path = Path(self.temp_dir.name) / "offline-backfill.xlsx"
-        workbook = Workbook()
-        worksheet = workbook.active
-        worksheet.append(["车辆标识", "车辆所有人/企业"])
-        worksheet.append(["粤A1", "离线公司"])
-        workbook.save(workbook_path)
-        workbook.close()
-        window.workflow_page.file_path = str(workbook_path)
-        window.workflow_page.file_edit.setText(str(workbook_path))
-        self.assertTrue(window.workflow_page._reload_preview(force=True))
-        self.assertTrue(window.workflow_page.backfill_tencent_docs_btn.isEnabled())
         self.assertTrue(
             window._record_workflow_summary(
                 {WORKFLOW_TOTAL_METRIC: 9},
@@ -3693,15 +3685,10 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertLess(
             preview_header.indexOf(page.open_workbook_folder_btn),
-            preview_header.indexOf(page.backfill_tencent_docs_btn),
-        )
-        self.assertLess(
-            preview_header.indexOf(page.backfill_tencent_docs_btn),
             preview_header.indexOf(page.preview_toggle_btn),
         )
         self.assertFalse(page.open_workbook_btn.isEnabled())
         self.assertFalse(page.open_workbook_folder_btn.isEnabled())
-        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
 
         workbook_path = Path(self.temp_dir.name) / "preview-actions.xlsx"
         workbook = Workbook()
@@ -3714,7 +3701,6 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page._reload_preview(force=True))
         self.assertTrue(page.open_workbook_btn.isEnabled())
         self.assertTrue(page.open_workbook_folder_btn.isEnabled())
-        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
         with patch(
             "integrated_client.ui.workflow_page.QDesktopServices.openUrl",
             return_value=True,
@@ -3805,93 +3791,6 @@ class ToolAndUiTests(unittest.TestCase):
             new_url,
         )
         self.assertFalse(timing.is_active)
-        self.assertTrue(page.shutdown())
-        page.close()
-
-    def test_tencent_docs_backfill_button_requires_complete_company_column(self):
-        page = WorkflowPage()
-        workbook_path = Path(self.temp_dir.name) / "backfill-ready.xlsx"
-        workbook = Workbook()
-        worksheet = workbook.active
-        worksheet.append(
-            [
-                "车辆标识",
-                "车辆所有人/企业",
-                "负责人/法人代表",
-                "地址",
-                "电话",
-            ]
-        )
-        worksheet.append(["粤A1", "甲公司", "张三", "地址甲", "123"])
-        worksheet.append(["粤A2", "乙公司", "李四", "", "456"])
-        workbook.save(workbook_path)
-        workbook.close()
-        page.file_path = str(workbook_path)
-        page.file_edit.setText(str(workbook_path))
-
-        self.assertTrue(page._reload_preview(force=True))
-        self.assertTrue(page.backfill_tencent_docs_btn.isEnabled())
-        page.df.at[1, "车辆所有人/企业"] = ""
-        page.model.set_dataframe(page.df)
-        page._update_workbook_action_buttons()
-        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
-        page.df.at[1, "车辆所有人/企业"] = "乙公司"
-        page._update_workbook_action_buttons()
-        page._set_controls_running(True)
-        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
-        page._set_controls_running(False)
-        self.assertTrue(page.backfill_tencent_docs_btn.isEnabled())
-        self.assertTrue(page.shutdown())
-        page.close()
-
-    def test_tencent_docs_backfill_reuses_and_persists_account_link(self):
-        preferences = ClientPreferences(self.temp_dir.name)
-        old_url = "https://docs.qq.com/sheet/old-backfill"
-        new_url = "https://docs.qq.com/sheet/new-backfill"
-        preferences.set_tencent_document_url("admin", old_url)
-        page = WorkflowPage(
-            client_preferences=preferences,
-            account_key="admin",
-        )
-        workbook_path = Path(self.temp_dir.name) / "backfill-dialog.xlsx"
-        workbook = Workbook()
-        worksheet = workbook.active
-        worksheet.append(["车辆标识", "车辆所有人/企业"])
-        worksheet.append(["粤A1", "甲公司"])
-        workbook.save(workbook_path)
-        workbook.close()
-        page.file_path = str(workbook_path)
-        page.file_edit.setText(str(workbook_path))
-        self.assertTrue(page._reload_preview(force=True))
-
-        with patch(
-            "integrated_client.ui.workflow_page.TencentDocsLinkDialog",
-        ) as dialog_type, patch(
-            "integrated_client.ui.workflow_page.get_builtin_chromium_path",
-            return_value=r"C:\browser\chrome.exe",
-        ), patch.object(
-            page,
-            "_start_tencent_docs_backfill",
-        ) as start_backfill:
-            dialog = dialog_type.return_value
-            dialog.Accepted = 1
-            dialog.exec_.return_value = 1
-            dialog.value.return_value = new_url
-            page.backfill_tencent_docs_btn.click()
-
-        dialog_type.assert_called_once_with(
-            old_url,
-            page,
-            title="回填业务数据",
-            confirm_text="确认并回填",
-        )
-        start_backfill.assert_called_once_with(new_url)
-        self.assertEqual(
-            ClientPreferences(self.temp_dir.name).tencent_document_url(
-                "ADMIN"
-            ),
-            new_url,
-        )
         self.assertTrue(page.shutdown())
         page.close()
 
@@ -5960,6 +5859,81 @@ class ToolAndUiTests(unittest.TestCase):
         )
         page.close()
         page.deleteLater()
+
+    def test_workflow_accepts_a_single_local_xlsx_drop_and_loads_preview(self):
+        workbook_path = Path(self.temp_dir.name) / "dropped-business.xlsx"
+        expected = pd.DataFrame(
+            {
+                "company": ["Acme", "Example"],
+                "phone": ["123", "456"],
+            }
+        )
+        expected.to_excel(workbook_path, index=False, engine="openpyxl")
+        page = WorkflowPage()
+        mime_data = QMimeData()
+        mime_data.setUrls([QUrl.fromLocalFile(str(workbook_path))])
+        drop_event = QDropEvent(
+            QPointF(4, 4),
+            Qt.CopyAction,
+            mime_data,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+
+        page.file_edit.dropEvent(drop_event)
+
+        self.assertTrue(drop_event.isAccepted())
+        self.assertEqual(drop_event.dropAction(), Qt.CopyAction)
+        self.assertEqual(Path(page.file_path), workbook_path.resolve())
+        self.assertEqual(page.file_edit.text(), str(workbook_path.resolve()))
+        pd.testing.assert_frame_equal(page.df, expected)
+        self.assertEqual(page.model.rowCount(), len(expected))
+        self.assertEqual(page.model.columnCount(), len(expected.columns))
+        self.assertTrue(page.open_workbook_btn.isEnabled())
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_workflow_rejects_non_xlsx_drop_without_replacing_selection(self):
+        workbook_path = Path(self.temp_dir.name) / "selected-business.xlsx"
+        expected = pd.DataFrame(
+            {
+                "company": ["Existing selection"],
+                "phone": ["123"],
+            }
+        )
+        expected.to_excel(workbook_path, index=False, engine="openpyxl")
+        rejected_path = Path(self.temp_dir.name) / "replacement.csv"
+        rejected_path.write_text("company,phone\nRejected,999\n", encoding="utf-8")
+        page = WorkflowPage()
+        self.assertTrue(page._load_workbook_path(workbook_path))
+        selected_path = page.file_path
+        selected_text = page.file_edit.text()
+        selected_preview = page.df.copy(deep=True)
+        mime_data = QMimeData()
+        mime_data.setUrls([QUrl.fromLocalFile(str(rejected_path))])
+        drop_event = QDropEvent(
+            QPointF(4, 4),
+            Qt.CopyAction,
+            mime_data,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+
+        with patch(
+            "integrated_client.ui.workflow_page.QMessageBox.warning"
+        ) as warning:
+            page.file_edit.dropEvent(drop_event)
+
+        self.assertTrue(drop_event.isAccepted())
+        self.assertEqual(drop_event.dropAction(), Qt.CopyAction)
+        warning.assert_called_once()
+        self.assertEqual(page.file_path, selected_path)
+        self.assertEqual(page.file_edit.text(), selected_text)
+        pd.testing.assert_frame_equal(page.df, selected_preview)
+        self.assertEqual(page.model.rowCount(), len(expected))
+        self.assertEqual(page.model.columnCount(), len(expected.columns))
+        self.assertTrue(page.shutdown())
+        page.close()
 
     def test_failed_workflow_does_not_record_counts(self):
         file_path = Path(self.temp_dir.name) / "failed.xlsx"

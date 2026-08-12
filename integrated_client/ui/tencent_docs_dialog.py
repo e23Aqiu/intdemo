@@ -12,16 +12,9 @@ from .frameless import FramelessDialog
 
 
 class TencentDocsLinkDialog(FramelessDialog):
-    def __init__(
-        self,
-        current_url="",
-        parent=None,
-        *,
-        title="导入腾讯文档",
-        confirm_text="确认并打开",
-    ):
+    def __init__(self, current_url="", parent=None):
         super().__init__(parent)
-        self.setWindowTitle(title)
+        self.setWindowTitle("导入腾讯文档")
         self.setModal(True)
         self.setFixedSize(590, 255)
 
@@ -29,9 +22,9 @@ class TencentDocsLinkDialog(FramelessDialog):
         layout.setContentsMargins(28, 26, 28, 24)
         layout.setSpacing(14)
 
-        title_label = QLabel(title)
-        title_label.setObjectName("PageTitle")
-        layout.addWidget(title_label)
+        title = QLabel("导入腾讯文档")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
         prompt = QLabel("请输入腾讯文档在线表格链接")
         prompt.setObjectName("SettingFieldLabel")
         layout.addWidget(prompt)
@@ -52,7 +45,7 @@ class TencentDocsLinkDialog(FramelessDialog):
         buttons.addStretch()
         cancel = QPushButton("取消")
         cancel.clicked.connect(self.reject)
-        confirm = QPushButton(confirm_text)
+        confirm = QPushButton("确认并打开")
         confirm.setObjectName("PrimaryButton")
         confirm.clicked.connect(self._accept_if_valid)
         buttons.addWidget(cancel)
@@ -73,18 +66,11 @@ class TencentDocsLinkDialog(FramelessDialog):
 class TencentDocsProgressDialog(FramelessDialog):
     cancel_requested = pyqtSignal()
 
-    def __init__(
-        self,
-        parent=None,
-        *,
-        title="导入腾讯文档",
-        operation="导入腾讯文档",
-        cancel_text="取消导入",
-    ):
+    def __init__(self, parent=None):
         super().__init__(parent)
         self._finished = False
         self._cancel_sent = False
-        self.setWindowTitle(title)
+        self.setWindowTitle("导入腾讯文档")
         self.setModal(True)
         self.setFixedSize(460, 210)
 
@@ -92,9 +78,9 @@ class TencentDocsProgressDialog(FramelessDialog):
         layout.setContentsMargins(28, 28, 28, 24)
         layout.setSpacing(16)
 
-        title_label = QLabel(f"正在{operation}")
-        title_label.setObjectName("PageTitle")
-        layout.addWidget(title_label)
+        title = QLabel("正在导入腾讯文档")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
         self.status_label = QLabel("正在准备浏览器…")
         self.status_label.setObjectName("LoadingMessage")
         self.status_label.setWordWrap(True)
@@ -106,7 +92,7 @@ class TencentDocsProgressDialog(FramelessDialog):
         self.progress.setFormat("%p%")
         self.progress.setTextVisible(True)
         layout.addWidget(self.progress)
-        self.cancel_button = QPushButton(cancel_text)
+        self.cancel_button = QPushButton("取消导入")
         self.cancel_button.clicked.connect(self._request_cancel)
         layout.addWidget(self.cancel_button)
 
