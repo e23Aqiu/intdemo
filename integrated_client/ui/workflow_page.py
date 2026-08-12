@@ -39,7 +39,11 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..browser import check_builtin_chromium, get_builtin_chromium_path
+from ..browser import (
+    check_builtin_chromium,
+    get_builtin_chromium_path,
+    get_compatible_browser_path,
+)
 from .file_dialogs import SystemFileDialog as QFileDialog
 from ..database import (
     WORKFLOW_EMPTY_METRIC,
@@ -419,6 +423,12 @@ class WorkflowPage(QWidget):
         self.captcha_retry.setValue(10)
         self.captcha_retry.setSuffix(" 次")
         self.captcha_retry.setMinimumWidth(100)
+        self.aiqicha_compatibility_mode = QCheckBox("爱企查兼容模式")
+        self.aiqicha_compatibility_mode.setChecked(True)
+        self.aiqicha_compatibility_mode.setToolTip(
+            "勾选后步骤 3 使用本机浏览器（Windows 优先 Edge，统信使用 Deepin 浏览器）；"
+            "取消勾选后使用项目内置 Chromium。"
+        )
 
         cards_layout = QHBoxLayout()
         cards_layout.setSpacing(12)
@@ -435,6 +445,7 @@ class WorkflowPage(QWidget):
         self.mode_hint.setObjectName("ModeHint")
         self.mode_hint.setWordWrap(True)
         mode_layout.addWidget(self.mode_hint)
+        mode_layout.addWidget(self.aiqicha_compatibility_mode)
         mode_layout.addStretch()
         cards_layout.addWidget(self.mode_card, 1)
 
@@ -816,6 +827,7 @@ class WorkflowPage(QWidget):
     def _run_settings_snapshot(self):
         return {
             "auto_mode": bool(self.mode_combo.currentData()),
+            "aiqicha_compatibility_mode": self.aiqicha_compatibility_mode.isChecked(),
             "manual_captcha": self.manual_captcha.isChecked(),
             "auto_continue": self.auto_continue.isChecked(),
             "only_yellow": self.only_yellow.isChecked(),
@@ -840,6 +852,9 @@ class WorkflowPage(QWidget):
         self.manual_captcha.setChecked(
             bool(settings.get("manual_captcha", True))
         )
+        self.aiqicha_compatibility_mode.setChecked(
+            bool(settings.get("aiqicha_compatibility_mode", True))
+        )
         self.auto_continue.setChecked(
             bool(settings.get("auto_continue", True))
         )
@@ -859,6 +874,7 @@ class WorkflowPage(QWidget):
             self.auto_continue,
             self.only_yellow,
             self.infinite_captcha,
+            self.aiqicha_compatibility_mode,
         ):
             checkbox.toggled.connect(self._save_run_settings)
         self.page_retry.valueChanged.connect(self._save_run_settings)
@@ -1259,6 +1275,15 @@ class WorkflowPage(QWidget):
         except RuntimeError as exc:
             QMessageBox.warning(self, "内置浏览器不可用", str(exc))
             return
+        if self.aiqicha_compatibility_mode.isChecked():
+            try:
+                browser_path, browser_name = get_compatible_browser_path()
+            except RuntimeError as exc:
+                QMessageBox.warning(self, "爱企查兼容模式不可用", str(exc))
+                return
+            self._log(f"步骤 3 将使用{browser_name}：{browser_path}")
+        else:
+            self._log("步骤 3 将使用项目内置 Chromium。")
 
         self.stopping = False
         self.awaiting_login = False
@@ -1466,6 +1491,7 @@ class WorkflowPage(QWidget):
             self.df.copy(),
             COMPANY_COL_NAME,
             browser_profile_directory=self._aiqicha_profile_directory(),
+            compatibility_mode=self.aiqicha_compatibility_mode.isChecked(),
         )
         self.current_worker = worker
         worker.log_signal.connect(self._log)
@@ -1480,11 +1506,23 @@ class WorkflowPage(QWidget):
         worker.browser_loading_finished.connect(
             self._on_aiqicha_browser_loading_finished
         )
+        worker.compatibility_browser_unavailable.connect(
+            self._on_compatibility_browser_unavailable
+        )
         if hasattr(worker, "retry_signal"):
             worker.retry_signal.connect(self._timing_retry)
         worker.finished_signal.connect(lambda success, obj=worker: self._aiqicha_finished(obj, success))
         self._on_aiqicha_browser_loading_started()
         worker.start()
+
+    def _on_compatibility_browser_unavailable(self, message):
+        """Explain how to recover when the selected local browser disappears."""
+        QMessageBox.warning(
+            self,
+            "爱企查兼容模式不可用",
+            f"{message}\n\n请在运行设置中取消勾选“爱企查兼容模式”，"
+            "改用项目内置 Chromium 后重试。",
+        )
 
     def _on_aiqicha_browser_loading_started(self):
         if (

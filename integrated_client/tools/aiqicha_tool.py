@@ -13,11 +13,13 @@ import sys
 import os
 import re
 import socket
+import subprocess
 import time
 import random
 import threading
 from datetime import datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -30,8 +32,16 @@ import pandas as pd
 import openpyxl
 from DrissionPage import ChromiumPage, ChromiumOptions
 
-from ..browser import get_builtin_chromium_path
-from ..platform_support import chromium_launch_args
+from ..browser import (
+    CompatibleBrowserUnavailableError,
+    get_builtin_chromium_path,
+    get_compatible_browser_path,
+)
+from ..platform_support import (
+    chromium_launch_args,
+    system_application_environment,
+    system_application_launch_context,
+)
 from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 
 
@@ -94,18 +104,67 @@ def _available_local_port():
         return int(sock.getsockname()[1])
 
 
-def create_browser(profile_directory=None):
-    """使用自动解析的兼容 Chromium 创建浏览器实例。"""
+def _terminate_browser_process(process):
+    """Best-effort cleanup when DrissionPage cannot attach to a browser we started."""
+    try:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        process.wait(timeout=3)
+    except Exception:
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _create_compatible_browser(options, browser_path):
+    """Start a system browser without inheriting the packaged app runtime."""
+    port = str(options.address).rsplit(":", 1)[-1]
+    launch_arguments = [
+        str(browser_path),
+        f"--remote-debugging-port={port}",
+        *(
+            argument
+            for argument in options.arguments
+            if not str(argument).startswith("--remote-debugging-port=")
+        ),
+    ]
+    with system_application_launch_context():
+        process = subprocess.Popen(
+            launch_arguments,
+            shell=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=system_application_environment(),
+        )
+    try:
+        options.existing_only()
+        page = ChromiumPage(options)
+        page._intdemo_browser_process = process
+        return page
+    except Exception:
+        _terminate_browser_process(process)
+        raise
+
+
+def create_browser(profile_directory=None, *, compatibility_mode=False):
+    """Create the 爱企查 browser, optionally using a local system browser."""
     co = ChromiumOptions()
     co.set_argument('--disable-blink-features=AutomationControlled')
     co.set_argument('--no-sandbox')
     co.set_argument('--disable-infobars')
     for argument in chromium_launch_args():
         co.set_argument(argument)
+    temporary_profile = None
     if profile_directory:
         profile_directory = Path(profile_directory).resolve()
         profile_directory.mkdir(parents=True, exist_ok=True)
         co.set_user_data_path(str(profile_directory))
+        co.set_local_port(_available_local_port())
+    elif compatibility_mode:
+        temporary_profile = TemporaryDirectory(prefix="intdemo-aiqicha-")
+        co.set_user_data_path(temporary_profile.name)
         co.set_local_port(_available_local_port())
     else:
         co.auto_port()
@@ -123,8 +182,23 @@ def create_browser(profile_directory=None):
             'Chrome/131.0.0.0 Safari/537.36'
         )
     co.set_user_agent(ua)
-    co.set_browser_path(get_builtin_chromium_path())
-    page = ChromiumPage(co)
+    if compatibility_mode:
+        browser_path, _browser_name = get_compatible_browser_path()
+    else:
+        browser_path = get_builtin_chromium_path()
+    co.set_browser_path(browser_path)
+    try:
+        page = (
+            _create_compatible_browser(co, browser_path)
+            if compatibility_mode
+            else ChromiumPage(co)
+        )
+    except Exception:
+        if temporary_profile is not None:
+            temporary_profile.cleanup()
+        raise
+    if temporary_profile is not None:
+        page._intdemo_temporary_profile = temporary_profile
     page.set.timeouts(
         base=AIQICHA_RESULT_WAIT_SECONDS,
         page_load=AIQICHA_RESULT_WAIT_SECONDS,
@@ -395,6 +469,7 @@ class QueryWorker(QThread):
     retry_signal = pyqtSignal(str, str)           # 重试类型, 原因
     browser_loading_started = pyqtSignal()        # 浏览器或结果页面开始加载
     browser_loading_finished = pyqtSignal()       # 浏览器或结果页面加载结束
+    compatibility_browser_unavailable = pyqtSignal(str)
     
     def __init__(
         self,
@@ -402,6 +477,7 @@ class QueryWorker(QThread):
         company_col,
         *,
         browser_profile_directory=None,
+        compatibility_mode=False,
     ):
         super().__init__()
         self.df = df
@@ -411,6 +487,7 @@ class QueryWorker(QThread):
             if browser_profile_directory
             else None
         )
+        self.compatibility_mode = bool(compatibility_mode)
         self.page = None
         self._should_stop = False
         self._browser_lock = threading.RLock()
@@ -452,6 +529,15 @@ class QueryWorker(QThread):
             page.quit()
         except Exception:
             pass
+        process = getattr(page, "_intdemo_browser_process", None)
+        if process is not None:
+            _terminate_browser_process(process)
+        temporary_profile = getattr(page, "_intdemo_temporary_profile", None)
+        if temporary_profile is not None:
+            try:
+                temporary_profile.cleanup()
+            except Exception:
+                pass
 
     def close_browser(self, interrupt_loading=False):
         """从当前会话摘除并关闭浏览器，可安全重复或跨线程调用。"""
@@ -627,17 +713,26 @@ class QueryWorker(QThread):
                         if is_restart
                         else "🚀 正在启动浏览器..."
                     )
-                    page = (
-                        create_browser(self.browser_profile_directory)
-                        if self.browser_profile_directory is not None
-                        else create_browser()
-                    )
+                    if self.compatibility_mode:
+                        page = create_browser(
+                            self.browser_profile_directory,
+                            compatibility_mode=True,
+                        )
+                    elif self.browser_profile_directory is not None:
+                        page = create_browser(self.browser_profile_directory)
+                    else:
+                        page = create_browser()
                     with self._browser_lock:
                         self.page = page
                     if self._should_stop:
                         self.close_browser()
                         return False
-                    self.log_signal.emit("✅ 浏览器已启动")
+                    browser_label = (
+                        "本机兼容浏览器"
+                        if self.compatibility_mode
+                        else "内置 Chromium"
+                    )
+                    self.log_signal.emit(f"✅ {browser_label}已启动")
                     self.log_signal.emit("📌 正在打开爱企查首页...")
                     page.get("https://aiqicha.baidu.com")
                     if self._should_stop:
@@ -655,6 +750,12 @@ class QueryWorker(QThread):
                         "⏳ 请在浏览器中登录爱企查，然后点击「继续执行」..."
                     )
                     return self._wait_for_login_confirmation()
+                except CompatibleBrowserUnavailableError as exc:
+                    if self._should_stop:
+                        return False
+                    self.compatibility_browser_unavailable.emit(str(exc))
+                    self.log_signal.emit(f"❌ {exc}")
+                    return False
                 except Exception as exc:
                     if self._should_stop:
                         return False

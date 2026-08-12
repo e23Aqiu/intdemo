@@ -218,6 +218,9 @@ class ClientPreferences:
 
         sanitized = {
             "auto_mode": bool(settings.get("auto_mode", False)),
+            "aiqicha_compatibility_mode": bool(
+                settings.get("aiqicha_compatibility_mode", True)
+            ),
             "manual_captcha": bool(settings.get("manual_captcha", True)),
             "auto_continue": bool(settings.get("auto_continue", True)),
             "only_yellow": bool(settings.get("only_yellow", True)),

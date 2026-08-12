@@ -18,6 +18,110 @@ _LINUX_BROWSER_COMMANDS = (
     "google-chrome",
 )
 
+_WINDOWS_COMPATIBLE_BROWSER_NAMES = (
+    "Microsoft Edge",
+    "360 浏览器",
+)
+
+
+class CompatibleBrowserUnavailableError(RuntimeError):
+    """Raised when 爱企查兼容模式 has no usable system browser."""
+
+
+def _candidate_paths(*values):
+    """Yield existing executable candidates without assuming one install layout."""
+    for value in values:
+        if value:
+            candidate_path = Path(str(value)).expanduser()
+            if not candidate_path.is_absolute():
+                continue
+            candidate = _usable_browser(candidate_path)
+            if candidate is not None:
+                yield candidate
+
+
+def get_compatible_browser_path() -> tuple[str, str]:
+    """Resolve the browser used by 爱企查兼容模式.
+
+    The returned tuple is ``(path, display_name)``. Windows prefers Edge and
+    then 360; UOS uses the Deepin browser. Other platforms deliberately do not
+    opt into this mode.
+    """
+    if sys.platform.startswith("win"):
+        program_files = os.environ.get("ProgramFiles", "")
+        program_w6432 = os.environ.get("ProgramW6432", "")
+        program_files_x86 = os.environ.get("ProgramFiles(x86)", "")
+        local_app_data = os.environ.get("LOCALAPPDATA", "")
+        roaming_app_data = os.environ.get("APPDATA", "")
+        edge_candidates = tuple(
+            Path(root) / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+            for root in (
+                program_w6432,
+                program_files,
+                program_files_x86,
+                local_app_data,
+            )
+            if root
+        )
+        for candidate in _candidate_paths(*edge_candidates):
+            return str(candidate), _WINDOWS_COMPATIBLE_BROWSER_NAMES[0]
+        candidate = _usable_browser(shutil.which("msedge.exe"))
+        if candidate is not None:
+            return str(candidate), _WINDOWS_COMPATIBLE_BROWSER_NAMES[0]
+
+        browser_roots = tuple(
+            root
+            for root in (
+                program_w6432,
+                program_files,
+                program_files_x86,
+                local_app_data,
+                roaming_app_data,
+            )
+            if root
+        )
+        browser_360_candidates = tuple(
+            Path(root) / relative
+            for root in browser_roots
+            for relative in (
+                Path("360") / "360se6" / "Application" / "360se.exe",
+                Path("360") / "360se" / "360se.exe",
+                Path("360se6") / "Application" / "360se.exe",
+                Path("360") / "360Chrome" / "Chrome" / "Application" / "360chrome.exe",
+                Path("360Chrome") / "Chrome" / "Application" / "360chrome.exe",
+                Path("360ChromeX") / "Chrome" / "Application" / "360chrome.exe",
+                Path("360") / "360ChromeX" / "Chrome" / "Application" / "360chrome.exe",
+                Path("360ChromeX") / "Chrome" / "Application" / "360ChromeX.exe",
+                Path("360") / "360ChromeX" / "Chrome" / "Application" / "360ChromeX.exe",
+            )
+        )
+        for candidate in _candidate_paths(*browser_360_candidates):
+            return str(candidate), _WINDOWS_COMPATIBLE_BROWSER_NAMES[1]
+        for command in ("360se.exe", "360chrome.exe", "360ChromeX.exe"):
+            candidate = _usable_browser(shutil.which(command))
+            if candidate is not None:
+                return str(candidate), _WINDOWS_COMPATIBLE_BROWSER_NAMES[1]
+        raise CompatibleBrowserUnavailableError(
+            "未找到本机兼容浏览器（优先 Microsoft Edge，其次 360 浏览器）。"
+            "请关闭“爱企查兼容模式”后重试。"
+        )
+
+    if sys.platform.startswith("linux"):
+        for command in (
+            "deepin-browser",
+            "deepin-browser-stable",
+        ):
+            candidate = _usable_browser(shutil.which(command))
+            if candidate is not None:
+                return str(candidate), "统信 Deepin 浏览器"
+        raise CompatibleBrowserUnavailableError(
+            "未找到统信 Deepin 浏览器。请关闭“爱企查兼容模式”后重试。"
+        )
+
+    raise CompatibleBrowserUnavailableError(
+        "当前系统不支持爱企查兼容模式，请关闭该模式后重试。"
+    )
+
 
 def configure_playwright_browser_path() -> None:
     """Configure the platform-specific managed-browser location."""

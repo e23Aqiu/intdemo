@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from integrated_client import browser, platform_support
+from integrated_client.tools.aiqicha_tool import create_browser
 from integrated_client.online.config import OnlineConfig
 from integrated_client.online.secure import (
     SecretServiceProtector,
@@ -19,6 +20,217 @@ from integrated_client.ui import file_dialogs
 
 
 class UosCompatibilityTests(unittest.TestCase):
+    @staticmethod
+    def _make_executable(path: Path) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"browser")
+        try:
+            path.chmod(0o755)
+        except OSError:
+            pass
+        return path
+
+    def test_windows_compatible_browser_prefers_edge_over_360(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            edge = self._make_executable(
+                root / "edge" / "Microsoft" / "Edge" / "Application" / "msedge.exe"
+            )
+            self._make_executable(
+                root / "360" / "360" / "360se6" / "Application" / "360se.exe"
+            )
+            environment = {
+                "ProgramFiles": str(root / "program-files"),
+                "ProgramFiles(x86)": str(root / "edge"),
+                "LOCALAPPDATA": str(root / "local-app-data"),
+            }
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                browser.sys, "platform", "win32"
+            ), patch.object(browser.shutil, "which", return_value=None):
+                path, name = browser.get_compatible_browser_path()
+            self.assertEqual(path, str(edge.resolve()))
+            self.assertEqual(name, "Microsoft Edge")
+
+    def test_windows_compatible_browser_falls_back_to_360(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            browser_360 = self._make_executable(
+                root / "360" / "360se6" / "Application" / "360se.exe"
+            )
+            environment = {
+                "ProgramFiles": str(root / "program-files"),
+                "ProgramFiles(x86)": str(root),
+                "LOCALAPPDATA": str(root / "local-app-data"),
+            }
+            with patch.dict(os.environ, environment, clear=True), patch.object(
+                browser.sys, "platform", "win32"
+            ), patch.object(browser.shutil, "which", return_value=None):
+                path, name = browser.get_compatible_browser_path()
+            self.assertEqual(path, str(browser_360.resolve()))
+            self.assertEqual(name, "360 浏览器")
+
+    def test_windows_compatible_browser_prefers_edge_from_path_over_360(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            edge = self._make_executable(root / "custom-edge" / "msedge.exe")
+            self._make_executable(
+                root / "program-files" / "360" / "360se6" / "Application" / "360se.exe"
+            )
+
+            def which(command):
+                return str(edge) if command == "msedge.exe" else None
+
+            with patch.dict(
+                os.environ,
+                {"ProgramFiles": str(root / "program-files")},
+                clear=True,
+            ), patch.object(browser.sys, "platform", "win32"), patch.object(
+                browser.shutil,
+                "which",
+                side_effect=which,
+            ):
+                path, name = browser.get_compatible_browser_path()
+            self.assertEqual(path, str(edge.resolve()))
+            self.assertEqual(name, "Microsoft Edge")
+
+    def test_windows_compatible_browser_finds_per_user_360(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            browser_360 = self._make_executable(
+                root / "roaming" / "360se6" / "Application" / "360se.exe"
+            )
+            with patch.dict(
+                os.environ,
+                {"APPDATA": str(root / "roaming")},
+                clear=True,
+            ), patch.object(browser.sys, "platform", "win32"), patch.object(
+                browser.shutil,
+                "which",
+                return_value=None,
+            ):
+                path, name = browser.get_compatible_browser_path()
+            self.assertEqual(path, str(browser_360.resolve()))
+            self.assertEqual(name, "360 浏览器")
+
+    def test_uos_compatible_browser_uses_deepin_browser(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            executable = self._make_executable(Path(temporary) / "deepin-browser")
+
+            def which(command):
+                return str(executable) if command == "deepin-browser" else None
+
+            with patch.dict(os.environ, {}, clear=True), patch.object(
+                browser.sys, "platform", "linux"
+            ), patch.object(browser.shutil, "which", side_effect=which):
+                path, name = browser.get_compatible_browser_path()
+            self.assertEqual(path, str(executable.resolve()))
+            self.assertEqual(name, "统信 Deepin 浏览器")
+
+    def test_compatible_browser_missing_explains_disabling_mode(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            browser.sys, "platform", "linux"
+        ), patch.object(browser.shutil, "which", return_value=None), self.assertRaisesRegex(
+            browser.CompatibleBrowserUnavailableError,
+            "关闭.*爱企查兼容模式",
+        ):
+            browser.get_compatible_browser_path()
+
+    def test_create_browser_uses_selected_compatible_executable(self):
+        class Options:
+            def __init__(self):
+                self.address = ""
+                self.arguments = []
+                self.existing = False
+
+            def set_argument(self, *_args):
+                self.arguments.append(str(_args[0]))
+                return self
+
+            def set_user_data_path(self, value):
+                self.set_argument(f"--user-data-dir={value}")
+                return self
+
+            def set_local_port(self, value):
+                self.address = f"127.0.0.1:{value}"
+                return self
+
+            def set_user_agent(self, _value):
+                self.set_argument(f"--user-agent={_value}")
+                return self
+
+            def set_browser_path(self, value):
+                self.browser_path = value
+                return self
+
+            def existing_only(self):
+                self.existing = True
+                return self
+
+        page = type(
+            "Page",
+            (),
+            {
+                "set": type(
+                    "Timeouts",
+                    (),
+                    {"timeouts": lambda *_args, **_kwargs: None},
+                )()
+            },
+        )()
+        options = Options()
+        process = Mock()
+        with patch(
+            "integrated_client.tools.aiqicha_tool.ChromiumOptions",
+            return_value=options,
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.ChromiumPage",
+            return_value=page,
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.get_compatible_browser_path",
+            return_value=("/usr/bin/deepin-browser", "统信 Deepin 浏览器"),
+        ), patch(
+            "integrated_client.tools.aiqicha_tool._available_local_port",
+            return_value=19321,
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.system_application_environment",
+            return_value={"PATH": "/usr/bin"},
+        ), patch(
+            "integrated_client.tools.aiqicha_tool.subprocess.Popen",
+            return_value=process,
+        ) as popen:
+            self.assertIs(create_browser(compatibility_mode=True), page)
+        self.assertEqual(options.browser_path, "/usr/bin/deepin-browser")
+        self.assertTrue(options.existing)
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], "/usr/bin/deepin-browser")
+        self.assertIn("--remote-debugging-port=19321", command)
+        self.assertEqual(popen.call_args.kwargs["env"], {"PATH": "/usr/bin"})
+        temporary_profile = page._intdemo_temporary_profile
+        self.assertTrue(Path(temporary_profile.name).is_dir())
+        temporary_profile.cleanup()
+
+    def test_system_browser_environment_drops_packaged_runtime_paths(self):
+        source = {
+            "LD_LIBRARY_PATH": "/opt/intdemo/_internal",
+            "LD_LIBRARY_PATH_ORIG": "/usr/lib/aarch64-linux-gnu",
+            "QT_PLUGIN_PATH": "/opt/intdemo/_internal/PyQt5/Qt5/plugins",
+            "QT_QPA_PLATFORM_PLUGIN_PATH": "/opt/intdemo/_internal/platforms",
+            "QT_QPA_PLATFORM": "xcb",
+            "QT_IM_MODULE": "fcitx",
+            "PATH": "/usr/bin",
+        }
+        with patch.object(platform_support.sys, "platform", "linux"):
+            cleaned = platform_support.system_application_environment(source)
+
+        self.assertEqual(cleaned["LD_LIBRARY_PATH"], "/usr/lib/aarch64-linux-gnu")
+        self.assertNotIn("LD_LIBRARY_PATH_ORIG", cleaned)
+        self.assertNotIn("QT_PLUGIN_PATH", cleaned)
+        self.assertNotIn("QT_QPA_PLATFORM_PLUGIN_PATH", cleaned)
+        self.assertNotIn("QT_QPA_PLATFORM", cleaned)
+        self.assertEqual(cleaned["QT_IM_MODULE"], "fcitx")
+        self.assertEqual(cleaned["PATH"], "/usr/bin")
+        self.assertEqual(source["LD_LIBRARY_PATH"], "/opt/intdemo/_internal")
+
     def test_uos_file_selection_prefers_desktop_portal_chooser(self):
         runner = Mock(
             return_value=Mock(

@@ -4,6 +4,7 @@ import os
 import platform
 import shutil
 import sys
+from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
 
 
@@ -198,6 +199,13 @@ def update_install_environment(environment=None):
     if update_platform_key() != UOS_UPDATE_PLATFORM:
         return cleaned
 
+    return _clean_linux_system_application_environment(cleaned)
+
+
+def _clean_linux_system_application_environment(environment):
+    """Remove PyInstaller runtime paths before starting a distro application."""
+    cleaned = {str(key): str(value) for key, value in environment.items()}
+
     original_library_path = cleaned.pop("LD_LIBRARY_PATH_ORIG", None)
     if original_library_path:
         cleaned["LD_LIBRARY_PATH"] = original_library_path
@@ -215,3 +223,37 @@ def update_install_environment(environment=None):
     ):
         cleaned.pop(variable, None)
     return cleaned
+
+
+def system_application_environment(environment=None):
+    """Return a child environment suitable for a system-owned application."""
+    source = os.environ if environment is None else environment
+    copied = {str(key): str(value) for key, value in source.items()}
+    if not sys.platform.startswith("linux"):
+        return copied
+    return _clean_linux_system_application_environment(copied)
+
+
+@contextmanager
+def system_application_launch_context():
+    """Prevent a frozen Windows client from lending its DLLs to a system app."""
+    bundled_directory = str(getattr(sys, "_MEIPASS", "") or "").strip()
+    if os.name != "nt" or not getattr(sys, "frozen", False) or not bundled_directory:
+        yield
+        return
+
+    try:
+        import ctypes
+
+        set_dll_directory = ctypes.windll.kernel32.SetDllDirectoryW
+        set_dll_directory.argtypes = [ctypes.c_wchar_p]
+        set_dll_directory.restype = ctypes.c_int
+        cleared = bool(set_dll_directory(None))
+    except (AttributeError, OSError, TypeError, ValueError):
+        cleared = False
+
+    try:
+        yield
+    finally:
+        if cleared:
+            set_dll_directory(bundled_directory)

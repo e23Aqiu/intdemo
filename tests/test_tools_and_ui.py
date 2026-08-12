@@ -1186,6 +1186,7 @@ class ToolAndUiTests(unittest.TestCase):
             dataframe,
             "车辆所有人/企业",
             browser_profile_directory=profile_directory,
+            compatibility_mode=True,
         )
         login_requests = []
         logs = []
@@ -1208,7 +1209,10 @@ class ToolAndUiTests(unittest.TestCase):
         ):
             self.assertTrue(worker._start_browser_session())
 
-        create_browser_mock.assert_called_once_with(profile_directory.resolve())
+        create_browser_mock.assert_called_once_with(
+            profile_directory.resolve(),
+            compatibility_mode=True,
+        )
         self.assertEqual(page.home_calls, 1)
         self.assertEqual(login_requests, [])
         self.assertTrue(any("无需重复登录" in message for message in logs))
@@ -1230,6 +1234,47 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             loading_events,
             ["start", "finish", "start", "finish"],
+        )
+
+    def test_aiqicha_worker_uses_builtin_browser_when_compatibility_is_off(self):
+        dataframe = pd.DataFrame({"车辆所有人/企业": []})
+
+        class Page:
+            @staticmethod
+            def get(url):
+                if url != "https://aiqicha.baidu.com":
+                    raise AssertionError(url)
+
+            @staticmethod
+            def cookies(all_domains=False):
+                return (
+                    [{"name": "BDUSS", "value": "session", "domain": ".baidu.com"}]
+                    if all_domains
+                    else []
+                )
+
+            @staticmethod
+            def quit():
+                return None
+
+        worker = QueryWorker(
+            dataframe,
+            "车辆所有人/企业",
+            browser_profile_directory=Path(self.temp_dir.name) / "builtin-profile",
+            compatibility_mode=False,
+        )
+        with patch(
+            "integrated_client.tools.aiqicha_tool.create_browser",
+            return_value=Page(),
+        ) as create_browser_mock, patch.object(
+            worker,
+            "_interruptible_sleep",
+            return_value=True,
+        ):
+            self.assertTrue(worker._start_browser_session())
+
+        create_browser_mock.assert_called_once_with(
+            (Path(self.temp_dir.name) / "builtin-profile").resolve()
         )
 
     def test_aiqicha_persisted_login_requires_baidu_auth_cookie(self):
@@ -3575,6 +3620,15 @@ class ToolAndUiTests(unittest.TestCase):
             ["SettingCard", "SettingCard", "SettingCard"],
         )
         self.assertIn("人工接管", page.mode_hint.text())
+        self.assertTrue(page.aiqicha_compatibility_mode.isChecked())
+        self.assertGreater(
+            page.mode_card.layout().indexOf(page.aiqicha_compatibility_mode),
+            page.mode_card.layout().indexOf(page.mode_hint),
+        )
+        self.assertIn(
+            "Windows 优先 Edge",
+            page.aiqicha_compatibility_mode.toolTip(),
+        )
         page.mode_combo.setCurrentIndex(page.mode_combo.findData(True))
         self.assertIn("全自动运行", page.mode_hint.text())
         self.assertFalse(page.manual_captcha.isEnabled())
@@ -3745,6 +3799,7 @@ class ToolAndUiTests(unittest.TestCase):
             account_key="Admin",
         )
         page.mode_combo.setCurrentIndex(page.mode_combo.findData(True))
+        page.aiqicha_compatibility_mode.setChecked(False)
         page.manual_captcha.setChecked(False)
         page.auto_continue.setChecked(False)
         page.only_yellow.setChecked(False)
@@ -3759,6 +3814,7 @@ class ToolAndUiTests(unittest.TestCase):
             saved,
             {
                 "auto_mode": True,
+                "aiqicha_compatibility_mode": False,
                 "manual_captcha": False,
                 "auto_continue": False,
                 "only_yellow": False,
@@ -3775,6 +3831,7 @@ class ToolAndUiTests(unittest.TestCase):
             account_key="admin",
         )
         self.assertTrue(bool(restored.mode_combo.currentData()))
+        self.assertFalse(restored.aiqicha_compatibility_mode.isChecked())
         self.assertFalse(restored.manual_captcha.isChecked())
         self.assertFalse(restored.auto_continue.isChecked())
         self.assertFalse(restored.only_yellow.isChecked())
@@ -3787,6 +3844,7 @@ class ToolAndUiTests(unittest.TestCase):
             account_key="station",
         )
         self.assertFalse(bool(other_account.mode_combo.currentData()))
+        self.assertTrue(other_account.aiqicha_compatibility_mode.isChecked())
         self.assertTrue(other_account.manual_captcha.isChecked())
         self.assertTrue(other_account.only_yellow.isChecked())
         self.assertEqual(other_account.page_retry.value(), 5)
@@ -4076,6 +4134,7 @@ class ToolAndUiTests(unittest.TestCase):
             {"车辆标识": ["粤A12345_黄色"], "已协助补缴": [""]}
         )
         page.browser_check_state = "ready"
+        page.aiqicha_compatibility_mode.setChecked(False)
         page.log_text.setPlainText("[19:00:00] 上一次执行发生浏览器异常")
         with patch.object(page, "_reload_preview", return_value=True), patch.object(
             page,
@@ -4123,6 +4182,75 @@ class ToolAndUiTests(unittest.TestCase):
             ),
         )
         self.assertIn("QProgressBar#BrowserCheckProgress", APP_STYLESHEET)
+
+    def test_workflow_start_checks_builtin_and_selected_compatible_browser(self):
+        file_path = Path(self.temp_dir.name) / "compatible-browser-start.xlsx"
+        workbook = Workbook()
+        workbook.active.append(["车辆标识", "已协助补缴"])
+        workbook.active.append(["粤A12345_黄色", ""])
+        workbook.save(file_path)
+        workbook.close()
+
+        page = WorkflowPage()
+        page.file_path = str(file_path)
+        page.df = pd.DataFrame(
+            {"车辆标识": ["粤A12345_黄色"], "已协助补缴": [""]}
+        )
+        page.browser_check_state = "ready"
+        self.assertTrue(page.aiqicha_compatibility_mode.isChecked())
+        with patch.object(page, "_reload_preview", return_value=True), patch.object(
+            page,
+            "_start_transport_worker",
+        ), patch(
+            "integrated_client.ui.workflow_page.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ) as builtin_browser, patch(
+            "integrated_client.ui.workflow_page.get_compatible_browser_path",
+            return_value=(
+                r"C:\Program Files\Microsoft\Edge\msedge.exe",
+                "Microsoft Edge",
+            ),
+        ) as compatible_browser:
+            page.start_pipeline()
+
+        builtin_browser.assert_called_once_with()
+        compatible_browser.assert_called_once_with()
+        self.assertIn("步骤 3 将使用Microsoft Edge", page.log_text.toPlainText())
+        page._finish_pipeline(False, "测试结束", outcome="failed")
+        page.close()
+        page.deleteLater()
+        self.app.processEvents()
+
+    def test_workflow_missing_compatible_browser_prompts_to_disable_mode(self):
+        file_path = Path(self.temp_dir.name) / "missing-compatible-browser.xlsx"
+        workbook = Workbook()
+        workbook.active.append(["车辆标识", "已协助补缴"])
+        workbook.active.append(["粤A12345_黄色", ""])
+        workbook.save(file_path)
+        workbook.close()
+
+        page = WorkflowPage()
+        page.file_path = str(file_path)
+        page.df = pd.DataFrame(
+            {"车辆标识": ["粤A12345_黄色"], "已协助补缴": [""]}
+        )
+        page.browser_check_state = "ready"
+        message = "未找到本机兼容浏览器。请关闭“爱企查兼容模式”后重试。"
+        with patch.object(page, "_reload_preview", return_value=True), patch(
+            "integrated_client.ui.workflow_page.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ), patch(
+            "integrated_client.ui.workflow_page.get_compatible_browser_path",
+            side_effect=RuntimeError(message),
+        ), patch(
+            "integrated_client.ui.workflow_page.QMessageBox.warning"
+        ) as warning:
+            page.start_pipeline()
+
+        warning.assert_called_once_with(page, "爱企查兼容模式不可用", message)
+        self.assertFalse(page.pipeline_running)
+        self.assertTrue(page.shutdown())
+        page.close()
 
     def test_disabled_widgets_use_forbidden_cursor(self):
         previous_stylesheet = self.app.styleSheet()
@@ -4407,6 +4535,7 @@ class ToolAndUiTests(unittest.TestCase):
         chart.resize(1000, 280)
         chart.grab()
         self.app.processEvents()
+
         self.assertEqual(len(chart._slice_hitboxes), 2)
         self.assertEqual(
             len(chart._bar_rects),
