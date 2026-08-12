@@ -40,6 +40,7 @@ class WorkflowTimingService:
         self._run_active_ms = 0
         self._run_paused_ms = 0
         self._run_segment_started = None
+        self._pause_excludes_total = False
         self._step_active_ms = 0
         self._step_paused_ms = 0
         self._step_segment_started = None
@@ -142,6 +143,7 @@ class WorkflowTimingService:
         self._run_active_ms = 0
         self._run_paused_ms = 0
         self._run_segment_started = self.clock()
+        self._pause_excludes_total = False
         self._step_active_ms = 0
         self._step_paused_ms = 0
         self._step_segment_started = None
@@ -174,7 +176,7 @@ class WorkflowTimingService:
             )
             if self.state in self.ACTIVE_STATES:
                 run_active += elapsed
-            elif self.state == "paused":
+            elif self.state == "paused" and not self._pause_excludes_total:
                 run_paused += elapsed
 
         step_active = self._step_active_ms
@@ -186,7 +188,7 @@ class WorkflowTimingService:
             )
             if self.state in self.ACTIVE_STATES:
                 step_active += elapsed
-            elif self.state == "paused":
+            elif self.state == "paused" and not self._pause_excludes_total:
                 step_paused += elapsed
         return run_active, run_paused, step_active, step_paused
 
@@ -247,8 +249,23 @@ class WorkflowTimingService:
     def heartbeat(self):
         self._checkpoint()
 
-    def _transition(self, state, event_type, reason=""):
-        if not self.is_active or self.state == state:
+    def _transition(
+        self,
+        state,
+        event_type,
+        reason="",
+        *,
+        pause_excludes_total=False,
+    ):
+        if not self.is_active:
+            return
+        pause_excludes_total = bool(
+            state == "paused" and pause_excludes_total
+        )
+        if (
+            self.state == state
+            and self._pause_excludes_total == pause_excludes_total
+        ):
             return
         now = self.clock()
         run_active, run_paused, step_active, step_paused = self._totals_at(now)
@@ -257,14 +274,27 @@ class WorkflowTimingService:
         self._step_active_ms = step_active
         self._step_paused_ms = step_paused
         self.state = state
+        self._pause_excludes_total = pause_excludes_total
         self._run_segment_started = now
         if self.attempt_id:
             self._step_segment_started = now
         self._checkpoint(event_type, reason)
 
     def pause(self, reason=""):
-        if self.state in self.ACTIVE_STATES:
+        if self.state in self.ACTIVE_STATES or (
+            self.state == "paused" and self._pause_excludes_total
+        ):
             self._transition("paused", "paused", reason)
+
+    def pause_excluding_total(self, reason=""):
+        """Pause without adding the waiting period to either time total."""
+        if self.state in self.ACTIVE_STATES or self.state == "paused":
+            self._transition(
+                "paused",
+                "paused",
+                reason,
+                pause_excludes_total=True,
+            )
 
     def resume(self, reason=""):
         if self.state == "paused":
@@ -324,6 +354,7 @@ class WorkflowTimingService:
         self._run_active_ms = run_active
         self._run_paused_ms = run_paused
         self._run_segment_started = None
+        self._pause_excludes_total = False
         self._final_snapshot = {
             "state": status,
             "batch_id": self.batch_id,

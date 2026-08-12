@@ -175,6 +175,81 @@ class WorkflowTimingTests(unittest.TestCase):
         self.assertEqual(attempt["paused_ms"], 30_000)
         self.assertTrue({"paused", "resumed", "retry"}.issubset(events))
 
+    def test_pause_excluding_total_freezes_both_timers_until_resumed(self):
+        service = WorkflowTimingService(self.db, self.account.id, clock=self.clock)
+        service.start_run(
+            self.source_path,
+            self.dataframe,
+            run_id="excluded-pause-run",
+        )
+        step = service.start_step(3)
+
+        self.now += 10
+        service.pause("等待爱企查页面加载")
+        self.now += 4
+        service.pause_excluding_total("等待用户登录爱企查")
+        before_login_wait = service.snapshot()
+
+        self.now += 60
+        during_login_wait = service.snapshot()
+        service.heartbeat()
+
+        self.assertEqual(before_login_wait["run_active_ms"], 10_000)
+        self.assertEqual(before_login_wait["run_paused_ms"], 4_000)
+        self.assertEqual(before_login_wait["run_total_ms"], 14_000)
+        self.assertEqual(during_login_wait["run_active_ms"], 10_000)
+        self.assertEqual(during_login_wait["run_paused_ms"], 4_000)
+        self.assertEqual(during_login_wait["run_total_ms"], 14_000)
+        self.assertEqual(during_login_wait["step_active_ms"], 10_000)
+        self.assertEqual(during_login_wait["step_paused_ms"], 4_000)
+
+        stored_during_wait = self.db.get_workflow_run("excluded-pause-run")
+        self.assertEqual(stored_during_wait["active_ms"], 10_000)
+        self.assertEqual(stored_during_wait["paused_ms"], 4_000)
+
+        service.resume("用户继续执行")
+        self.now += 5
+        snapshot = service.finish_run("succeeded")
+
+        self.assertEqual(snapshot["run_active_ms"], 15_000)
+        self.assertEqual(snapshot["run_paused_ms"], 4_000)
+        self.assertEqual(snapshot["run_total_ms"], 19_000)
+        with self.db._connect() as conn:
+            attempt = conn.execute(
+                "SELECT active_ms, paused_ms FROM workflow_step_attempts "
+                "WHERE attempt_id=?",
+                (step["attempt_id"],),
+            ).fetchone()
+        self.assertEqual(attempt["active_ms"], 15_000)
+        self.assertEqual(attempt["paused_ms"], 4_000)
+
+    def test_normal_pause_after_excluded_pause_resumes_total_only(self):
+        service = WorkflowTimingService(self.db, self.account.id, clock=self.clock)
+        service.start_run(
+            self.source_path,
+            self.dataframe,
+            run_id="excluded-to-normal-pause-run",
+        )
+        service.start_step(3)
+
+        self.now += 2
+        service.pause_excluding_total("等待用户登录爱企查")
+        self.now += 30
+        service.pause("用户已完成登录，继续等待浏览器加载")
+        self.now += 7
+
+        loading_snapshot = service.snapshot()
+        self.assertEqual(loading_snapshot["run_active_ms"], 2_000)
+        self.assertEqual(loading_snapshot["run_paused_ms"], 7_000)
+        self.assertEqual(loading_snapshot["run_total_ms"], 9_000)
+
+        service.resume("爱企查页面加载完成")
+        self.now += 3
+        snapshot = service.finish_run("succeeded")
+        self.assertEqual(snapshot["run_active_ms"], 5_000)
+        self.assertEqual(snapshot["run_paused_ms"], 7_000)
+        self.assertEqual(snapshot["run_total_ms"], 12_000)
+
     def test_stale_running_task_is_marked_interrupted_and_can_resume(self):
         service = WorkflowTimingService(self.db, self.account.id, clock=self.clock)
         result = service.start_run(

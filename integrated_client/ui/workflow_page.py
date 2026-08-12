@@ -56,6 +56,8 @@ from ..database import (
     split_violation_reasons,
 )
 from ..tencent_docs import (
+    TencentDocsBackfillResult,
+    TencentDocsBackfillWorker,
     TencentDocsImportResult,
     TencentDocsImportWorker,
     tencent_docs_import_directory,
@@ -295,6 +297,8 @@ class WorkflowPage(QWidget):
         self.last_force_shutdown_error = ""
         self.tencent_import_worker = None
         self.tencent_import_dialog = None
+        self.tencent_backfill_worker = None
+        self.tencent_backfill_dialog = None
 
         self._build_ui()
         self._restore_run_settings()
@@ -587,8 +591,17 @@ class WorkflowPage(QWidget):
         self.open_workbook_folder_btn.clicked.connect(
             self._open_current_workbook_folder
         )
+        self.backfill_tencent_docs_btn = QPushButton("回填业务数据")
+        self.backfill_tencent_docs_btn.setEnabled(False)
+        self.backfill_tencent_docs_btn.setToolTip(
+            "按腾讯文档实际存在的列回填公司名称、法人、地址和电话"
+        )
+        self.backfill_tencent_docs_btn.clicked.connect(
+            self._prompt_tencent_docs_backfill
+        )
         self.preview_panel.add_header_widget(self.open_workbook_btn)
         self.preview_panel.add_header_widget(self.open_workbook_folder_btn)
+        self.preview_panel.add_header_widget(self.backfill_tencent_docs_btn)
         self.preview_toggle_btn = self.preview_panel.toggle_button
         self.preview_panel.expanded_changed.connect(self._rebalance_content_panels)
         splitter.addWidget(self.preview_panel)
@@ -774,6 +787,15 @@ class WorkflowPage(QWidget):
         except Exception as exc:
             self._log(f"⚠️ 暂停计时记录失败：{exc}")
 
+    def _timing_pause_excluding_total(self, reason):
+        if self._timing_service is None:
+            return
+        try:
+            self._timing_service.pause_excluding_total(reason)
+            self._refresh_timing_label()
+        except Exception as exc:
+            self._log(f"⚠️ 暂停计时记录失败：{exc}")
+
     def _timing_resume(self, reason):
         if self._timing_service is None:
             return
@@ -906,9 +928,44 @@ class WorkflowPage(QWidget):
             self.file_path and Path(self.file_path).is_file()
         )
         import_running = self.tencent_import_worker is not None
-        enabled = path_exists and not self.pipeline_running and not import_running
+        backfill_running = self.tencent_backfill_worker is not None
+        enabled = (
+            path_exists
+            and not self.pipeline_running
+            and not import_running
+            and not backfill_running
+        )
         self.open_workbook_btn.setEnabled(enabled)
         self.open_workbook_folder_btn.setEnabled(enabled)
+        company_values_ready = (
+            path_exists
+            and not self.df.empty
+            and COMPANY_COL_NAME in self.df.columns
+            and all(
+                not pd.isna(value) and str(value).strip()
+                for value in self.df[COMPANY_COL_NAME].tolist()
+            )
+        )
+        self.backfill_tencent_docs_btn.setEnabled(
+            company_values_ready
+            and not self.pipeline_running
+            and not import_running
+            and not backfill_running
+        )
+
+    def _refresh_tencent_task_controls(self):
+        task_busy = (
+            self.tencent_import_worker is not None
+            or self.tencent_backfill_worker is not None
+        )
+        enabled = not self.pipeline_running and not task_busy
+        self.choose_btn.setEnabled(enabled)
+        self.tencent_docs_btn.setEnabled(enabled)
+        self.open_tencent_docs_folder_btn.setEnabled(enabled)
+        self.reload_btn.setEnabled(enabled)
+        self.start_btn.setEnabled(enabled)
+        self.settings_group.setEnabled(enabled)
+        self._update_workbook_action_buttons()
 
     def _open_current_workbook(self):
         path = Path(self.file_path) if self.file_path else None
@@ -1005,7 +1062,7 @@ class WorkflowPage(QWidget):
         if self.pipeline_running or (
             self.tencent_import_worker is not None
             and self.tencent_import_worker.isRunning()
-        ):
+        ) or self.tencent_backfill_worker is not None:
             return
         dialog = TencentDocsLinkDialog(
             self._saved_tencent_document_url(),
@@ -1026,6 +1083,192 @@ class WorkflowPage(QWidget):
             QMessageBox.warning(self, "无法导入腾讯文档", str(exc))
             return
         self._start_tencent_docs_import(url)
+
+    def _prompt_tencent_docs_backfill(self):
+        if not self._can_backfill_tencent_docs():
+            self._update_workbook_action_buttons()
+            return
+        if is_excel_file_open(self.file_path):
+            QMessageBox.warning(
+                self,
+                "表格被占用",
+                "请先关闭 Excel/WPS 中打开的业务表格，再执行腾讯文档回填。",
+            )
+            return
+        if not self._reload_preview(force=True):
+            QMessageBox.warning(
+                self,
+                "无法回填业务数据",
+                "无法重新读取当前业务表格，请确认文件存在且未被 Excel/WPS 占用。",
+            )
+            return
+        if not self._can_backfill_tencent_docs():
+            self._update_workbook_action_buttons()
+            QMessageBox.warning(
+                self,
+                "无法回填业务数据",
+                f"请确认业务表格存在“{COMPANY_COL_NAME}”列，且该列没有空值。",
+            )
+            return
+        dialog = TencentDocsLinkDialog(
+            self._saved_tencent_document_url(),
+            self,
+            title="回填业务数据",
+            confirm_text="确认并回填",
+        )
+        if dialog.exec_() != dialog.Accepted:
+            return
+        url = dialog.value()
+        try:
+            url = validate_tencent_docs_url(url)
+            get_builtin_chromium_path()
+            if self.client_preferences is not None:
+                self.client_preferences.set_tencent_document_url(
+                    self.account_key,
+                    url,
+                )
+        except (OSError, RuntimeError, ValueError) as exc:
+            QMessageBox.warning(self, "无法回填腾讯文档", str(exc))
+            return
+        self._start_tencent_docs_backfill(url)
+
+    def _can_backfill_tencent_docs(self):
+        if (
+            self.pipeline_running
+            or not self.file_path
+            or not Path(self.file_path).is_file()
+            or self.df.empty
+            or COMPANY_COL_NAME not in self.df.columns
+            or self.tencent_import_worker is not None
+            or self.tencent_backfill_worker is not None
+        ):
+            return False
+        return all(
+            not pd.isna(value) and str(value).strip()
+            for value in self.df[COMPANY_COL_NAME].tolist()
+        )
+
+    def _tencent_backfill_rows(self):
+        def cell_text(value):
+            if pd.isna(value):
+                return ""
+            text = str(value).strip()
+            return "" if text in {"nan", "NaN", "None"} else text
+
+        rows = []
+        for _, row in self.df.iterrows():
+            rows.append(
+                (
+                    cell_text(row.get(COMPANY_COL_NAME, "")),
+                    cell_text(row.get(LEGAL_COL_NAME, "")),
+                    cell_text(row.get(ADDR_COL_NAME, "")),
+                    cell_text(row.get(PHONE_COL_NAME, "")),
+                )
+            )
+        return tuple(rows)
+
+    def _start_tencent_docs_backfill(self, url):
+        worker = TencentDocsBackfillWorker(
+            url,
+            self.account_key,
+            self._tencent_backfill_rows(),
+            data_directory=self._tencent_docs_data_directory(),
+            parent=self,
+        )
+        dialog = TencentDocsProgressDialog(
+            self,
+            title="回填腾讯文档",
+            operation="回填腾讯文档业务数据",
+            cancel_text="取消回填",
+        )
+        dialog.cancel_requested.connect(worker.stop)
+        worker.status_changed.connect(dialog.set_status)
+        worker.progress_changed.connect(dialog.set_progress)
+        worker.backfill_succeeded.connect(
+            lambda result, current=worker, progress=dialog:
+            self._tencent_docs_backfill_succeeded(
+                current,
+                progress,
+                result,
+            )
+        )
+        worker.backfill_failed.connect(
+            lambda message, current=worker, progress=dialog:
+            self._tencent_docs_backfill_failed(
+                current,
+                progress,
+                message,
+            )
+        )
+        worker.backfill_cancelled.connect(
+            lambda current=worker, progress=dialog:
+            self._tencent_docs_backfill_cancelled(current, progress)
+        )
+        worker.finished.connect(
+            lambda current=worker, progress=dialog:
+            self._tencent_docs_backfill_finished(current, progress)
+        )
+        self.tencent_backfill_worker = worker
+        self.tencent_backfill_dialog = dialog
+        self.choose_btn.setEnabled(False)
+        self.tencent_docs_btn.setEnabled(False)
+        self.open_tencent_docs_folder_btn.setEnabled(False)
+        self.reload_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.settings_group.setEnabled(False)
+        self._update_workbook_action_buttons()
+        self._log("开始回填腾讯文档；此过程不计入业务处理时间。")
+        dialog.open()
+        worker.start()
+
+    def _tencent_docs_backfill_succeeded(self, worker, dialog, result):
+        if (
+            worker is not self.tencent_backfill_worker
+            or not isinstance(result, TencentDocsBackfillResult)
+        ):
+            return
+        dialog.finish()
+        self._last_file_mtime = None
+        self._reload_preview(force=True)
+        self._log(
+            f"腾讯文档回填完成：从第 {result.start_row} 行开始，"
+            f"已回填 {result.updated_rows} 行（"
+            f"{'、'.join(result.updated_columns)}）。"
+        )
+        QMessageBox.information(
+            self,
+            "腾讯文档回填完成",
+            f"已回填 {result.updated_rows} 行业务数据。\n"
+            f"仅修改了腾讯文档中实际存在的列："
+            f"{'、'.join(result.updated_columns)}。",
+        )
+
+    def _tencent_docs_backfill_failed(self, worker, dialog, message):
+        if worker is not self.tencent_backfill_worker:
+            return
+        dialog.finish()
+        self._log(f"腾讯文档回填失败：{message}")
+        QMessageBox.warning(self, "腾讯文档回填失败", str(message))
+
+    def _tencent_docs_backfill_cancelled(self, worker, dialog):
+        if worker is not self.tencent_backfill_worker:
+            return
+        dialog.finish()
+        self._log(
+            "已取消腾讯文档回填；程序已停止后续写入，"
+            "取消前已经粘贴的列可能已由腾讯文档保存。"
+        )
+
+    def _tencent_docs_backfill_finished(self, worker, dialog):
+        if worker is self.tencent_backfill_worker:
+            self.tencent_backfill_worker = None
+        if dialog is self.tencent_backfill_dialog:
+            self.tencent_backfill_dialog = None
+        if dialog.isVisible():
+            dialog.finish()
+        dialog.deleteLater()
+        worker.deleteLater()
+        self._refresh_tencent_task_controls()
 
     def _start_tencent_docs_import(self, url):
         worker = TencentDocsImportWorker(
@@ -1066,7 +1309,10 @@ class WorkflowPage(QWidget):
         self.tencent_import_dialog = dialog
         self.choose_btn.setEnabled(False)
         self.tencent_docs_btn.setEnabled(False)
+        self.open_tencent_docs_folder_btn.setEnabled(False)
         self.reload_btn.setEnabled(False)
+        self.start_btn.setEnabled(False)
+        self.settings_group.setEnabled(False)
         self._update_workbook_action_buttons()
         self._log("开始导入腾讯文档；此过程不计入业务处理时间。")
         dialog.open()
@@ -1134,10 +1380,7 @@ class WorkflowPage(QWidget):
             dialog.finish()
         dialog.deleteLater()
         worker.deleteLater()
-        self.choose_btn.setEnabled(not self.pipeline_running)
-        self.tencent_docs_btn.setEnabled(not self.pipeline_running)
-        self.reload_btn.setEnabled(not self.pipeline_running)
-        self._update_workbook_action_buttons()
+        self._refresh_tencent_task_controls()
 
     def _read_dataframe(self):
         return pd.read_excel(
@@ -1188,12 +1431,18 @@ class WorkflowPage(QWidget):
     def _set_controls_running(self, running):
         self.pipeline_running = running
         self.choose_btn.setEnabled(not running)
+        self.open_tencent_docs_folder_btn.setEnabled(
+            not running
+            and self.tencent_import_worker is None
+            and self.tencent_backfill_worker is None
+        )
         self.tencent_docs_btn.setEnabled(
             not running
             and not (
                 self.tencent_import_worker is not None
                 and self.tencent_import_worker.isRunning()
             )
+            and self.tencent_backfill_worker is None
         )
         self.reload_btn.setEnabled(not running)
         self._update_workbook_action_buttons()
@@ -1284,6 +1533,16 @@ class WorkflowPage(QWidget):
 
     def start_pipeline(self):
         if self.pipeline_running:
+            return
+        if (
+            self.tencent_import_worker is not None
+            or self.tencent_backfill_worker is not None
+        ):
+            QMessageBox.warning(
+                self,
+                "腾讯文档任务正在运行",
+                "请等待当前腾讯文档导入或回填结束后再开始业务处理。",
+            )
             return
         if not self.file_path or not os.path.exists(self.file_path):
             QMessageBox.warning(self, "缺少表格", "请先选择业务表格。")
@@ -1590,11 +1849,14 @@ class WorkflowPage(QWidget):
 
     def _on_login_required(self):
         self.awaiting_login = True
-        self._timing_pause("等待用户登录爱企查")
+        self._timing_pause_excluding_total("等待用户登录爱企查")
         self.continue_btn.setEnabled(True)
         self.pause_btn.setEnabled(False)
         self._set_step_status(3, "请登录爱企查后点击继续", "paused")
-        self._log("请在已打开的浏览器中登录爱企查，然后点击“继续执行”。")
+        self._log(
+            "请在已打开的浏览器中登录爱企查，然后点击“继续执行”。"
+            "登录等待期间已暂停计时。"
+        )
 
     def _on_aiqicha_resumed(self):
         self.awaiting_login = False
@@ -1832,7 +2094,10 @@ class WorkflowPage(QWidget):
         worker = self.current_worker
         if not worker or not worker.isRunning():
             return
-        if isinstance(worker, QueryWorker) and self.awaiting_login:
+        was_awaiting_login = (
+            isinstance(worker, QueryWorker) and self.awaiting_login
+        )
+        if was_awaiting_login:
             worker.confirm_login()
             self.awaiting_login = False
         else:
@@ -1841,7 +2106,9 @@ class WorkflowPage(QWidget):
             self._backfill_browser_loading
             or self._aiqicha_browser_loading
         )
-        if not browser_loading:
+        if browser_loading and was_awaiting_login:
+            self._timing_pause("用户已完成登录，继续等待浏览器加载")
+        elif not browser_loading:
             self._timing_resume("用户继续执行")
         self.continue_btn.setEnabled(False)
         self.pause_btn.setEnabled(True)
@@ -1949,6 +2216,13 @@ class WorkflowPage(QWidget):
                 return False
         if self.tencent_import_dialog is not None:
             self.tencent_import_dialog.finish()
+        tencent_backfill_worker = self.tencent_backfill_worker
+        if tencent_backfill_worker and tencent_backfill_worker.isRunning():
+            tencent_backfill_worker.stop()
+            if not tencent_backfill_worker.wait(timeout_ms):
+                return False
+        if self.tencent_backfill_dialog is not None:
+            self.tencent_backfill_dialog.finish()
         browser_check_worker = self.browser_check_worker
         if browser_check_worker and browser_check_worker.isRunning():
             if not browser_check_worker.wait(timeout_ms):
@@ -1985,6 +2259,7 @@ class WorkflowPage(QWidget):
         for thread in (
             self.browser_check_worker,
             self.tencent_import_worker,
+            self.tencent_backfill_worker,
             self.current_worker,
             *self._retired_workers,
         ):
@@ -2076,6 +2351,11 @@ class WorkflowPage(QWidget):
             if self.tencent_import_worker in stubborn_threads
             else None
         )
+        self.tencent_backfill_worker = (
+            self.tencent_backfill_worker
+            if self.tencent_backfill_worker in stubborn_threads
+            else None
+        )
         self.current_worker = (
             self.current_worker
             if self.current_worker in stubborn_threads
@@ -2086,6 +2366,7 @@ class WorkflowPage(QWidget):
             for thread in stubborn_threads
             if thread is not self.browser_check_worker
             and thread is not self.current_worker
+            and thread is not self.tencent_backfill_worker
         ]
         self.pipeline_running = False
         self.awaiting_login = False

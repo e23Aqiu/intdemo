@@ -2510,6 +2510,29 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIsNone(window.account_page)
         self.assertFalse(window.announcement_service_available)
         self.assertTrue(window.guest_logout_button.isVisibleTo(window.sidebar))
+        self.assertTrue(window.workflow_page.tencent_docs_btn.isEnabled())
+        self.assertEqual(window.workflow_page.account_key, "guest")
+        self.assertIs(
+            window.workflow_page.client_preferences,
+            window.client_preferences,
+        )
+        saved_url = "https://docs.qq.com/sheet/offline-guest"
+        window.client_preferences.set_tencent_document_url("guest", saved_url)
+        self.assertEqual(
+            window.workflow_page._saved_tencent_document_url(),
+            saved_url,
+        )
+        workbook_path = Path(self.temp_dir.name) / "offline-backfill.xlsx"
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["车辆标识", "车辆所有人/企业"])
+        worksheet.append(["粤A1", "离线公司"])
+        workbook.save(workbook_path)
+        workbook.close()
+        window.workflow_page.file_path = str(workbook_path)
+        window.workflow_page.file_edit.setText(str(workbook_path))
+        self.assertTrue(window.workflow_page._reload_preview(force=True))
+        self.assertTrue(window.workflow_page.backfill_tencent_docs_btn.isEnabled())
         self.assertTrue(
             window._record_workflow_summary(
                 {WORKFLOW_TOTAL_METRIC: 9},
@@ -3670,10 +3693,15 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertLess(
             preview_header.indexOf(page.open_workbook_folder_btn),
+            preview_header.indexOf(page.backfill_tencent_docs_btn),
+        )
+        self.assertLess(
+            preview_header.indexOf(page.backfill_tencent_docs_btn),
             preview_header.indexOf(page.preview_toggle_btn),
         )
         self.assertFalse(page.open_workbook_btn.isEnabled())
         self.assertFalse(page.open_workbook_folder_btn.isEnabled())
+        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
 
         workbook_path = Path(self.temp_dir.name) / "preview-actions.xlsx"
         workbook = Workbook()
@@ -3686,6 +3714,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page._reload_preview(force=True))
         self.assertTrue(page.open_workbook_btn.isEnabled())
         self.assertTrue(page.open_workbook_folder_btn.isEnabled())
+        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
         with patch(
             "integrated_client.ui.workflow_page.QDesktopServices.openUrl",
             return_value=True,
@@ -3776,6 +3805,93 @@ class ToolAndUiTests(unittest.TestCase):
             new_url,
         )
         self.assertFalse(timing.is_active)
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_tencent_docs_backfill_button_requires_complete_company_column(self):
+        page = WorkflowPage()
+        workbook_path = Path(self.temp_dir.name) / "backfill-ready.xlsx"
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(
+            [
+                "车辆标识",
+                "车辆所有人/企业",
+                "负责人/法人代表",
+                "地址",
+                "电话",
+            ]
+        )
+        worksheet.append(["粤A1", "甲公司", "张三", "地址甲", "123"])
+        worksheet.append(["粤A2", "乙公司", "李四", "", "456"])
+        workbook.save(workbook_path)
+        workbook.close()
+        page.file_path = str(workbook_path)
+        page.file_edit.setText(str(workbook_path))
+
+        self.assertTrue(page._reload_preview(force=True))
+        self.assertTrue(page.backfill_tencent_docs_btn.isEnabled())
+        page.df.at[1, "车辆所有人/企业"] = ""
+        page.model.set_dataframe(page.df)
+        page._update_workbook_action_buttons()
+        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
+        page.df.at[1, "车辆所有人/企业"] = "乙公司"
+        page._update_workbook_action_buttons()
+        page._set_controls_running(True)
+        self.assertFalse(page.backfill_tencent_docs_btn.isEnabled())
+        page._set_controls_running(False)
+        self.assertTrue(page.backfill_tencent_docs_btn.isEnabled())
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_tencent_docs_backfill_reuses_and_persists_account_link(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        old_url = "https://docs.qq.com/sheet/old-backfill"
+        new_url = "https://docs.qq.com/sheet/new-backfill"
+        preferences.set_tencent_document_url("admin", old_url)
+        page = WorkflowPage(
+            client_preferences=preferences,
+            account_key="admin",
+        )
+        workbook_path = Path(self.temp_dir.name) / "backfill-dialog.xlsx"
+        workbook = Workbook()
+        worksheet = workbook.active
+        worksheet.append(["车辆标识", "车辆所有人/企业"])
+        worksheet.append(["粤A1", "甲公司"])
+        workbook.save(workbook_path)
+        workbook.close()
+        page.file_path = str(workbook_path)
+        page.file_edit.setText(str(workbook_path))
+        self.assertTrue(page._reload_preview(force=True))
+
+        with patch(
+            "integrated_client.ui.workflow_page.TencentDocsLinkDialog",
+        ) as dialog_type, patch(
+            "integrated_client.ui.workflow_page.get_builtin_chromium_path",
+            return_value=r"C:\browser\chrome.exe",
+        ), patch.object(
+            page,
+            "_start_tencent_docs_backfill",
+        ) as start_backfill:
+            dialog = dialog_type.return_value
+            dialog.Accepted = 1
+            dialog.exec_.return_value = 1
+            dialog.value.return_value = new_url
+            page.backfill_tencent_docs_btn.click()
+
+        dialog_type.assert_called_once_with(
+            old_url,
+            page,
+            title="回填业务数据",
+            confirm_text="确认并回填",
+        )
+        start_backfill.assert_called_once_with(new_url)
+        self.assertEqual(
+            ClientPreferences(self.temp_dir.name).tencent_document_url(
+                "ADMIN"
+            ),
+            new_url,
+        )
         self.assertTrue(page.shutdown())
         page.close()
 
@@ -4054,10 +4170,14 @@ class ToolAndUiTests(unittest.TestCase):
 
             def __init__(self):
                 self.pause_reasons = []
+                self.excluded_pause_reasons = []
                 self.resume_reasons = []
 
             def pause(self, reason):
                 self.pause_reasons.append(reason)
+
+            def pause_excluding_total(self, reason):
+                self.excluded_pause_reasons.append(reason)
 
             def resume(self, reason):
                 self.resume_reasons.append(reason)
@@ -4081,14 +4201,67 @@ class ToolAndUiTests(unittest.TestCase):
             page._on_login_required()
             self.assertTrue(page.awaiting_login)
             self.assertEqual(
-                timing.pause_reasons,
+                timing.excluded_pause_reasons,
                 ["等待用户登录爱企查"],
             )
+            self.assertEqual(timing.pause_reasons, [])
             page.continue_pipeline()
 
         self.assertTrue(worker._login_wait.is_set())
         self.assertFalse(page.awaiting_login)
         self.assertEqual(timing.resume_reasons, ["用户继续执行"])
+        page.current_worker = None
+        self.assertTrue(page.shutdown())
+        page.close()
+
+    def test_aiqicha_login_continue_restores_total_during_page_loading(self):
+        class TimingService:
+            is_active = False
+
+            def __init__(self):
+                self.pause_reasons = []
+                self.excluded_pause_reasons = []
+                self.resume_reasons = []
+
+            def pause(self, reason):
+                self.pause_reasons.append(reason)
+
+            def pause_excluding_total(self, reason):
+                self.excluded_pause_reasons.append(reason)
+
+            def resume(self, reason):
+                self.resume_reasons.append(reason)
+
+        timing = TimingService()
+        page = WorkflowPage(timing_service=timing)
+        worker = QueryWorker(
+            pd.DataFrame({"车辆所有人/企业": []}),
+            "车辆所有人/企业",
+        )
+        page.current_worker = worker
+        page.current_step = 3
+        page._aiqicha_browser_loading = True
+        with patch.object(
+            page,
+            "_refresh_timing_label",
+        ), patch.object(
+            worker,
+            "isRunning",
+            return_value=True,
+        ):
+            page._on_login_required()
+            page.continue_pipeline()
+
+        self.assertTrue(worker._login_wait.is_set())
+        self.assertEqual(
+            timing.excluded_pause_reasons,
+            ["等待用户登录爱企查"],
+        )
+        self.assertEqual(
+            timing.pause_reasons,
+            ["用户已完成登录，继续等待浏览器加载"],
+        )
+        self.assertEqual(timing.resume_reasons, [])
         page.current_worker = None
         self.assertTrue(page.shutdown())
         page.close()
