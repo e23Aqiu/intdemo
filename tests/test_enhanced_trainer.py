@@ -29,6 +29,7 @@ from enhanced_trainer.package_tool import (
     SIGNING_KEY_ENVIRONMENT,
     WINDOWS_PLATFORM,
     PackageToolError,
+    build_native_bundle,
     load_signing_key,
     package_bundle,
     require_native_platform,
@@ -510,6 +511,42 @@ class EnhancedPackageToolTests(unittest.TestCase):
             )
         self.assertTrue(result["ok"])
         self.assertNotIn(SIGNING_KEY_ENVIRONMENT, observed_environment)
+
+    def test_native_build_uses_package_hooks_without_collect_all(self):
+        commands = []
+
+        def runner(command, **_options):
+            commands.append(command)
+            dist = Path(command[command.index("--distpath") + 1])
+            bundle = dist / "intdemo-trainer"
+            bundle.mkdir(parents=True)
+            (bundle / "intdemo-trainer.exe").write_bytes(b"trainer")
+            return subprocess.CompletedProcess(command, 0)
+
+        build_root = self.root / "native-build"
+        with patch(
+            "enhanced_trainer.package_tool.native_platform_key",
+            return_value=WINDOWS_PLATFORM,
+        ), patch(
+            "enhanced_trainer.package_tool._require_build_dependencies",
+        ), patch(
+            "enhanced_trainer.package_tool.self_test_bundle",
+        ):
+            bundle = build_native_bundle(
+                build_root,
+                requested_platform=WINDOWS_PLATFORM,
+                runner=runner,
+            )
+
+        self.assertEqual(bundle, build_root / "dist" / "intdemo-trainer")
+        command = commands[0]
+        self.assertNotIn("--collect-all", command)
+        hidden = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--hidden-import"
+        ]
+        self.assertEqual(hidden, ["torch", "onnx", "onnxruntime"])
 
 
 if __name__ == "__main__":

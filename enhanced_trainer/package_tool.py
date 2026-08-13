@@ -419,14 +419,12 @@ def build_native_bundle(
         str(specs),
         "--paths",
         str(repository),
-        "--collect-all",
+        "--hidden-import",
         "torch",
-        "--collect-all",
+        "--hidden-import",
         "onnx",
-        "--collect-all",
+        "--hidden-import",
         "onnxruntime",
-        "--collect-all",
-        "PIL",
         str(entrypoint),
     ]
     try:
