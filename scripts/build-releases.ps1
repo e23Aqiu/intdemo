@@ -5,8 +5,6 @@ param(
 
     [string]$CaBundle = "",
 
-    [string]$TrainerTrustFile = "",
-
     [ValidateSet("test", "stable")]
     [string]$Channel = "test",
 
@@ -26,9 +24,6 @@ $portableArguments = @{
     Channel = $Channel
     Version = $Version
 }
-if ($TrainerTrustFile) {
-    $portableArguments.TrainerTrustFile = $TrainerTrustFile
-}
 & (Join-Path $PSScriptRoot "build-portable.ps1") @portableArguments
 if (-not $?) {
     throw "Portable package build failed"
@@ -40,9 +35,6 @@ $installerArguments = @{
     Channel = $Channel
     Version = $Version
     DeltaFromVersion = $DeltaFromVersion
-}
-if ($TrainerTrustFile) {
-    $installerArguments.TrainerTrustFile = $TrainerTrustFile
 }
 if ($InnoCompiler) {
     $installerArguments.InnoCompiler = $InnoCompiler

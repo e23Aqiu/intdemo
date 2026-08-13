@@ -36,10 +36,6 @@ from ..trainer_component import (
     TrainerComponentError,
     TrainerComponentManager,
 )
-from ..trainer_trust import (
-    TrainerTrustConfigurationError,
-    create_trainer_component_manager,
-)
 from .announcement_page import ImagePreviewDialog, start_api_task
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
@@ -109,20 +105,10 @@ class MachineLearningPage(QWidget):
         super().__init__(parent)
         self.session_manager = session_manager
         self.learning_service = learning_service
-        self._trainer_configuration_error = ""
         if trainer_manager is not None:
             self.trainer_manager = trainer_manager
         else:
-            try:
-                self.trainer_manager = create_trainer_component_manager()
-            except TrainerTrustConfigurationError as exc:
-                # A malformed optional trust file must not make the admin UI
-                # unusable. Standard training remains available; component
-                # installation is disabled until the public config is fixed.
-                self._trainer_configuration_error = str(exc)
-                self.trainer_manager = TrainerComponentManager(
-                    signature_verifier=None,
-                )
+            self.trainer_manager = TrainerComponentManager()
         self._tasks = []
         self._task_callbacks = {}
         self._refresh_task = None
@@ -473,9 +459,7 @@ class MachineLearningPage(QWidget):
     def _set_component_controls_enabled(self, enabled):
         available = bool(enabled) and not self._training_in_progress
         self.training_mode_combo.setEnabled(available)
-        self.install_trainer_btn.setEnabled(
-            available and not self._trainer_configuration_error
-        )
+        self.install_trainer_btn.setEnabled(available)
         status = self.trainer_manager.status(verify_files=False)
         self.self_test_trainer_btn.setEnabled(available and status.available)
         self.uninstall_trainer_btn.setEnabled(
@@ -508,15 +492,7 @@ class MachineLearningPage(QWidget):
             "windows-x86_64": "Windows x64",
             "linux-aarch64": "统信 UOS ARM64",
         }
-        if self._trainer_configuration_error:
-            self.trainer_status_label.setText(
-                "强化组件：可信公钥配置错误；标准模式仍可使用 · "
-                f"{self._trainer_configuration_error}"
-            )
-            self.install_trainer_btn.setToolTip(
-                "请先修复 trainer-trust.json，再安装强化组件"
-            )
-        elif status.code == STATUS_AVAILABLE:
+        if status.code == STATUS_AVAILABLE:
             details = [
                 "强化组件：已安装",
                 f"版本 {status.version or '-'}",

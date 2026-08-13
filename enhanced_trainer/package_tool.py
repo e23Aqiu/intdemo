@@ -1,9 +1,8 @@
-"""Native-only PyInstaller build and Ed25519-signed .inttrainer packager."""
+"""Native-only PyInstaller build and .inttrainer packager."""
 
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import importlib.util
 import json
@@ -19,14 +18,11 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
 from .protocol import COMPONENT_VERSION
 
 WINDOWS_PLATFORM = "windows-x86_64"
 LINUX_ARM64_PLATFORM = "linux-aarch64"
 SUPPORTED_PLATFORMS = {WINDOWS_PLATFORM, LINUX_ARM64_PLATFORM}
-SIGNING_KEY_ENVIRONMENT = "INTDEMO_TRAINER_SIGNING_PRIVATE_KEY"
 MAX_SOURCE_FILES = 20_000
 MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024
 WINDOWS_RUNTIME_FILES = (
@@ -38,7 +34,6 @@ WINDOWS_RUNTIME_FILES = (
     "vcruntime140_1.dll",
 )
 WINDOWS_AMD64_MACHINE = 0x8664
-_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _VERSION_PATTERN = re.compile(r"^\d+(?:\.\d+){2,3}$")
 
 
@@ -68,66 +63,6 @@ def require_native_platform(requested: str | None = None) -> str:
             f"禁止交叉打包：当前为 {actual}，请求目标为 {expected or '-'}"
         )
     return actual
-
-
-def _canonical_manifest(manifest: dict) -> bytes:
-    unsigned = dict(manifest)
-    unsigned.pop("signature", None)
-    return json.dumps(
-        unsigned,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-
-
-def load_signing_key(
-    *,
-    private_key_file: Path | str | None = None,
-    environ: dict[str, str] | None = None,
-) -> Ed25519PrivateKey:
-    """Read a raw 32-byte key from one explicit file or the dedicated env."""
-
-    environment = os.environ if environ is None else environ
-    encoded_environment = str(
-        environment.get(SIGNING_KEY_ENVIRONMENT) or ""
-    ).strip()
-    if private_key_file and encoded_environment:
-        raise PackageToolError("签名私钥文件与环境变量不能同时使用")
-    if private_key_file:
-        path = Path(private_key_file).expanduser().resolve()
-        try:
-            if path.is_symlink() or not path.is_file():
-                raise ValueError("not a regular file")
-            if path.stat().st_size > 4096:
-                raise ValueError("file too large")
-            repository = Path(__file__).resolve().parents[1]
-            try:
-                path.relative_to(repository)
-            except ValueError:
-                pass
-            else:
-                raise ValueError("private key inside repository")
-            if os.name != "nt" and path.stat().st_mode & 0o077:
-                raise ValueError("private key permissions are too broad")
-            encoded = path.read_text(encoding="ascii").strip()
-        except (OSError, UnicodeError, ValueError) as exc:
-            raise PackageToolError(f"无法读取强化组件签名私钥文件：{exc}") from exc
-    else:
-        encoded = encoded_environment
-    if not encoded:
-        raise PackageToolError(
-            "必须通过 --private-key-file 或 "
-            f"{SIGNING_KEY_ENVIRONMENT} 显式提供签名私钥"
-        )
-    try:
-        raw = base64.b64decode(encoded, validate=True)
-        if len(raw) != 32:
-            raise ValueError("private key length")
-        return Ed25519PrivateKey.from_private_bytes(raw)
-    except (TypeError, ValueError) as exc:
-        raise PackageToolError("签名私钥必须是 Base64 编码的 32 字节 Ed25519 私钥") from exc
 
 
 def _sha256(path: Path) -> str:
@@ -197,14 +132,10 @@ def package_bundle(
     bundle_dir: Path | str,
     output_path: Path | str,
     *,
-    key_id: str,
-    private_key: Ed25519PrivateKey,
     component_version: str = COMPONENT_VERSION,
     requested_platform: str | None = None,
 ) -> Path:
     platform_key = require_native_platform(requested_platform)
-    if not _KEY_ID_PATTERN.fullmatch(str(key_id or "")):
-        raise PackageToolError("强化组件签名密钥编号格式无效")
     if not _VERSION_PATTERN.fullmatch(str(component_version or "")):
         raise PackageToolError("强化组件版本号格式无效")
     if component_version != COMPONENT_VERSION:
@@ -253,12 +184,6 @@ def package_bundle(
             {"path": name, "size": size, "sha256": digest}
             for name, _source, size, digest in files
         ],
-    }
-    signature = private_key.sign(_canonical_manifest(manifest))
-    manifest["signature"] = {
-        "algorithm": "ed25519",
-        "key_id": key_id,
-        "value": base64.b64encode(signature).decode("ascii"),
     }
     manifest_bytes = json.dumps(
         manifest,
@@ -326,11 +251,7 @@ def _require_build_dependencies() -> None:
 
 
 def _child_environment() -> dict[str, str]:
-    """Never expose the component-signing secret to build/test children."""
-
-    environment = {str(key): str(value) for key, value in os.environ.items()}
-    environment.pop(SIGNING_KEY_ENVIRONMENT, None)
-    return environment
+    return {str(key): str(value) for key, value in os.environ.items()}
 
 
 def _pe_machine(path: Path) -> int:
@@ -534,8 +455,6 @@ def build_native_bundle(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="intdemo-trainer-packager")
     parser.add_argument("--platform", choices=sorted(SUPPORTED_PLATFORMS))
-    parser.add_argument("--key-id", required=True)
-    parser.add_argument("--private-key-file")
     parser.add_argument("--component-version", default=COMPONENT_VERSION)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -563,7 +482,6 @@ def main(arguments=None) -> int:
             )
             print(bundle)
             return 0
-        private_key = load_signing_key(private_key_file=options.private_key_file)
         if options.command == "package":
             bundle = options.bundle_dir
             self_test_bundle(bundle, requested_platform=options.platform)
@@ -575,8 +493,6 @@ def main(arguments=None) -> int:
         output = package_bundle(
             bundle,
             options.output,
-            key_id=options.key_id,
-            private_key=private_key,
             component_version=options.component_version,
             requested_platform=options.platform,
         )

@@ -3,8 +3,8 @@
 强化训练器是管理员离线分发的可选组件，不上传服务器，也不由客户端联网下载。
 组件支持 Windows x86_64 和统信 UOS/Linux aarch64 本机 CPU 训练。两个平台必须分别在
 目标系统本机用 PyInstaller 构建，禁止交叉打包。
-UOS 的 PyInstaller 6 `onedir` 产物允许使用仅指向组件目录内普通文件的符号链接；签包
-时会把这些链接展开为受签名保护的普通文件，越界链接、目录链接和特殊文件仍会被拒绝。
+UOS 的 PyInstaller 6 `onedir` 产物允许使用仅指向组件目录内普通文件的符号链接；打包
+时会把这些链接展开为普通文件，越界链接、目录链接和特殊文件仍会被拒绝。
 
 ## 模型与协议
 
@@ -54,8 +54,6 @@ python -m pip install --no-index --find-links WHEELHOUSE \
 ```powershell
 python scripts/package-trainer.py `
   --platform windows-x86_64 `
-  --key-id trainer-production-1 `
-  --private-key-file D:\secure\trainer-ed25519-private.txt `
   all --build-root D:\trainer-build `
   --output D:\release\IntDemo-Trainer-1.0.0-windows-x86_64.inttrainer
 ```
@@ -65,30 +63,21 @@ python scripts/package-trainer.py `
 ```bash
 python scripts/package-trainer.py \
   --platform linux-aarch64 \
-  --key-id trainer-production-1 \
-  --private-key-file /secure/trainer-ed25519-private.txt \
   all --build-root /tmp/intdemo-trainer-build \
   --output /release/IntDemo-Trainer-1.0.0-linux-aarch64.inttrainer
 ```
 
-私钥文件内容必须是 Base64 编码的 32 字节 Ed25519 私钥。也可以不用
-`--private-key-file`，改为显式设置 `INTDEMO_TRAINER_SIGNING_PRIVATE_KEY`。两者同时存在
-会被拒绝。私钥、公钥签发材料及实际组件包均不得提交到仓库。
-
-外层 `.inttrainer` 是 ZIP 容器，`manifest.json` 使用专用 Ed25519 密钥签名，每个文件
-同时记录大小和 SHA-256。应用安装包不会把生产公钥硬编码进程序；发布器在构建 Windows
-安装包/便携包或 UOS DEB 时，通过管理员选择的 `trainer-trust.json` 将公钥随包写入。
-未选择该文件时，安装包仍可运行标准训练，但不能校验和安装签名的强化组件。在线离线
-授权密钥不会被复用为组件签名密钥。
-`trainer-trust.json` 损坏或格式无效时，机器学习页面仍可打开并继续使用标准模式，但会
-禁用强化组件安装并显示配置错误；发布器在构建前会拒绝无效配置，避免生成无法安装组件的
-产物。
+外层 `.inttrainer` 是 ZIP 容器，也是管理员安装所需的唯一文件，不需要配套 JSON、
+公钥或私钥。`manifest.json` 记录每个文件的大小和 SHA-256；安装器还会检查平台、路径、
+入口程序、清单完整性，并在激活前运行组件 `self-test`。SHA-256 用于发现传输损坏或包内
+文件与清单不一致，不用于证明发布者身份，因此管理员应只安装来自可信本地来源的组件包。
+实际组件包不得提交到仓库。
 
 ## 安装与卸载
 
 管理员在客户端“机器学习”页面查看当前训练模式、实际算法、组件版本、目标平台和
-占用空间，并从本地选择与当前系统相符的 `.inttrainer` 文件安装。安装时会验证签名、
-平台、文件清单和组件自检；Windows x64 包不能装到 UOS ARM64，反之亦然。
+占用空间，并从本地选择与当前系统相符的 `.inttrainer` 文件安装。安装时会验证平台、
+文件清单、文件大小/SHA-256 和组件自检；Windows x64 包不能装到 UOS ARM64，反之亦然。
 升级成功后会保留当前版本和最近一个非活动版本作为本地回退点，更早版本自动清理；
 页面显示的占用空间包含这两个版本及组件清单等本地文件。
 

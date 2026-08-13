@@ -1,4 +1,3 @@
-import base64
 import hashlib
 import json
 import os
@@ -14,32 +13,19 @@ import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-
 from integrated_client.trainer_component import (
     STATUS_AVAILABLE,
     STATUS_DAMAGED,
     STATUS_INCOMPATIBLE,
     STATUS_NOT_INSTALLED,
     TRAINER_COMPONENT_ID,
-    Ed25519ManifestVerifier,
     TrainerBusyError,
     TrainerCompatibilityError,
     TrainerComponentError,
     TrainerComponentManager,
     TrainerPackageError,
     TrainerSelfTestError,
-    TrainerSignatureError,
-    canonical_manifest_payload,
 )
-
-
-def _raw_public_key(private_key):
-    return private_key.public_key().public_bytes(
-        serialization.Encoding.Raw,
-        serialization.PublicFormat.Raw,
-    )
 
 
 _LOCK_HOLDER_SCRIPT = """
@@ -73,16 +59,6 @@ def _wait_for_file(path, timeout=10):
 
 
 class TrainerPackageFactory:
-    def __init__(self):
-        self.private_key = Ed25519PrivateKey.generate()
-        self.key_id = "test-key-1"
-
-    @property
-    def verifier(self):
-        return Ed25519ManifestVerifier(
-            {self.key_id: _raw_public_key(self.private_key)}
-        )
-
     def manifest(
         self,
         files,
@@ -115,13 +91,6 @@ class TrainerPackageFactory:
             "files": entries,
         }
         payload.update(overrides)
-        payload["signature"] = {
-            "algorithm": "ed25519",
-            "key_id": self.key_id,
-            "value": base64.b64encode(
-                self.private_key.sign(canonical_manifest_payload(payload))
-            ).decode("ascii"),
-        }
         return payload
 
     def package(self, path, files=None, manifest=None, extra=(), members=None):
@@ -173,7 +142,6 @@ class TrainerComponentTests(unittest.TestCase):
         kwargs.setdefault("runner", self.successful_runner)
         return TrainerComponentManager(
             data_dir=self.root / "data",
-            signature_verifier=self.factory.verifier,
             platform_key="windows-x86_64",
             current_version="1.1.0",
             **kwargs,
@@ -347,7 +315,6 @@ class TrainerComponentTests(unittest.TestCase):
         )
         manager = TrainerComponentManager(
             data_dir=self.root / "linux-data",
-            signature_verifier=self.factory.verifier,
             platform_key="linux-aarch64",
             current_version="1.1.0",
             runner=self.successful_runner,
@@ -363,38 +330,25 @@ class TrainerComponentTests(unittest.TestCase):
         self.assertIn("click", command)
         self.assertTrue(manager.active_executable().is_file())
 
-    def test_install_requires_dedicated_signature_verifier(self):
+    def test_install_does_not_require_a_trust_file(self):
         manager = TrainerComponentManager(
             data_dir=self.root / "data",
             platform_key="windows-x86_64",
             current_version="1.1.0",
             runner=self.successful_runner,
         )
-        with self.assertRaises(TrainerSignatureError):
-            manager.install(self.package())
-        self.assertEqual(manager.status().code, STATUS_NOT_INSTALLED)
-        # Signature configuration gates installation/activation only; an
-        # administrator can always remove the local component directory.
-        self.assertEqual(manager.uninstall(), 0)
-
-    def test_missing_verifier_reports_incompatible_but_allows_uninstall(self):
-        manager = self.manager()
-        manager.install(self.package())
-        manager.signature_verifier = None
-
-        status = manager.status()
-
-        self.assertEqual(status.code, STATUS_INCOMPATIBLE)
-        self.assertTrue(status.message)
+        self.assertEqual(manager.install(self.package()).status.code, STATUS_AVAILABLE)
         self.assertGreater(manager.uninstall(), 0)
         self.assertEqual(manager.status().code, STATUS_NOT_INSTALLED)
 
-    def test_rejects_tampered_manifest(self):
+    def test_accepts_valid_unsigned_manifest(self):
         files = [("bin/intdemo-trainer.exe", b"trainer")]
         manifest = self.factory.manifest(files)
         manifest["version"] = "1.0.1"
-        with self.assertRaises(TrainerSignatureError):
-            self.manager().install(self.package(manifest=manifest, files=files))
+        result = self.manager().install(
+            self.package(manifest=manifest, files=files)
+        )
+        self.assertEqual(result.status.version, "1.0.1")
 
     def test_rejects_tampered_file(self):
         declared = [("bin/intdemo-trainer.exe", b"trainer")]
@@ -478,9 +432,6 @@ class TrainerComponentTests(unittest.TestCase):
         files = [("bin/intdemo-trainer.exe", b"trainer")]
         manifest = self.factory.manifest(files)
         manifest["files"][0]["size"] += 1
-        manifest["signature"]["value"] = base64.b64encode(
-            self.factory.private_key.sign(canonical_manifest_payload(manifest))
-        ).decode("ascii")
         with self.assertRaisesRegex(TrainerPackageError, "大小"):
             self.manager().install(self.package(files=files, manifest=manifest))
 
@@ -952,15 +903,6 @@ class TrainerComponentTests(unittest.TestCase):
         status = manager.status()
         self.assertEqual(status.code, STATUS_DAMAGED)
         self.assertTrue(status.message)
-
-    def test_untrusted_key_is_reported_as_incompatible_after_install(self):
-        manager = self.manager()
-        manager.install(self.package())
-        manager.signature_verifier = Ed25519ManifestVerifier(
-            {"different-key": _raw_public_key(Ed25519PrivateKey.generate())}
-        )
-        self.assertEqual(manager.status().code, STATUS_INCOMPATIBLE)
-
 
 if __name__ == "__main__":
     unittest.main()

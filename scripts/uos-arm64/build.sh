@@ -17,7 +17,6 @@ base_url=""
 channel="test"
 ca_bundle=""
 ca_bundle_mode="default"
-trainer_trust_file=""
 
 usage() {
   cat <<'EOF'
@@ -28,7 +27,6 @@ usage() {
   --skip-deb            只生成 tar.gz，不生成 UOS ARM64 DEB
   --base-url URL        写入安装包的 HTTPS 在线服务地址
   --ca-bundle PATH      写入安装包的私有 CA 根证书
-  --trainer-trust-file PATH  写入强化组件专用 Ed25519 可信公钥配置
   --no-ca-bundle        使用系统公共 CA，不附带私有根证书
   --channel NAME        更新通道：test 或 stable（默认 test）
 EOF
@@ -49,11 +47,6 @@ while (($#)); do
       (($# >= 2)) || { echo "错误：--ca-bundle 缺少参数。" >&2; exit 2; }
       ca_bundle="$2"
       ca_bundle_mode="file"
-      shift
-      ;;
-    --trainer-trust-file)
-      (($# >= 2)) || { echo "错误：--trainer-trust-file 缺少参数。" >&2; exit 2; }
-      trainer_trust_file="$2"
       shift
       ;;
     --no-ca-bundle)
@@ -87,16 +80,6 @@ if [[ "$ca_bundle_mode" == "file" ]]; then
     echo "错误：找不到 --ca-bundle 指定的证书：$ca_bundle" >&2
     exit 2
   fi
-fi
-if [[ -n "$trainer_trust_file" ]]; then
-  if [[ "$trainer_trust_file" != /* ]]; then
-    trainer_trust_file="$repo_root/$trainer_trust_file"
-  fi
-  if [[ ! -f "$trainer_trust_file" ]]; then
-    echo "错误：找不到 --trainer-trust-file 指定的配置：$trainer_trust_file" >&2
-    exit 2
-  fi
-  trainer_trust_file="$(readlink -f "$trainer_trust_file")"
 fi
 
 case "$(uname -m)" in
@@ -359,9 +342,6 @@ mkdir -p "$package_root/app" "$package_root/browser" "$package_root/certs"
 cp -a "$pyinstaller_dist/intdemo-client/." "$package_root/app/"
 cp -a "$browser_source_dir/." "$package_root/browser/"
 cp "$repo_root/packaging/uos-arm64/client-online.json" "$package_root/"
-if [[ -n "$trainer_trust_file" ]]; then
-  cp "$trainer_trust_file" "$package_root/trainer-trust.json"
-fi
 package_ca_bundle=""
 if [[ "$ca_bundle_mode" == "default" ]]; then
   ca_bundle="$repo_root/packaging/uos-arm64/certs/intdemo-caddy-root.crt"

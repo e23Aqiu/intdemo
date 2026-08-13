@@ -1,8 +1,6 @@
-import base64
 import hashlib
 import io
 import json
-import os
 import stat
 import subprocess
 import tempfile
@@ -12,8 +10,6 @@ from pathlib import Path
 from unittest.mock import patch
 
 import numpy as np
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from PIL import Image
 
 from enhanced_trainer import cli, training
@@ -26,13 +22,11 @@ from enhanced_trainer.dataset import (
 )
 from enhanced_trainer.package_tool import (
     LINUX_ARM64_PLATFORM,
-    SIGNING_KEY_ENVIRONMENT,
     WINDOWS_RUNTIME_FILES,
     WINDOWS_PLATFORM,
     PackageToolError,
     _synchronize_windows_runtime,
     build_native_bundle,
-    load_signing_key,
     package_bundle,
     require_native_platform,
     self_test_bundle,
@@ -59,7 +53,6 @@ from enhanced_trainer.protocol import (
 from integrated_client import enhanced_training
 from integrated_client.trainer_component import (
     STATUS_AVAILABLE,
-    Ed25519ManifestVerifier,
     TrainerComponentManager,
 )
 
@@ -338,7 +331,6 @@ class EnhancedPackageToolTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
-        self.private_key = Ed25519PrivateKey.generate()
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -351,21 +343,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
         (bundle / "_internal" / "torch.dll").write_bytes(b"runtime")
         return bundle
 
-    def test_private_key_must_be_explicit_and_is_never_generated(self):
-        with self.assertRaisesRegex(PackageToolError, "显式提供"):
-            load_signing_key(environ={})
-
-        raw = self.private_key.private_bytes(
-            serialization.Encoding.Raw,
-            serialization.PrivateFormat.Raw,
-            serialization.NoEncryption(),
-        )
-        loaded = load_signing_key(
-            environ={SIGNING_KEY_ENVIRONMENT: base64.b64encode(raw).decode("ascii")}
-        )
-        self.assertIsInstance(loaded, Ed25519PrivateKey)
-
-    def test_native_signed_package_installs_through_component_manager(self):
+    def test_native_unsigned_package_installs_through_component_manager(self):
         package = self.root / "trainer.inttrainer"
         with patch(
             "enhanced_trainer.package_tool.native_platform_key",
@@ -374,14 +352,11 @@ class EnhancedPackageToolTests(unittest.TestCase):
             package_bundle(
                 self._bundle(),
                 package,
-                key_id="trainer-test-key",
-                private_key=self.private_key,
                 requested_platform=WINDOWS_PLATFORM,
             )
-        public_key = self.private_key.public_key().public_bytes(
-            serialization.Encoding.Raw,
-            serialization.PublicFormat.Raw,
-        )
+        with zipfile.ZipFile(package) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+        self.assertNotIn("signature", manifest)
 
         def runner(command, **_kwargs):
             manifest = json.loads(
@@ -402,9 +377,6 @@ class EnhancedPackageToolTests(unittest.TestCase):
 
         manager = TrainerComponentManager(
             data_dir=self.root / "data",
-            signature_verifier=Ed25519ManifestVerifier(
-                {"trainer-test-key": public_key}
-            ),
             platform_key=WINDOWS_PLATFORM,
             current_version="1.1.0",
             runner=runner,
@@ -418,7 +390,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
         ), self.assertRaisesRegex(PackageToolError, "禁止交叉打包"):
             require_native_platform(LINUX_ARM64_PLATFORM)
 
-    def test_package_refuses_to_overwrite_existing_signed_artifact(self):
+    def test_package_refuses_to_overwrite_existing_artifact(self):
         output = self.root / "existing.inttrainer"
         output.write_bytes(b"keep-me")
         with patch(
@@ -428,8 +400,6 @@ class EnhancedPackageToolTests(unittest.TestCase):
             package_bundle(
                 self._bundle(),
                 output,
-                key_id="trainer-test-key",
-                private_key=self.private_key,
                 requested_platform=WINDOWS_PLATFORM,
             )
         self.assertEqual(output.read_bytes(), b"keep-me")
@@ -454,8 +424,6 @@ class EnhancedPackageToolTests(unittest.TestCase):
             package_bundle(
                 bundle,
                 self.root / "escape.inttrainer",
-                key_id="trainer-test-key",
-                private_key=self.private_key,
                 requested_platform=WINDOWS_PLATFORM,
             )
 
@@ -468,8 +436,6 @@ class EnhancedPackageToolTests(unittest.TestCase):
             package_bundle(
                 bundle,
                 package,
-                key_id="trainer-test-key",
-                private_key=self.private_key,
                 requested_platform=WINDOWS_PLATFORM,
             )
         with zipfile.ZipFile(package) as archive:
@@ -482,10 +448,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
 
     def test_frozen_bundle_self_test_contract(self):
         bundle = self._bundle()
-        observed_environment = {}
-
         def runner(command, **options):
-            observed_environment.update(options["env"])
             return subprocess.CompletedProcess(
                 command,
                 0,
@@ -499,10 +462,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
                 stderr="",
             )
 
-        with patch.dict(
-            os.environ,
-            {SIGNING_KEY_ENVIRONMENT: "must-not-reach-child"},
-        ), patch(
+        with patch(
                 "enhanced_trainer.package_tool.native_platform_key",
                 return_value=WINDOWS_PLATFORM,
             ):
@@ -512,7 +472,6 @@ class EnhancedPackageToolTests(unittest.TestCase):
                 runner=runner,
             )
         self.assertTrue(result["ok"])
-        self.assertNotIn(SIGNING_KEY_ENVIRONMENT, observed_environment)
 
     def test_native_build_uses_package_hooks_without_collect_all(self):
         commands = []

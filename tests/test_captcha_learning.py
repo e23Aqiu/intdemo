@@ -35,7 +35,6 @@ from integrated_client.tools.transport_tool import (
 )
 from integrated_client.ui.machine_learning_page import MachineLearningPage
 from integrated_client.ui.main_window import MainWindow
-from integrated_client.trainer_trust import TrainerTrustConfigurationError
 
 
 class _FakeTrainerStatus:
@@ -2096,42 +2095,6 @@ class CaptchaLearningTests(unittest.TestCase):
 
         self.assertIn("检测到组件残留", page.trainer_status_label.text())
         self.assertTrue(page.uninstall_trainer_btn.isEnabled())
-        page.deleteLater()
-
-    def test_machine_learning_page_survives_invalid_trainer_trust_config(self):
-        with patch.object(MachineLearningPage, "refresh"), patch(
-            "integrated_client.ui.machine_learning_page."
-            "create_trainer_component_manager",
-            side_effect=TrainerTrustConfigurationError("公钥配置损坏"),
-        ):
-            page = MachineLearningPage(_FakeSession())
-        page.refresh_timer.stop()
-
-        self.assertEqual(page.training_mode_combo.currentData(), "standard")
-        self.assertIn("公钥配置损坏", page.trainer_status_label.text())
-        self.assertIn("标准模式仍可使用", page.trainer_status_label.text())
-        self.assertFalse(page.install_trainer_btn.isEnabled())
-        self.assertTrue(page.training_mode_combo.isEnabled())
-        page.deleteLater()
-
-    def test_machine_learning_page_survives_deeply_nested_trust_file(self):
-        with tempfile.TemporaryDirectory() as directory:
-            trust_file = Path(directory) / "trainer-trust.json"
-            trust_file.write_text(
-                "[" * 1_500 + "0" + "]" * 1_500,
-                encoding="utf-8",
-            )
-            with patch.object(MachineLearningPage, "refresh"), patch.dict(
-                os.environ,
-                {"INTDEMO_TRAINER_TRUST_FILE": str(trust_file)},
-                clear=False,
-            ):
-                page = MachineLearningPage(_FakeSession())
-        page.refresh_timer.stop()
-
-        self.assertEqual(page.training_mode_combo.currentData(), "standard")
-        self.assertIn("标准模式仍可使用", page.trainer_status_label.text())
-        self.assertFalse(page.install_trainer_btn.isEnabled())
         page.deleteLater()
 
     def test_machine_learning_page_runs_trainer_component_lifecycle(self):

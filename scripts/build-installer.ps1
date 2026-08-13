@@ -5,8 +5,6 @@ param(
 
     [string]$CaBundle = "",
 
-    [string]$TrainerTrustFile = "",
-
     [ValidateSet("test", "stable")]
     [string]$Channel = "test",
 
@@ -79,13 +77,6 @@ try {
 
     Reset-DirectoryWithinDist $stage
     Copy-Item -Path (Join-Path $buildOutput.FullName "*") -Destination $stage -Recurse -Force
-
-    if ($TrainerTrustFile) {
-        $resolvedTrainerTrust = (Resolve-Path -LiteralPath $TrainerTrustFile).Path
-        Copy-Item -LiteralPath $resolvedTrainerTrust `
-            -Destination (Join-Path $stage "trainer-trust.json") `
-            -Force
-    }
 
     $relativeCa = $null
     if ($CaBundle) {

@@ -1,20 +1,7 @@
-"""Secure, offline management for the optional enhanced trainer component.
-
-The enhanced trainer is deliberately distributed outside the application and
-server.  ``TrainerComponentManager`` installs a signed ``.inttrainer`` ZIP in
-the current user's data directory, verifies it before activation, and exposes
-one platform-neutral command-line protocol to the UI/training service.
-
-Package signatures use a dedicated Ed25519 trust root.  The online entitlement
-key is intentionally not reused: that key is delivered by the server at login
-time and its private key has a different security purpose.  Production builds
-must inject an ``Ed25519ManifestVerifier`` populated with the public keys used
-by the offline component packager.
-"""
+"""Secure, offline management for the optional enhanced trainer component."""
 
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import json
@@ -32,15 +19,11 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
-from typing import Protocol
 
 if os.name == "nt":
     import msvcrt
 else:
     import fcntl
-
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from .config import APP_VERSION, get_data_dir
 from .platform_support import (
@@ -82,7 +65,6 @@ STATUS_INCOMPATIBLE = "incompatible"
 
 _VERSION_PATTERN = re.compile(r"^\d+(?:\.\d+){2,3}$")
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
-_KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _CAPABILITY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _INSTALLING_DIRECTORY_PATTERN = re.compile(r"^\.installing-[A-Za-z0-9_-]{6,64}$")
 _REMOVAL_DIRECTORY_PATTERN = re.compile(r"^\.trainer-removing-([0-9a-f]{32})$")
@@ -109,10 +91,6 @@ class TrainerComponentError(RuntimeError):
 
 class TrainerPackageError(TrainerComponentError):
     """The selected archive is malformed or violates package policy."""
-
-
-class TrainerSignatureError(TrainerPackageError):
-    """The package manifest cannot be authenticated by a trusted key."""
 
 
 class TrainerCompatibilityError(TrainerPackageError):
@@ -173,69 +151,6 @@ class _LifecycleResiduals:
     @property
     def present(self) -> bool:
         return bool(self.descriptions)
-
-
-class ManifestSignatureVerifier(Protocol):
-    """Verify the canonical manifest bytes against its signature block."""
-
-    def verify(self, payload: bytes, signature: Mapping[str, object]) -> None:
-        ...
-
-
-class Ed25519ManifestVerifier:
-    """Ed25519 verifier backed by explicitly configured trusted public keys."""
-
-    def __init__(self, trusted_public_keys: Mapping[str, bytes | str]):
-        keys: dict[str, Ed25519PublicKey] = {}
-        for raw_key_id, encoded_key in trusted_public_keys.items():
-            key_id = str(raw_key_id or "").strip()
-            if not _KEY_ID_PATTERN.fullmatch(key_id):
-                raise ValueError(f"无效的强化组件签名密钥编号：{key_id or '-'}")
-            try:
-                if isinstance(encoded_key, str):
-                    raw = base64.b64decode(encoded_key, validate=True)
-                else:
-                    raw = bytes(encoded_key)
-                keys[key_id] = Ed25519PublicKey.from_public_bytes(raw)
-            except (TypeError, ValueError) as exc:
-                raise ValueError(
-                    f"强化组件签名公钥 {key_id} 必须是 32 字节 Ed25519 公钥"
-                ) from exc
-        self._keys = keys
-
-    def verify(self, payload: bytes, signature: Mapping[str, object]) -> None:
-        if set(signature) != {"algorithm", "key_id", "value"}:
-            raise TrainerSignatureError("强化组件签名字段不完整或包含未知字段")
-        if str(signature.get("algorithm") or "").casefold() != "ed25519":
-            raise TrainerSignatureError("强化组件只接受 Ed25519 签名")
-        key_id = str(signature.get("key_id") or "").strip()
-        key = self._keys.get(key_id)
-        if key is None:
-            raise TrainerSignatureError(
-                f"强化组件签名密钥不受信任：{key_id or '-'}"
-            )
-        try:
-            encoded_signature = str(signature.get("value") or "").strip()
-            raw_signature = base64.b64decode(encoded_signature, validate=True)
-            if len(raw_signature) != 64:
-                raise ValueError("signature length")
-            key.verify(raw_signature, payload)
-        except (InvalidSignature, TypeError, ValueError) as exc:
-            raise TrainerSignatureError("强化组件签名验证失败") from exc
-
-
-def canonical_manifest_payload(manifest: Mapping[str, object]) -> bytes:
-    """Return the exact byte representation covered by the Ed25519 signature."""
-
-    unsigned = dict(manifest)
-    unsigned.pop("signature", None)
-    return json.dumps(
-        unsigned,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
 
 
 def _version_key(value: str) -> tuple[int, int, int, int]:
@@ -337,7 +252,6 @@ class TrainerComponentManager:
         self,
         *,
         data_dir: Path | str | None = None,
-        signature_verifier: ManifestSignatureVerifier | None = None,
         platform_key: str | None = None,
         current_version: str | None = None,
         runner: Callable[..., subprocess.CompletedProcess] | None = None,
@@ -350,7 +264,6 @@ class TrainerComponentManager:
         # The lock must remain outside component_root: uninstall renames that
         # directory, which cannot safely carry an open lock file on Windows.
         self.training_lock_path = self.component_root.parent / ".trainer-operation.lock"
-        self.signature_verifier = signature_verifier
         self.platform_key = str(platform_key or update_platform_key()).casefold()
         self.current_version = str(current_version or APP_VERSION).strip()
         self.runner = runner or subprocess.run
@@ -361,19 +274,6 @@ class TrainerComponentManager:
                 "当前系统不支持强化训练组件，仅支持 Windows x64 和 Linux ARM64"
             )
         _version_key(self.current_version)
-
-    def _verify_signature(self, manifest: Mapping[str, object]) -> None:
-        if self.signature_verifier is None:
-            raise TrainerSignatureError(
-                "客户端尚未配置强化组件专用 Ed25519 可信公钥"
-            )
-        signature = manifest.get("signature")
-        if not isinstance(signature, dict):
-            raise TrainerSignatureError("强化组件清单缺少 Ed25519 签名")
-        self.signature_verifier.verify(
-            canonical_manifest_payload(manifest),
-            signature,
-        )
 
     def _validate_manifest(self, manifest: dict) -> dict:
         required = {
@@ -386,7 +286,6 @@ class TrainerComponentManager:
             "entrypoint",
             "capabilities",
             "files",
-            "signature",
         }
         allowed = required | {"max_client_version"}
         if set(manifest) != required and not (
@@ -575,10 +474,6 @@ class TrainerComponentManager:
                 manifest_bytes,
                 label="强化组件清单",
             )
-            # Authenticate the exact JSON values supplied by the packager.
-            # Validation may normalize path separators and case for safe local
-            # use, but that must never make an altered manifest appear signed.
-            self._verify_signature(raw_manifest)
             manifest = self._validate_manifest(raw_manifest)
             self._check_compatibility(manifest)
 
@@ -702,7 +597,6 @@ class TrainerComponentManager:
             str(TRAINER_PROTOCOL_VERSION),
         ]
         environment = system_application_environment()
-        environment.pop("INTDEMO_TRAINER_SIGNING_PRIVATE_KEY", None)
         environment.update(
             {
                 "INTDEMO_TRAINER_COMPONENT_DIR": str(directory),
@@ -795,7 +689,6 @@ class TrainerComponentManager:
             manifest_bytes,
             label="已安装强化组件清单",
         )
-        self._verify_signature(raw_manifest)
         manifest = self._validate_manifest(raw_manifest)
         self._check_compatibility(manifest)
         if active["version"] != manifest["version"] or (
@@ -850,14 +743,6 @@ class TrainerComponentManager:
                 verify_files=verify_files
             )
         except TrainerCompatibilityError as exc:
-            version, platform_name = self._active_status_hints()
-            return TrainerComponentStatus(
-                code=STATUS_INCOMPATIBLE,
-                message=str(exc),
-                version=version,
-                platform=platform_name,
-            )
-        except TrainerSignatureError as exc:
             version, platform_name = self._active_status_hints()
             return TrainerComponentStatus(
                 code=STATUS_INCOMPATIBLE,
@@ -1608,8 +1493,6 @@ __all__ = [
     "TRAINER_OUTPUT_MODEL_NAME",
     "TRAINER_PACKAGE_SUFFIX",
     "TRAINER_PROTOCOL_VERSION",
-    "Ed25519ManifestVerifier",
-    "ManifestSignatureVerifier",
     "TrainerBusyError",
     "TrainerCompatibilityError",
     "TrainerComponentError",
@@ -1618,6 +1501,4 @@ __all__ = [
     "TrainerInstallResult",
     "TrainerPackageError",
     "TrainerSelfTestError",
-    "TrainerSignatureError",
-    "canonical_manifest_payload",
 ]

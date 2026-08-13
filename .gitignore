@@ -20,8 +20,6 @@ Miniforge3-*.sh
 .env.*
 !.env.example
 /client-online.json
-trainer-trust.json
-!packaging/trainer/trainer-trust.example.json
 *.inttrainer
 
 # Test and coverage output
