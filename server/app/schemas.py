@@ -458,6 +458,7 @@ class CaptchaLearningOverview(StrictModel):
     dataset: CaptchaDatasetStats
     attempts: list[CaptchaAttemptMetric]
     models: list[CaptchaModelView]
+    supported_model_algorithms: dict[Literal["numeric", "click"], list[str]]
 
 
 class CaptchaModelCreate(StrictModel):

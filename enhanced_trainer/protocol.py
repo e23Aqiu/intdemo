@@ -285,10 +285,13 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
     expected_accuracy = metadata["correct_count"] / metadata["test_count"]
     if abs(float(accuracy) - expected_accuracy) > 1e-9:
         raise TrainerProtocolError("强化训练准确率与计数不一致")
-    for field in ("train_samples", "test_samples", "correct_samples", "seed"):
+    for field in ("train_samples", "test_samples", "correct_samples"):
         value = metrics.get(field)
         if type(value) is not int or value < 0 or value > 10_000_000:
             raise TrainerProtocolError(f"强化训练指标 {field} 无效")
+    seed = metrics.get("seed")
+    if type(seed) is not int or not 0 <= seed <= 2_147_483_647:
+        raise TrainerProtocolError("强化训练指标 seed 无效")
     for field in ("epochs", "batch_size"):
         value = metrics.get(field)
         if type(value) is not int or not 1 <= value <= 10_000_000:

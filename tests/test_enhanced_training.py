@@ -126,7 +126,7 @@ class _OutputRunner:
             "test_samples": 5,
             "correct_samples": 4,
             "accuracy": 0.8,
-            "seed": 104729,
+            "seed": 2_147_483_647,
             "epochs": 8,
             "batch_size": 16,
             "per_position_accuracy": [1.0, 0.8, 0.8, 0.6],

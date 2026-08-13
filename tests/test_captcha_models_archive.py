@@ -4,6 +4,7 @@ import unittest
 import zipfile
 
 import numpy as np
+from PIL import Image
 
 from integrated_client.captcha_models import (
     CaptchaModelManager,
@@ -11,6 +12,8 @@ from integrated_client.captcha_models import (
     HogLinearSvmCaptchaModel,
     KnnCaptchaModel,
     _safe_dataset_archive,
+    _split_numeric_samples,
+    inspect_training_dataset,
 )
 
 
@@ -47,6 +50,12 @@ def _rewrite_npz(artifact, **replacements):
 
 
 class CaptchaDatasetArchiveTests(unittest.TestCase):
+    @staticmethod
+    def _png_bytes():
+        output = io.BytesIO()
+        Image.new("L", (32, 16), 255).save(output, format="PNG")
+        return output.getvalue()
+
     def test_reads_top_level_english_category_directories(self):
         samples = [
             {
@@ -163,6 +172,101 @@ class CaptchaDatasetArchiveTests(unittest.TestCase):
 
         with self.assertRaises(CaptchaTrainingError):
             _safe_dataset_archive(archive)
+
+    def test_training_inspection_reports_invalid_and_duplicate_samples(self):
+        image = self._png_bytes()
+        samples = []
+        entries = []
+        for index in range(30):
+            image_name = f"numeric/{index}.png"
+            item = {
+                "captcha_type": "numeric",
+                "image": image_name,
+                "answer": {"value": f"{index:04d}"[-4:]},
+                "fingerprint": f"{index + 1:064x}",
+            }
+            if index == 20:
+                item["answer"] = {"value": "12x4"}
+            if index == 21:
+                item["fingerprint"] = f"{1:064x}"
+            samples.append(item)
+            if index != 22:
+                entries.append((image_name, b"invalid" if index == 23 else image))
+        archive = _archive(
+            [
+                (
+                    "manifest.json",
+                    json.dumps({"schema_version": 1, "samples": samples}),
+                ),
+                *entries,
+            ]
+        )
+
+        inspection = inspect_training_dataset(archive, "numeric")
+
+        self.assertEqual(inspection.declared_samples, 30)
+        self.assertEqual(inspection.valid_count, 26)
+        self.assertEqual(inspection.invalid_answers, 1)
+        self.assertEqual(inspection.duplicate_samples, 1)
+        self.assertEqual(inspection.missing_images, 1)
+        self.assertEqual(inspection.invalid_images, 1)
+        self.assertIn("图片无法读取 1 条", inspection.rejection_summary())
+
+    def test_training_inspection_uses_server_source_count_for_skipped_rows(self):
+        image = self._png_bytes()
+        samples = [
+            {
+                "captcha_type": "numeric",
+                "image": f"numeric/{index}.png",
+                "answer": {"value": f"{index:04d}"[-4:]},
+                "fingerprint": f"{index + 1:064x}",
+            }
+            for index in range(19)
+        ]
+        archive = _archive(
+            [
+                (
+                    "manifest.json",
+                    json.dumps(
+                        {
+                            "schema_version": 1,
+                            "captcha_type": "numeric",
+                            "source_sample_count": 30,
+                            "skipped_sample_count": 11,
+                            "samples": samples,
+                        }
+                    ),
+                ),
+                *((item["image"], image) for item in samples),
+            ]
+        )
+
+        inspection = inspect_training_dataset(archive, "numeric")
+
+        self.assertEqual(inspection.declared_samples, 30)
+        self.assertEqual(inspection.valid_count, 19)
+        self.assertEqual(inspection.missing_images, 11)
+
+    def test_numeric_holdout_preserves_last_training_example_for_each_digit(self):
+        values = ["0000", "0000", "1111", "1111"] + [
+            f"{index % 10}{(index + 1) % 10}{(index + 2) % 10}{(index + 3) % 10}"
+            for index in range(20)
+        ]
+        samples = [
+            {
+                "answer": {"value": value},
+                "fingerprint": f"{index + 1:064x}",
+            }
+            for index, value in enumerate(values)
+        ]
+
+        train, test = _split_numeric_samples(samples)
+
+        self.assertTrue(test)
+        for position in range(4):
+            all_digits = {item["answer"]["value"][position] for item in samples}
+            train_digits = {item["answer"]["value"][position] for item in train}
+            self.assertEqual(train_digits, all_digits)
 
 
 class CaptchaStandardModelArchiveTests(unittest.TestCase):

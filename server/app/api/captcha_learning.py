@@ -1426,6 +1426,10 @@ def learning_overview(
     return {
         "policy": _policy_view(db, policy),
         "dataset": _dataset_stats(db),
+        "supported_model_algorithms": {
+            captcha_type: sorted(supported_algorithms(captcha_type))
+            for captcha_type in sorted(CAPTCHA_TYPES)
+        },
         "attempts": _attempt_metrics(
             db,
             captcha_type=captcha_type,
@@ -1633,6 +1637,8 @@ def export_captcha_dataset(
         manifest = {
             "schema_version": DATASET_SCHEMA_VERSION,
             "captcha_type": captcha_type or "mixed",
+            "source_sample_count": len(samples),
+            "skipped_sample_count": len(samples) - len(manifest_samples),
             "categories": {
                 "numeric": {
                     "label": "数字验证码",

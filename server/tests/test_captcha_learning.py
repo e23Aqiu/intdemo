@@ -483,6 +483,10 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     )
     assert overview.status_code == 200
     body = overview.json()
+    assert body["supported_model_algorithms"] == {
+        "click": ["hog-linear-svm-v1", "tiny-cnn-onnx-v1"],
+        "numeric": ["hog-linear-svm-v1", "tiny-cnn-onnx-v1"],
+    }
     assert body["dataset"]["total_count"] == 1
     assert body["dataset"]["numeric_count"] == 1
     assert body["dataset"]["total_bytes"] == len(PNG_1X1)
@@ -585,6 +589,8 @@ def test_dataset_export_import_and_model_activation(client):
         assert "manifest.json" in archive.namelist()
         manifest = json.loads(archive.read("manifest.json"))
         assert manifest["captcha_type"] == "mixed"
+        assert manifest["source_sample_count"] == 2
+        assert manifest["skipped_sample_count"] == 0
         assert manifest["categories"]["numeric"]["sample_count"] == 1
         assert manifest["categories"]["click"]["sample_count"] == 1
         assert not any(
@@ -624,6 +630,8 @@ def test_dataset_export_import_and_model_activation(client):
         with zipfile.ZipFile(io.BytesIO(classified.content)) as archive:
             manifest = json.loads(archive.read("manifest.json"))
             assert manifest["captcha_type"] == captcha_type
+            assert manifest["source_sample_count"] == 1
+            assert manifest["skipped_sample_count"] == 0
             assert manifest["sample_count"] == 1
             assert {
                 item["captcha_type"] for item in manifest["samples"]

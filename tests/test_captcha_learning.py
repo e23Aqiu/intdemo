@@ -2216,13 +2216,58 @@ class CaptchaLearningTests(unittest.TestCase):
             return_value=candidate,
         ) as enhanced, patch(
             "integrated_client.ui.machine_learning_page.train_candidate",
-        ) as standard:
+        ) as standard, patch(
+            "integrated_client.ui.machine_learning_page.inspect_training_dataset",
+            return_value=SimpleNamespace(valid_count=25),
+        ):
             page._train_model("numeric")
 
         enhanced.assert_called_once_with(b"dataset", "numeric", manager)
         standard.assert_not_called()
         self.assertTrue(page.train_numeric_btn.isEnabled())
         self.assertTrue(page.train_click_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_blocks_training_against_old_server(self):
+        session = _FakeSession()
+        manager = _FakeTrainerManager(available=True, mode="standard")
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session, trainer_manager=manager)
+        page.refresh_timer.stop()
+        page._server_capabilities_loaded = True
+        page._server_model_algorithms = {}
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning, patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.question"
+        ) as question, patch.object(page, "_start") as start:
+            page._train_model("numeric")
+
+        self.assertEqual(warning.call_args.args[1], "服务器版本不兼容")
+        self.assertIn("升级到 v1.1.0", warning.call_args.args[2])
+        question.assert_not_called()
+        start.assert_not_called()
+        page.deleteLater()
+
+    def test_machine_learning_page_reports_old_server_upload_validation(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        error = ApiResponseError(
+            "validation_error",
+            "请求参数无效",
+            status_code=422,
+        )
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning:
+            page._model_trained("numeric", None, error)
+
+        self.assertEqual(warning.call_args.args[1], "服务器版本不兼容")
+        self.assertIn("升级到 v1.1.0", warning.call_args.args[2])
         page.deleteLater()
 
     def test_workers_emit_success_metrics_without_sample_data(self):

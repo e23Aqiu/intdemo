@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
 from ..captcha_models import (
     BUILTIN_MODEL_VERSION,
     CaptchaTrainingError,
+    inspect_training_dataset,
     train_candidate,
 )
 from ..enhanced_training import train_enhanced_candidate
@@ -59,6 +60,10 @@ ACTIVATABLE_MODEL_ALGORITHMS = frozenset(
     {"hog-linear-svm-v1", "tiny-cnn-onnx-v1"}
 )
 RETIRED_KNN_ALGORITHM = "knn-pixels-v1"
+TRAINING_ALGORITHM_BY_MODE = {
+    "standard": "hog-linear-svm-v1",
+    "enhanced": "tiny-cnn-onnx-v1",
+}
 
 
 def _format_size(size):
@@ -120,6 +125,8 @@ class MachineLearningPage(QWidget):
         self._loading_training_mode = False
         self._component_task_running = False
         self._training_in_progress = False
+        self._server_capabilities_loaded = False
+        self._server_model_algorithms = {}
         self._confirmed_upload_mode = "off"
         self._model_rows = []
         self._all_model_rows = []
@@ -688,6 +695,17 @@ class MachineLearningPage(QWidget):
             self.policy_detail.setText(f"读取失败：{error}")
             return
         overview = result or {}
+        capabilities = overview.get("supported_model_algorithms")
+        self._server_capabilities_loaded = True
+        self._server_model_algorithms = (
+            {
+                kind: frozenset(str(value) for value in values)
+                for kind, values in capabilities.items()
+                if kind in {"numeric", "click"} and isinstance(values, list)
+            }
+            if isinstance(capabilities, dict)
+            else {}
+        )
         policy = overview.get("policy") or {}
         dataset = overview.get("dataset") or {}
         models = overview.get("models") or []
@@ -1632,6 +1650,17 @@ class MachineLearningPage(QWidget):
         mode = self.trainer_manager.preferred_mode()
         mode_name = "强化模式" if mode == "enhanced" else "标准模式"
         method_name = TRAINING_METHODS[mode]
+        algorithm = TRAINING_ALGORITHM_BY_MODE[mode]
+        if self._server_capabilities_loaded and algorithm not in (
+            self._server_model_algorithms.get(captcha_type) or frozenset()
+        ):
+            QMessageBox.warning(
+                self,
+                "服务器版本不兼容",
+                "当前在线服务器尚不支持 v1.1.0 的验证码训练模型。\n\n"
+                "请先将服务器升级到 v1.1.0，再开始训练。",
+            )
+            return
         reply = QMessageBox.question(
             self,
             "训练候选模型",
@@ -1660,6 +1689,15 @@ class MachineLearningPage(QWidget):
                 token,
                 captcha_type,
             )
+            inspection = inspect_training_dataset(archive, captcha_type)
+            minimum = 20 if captcha_type == "numeric" else 30
+            if inspection.valid_count < minimum:
+                raise CaptchaTrainingError(
+                    f"服务器记录 {inspection.declared_samples} 条，实际有效且不重复的"
+                    f"{type_name}样本只有 {inspection.valid_count} 条，"
+                    f"至少需要 {minimum} 条。\n"
+                    f"过滤原因：{inspection.rejection_summary()}"
+                )
             candidate = (
                 train_enhanced_candidate(
                     archive,
@@ -1709,6 +1747,17 @@ class MachineLearningPage(QWidget):
             else "训练点选候选模型"
         )
         if error is not None:
+            if (
+                isinstance(error, ApiResponseError)
+                and error.code == "validation_error"
+            ):
+                QMessageBox.warning(
+                    self,
+                    "服务器版本不兼容",
+                    "服务器拒绝了 v1.1.0 模型参数。请先将在线服务器升级到 "
+                    "v1.1.0，再重新训练。",
+                )
+                return
             title = (
                 "样本不足"
                 if isinstance(error, CaptchaTrainingError)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import re
 import threading
 import unicodedata
@@ -50,6 +51,33 @@ class CaptchaCandidate:
     @property
     def accuracy(self) -> float:
         return self.correct_count / self.test_count if self.test_count else 0.0
+
+
+@dataclass(frozen=True)
+class CaptchaDatasetInspection:
+    captcha_type: str
+    declared_samples: int
+    valid_samples: tuple[dict, ...]
+    missing_images: int = 0
+    invalid_answers: int = 0
+    invalid_images: int = 0
+    duplicate_samples: int = 0
+
+    @property
+    def valid_count(self) -> int:
+        return len(self.valid_samples)
+
+    def rejection_summary(self) -> str:
+        reasons = []
+        for count, label in (
+            (self.missing_images, "图片缺失或路径无效"),
+            (self.invalid_answers, "答案格式无效"),
+            (self.invalid_images, "图片无法读取"),
+            (self.duplicate_samples, "内容重复"),
+        ):
+            if count:
+                reasons.append(f"{label} {count} 条")
+        return "、".join(reasons) or "无"
 
 
 def _open_captcha_image(image_bytes: bytes, mode: str) -> Image.Image:
@@ -329,6 +357,156 @@ def _safe_dataset_archive(archive_bytes: bytes) -> list[dict]:
         archive.close()
 
 
+def inspect_training_dataset(
+    archive_bytes: bytes,
+    captcha_type: str,
+) -> CaptchaDatasetInspection:
+    """Apply the common standard/enhanced validity rules before training."""
+    if captcha_type not in {"numeric", "click"}:
+        raise CaptchaTrainingError("验证码类型无效")
+    parsed = _safe_dataset_archive(archive_bytes)
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as archive:
+            manifest_info = next(
+                (
+                    info
+                    for info in archive.infolist()
+                    if _normalize_archive_member(info.filename) == "manifest.json"
+                ),
+                None,
+            )
+            if manifest_info is None:
+                raise ValueError("manifest missing")
+            manifest = json.loads(archive.read(manifest_info).decode("utf-8-sig"))
+    except (
+        OSError,
+        ValueError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+    ) as exc:
+        raise CaptchaTrainingError("数据集清单无效") from exc
+
+    manifest_samples = manifest.get("samples", [])
+    exported = sum(
+        1
+        for item in manifest_samples
+        if isinstance(item, dict) and item.get("captcha_type") == captcha_type
+    )
+    source_count = manifest.get("source_sample_count")
+    if (
+        manifest.get("captcha_type") == captcha_type
+        and type(source_count) is int
+        and source_count >= exported
+    ):
+        declared = source_count
+    else:
+        declared = exported
+    selected = [item for item in parsed if item["captcha_type"] == captcha_type]
+    missing_images = max(0, declared - len(selected))
+    invalid_answers = 0
+    invalid_images = 0
+    duplicate_samples = 0
+    fingerprints = set()
+    valid_samples = []
+    for item in selected:
+        answer = item["answer"]
+        if captcha_type == "numeric":
+            value = str(answer.get("value") or "").strip()
+            if re.fullmatch(r"[0-9]{4}", value) is None:
+                invalid_answers += 1
+                continue
+            normalized_answer = {"value": value}
+        else:
+            prompt = answer.get("prompt")
+            points = answer.get("points")
+            if (
+                not isinstance(prompt, list)
+                or not isinstance(points, list)
+                or not 1 <= len(prompt) <= 8
+                or len(prompt) != len(points)
+            ):
+                invalid_answers += 1
+                continue
+            normalized_prompt = []
+            normalized_points = []
+            valid_answer = True
+            for label, point in zip(prompt, points):
+                label = str(label or "").strip()
+                if (
+                    not label
+                    or len(label) > 4
+                    or not isinstance(point, dict)
+                    or set(point) != {"x", "y"}
+                ):
+                    valid_answer = False
+                    break
+                try:
+                    x = float(point["x"])
+                    y = float(point["y"])
+                except (TypeError, ValueError):
+                    valid_answer = False
+                    break
+                if not math.isfinite(x) or not math.isfinite(y) or not (
+                    0 <= x <= 1 and 0 <= y <= 1
+                ):
+                    valid_answer = False
+                    break
+                normalized_prompt.append(label)
+                normalized_points.append({"x": x, "y": y})
+            if not valid_answer:
+                invalid_answers += 1
+                continue
+            normalized_answer = {
+                "prompt": normalized_prompt,
+                "points": normalized_points,
+            }
+        try:
+            with Image.open(io.BytesIO(item["image"])) as image:
+                if image.width * image.height > MAX_IMAGE_PIXELS:
+                    raise ValueError("image pixel count exceeded")
+                image.verify()
+        except (OSError, SyntaxError, ValueError):
+            invalid_images += 1
+            continue
+        fingerprint = str(item.get("fingerprint") or "").strip().casefold()
+        if re.fullmatch(r"[0-9a-f]{64}", fingerprint) is None:
+            digest = hashlib.sha256()
+            digest.update(captcha_type.encode("ascii"))
+            digest.update(b"\0")
+            digest.update(item["image"])
+            digest.update(b"\0")
+            digest.update(
+                json.dumps(
+                    normalized_answer,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            fingerprint = digest.hexdigest()
+        if fingerprint in fingerprints:
+            duplicate_samples += 1
+            continue
+        fingerprints.add(fingerprint)
+        valid_samples.append(
+            {
+                **item,
+                "answer": normalized_answer,
+                "fingerprint": fingerprint,
+            }
+        )
+    return CaptchaDatasetInspection(
+        captcha_type=captcha_type,
+        declared_samples=declared,
+        valid_samples=tuple(valid_samples),
+        missing_images=missing_images,
+        invalid_answers=invalid_answers,
+        invalid_images=invalid_images,
+        duplicate_samples=duplicate_samples,
+    )
+
+
 def _normalize_archive_member(name: str) -> str:
     """Return a canonical, safe ZIP member name.
 
@@ -361,6 +539,39 @@ def _split_samples(samples: list[dict]) -> tuple[list[dict], list[dict]]:
     train = [item for index, item in enumerate(ordered) if index % 5 != 0]
     if not test or not train:
         raise CaptchaTrainingError("数据集无法划分训练集和测试集")
+    return train, test
+
+
+def _split_numeric_samples(samples: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Build a deterministic holdout without removing a position's last digit."""
+    ordered = sorted(samples, key=lambda item: item["fingerprint"])
+    counts = [
+        {
+            digit: sum(
+                item["answer"]["value"][position] == digit
+                for item in ordered
+            )
+            for digit in "0123456789"
+        }
+        for position in range(4)
+    ]
+    target = max(1, len(ordered) // 5)
+    test = []
+    train = []
+    for item in ordered:
+        value = item["answer"]["value"]
+        can_hold_out = len(test) < target and all(
+            counts[position][digit] > 1
+            for position, digit in enumerate(value)
+        )
+        if can_hold_out:
+            test.append(item)
+            for position, digit in enumerate(value):
+                counts[position][digit] -= 1
+        else:
+            train.append(item)
+    if not test or not train:
+        return _split_samples(ordered)
     return train, test
 
 
@@ -566,7 +777,9 @@ def _train_binary_linear_svm(features: np.ndarray, positive: np.ndarray):
     bias = float(rho)
     norm = float(np.linalg.norm(weight))
     if not np.isfinite(norm) or norm <= 1e-12 or not np.isfinite(bias):
-        raise CaptchaTrainingError("线性 SVM 参数无效")
+        raise CaptchaTrainingError(
+            "线性 SVM 无法区分当前样本；请增加图像差异更大的验证码样本后重试"
+        )
     return (weight / norm).astype(np.float32), np.float32(bias / norm)
 
 
@@ -1118,7 +1331,7 @@ def _train_numeric(samples: list[dict]) -> CaptchaCandidate:
         raise CaptchaTrainingError(
             f"数字验证码至少需要 {MIN_NUMERIC_SAMPLES} 个成功样本"
         )
-    train, test = _split_samples(samples)
+    train, test = _split_numeric_samples(samples)
     features = []
     values = []
     valid_train = 0
@@ -1291,11 +1504,17 @@ def train_candidate(
         raise CaptchaTrainingError("验证码类型无效")
     if str(mode).strip().lower() != "standard":
         raise CaptchaTrainingError("强化模式训练必须由本机强化训练组件执行")
-    samples = [
-        item
-        for item in _safe_dataset_archive(archive_bytes)
-        if item["captcha_type"] == captcha_type
-    ]
+    inspection = inspect_training_dataset(archive_bytes, captcha_type)
+    samples = list(inspection.valid_samples)
+    minimum = (
+        MIN_NUMERIC_SAMPLES if captcha_type == "numeric" else MIN_CLICK_SAMPLES
+    )
+    if len(samples) < minimum:
+        raise CaptchaTrainingError(
+            f"服务器记录 {inspection.declared_samples} 条，实际有效且不重复的"
+            f"{('数字' if captcha_type == 'numeric' else '点选')}验证码只有 {len(samples)} 条，"
+            f"至少需要 {minimum} 条。过滤原因：{inspection.rejection_summary()}"
+        )
     available_samples = len(samples)
     if available_samples > MAX_TRAINING_SAMPLES:
         samples = sorted(
