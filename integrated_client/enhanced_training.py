@@ -9,6 +9,8 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+from collections.abc import Callable
 from pathlib import Path
 
 from .captcha_models import (
@@ -68,6 +70,142 @@ _METRICS_OPTIONAL_FIELDS = {
 
 class EnhancedTrainingError(CaptchaTrainingError):
     """The local enhanced trainer or its output violated protocol v1."""
+
+
+EnhancedProgressCallback = Callable[[dict[str, object]], None]
+
+
+def _emit_progress(
+    callback: EnhancedProgressCallback | None,
+    payload: dict[str, object],
+) -> None:
+    if callback is None:
+        return
+    try:
+        callback(payload)
+    except Exception:  # noqa: BLE001,S110 - observer callbacks are non-critical
+        # Display failures must not affect model training or validation.
+        pass
+
+
+def _component_progress_event(
+    raw_line: str,
+    callback: EnhancedProgressCallback | None,
+) -> None:
+    if callback is None or len(raw_line) > 16_384:
+        return
+    try:
+        event = json.loads(raw_line)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return
+    if not isinstance(event, dict) or event.get("protocol_version") != 1:
+        return
+    name = str(event.get("event") or "")
+    try:
+        epochs = int(event.get("epochs") or 0)
+        epoch = int(event.get("epoch") or 0)
+        samples = int(event.get("sample_count") or 0)
+        batch_size = int(event.get("batch_size") or 0)
+        threads = int(event.get("cpu_threads") or 0)
+        loss = float(event.get("loss") or 0.0)
+        accuracy = float(event.get("accuracy") or 0.0)
+    except (TypeError, ValueError, OverflowError):
+        return
+    if name == "started":
+        _emit_progress(
+            callback,
+            {
+                "event": name,
+                "progress": 32,
+                "message": (
+                    f"强化训练开始：{samples} 条样本，{epochs} 轮，"
+                    f"批次 {batch_size}，CPU 线程 {threads}"
+                ),
+                "epochs": epochs,
+                "sample_count": samples,
+                "batch_size": batch_size,
+                "cpu_threads": threads,
+            },
+        )
+    elif name == "epoch":
+        epochs = max(1, epochs)
+        _emit_progress(
+            callback,
+            {
+                "event": name,
+                "progress": 32 + round(48 * epoch / epochs),
+                "message": f"训练轮次 {epoch}/{epochs} · 损失 {loss:.6f}",
+                "epoch": epoch,
+                "epochs": epochs,
+                "loss": loss,
+            },
+        )
+    elif name == "completed":
+        _emit_progress(
+            callback,
+            {
+                "event": name,
+                "progress": 84,
+                "message": f"强化训练完成 · 固定留出集准确率 {accuracy * 100:.1f}%",
+                "accuracy": accuracy,
+            },
+        )
+
+
+def _run_component_streaming(
+    command: list[str],
+    run_options: dict[str, object],
+    *,
+    timeout: float,
+    progress_callback: EnhancedProgressCallback,
+) -> subprocess.CompletedProcess:
+    popen_options = dict(run_options)
+    popen_options.pop("timeout", None)
+    popen_options.pop("check", None)
+    popen_options.update(
+        {
+            "stdout": subprocess.PIPE,
+            "text": False,
+            "bufsize": 0,
+        }
+    )
+    process = subprocess.Popen(command, **popen_options)
+
+    def read_progress() -> None:
+        stream = process.stdout
+        if stream is None:
+            return
+        try:
+            while True:
+                line = stream.readline(16_385)
+                if not line:
+                    break
+                if len(line) > 16_384 or not line.endswith(b"\n"):
+                    while line and not line.endswith(b"\n"):
+                        line = stream.readline(16_385)
+                    continue
+                _component_progress_event(
+                    line.decode("utf-8", errors="replace").strip(),
+                    progress_callback,
+                )
+        finally:
+            stream.close()
+
+    reader = threading.Thread(
+        target=read_progress,
+        name="intdemo-trainer-progress",
+        daemon=True,
+    )
+    reader.start()
+    try:
+        return_code = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        raise
+    finally:
+        reader.join(timeout=5)
+    return subprocess.CompletedProcess(command, return_code, stdout=None, stderr=None)
 
 
 def _strict_json_file(path: Path, *, label: str) -> tuple[dict, bytes]:
@@ -356,6 +494,7 @@ def train_enhanced_candidate(
     *,
     runner=None,
     timeout_seconds: float = ENHANCED_TRAINING_TIMEOUT_SECONDS,
+    progress_callback: EnhancedProgressCallback | None = None,
 ) -> CaptchaCandidate:
     """Train through the installed component and return a verified candidate."""
     if captcha_type not in {"numeric", "click"}:
@@ -379,6 +518,14 @@ def train_enhanced_candidate(
             output_dir = workspace / "output"
             output_dir.mkdir()
             dataset_path.write_bytes(archive_bytes)
+            _emit_progress(
+                progress_callback,
+                {
+                    "event": "preparing",
+                    "progress": 26,
+                    "message": "正在准备强化训练工作区并校验本机组件",
+                },
+            )
             with (workspace / "trainer.stderr").open("w+b") as stderr_stream:
                 run_options = {
                     "cwd": str(workspace),
@@ -420,7 +567,26 @@ def train_enhanced_candidate(
                     run_options["env"] = environment
                     try:
                         with system_application_launch_context():
-                            result = process_runner(command, **run_options)
+                            if runner is None and progress_callback is not None:
+                                result = _run_component_streaming(
+                                    command,
+                                    run_options,
+                                    timeout=timeout,
+                                    progress_callback=progress_callback,
+                                )
+                            else:
+                                if progress_callback is not None:
+                                    run_options["stdout"] = subprocess.PIPE
+                                result = process_runner(command, **run_options)
+                                if progress_callback is not None:
+                                    stdout = getattr(result, "stdout", b"")
+                                    if isinstance(stdout, bytes):
+                                        stdout = stdout.decode("utf-8", errors="replace")
+                                    for line in str(stdout or "").splitlines():
+                                        _component_progress_event(
+                                            line.strip(),
+                                            progress_callback,
+                                        )
                     except subprocess.TimeoutExpired as exc:
                         detail = _stderr_file_detail(stderr_stream) or _stderr_detail(
                             exc.stderr
@@ -435,9 +601,30 @@ def train_enhanced_candidate(
                         raise EnhancedTrainingError(
                             "强化训练器执行失败" + (f"：{detail}" if detail else "")
                         )
-                    # stdout is intentionally ignored; only authenticated filesystem
-                    # outputs participate in candidate construction.
-                    return _validate_outputs(output_dir, captcha_type, component_manager)
+                    # Progress stdout is informational only; only authenticated
+                    # filesystem outputs participate in candidate construction.
+                    _emit_progress(
+                        progress_callback,
+                        {
+                            "event": "validating",
+                            "progress": 86,
+                            "message": "正在校验 ONNX 模型、训练指标和文件完整性",
+                        },
+                    )
+                    candidate = _validate_outputs(
+                        output_dir,
+                        captcha_type,
+                        component_manager,
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        {
+                            "event": "validated",
+                            "progress": 90,
+                            "message": "强化模型校验通过",
+                        },
+                    )
+                    return candidate
     except EnhancedTrainingError:
         raise
     except (OSError, subprocess.SubprocessError) as exc:

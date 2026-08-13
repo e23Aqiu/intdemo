@@ -8,6 +8,7 @@ import re
 import threading
 import unicodedata
 import zipfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -35,6 +36,32 @@ _ARCHIVE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
 
 class CaptchaTrainingError(RuntimeError):
     pass
+
+
+TrainingProgressCallback = Callable[[dict[str, object]], None]
+
+
+def _report_training_progress(
+    callback: TrainingProgressCallback | None,
+    event: str,
+    *,
+    progress: int,
+    message: str,
+    **details: object,
+) -> None:
+    if callback is None:
+        return
+    payload: dict[str, object] = {
+        "event": event,
+        "progress": max(0, min(100, int(progress))),
+        "message": str(message),
+    }
+    payload.update(details)
+    try:
+        callback(payload)
+    except Exception:  # noqa: BLE001,S110 - observer callbacks are non-critical
+        # Progress display is observational and must never break training.
+        pass
 
 
 @dataclass(frozen=True)
@@ -1326,16 +1353,27 @@ def _candidate_version(captcha_type: str, samples: list[dict]) -> str:
     return f"{captcha_type}-hog-svm-{stamp}-{digest.hexdigest()[:8]}"
 
 
-def _train_numeric(samples: list[dict]) -> CaptchaCandidate:
+def _train_numeric(
+    samples: list[dict],
+    progress_callback: TrainingProgressCallback | None = None,
+) -> CaptchaCandidate:
     if len(samples) < MIN_NUMERIC_SAMPLES:
         raise CaptchaTrainingError(
             f"数字验证码至少需要 {MIN_NUMERIC_SAMPLES} 个成功样本"
         )
     train, test = _split_numeric_samples(samples)
+    _report_training_progress(
+        progress_callback,
+        "split",
+        progress=25,
+        message=f"数据划分完成：训练 {len(train)} 条，测试 {len(test)} 条",
+        train_samples=len(train),
+        test_samples=len(test),
+    )
     features = []
     values = []
     valid_train = 0
-    for item in train:
+    for index, item in enumerate(train, start=1):
         value = str(item["answer"].get("value") or "")
         if len(value) != 4 or any(character not in "0123456789" for character in value):
             continue
@@ -1346,17 +1384,36 @@ def _train_numeric(samples: list[dict]) -> CaptchaCandidate:
         features.append(feature)
         values.append(value)
         valid_train += 1
+        interval = max(1, len(train) // 100)
+        if index == 1 or index == len(train) or index % interval == 0:
+            _report_training_progress(
+                progress_callback,
+                "feature",
+                progress=25 + round(30 * index / max(1, len(train))),
+                message=f"提取数字验证码 HOG 特征 {index}/{len(train)}",
+                current=index,
+                total=len(train),
+            )
     if valid_train < 10:
         raise CaptchaTrainingError("数字验证码有效训练样本或字符种类不足")
     version = _candidate_version("numeric", samples)
     feature_matrix = np.stack(features).astype(np.float32)
-    classifiers = [
-        _train_ovr_linear_svm(
-            feature_matrix,
-            [value[position] for value in values],
+    classifiers = []
+    for position in range(4):
+        _report_training_progress(
+            progress_callback,
+            "classifier",
+            progress=58 + position * 4,
+            message=f"训练第 {position + 1}/4 位数字分类器",
+            current=position + 1,
+            total=4,
         )
-        for position in range(4)
-    ]
+        classifiers.append(
+            _train_ovr_linear_svm(
+                feature_matrix,
+                [value[position] for value in values],
+            )
+        )
     maximum_classes = max(len(item[0]) for item in classifiers)
     model_labels = np.full((4, maximum_classes), "", dtype="<U4")
     class_counts = np.zeros(4, dtype=np.int32)
@@ -1383,7 +1440,7 @@ def _train_numeric(samples: list[dict]) -> CaptchaCandidate:
     )
     correct = 0
     evaluated = 0
-    for item in test:
+    for index, item in enumerate(test, start=1):
         expected = str(item["answer"].get("value") or "")
         if len(expected) != 4 or any(
             character not in "0123456789" for character in expected
@@ -1395,6 +1452,14 @@ def _train_numeric(samples: list[dict]) -> CaptchaCandidate:
             continue
         evaluated += 1
         correct += int(predicted == expected)
+        _report_training_progress(
+            progress_callback,
+            "evaluation",
+            progress=75 + round(11 * index / max(1, len(test))),
+            message=f"评估固定留出集 {index}/{len(test)}",
+            current=index,
+            total=len(test),
+        )
     if not evaluated:
         raise CaptchaTrainingError("数字验证码测试集没有可评估样本")
     return CaptchaCandidate(
@@ -1415,16 +1480,27 @@ def _train_numeric(samples: list[dict]) -> CaptchaCandidate:
     )
 
 
-def _train_click(samples: list[dict]) -> CaptchaCandidate:
+def _train_click(
+    samples: list[dict],
+    progress_callback: TrainingProgressCallback | None = None,
+) -> CaptchaCandidate:
     if len(samples) < MIN_CLICK_SAMPLES:
         raise CaptchaTrainingError(
             f"文字点选验证码至少需要 {MIN_CLICK_SAMPLES} 个成功样本"
         )
     train, test = _split_samples(samples)
+    _report_training_progress(
+        progress_callback,
+        "split",
+        progress=25,
+        message=f"数据划分完成：训练 {len(train)} 条，测试 {len(test)} 条",
+        train_samples=len(train),
+        test_samples=len(test),
+    )
     features = []
     labels = []
     valid_train = 0
-    for item in train:
+    for index, item in enumerate(train, start=1):
         prompt = item["answer"].get("prompt")
         points = item["answer"].get("points")
         if not isinstance(prompt, list) or not isinstance(points, list):
@@ -1440,9 +1516,26 @@ def _train_click(samples: list[dict]) -> CaptchaCandidate:
             except (CaptchaTrainingError, KeyError, TypeError, ValueError):
                 continue
         valid_train += int(trained == len(prompt))
+        interval = max(1, len(train) // 100)
+        if index == 1 or index == len(train) or index % interval == 0:
+            _report_training_progress(
+                progress_callback,
+                "feature",
+                progress=25 + round(35 * index / max(1, len(train))),
+                message=f"提取点选目标 HOG 特征 {index}/{len(train)}",
+                current=index,
+                total=len(train),
+            )
     if valid_train < 15 or len(set(labels)) < 2:
         raise CaptchaTrainingError("点选验证码有效训练样本或文字种类不足")
     version = _candidate_version("click", samples)
+    _report_training_progress(
+        progress_callback,
+        "classifier",
+        progress=66,
+        message=f"训练 {len(set(labels))} 类文字的线性 SVM 分类器",
+        class_count=len(set(labels)),
+    )
     click_labels, click_weights, click_biases = _train_ovr_linear_svm(
         np.stack(features),
         np.asarray(labels),
@@ -1457,7 +1550,7 @@ def _train_click(samples: list[dict]) -> CaptchaCandidate:
     )
     correct = 0
     evaluated = 0
-    for item in test:
+    for index, item in enumerate(test, start=1):
         prompt = item["answer"].get("prompt")
         points = item["answer"].get("points")
         if not isinstance(prompt, list) or not isinstance(points, list):
@@ -1474,6 +1567,14 @@ def _train_click(samples: list[dict]) -> CaptchaCandidate:
             continue
         evaluated += 1
         correct += int(predicted == [str(value) for value in prompt])
+        _report_training_progress(
+            progress_callback,
+            "evaluation",
+            progress=75 + round(11 * index / max(1, len(test))),
+            message=f"评估固定留出集 {index}/{len(test)}",
+            current=index,
+            total=len(test),
+        )
     if not evaluated:
         raise CaptchaTrainingError("点选验证码测试集没有可评估样本")
     return CaptchaCandidate(
@@ -1499,6 +1600,8 @@ def train_candidate(
     archive_bytes: bytes,
     captcha_type: str,
     mode: str = "standard",
+    *,
+    progress_callback: TrainingProgressCallback | None = None,
 ) -> CaptchaCandidate:
     if captcha_type not in {"numeric", "click"}:
         raise CaptchaTrainingError("验证码类型无效")
@@ -1506,6 +1609,18 @@ def train_candidate(
         raise CaptchaTrainingError("强化模式训练必须由本机强化训练组件执行")
     inspection = inspect_training_dataset(archive_bytes, captcha_type)
     samples = list(inspection.valid_samples)
+    _report_training_progress(
+        progress_callback,
+        "started",
+        progress=20,
+        message=(
+            f"标准训练开始：有效样本 {len(samples)} 条，"
+            f"算法 hog-linear-svm-v1"
+        ),
+        captcha_type=captcha_type,
+        sample_count=len(samples),
+        algorithm="hog-linear-svm-v1",
+    )
     minimum = (
         MIN_NUMERIC_SAMPLES if captcha_type == "numeric" else MIN_CLICK_SAMPLES
     )
@@ -1522,13 +1637,26 @@ def train_candidate(
             key=lambda item: item["fingerprint"],
         )[:MAX_TRAINING_SAMPLES]
     if captcha_type == "numeric":
-        candidate = _train_numeric(samples)
+        candidate = _train_numeric(samples, progress_callback)
     else:
-        candidate = _train_click(samples)
+        candidate = _train_click(samples, progress_callback)
     candidate.metrics.update(
         {
             "available_samples": available_samples,
             "selected_samples": len(samples),
         }
+    )
+    _report_training_progress(
+        progress_callback,
+        "completed",
+        progress=88,
+        message=(
+            f"标准训练完成：测试 {candidate.test_count} 条，"
+            f"完整验证码正确 {candidate.correct_count} 条，"
+            f"准确率 {candidate.accuracy * 100:.1f}%"
+        ),
+        accuracy=candidate.accuracy,
+        test_count=candidate.test_count,
+        correct_count=candidate.correct_count,
     )
     return candidate

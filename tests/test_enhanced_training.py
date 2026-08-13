@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
+import tempfile
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,6 +18,7 @@ from enhanced_trainer.protocol import (
 from integrated_client.captcha_models import CaptchaTrainingError
 from integrated_client.enhanced_training import (
     EnhancedTrainingError,
+    _run_component_streaming,
     train_enhanced_candidate,
 )
 
@@ -180,6 +183,84 @@ class _OutputRunner:
 
 
 class EnhancedTrainingTests(unittest.TestCase):
+    def test_streaming_runner_reads_live_json_lines_from_real_process(self):
+        events = []
+        script = (
+            "import json\n"
+            "print(json.dumps({'event':'started','protocol_version':1,"
+            "'sample_count':30,'epochs':2,'batch_size':16,'cpu_threads':4}),"
+            " flush=True)\n"
+            "print(json.dumps({'event':'epoch','protocol_version':1,"
+            "'epoch':1,'epochs':2,'loss':0.25}), flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (Path(directory) / "stderr.log").open("w+b") as stderr_stream:
+                options = {
+                    "cwd": directory,
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": stderr_stream,
+                    "text": False,
+                    "timeout": 10.0,
+                    "check": False,
+                    "shell": False,
+                }
+                if os.name == "nt":
+                    options["creationflags"] = getattr(
+                        subprocess,
+                        "CREATE_NO_WINDOW",
+                        0,
+                    )
+                result = _run_component_streaming(
+                    [sys.executable, "-c", script],
+                    options,
+                    timeout=10.0,
+                    progress_callback=events.append,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual([event["event"] for event in events], ["started", "epoch"])
+        self.assertIn("1/2", events[1]["message"])
+        self.assertEqual(events[1]["progress"], 56)
+
+    def test_streaming_runner_discards_oversized_progress_line(self):
+        events = []
+        script = (
+            "import json\n"
+            "print('x' * 20000, flush=True)\n"
+            "print(json.dumps({'event':'epoch','protocol_version':1,"
+            "'epoch':2,'epochs':2,'loss':0.125}), flush=True)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with (Path(directory) / "stderr.log").open("w+b") as stderr_stream:
+                options = {
+                    "cwd": directory,
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": stderr_stream,
+                    "text": False,
+                    "timeout": 10.0,
+                    "check": False,
+                    "shell": False,
+                }
+                if os.name == "nt":
+                    options["creationflags"] = getattr(
+                        subprocess,
+                        "CREATE_NO_WINDOW",
+                        0,
+                    )
+                result = _run_component_streaming(
+                    [sys.executable, "-c", script],
+                    options,
+                    timeout=10.0,
+                    progress_callback=events.append,
+                )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["event"], "epoch")
+        self.assertEqual(events[0]["progress"], 80)
+
     def test_success_runs_locked_without_shell_and_returns_verified_candidate(self):
         manager = _FakeComponentManager()
         runner = _OutputRunner(manager)
@@ -252,6 +333,46 @@ class EnhancedTrainingTests(unittest.TestCase):
             "click-enhanced-test",
             b"portable-onnx-artifact",
         )
+
+    def test_progress_callback_translates_component_json_lines(self):
+        manager = _FakeComponentManager()
+        runner = _OutputRunner(manager)
+        events = []
+        original_call = runner.__call__
+
+        def event_runner(command, **kwargs):
+            result = original_call(command, **kwargs)
+            result.stdout = (
+                b'{"event":"started","protocol_version":1,'
+                b'"sample_count":25,"epochs":24,"batch_size":16,'
+                b'"cpu_threads":4}\n'
+                b'{"event":"epoch","protocol_version":1,'
+                b'"epoch":12,"epochs":24,"loss":0.125}\n'
+                b'{"event":"completed","protocol_version":1,'
+                b'"accuracy":0.8}\n'
+            )
+            return result
+
+        with patch(
+            "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
+            return_value=object(),
+        ):
+            train_enhanced_candidate(
+                b"dataset-archive",
+                "numeric",
+                manager,
+                runner=event_runner,
+                progress_callback=events.append,
+            )
+
+        event_names = [event["event"] for event in events]
+        self.assertEqual(
+            event_names,
+            ["preparing", "started", "epoch", "completed", "validating", "validated"],
+        )
+        self.assertIn("12/24", events[2]["message"])
+        self.assertIn("0.125000", events[2]["message"])
+        self.assertEqual(events[-1]["progress"], 90)
 
     def test_failure_uses_bounded_sanitized_stderr_and_ignores_stdout(self):
         manager = _FakeComponentManager()

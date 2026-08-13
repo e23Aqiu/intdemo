@@ -5,7 +5,7 @@ import os
 import uuid
 from pathlib import Path
 
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -40,6 +40,7 @@ from ..trainer_component import (
 from .announcement_page import ImagePreviewDialog, start_api_task
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
+from .training_terminal_dialog import TrainingTerminalDialog
 
 MAX_IMPORT_BYTES = 100 * 1024 * 1024
 UPLOAD_MODES = (
@@ -64,6 +65,10 @@ TRAINING_ALGORITHM_BY_MODE = {
     "standard": "hog-linear-svm-v1",
     "enhanced": "tiny-cnn-onnx-v1",
 }
+
+
+class TrainingProgressSignals(QObject):
+    event_received = pyqtSignal(str, object)
 
 
 def _format_size(size):
@@ -125,6 +130,12 @@ class MachineLearningPage(QWidget):
         self._loading_training_mode = False
         self._component_task_running = False
         self._training_in_progress = False
+        self._training_id = ""
+        self._training_terminal = None
+        self._training_progress_signals = TrainingProgressSignals(self)
+        self._training_progress_signals.event_received.connect(
+            self._training_progress_received
+        )
         self._server_capabilities_loaded = False
         self._server_model_algorithms = {}
         self._confirmed_upload_mode = "off"
@@ -309,9 +320,15 @@ class MachineLearningPage(QWidget):
         self.train_click_btn = QPushButton("训练点选候选模型")
         self.train_click_btn.setObjectName("PrimaryButton")
         self.train_click_btn.clicked.connect(lambda: self._train_model("click"))
+        self.show_training_terminal_btn = QPushButton("查看训练终端")
+        self.show_training_terminal_btn.setEnabled(False)
+        self.show_training_terminal_btn.clicked.connect(
+            self._show_training_terminal
+        )
         actions.addWidget(self.export_btn)
         actions.addWidget(self.import_btn)
         actions.addStretch()
+        actions.addWidget(self.show_training_terminal_btn)
         actions.addWidget(self.train_numeric_btn)
         actions.addWidget(self.train_click_btn)
         root.addLayout(actions)
@@ -674,8 +691,18 @@ class MachineLearningPage(QWidget):
         self._sample_refresh_task = None
         self._sample_refresh_pending = False
         self._sample_image_loading = False
+        self._training_id = ""
+        terminal = self._training_terminal
+        if terminal is not None:
+            terminal.hide()
+            terminal.deleteLater()
+            self._training_terminal = None
         self._task_callbacks.clear()
         self._tasks.clear()
+
+    def closeEvent(self, event):
+        self.shutdown()
+        super().closeEvent(event)
 
     def refresh(self):
         if self._shutting_down or self._refresh_task is not None:
@@ -1645,6 +1672,76 @@ class MachineLearningPage(QWidget):
         )
         self.refresh()
 
+    def _begin_training_terminal(
+        self,
+        *,
+        training_id,
+        captcha_name,
+        mode_name,
+        method_name,
+    ):
+        previous = self._training_terminal
+        if previous is not None:
+            previous.close()
+            previous.deleteLater()
+        self._training_id = training_id
+        self._training_terminal = TrainingTerminalDialog(
+            captcha_name=captcha_name,
+            mode_name=mode_name,
+            method_name=method_name,
+            parent=self.window(),
+        )
+        self._training_terminal.destroyed.connect(
+            lambda _object=None, task_id=training_id: (
+                self._training_terminal_destroyed(task_id)
+            )
+        )
+        self.show_training_terminal_btn.setEnabled(True)
+        self._training_terminal.show()
+        self._training_terminal.raise_()
+        self._training_terminal.activateWindow()
+        self._emit_training_progress(
+            training_id,
+            {
+                "event": "queued",
+                "progress": 2,
+                "message": f"训练任务已启动 · {mode_name} · {method_name}",
+            },
+        )
+
+    def _training_terminal_destroyed(self, training_id):
+        if training_id != self._training_id:
+            return
+        self._training_terminal = None
+        self.show_training_terminal_btn.setEnabled(False)
+
+    def _show_training_terminal(self):
+        terminal = self._training_terminal
+        if terminal is None:
+            return
+        terminal.show()
+        terminal.raise_()
+        terminal.activateWindow()
+
+    def _emit_training_progress(self, training_id, payload):
+        if self._shutting_down:
+            return
+        try:
+            self._training_progress_signals.event_received.emit(
+                str(training_id),
+                dict(payload),
+            )
+        except RuntimeError:
+            # The page may be destroyed while a training worker is finishing.
+            return
+
+    def _training_progress_received(self, training_id, payload):
+        if self._shutting_down or training_id != self._training_id:
+            return
+        terminal = self._training_terminal
+        if terminal is not None:
+            terminal.append_event(dict(payload or {}))
+
     def _train_model(self, captcha_type):
         type_name = "数字验证码" if captcha_type == "numeric" else "文字点选验证码"
         mode = self.trainer_manager.preferred_mode()
@@ -1682,30 +1779,91 @@ class MachineLearningPage(QWidget):
         self.train_numeric_btn.setEnabled(False)
         self.train_click_btn.setEnabled(False)
         self._set_component_controls_enabled(False)
+        training_id = uuid.uuid4().hex
+        self._begin_training_terminal(
+            training_id=training_id,
+            captcha_name=type_name,
+            mode_name=mode_name,
+            method_name=method_name,
+        )
+
+        def progress(payload):
+            self._emit_training_progress(training_id, payload)
 
         def train():
+            progress(
+                {
+                    "event": "download",
+                    "progress": 5,
+                    "message": "正在从服务器下载未处理的原始成功样本",
+                }
+            )
             token = self.session_manager.access_token()
             archive = self.session_manager.api.admin_export_captcha_dataset(
                 token,
                 captcha_type,
             )
+            progress(
+                {
+                    "event": "inspect",
+                    "progress": 12,
+                    "message": f"数据集下载完成 · {_format_size(len(archive))}，正在检查样本",
+                }
+            )
             inspection = inspect_training_dataset(archive, captcha_type)
+            declared_samples = int(
+                getattr(inspection, "declared_samples", inspection.valid_count)
+                or 0
+            )
+            rejection_summary = getattr(inspection, "rejection_summary", None)
+            rejection_text = (
+                str(rejection_summary())
+                if callable(rejection_summary)
+                else "无"
+            )
+            progress(
+                {
+                    "event": "inspection_complete",
+                    "progress": 18,
+                    "message": (
+                        f"样本检查完成：服务器记录 {declared_samples} 条，"
+                        f"有效且不重复 {inspection.valid_count} 条，"
+                        f"过滤原因：{rejection_text}"
+                    ),
+                }
+            )
             minimum = 20 if captcha_type == "numeric" else 30
             if inspection.valid_count < minimum:
                 raise CaptchaTrainingError(
-                    f"服务器记录 {inspection.declared_samples} 条，实际有效且不重复的"
+                    f"服务器记录 {declared_samples} 条，实际有效且不重复的"
                     f"{type_name}样本只有 {inspection.valid_count} 条，"
                     f"至少需要 {minimum} 条。\n"
-                    f"过滤原因：{inspection.rejection_summary()}"
+                    f"过滤原因：{rejection_text}"
                 )
             candidate = (
                 train_enhanced_candidate(
                     archive,
                     captcha_type,
                     self.trainer_manager,
+                    progress_callback=progress,
                 )
                 if mode == "enhanced"
-                else train_candidate(archive, captcha_type, mode="standard")
+                else train_candidate(
+                    archive,
+                    captcha_type,
+                    mode="standard",
+                    progress_callback=progress,
+                )
+            )
+            progress(
+                {
+                    "event": "upload",
+                    "progress": 94,
+                    "message": (
+                        f"本机模型校验完成 · {_format_size(len(candidate.artifact))}，"
+                        "正在上传候选模型和评估结果"
+                    ),
+                }
             )
             model = self.session_manager.api.admin_create_captcha_model(
                 token,
@@ -1726,12 +1884,12 @@ class MachineLearningPage(QWidget):
 
         self._start(
             train,
-            lambda result, error, kind=captcha_type: (
-                self._model_trained(kind, result, error)
+            lambda result, error, kind=captcha_type, task_id=training_id: (
+                self._model_trained(kind, result, error, task_id)
             ),
         )
 
-    def _model_trained(self, captcha_type, result, error):
+    def _model_trained(self, captcha_type, result, error, training_id=None):
         button = (
             self.train_numeric_btn
             if captcha_type == "numeric"
@@ -1746,6 +1904,13 @@ class MachineLearningPage(QWidget):
             if captcha_type == "numeric"
             else "训练点选候选模型"
         )
+        terminal = (
+            self._training_terminal
+            if training_id is None or training_id == self._training_id
+            else None
+        )
+        if terminal is not None:
+            terminal.finish(error=error)
         if error is not None:
             if (
                 isinstance(error, ApiResponseError)

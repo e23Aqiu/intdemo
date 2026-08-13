@@ -8,7 +8,7 @@ import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -35,6 +35,7 @@ from integrated_client.tools.transport_tool import (
 )
 from integrated_client.ui.machine_learning_page import MachineLearningPage
 from integrated_client.ui.main_window import MainWindow
+from integrated_client.ui.training_terminal_dialog import TrainingTerminalDialog
 
 
 class _FakeTrainerStatus:
@@ -358,6 +359,28 @@ class CaptchaLearningTests(unittest.TestCase):
 
         with self.assertRaises(CaptchaTrainingError):
             train_candidate(self.archive, "numeric", mode="enhanced")
+
+    def test_standard_training_reports_real_progress_stages(self):
+        events = []
+
+        candidate = train_candidate(
+            self.archive,
+            "numeric",
+            progress_callback=events.append,
+        )
+
+        self.assertEqual(events[0]["event"], "started")
+        self.assertEqual(events[-1]["event"], "completed")
+        self.assertEqual(events[-1]["progress"], 88)
+        self.assertEqual(events[-1]["test_count"], candidate.test_count)
+        self.assertTrue(
+            {"split", "feature", "classifier", "evaluation"}
+            <= {event["event"] for event in events}
+        )
+        self.assertEqual(
+            sorted(event["progress"] for event in events),
+            [event["progress"] for event in events],
+        )
 
     def test_training_rejects_unsafe_or_insufficient_archives(self):
         output = io.BytesIO()
@@ -2057,6 +2080,36 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertTrue(page.uninstall_trainer_btn.isEnabled())
         page.deleteLater()
 
+    def test_training_terminal_hides_while_running_and_closes_when_finished(self):
+        dialog = TrainingTerminalDialog(
+            captcha_name="数字验证码",
+            mode_name="强化模式",
+            method_name="Tiny CNN + ONNX",
+        )
+        dialog.show()
+        self.app.processEvents()
+        dialog.append_event(
+            {
+                "progress": 50,
+                "message": "训练轮次 12/24 · 损失 0.125000",
+            }
+        )
+
+        dialog.reject()
+        self.assertFalse(dialog.isVisible())
+        self.assertTrue(dialog.running)
+        self.assertEqual(dialog.progress_bar.value(), 50)
+        self.assertIn("12/24", dialog.log.toPlainText())
+
+        dialog.show()
+        dialog.finish()
+        self.assertFalse(dialog.running)
+        self.assertEqual(dialog.progress_bar.value(), 100)
+        self.assertEqual(dialog.close_btn.text(), "关闭")
+        dialog.reject()
+        self.assertFalse(dialog.isVisible())
+        dialog.deleteLater()
+
     def test_machine_learning_page_disables_enhanced_mode_without_component(self):
         manager = _FakeTrainerManager(available=False)
         with patch.object(MachineLearningPage, "refresh"):
@@ -2222,7 +2275,12 @@ class CaptchaLearningTests(unittest.TestCase):
         ):
             page._train_model("numeric")
 
-        enhanced.assert_called_once_with(b"dataset", "numeric", manager)
+        enhanced.assert_called_once_with(
+            b"dataset",
+            "numeric",
+            manager,
+            progress_callback=ANY,
+        )
         standard.assert_not_called()
         self.assertTrue(page.train_numeric_btn.isEnabled())
         self.assertTrue(page.train_click_btn.isEnabled())
