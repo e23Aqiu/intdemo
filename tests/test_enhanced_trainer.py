@@ -27,8 +27,10 @@ from enhanced_trainer.dataset import (
 from enhanced_trainer.package_tool import (
     LINUX_ARM64_PLATFORM,
     SIGNING_KEY_ENVIRONMENT,
+    WINDOWS_RUNTIME_FILES,
     WINDOWS_PLATFORM,
     PackageToolError,
+    _synchronize_windows_runtime,
     build_native_bundle,
     load_signing_key,
     package_bundle,
@@ -531,7 +533,9 @@ class EnhancedPackageToolTests(unittest.TestCase):
             "enhanced_trainer.package_tool._require_build_dependencies",
         ), patch(
             "enhanced_trainer.package_tool.self_test_bundle",
-        ):
+        ), patch(
+            "enhanced_trainer.package_tool._synchronize_windows_runtime",
+        ) as synchronize_runtime:
             bundle = build_native_bundle(
                 build_root,
                 requested_platform=WINDOWS_PLATFORM,
@@ -539,6 +543,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
             )
 
         self.assertEqual(bundle, build_root / "dist" / "intdemo-trainer")
+        synchronize_runtime.assert_called_once_with(bundle)
         command = commands[0]
         self.assertNotIn("--collect-all", command)
         hidden = [
@@ -547,6 +552,36 @@ class EnhancedPackageToolTests(unittest.TestCase):
             if value == "--hidden-import"
         ]
         self.assertEqual(hidden, ["torch", "onnx", "onnxruntime"])
+
+    def test_windows_runtime_set_is_copied_and_hash_verified(self):
+        system_root = self.root / "Windows"
+        source_root = system_root / "System32"
+        source_root.mkdir(parents=True)
+        bundle = self.root / "bundle-runtime"
+        internal = bundle / "_internal"
+        internal.mkdir(parents=True)
+
+        pe_offset = 64
+        for index, name in enumerate(WINDOWS_RUNTIME_FILES):
+            payload = bytearray(72)
+            payload[:2] = b"MZ"
+            payload[0x3C:0x40] = pe_offset.to_bytes(4, "little")
+            payload[pe_offset:pe_offset + 4] = b"PE\0\0"
+            payload[pe_offset + 4:pe_offset + 6] = (0x8664).to_bytes(2, "little")
+            payload[-1] = index
+            (source_root / name).write_bytes(payload)
+
+        _synchronize_windows_runtime(bundle, system_root=system_root)
+
+        for name in WINDOWS_RUNTIME_FILES:
+            self.assertEqual(
+                (internal / name).read_bytes(),
+                (source_root / name).read_bytes(),
+            )
+
+        (source_root / WINDOWS_RUNTIME_FILES[0]).write_bytes(b"not-a-pe")
+        with self.assertRaisesRegex(PackageToolError, "Windows 运行库架构"):
+            _synchronize_windows_runtime(bundle, system_root=system_root)
 
 
 if __name__ == "__main__":

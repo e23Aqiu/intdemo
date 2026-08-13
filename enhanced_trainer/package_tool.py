@@ -12,6 +12,7 @@ import platform
 import re
 import shutil
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,15 @@ SUPPORTED_PLATFORMS = {WINDOWS_PLATFORM, LINUX_ARM64_PLATFORM}
 SIGNING_KEY_ENVIRONMENT = "INTDEMO_TRAINER_SIGNING_PRIVATE_KEY"
 MAX_SOURCE_FILES = 20_000
 MAX_SOURCE_BYTES = 2 * 1024 * 1024 * 1024
+WINDOWS_RUNTIME_FILES = (
+    "concrt140.dll",
+    "msvcp140.dll",
+    "msvcp140_1.dll",
+    "msvcp140_2.dll",
+    "vcruntime140.dll",
+    "vcruntime140_1.dll",
+)
+WINDOWS_AMD64_MACHINE = 0x8664
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _VERSION_PATTERN = re.compile(r"^\d+(?:\.\d+){2,3}$")
 
@@ -323,6 +333,71 @@ def _child_environment() -> dict[str, str]:
     return environment
 
 
+def _pe_machine(path: Path) -> int:
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(64)
+            if len(header) != 64 or header[:2] != b"MZ":
+                raise ValueError("DOS header")
+            pe_offset = struct.unpack_from("<I", header, 0x3C)[0]
+            if not 64 <= pe_offset <= 16 * 1024 * 1024:
+                raise ValueError("PE offset")
+            stream.seek(pe_offset)
+            pe_header = stream.read(6)
+            if len(pe_header) != 6 or pe_header[:4] != b"PE\0\0":
+                raise ValueError("PE header")
+            return struct.unpack_from("<H", pe_header, 4)[0]
+    except (OSError, ValueError, struct.error) as exc:
+        raise PackageToolError(f"无法验证 Windows 运行库架构：{path}") from exc
+
+
+def _synchronize_windows_runtime(
+    bundle_dir: Path | str,
+    *,
+    system_root: Path | str | None = None,
+) -> None:
+    """Use one serviced AMD64 VC++ runtime set in the frozen bundle."""
+
+    root_value = system_root or os.environ.get("SystemRoot")
+    if not root_value:
+        raise PackageToolError("无法定位 Windows 系统目录中的 VC++ 运行库")
+    source_root = Path(root_value).expanduser().resolve() / "System32"
+    target_root = Path(bundle_dir).expanduser().resolve() / "_internal"
+    if target_root.is_symlink() or not target_root.is_dir():
+        raise PackageToolError("强化训练器构建目录缺少 _internal 运行库目录")
+
+    for name in WINDOWS_RUNTIME_FILES:
+        source = source_root / name
+        try:
+            if source.is_symlink() or not source.is_file():
+                raise ValueError("not a regular file")
+            size = source.stat().st_size
+            if not 1 <= size <= 4 * 1024 * 1024:
+                raise ValueError("invalid size")
+        except (OSError, ValueError) as exc:
+            raise PackageToolError(f"Windows 系统缺少有效的 VC++ 运行库：{name}") from exc
+        if _pe_machine(source) != WINDOWS_AMD64_MACHINE:
+            raise PackageToolError(f"Windows VC++ 运行库不是 AMD64：{name}")
+
+        target = target_root / name
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{name}.",
+            suffix=".tmp",
+            dir=str(target_root),
+        )
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            shutil.copyfile(source, temporary)
+            if temporary.stat().st_size != size or _sha256(temporary) != _sha256(source):
+                raise PackageToolError(f"复制 Windows VC++ 运行库后校验失败：{name}")
+            os.replace(temporary, target)
+        except OSError as exc:
+            raise PackageToolError(f"无法写入 Windows VC++ 运行库：{name}") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
 def self_test_bundle(
     bundle_dir: Path | str,
     *,
@@ -446,6 +521,8 @@ def build_native_bundle(
     )
     if not expected.is_file():
         raise PackageToolError("PyInstaller 未生成预期的强化训练器入口")
+    if platform_key == WINDOWS_PLATFORM:
+        _synchronize_windows_runtime(bundle)
     self_test_bundle(
         bundle,
         requested_platform=platform_key,
