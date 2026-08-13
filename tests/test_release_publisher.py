@@ -24,9 +24,10 @@ from release_publisher.core import (
     build_git_commit_steps,
     build_git_mirror_push_plans,
     build_git_push_plan,
-    build_pause_distribution_steps,
     build_package_steps,
+    build_pause_distribution_steps,
     build_release_plan,
+    find_inno_compiler,
     git_status,
     project_version,
     project_version_mismatches,
@@ -41,6 +42,26 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleasePublisherCoreTests(unittest.TestCase):
+    def test_inno_discovery_skips_inaccessible_candidate(self):
+        inaccessible = Path("C:/restricted/Inno Setup 6/ISCC.exe")
+        available = Path("C:/tools/Inno Setup 6/ISCC.exe")
+
+        def is_file(path):
+            if path == inaccessible:
+                raise PermissionError("access denied")
+            return path == available
+
+        with patch.dict(
+            os.environ,
+            {
+                "LOCALAPPDATA": "C:/restricted",
+                "ProgramFiles": "C:/tools",
+                "ProgramFiles(x86)": "",
+            },
+            clear=False,
+        ), patch.object(Path, "is_file", autospec=True, side_effect=is_file):
+            self.assertEqual(find_inno_compiler(), available.resolve())
+
     def test_current_git_branch_uses_legacy_compatible_rev_parse(self):
         repo_root = Path("legacy-git-repo")
         with patch(
@@ -108,6 +129,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             settings = PublisherSettings(
                 base_url="https://api.example.com",
                 ca_bundle="C:/certs/root.crt",
+                trainer_trust_file="C:/secure/trainer-trust.json",
                 inno_compiler="C:/Inno/ISCC.exe",
                 remote_host="intdemo-test",
                 remote_path="/opt/intdemo/deploy/updates",
@@ -124,6 +146,76 @@ class ReleasePublisherCoreTests(unittest.TestCase):
 
             self.assertEqual(SettingsStore(path).load(), settings)
             self.assertNotIn("mandatory", path.read_text(encoding="utf-8"))
+
+    def test_trainer_trust_file_is_forwarded_to_windows_and_uos_builds(self):
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="trainer trust",
+            trainer_trust_file="C:/secure/trainer-trust.json",
+            build_windows=True,
+            build_uos=True,
+            uos_builder_host="uos-builder",
+        )
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=False,
+        ):
+            steps = build_package_steps(options)
+        windows = next(step for step in steps if step.key == "build_windows_packages")
+        uos = next(step for step in steps if step.key == "build_uos_package")
+        self.assertIn("--trainer-trust-file", windows.arguments)
+        self.assertIn("C:/secure/trainer-trust.json", windows.arguments)
+        self.assertIn("-TrainerTrustFile", uos.arguments)
+        self.assertIn("C:/secure/trainer-trust.json", uos.arguments)
+
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=True,
+        ):
+            native_steps = build_package_steps(options)
+        native_uos = next(step for step in native_steps if step.key == "build_uos_package")
+        github_windows = next(
+            step for step in native_steps if step.key == "build_windows_github"
+        )
+        self.assertIn("--trainer-trust-file", native_uos.arguments)
+        self.assertIn("--trainer-trust-file", github_windows.arguments)
+
+    def test_release_validation_rejects_invalid_trainer_trust_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trust_file = Path(directory) / "trainer-trust.json"
+            trust_file.write_text('{"schema_version":1,"keys":{}}', encoding="utf-8")
+            options = ReleaseOptions(
+                repo_root=REPO_ROOT,
+                version="1.2.3",
+                base_url="https://api.example.com",
+                notes="invalid trainer trust",
+                trainer_trust_file=str(trust_file),
+            )
+
+            errors = validate_release_options(options, for_build=True)
+
+        self.assertTrue(any("可信公钥配置无效" in error for error in errors))
+
+    def test_release_validation_rejects_deeply_nested_trainer_trust_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trust_file = Path(directory) / "trainer-trust.json"
+            trust_file.write_text(
+                "[" * 1_500 + "0" + "]" * 1_500,
+                encoding="utf-8",
+            )
+            options = ReleaseOptions(
+                repo_root=REPO_ROOT,
+                version="1.2.3",
+                base_url="https://api.example.com",
+                notes="deeply nested trainer trust",
+                trainer_trust_file=str(trust_file),
+            )
+
+            errors = validate_release_options(options, for_build=True)
+
+        self.assertTrue(any("可信公钥配置无效" in error for error in errors))
 
     def test_release_readiness_reports_validated_dual_candidates(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -406,8 +498,16 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             return_value=False,
         ):
             windows_steps = build_package_steps(windows_native)
-        self.assertEqual([step.key for step in windows_steps], ["build_windows_packages"])
-        self.assertTrue(any(Path(arg).name == "build-installer.ps1" for arg in windows_steps[0].arguments))
+        self.assertEqual(
+            [step.key for step in windows_steps],
+            ["build_windows_packages"],
+        )
+        self.assertTrue(
+            any(
+                Path(argument).name == "build-installer.ps1"
+                for argument in windows_steps[0].arguments
+            )
+        )
         with patch(
             "release_publisher.core.is_native_uos_arm64_builder",
             return_value=True,
@@ -664,7 +764,9 @@ function global:ssh {
         return
     }
     if ($command.StartsWith("if [ -f") -and $command.Contains("cat ")) {
-        Write-Output '{"schema_version":1,"channel":"test","version":"0.0.0","paused":true,"paused_version":"1.2.3"}'
+        $state = '{"schema_version":1,"channel":"test","version":"0.0.0",' +
+            '"paused":true,"paused_version":"1.2.3"}'
+        Write-Output $state
         return
     }
     throw "Unexpected fake ssh command: $command"
@@ -1238,12 +1340,13 @@ function global:git {
 param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
     [string]$CaBundle = "",
+    [string]$TrainerTrustFile = "",
     [string]$Channel = "test",
     [string]$Version = ""
 )
 [IO.File]::WriteAllText(
     (Join-Path $PSScriptRoot "portable-result.txt"),
-    "$BaseUrl|$Channel|$Version"
+    "$BaseUrl|$Channel|$Version|$TrainerTrustFile"
 )
 """.strip(),
                 encoding="utf-8",
@@ -1253,6 +1356,7 @@ param(
 param(
     [Parameter(Mandatory = $true)][string]$BaseUrl,
     [string]$CaBundle = "",
+    [string]$TrainerTrustFile = "",
     [string]$Channel = "test",
     [string]$Version = "",
     [string]$DeltaFromVersion = "",
@@ -1260,7 +1364,7 @@ param(
 )
 [IO.File]::WriteAllText(
     (Join-Path $PSScriptRoot "installer-result.txt"),
-    "$BaseUrl|$Channel|$Version|$DeltaFromVersion"
+    "$BaseUrl|$Channel|$Version|$DeltaFromVersion|$TrainerTrustFile"
 )
 """.strip(),
                 encoding="utf-8",
@@ -1283,6 +1387,8 @@ param(
                     "1.2.3",
                     "-DeltaFromVersion",
                     "1.2.2",
+                    "-TrainerTrustFile",
+                    "D:\\secure\\trainer-trust.json",
                 ],
                 check=False,
                 capture_output=True,
@@ -1294,11 +1400,11 @@ param(
             self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
             self.assertEqual(
                 (root / "portable-result.txt").read_text(encoding="utf-8"),
-                "https://api.example.com|stable|1.2.3",
+                "https://api.example.com|stable|1.2.3|D:\\secure\\trainer-trust.json",
             )
             self.assertEqual(
                 (root / "installer-result.txt").read_text(encoding="utf-8"),
-                "https://api.example.com|stable|1.2.3|1.2.2",
+                "https://api.example.com|stable|1.2.3|1.2.2|D:\\secure\\trainer-trust.json",
             )
 
 
@@ -1308,6 +1414,8 @@ class ReleasePublisherUiTests(unittest.TestCase):
         cls.application = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        self.settings_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.settings_directory.cleanup)
         settings_patcher = patch(
             "release_publisher.ui.SettingsStore.load",
             return_value=PublisherSettings(
@@ -1318,8 +1426,15 @@ class ReleasePublisherUiTests(unittest.TestCase):
             "release_publisher.ui.is_native_uos_arm64_builder",
             return_value=False,
         )
+        environment_patcher = patch.dict(
+            os.environ,
+            {"LOCALAPPDATA": self.settings_directory.name},
+            clear=False,
+        )
         settings_patcher.start()
         platform_patcher.start()
+        environment_patcher.start()
+        self.addCleanup(environment_patcher.stop)
         self.addCleanup(platform_patcher.stop)
         self.addCleanup(settings_patcher.stop)
 
@@ -1348,6 +1463,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertIn("v", window.release_readiness_label.text())
         self.assertTrue(window.windows_check.isChecked())
         self.assertTrue(window.uos_check.isChecked())
+        self.assertEqual(window.trainer_trust_edit.text(), "")
         self.assertFalse(window.portable_check.isChecked())
         self.assertIn("自动识别", window.portable_check.toolTip())
         self.assertEqual(window.output_mode_combo.currentData(), "both")
@@ -1388,6 +1504,15 @@ class ReleasePublisherUiTests(unittest.TestCase):
             "中文日志",
         )
 
+        window.deleteLater()
+
+    def test_ui_options_include_trainer_trust_file(self):
+        window = ReleasePublisherWindow(REPO_ROOT)
+        window.trainer_trust_edit.setText("C:/secure/trainer-trust.json")
+        self.assertEqual(
+            window._options().trainer_trust_file,
+            "C:/secure/trainer-trust.json",
+        )
         window.deleteLater()
 
     def test_native_uos_enables_windows_transfer_and_updates_build_text(self):
@@ -1449,7 +1574,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
                     patch.object(
                         window,
                         "_validate",
-                        side_effect=lambda: window._options(),
+                        side_effect=lambda current=window: current._options(),
                     ),
                     patch.object(window, "_save_settings"),
                     patch.object(window, "_run_steps") as run_steps,
@@ -1565,6 +1690,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
                 "release_publisher.ui.QMessageBox.warning",
                 return_value=QMessageBox.Yes,
             ) as warning,
+            patch.object(window, "_save_settings"),
             patch.object(window, "_run_steps") as run_steps,
         ):
             window._commit_changes()

@@ -364,6 +364,18 @@ def ca_fingerprint(path_value: str) -> str:
     return sha256(path)
 
 
+def trainer_trust_fingerprint(path_value: str) -> str:
+    """Return the digest of the optional offline trainer trust document."""
+
+    normalized = str(path_value or "").strip()
+    if not normalized:
+        return ""
+    path = Path(normalized).expanduser().resolve()
+    if not path.is_file():
+        raise ReleaseTaskError(f"强化组件可信公钥配置不存在：{path}")
+    return sha256(path)
+
+
 def validate_request(payload: Any) -> dict[str, Any]:
     if not isinstance(payload, dict) or int(payload.get("schema_version") or 0) != 1:
         raise ReleaseTaskError("Windows 构建任务版本不受支持")
@@ -397,12 +409,21 @@ def validate_request(payload: Any) -> dict[str, Any]:
         raise ReleaseTaskError("Windows 构建任务通道无效")
     if not isinstance(inputs, dict):
         raise ReleaseTaskError("Windows 构建任务缺少 inputs")
-    if set(inputs) != {"ca_bundle", "baseline_snapshot"}:
+    allowed_inputs = {"ca_bundle", "baseline_snapshot", "trainer_trust"}
+    if not set(inputs).issubset(allowed_inputs) or not {
+        "ca_bundle",
+        "baseline_snapshot",
+    }.issubset(inputs):
         raise ReleaseTaskError("Windows 构建任务 inputs 集合无效")
+    # Requests created before v1.1.0 did not carry the optional trust file.
+    inputs = {**inputs, "trainer_trust": inputs.get("trainer_trust")}
     ca_input = inputs.get("ca_bundle")
     baseline_input = inputs.get("baseline_snapshot")
+    trainer_trust_input = inputs.get("trainer_trust")
     if ca_input is not None:
         validate_descriptor(ca_input, "CA 根证书")
+    if trainer_trust_input is not None:
+        validate_descriptor(trainer_trust_input, "强化组件可信公钥配置")
     try:
         host_is_ip = ipaddress.ip_address(urlsplit(base_url).hostname or "") is not None
     except ValueError:
@@ -482,6 +503,7 @@ def load_request_from_directory(directory: Path) -> tuple[dict[str, Any], Path, 
     for key, label in (
         ("ca_bundle", "CA 根证书"),
         ("baseline_snapshot", "Windows 增量基线快照"),
+        ("trainer_trust", "强化组件可信公钥配置"),
     ):
         descriptor = request["inputs"].get(key)
         if descriptor is not None:
@@ -499,6 +521,7 @@ def create_windows_request(
     delta_from_version: str,
     build_portable: bool,
     github_remote: str,
+    trainer_trust_file: str = "",
 ) -> Path:
     version_key(version)
     normalized_url = normalize_base_url(base_url)
@@ -524,6 +547,7 @@ def create_windows_request(
         inputs: dict[str, Any] = {
             "ca_bundle": None,
             "baseline_snapshot": None,
+            "trainer_trust": None,
         }
         ca_value = str(ca_bundle or "").strip()
         if ca_value:
@@ -536,6 +560,20 @@ def create_windows_request(
             inputs["ca_bundle"] = artifact_descriptor(
                 target_ca,
                 "inputs/intdemo-ca-root.crt",
+            )
+        trust_value = str(trainer_trust_file or "").strip()
+        if trust_value:
+            source_trust = Path(trust_value).expanduser().resolve()
+            if not source_trust.is_file():
+                raise ReleaseTaskError(
+                    f"强化组件可信公钥配置不存在：{source_trust}"
+                )
+            target_trust = staging / "inputs" / "trainer-trust.json"
+            target_trust.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_trust, target_trust)
+            inputs["trainer_trust"] = artifact_descriptor(
+                target_trust,
+                "inputs/trainer-trust.json",
             )
         try:
             host_is_ip = ipaddress.ip_address(
@@ -684,6 +722,16 @@ def build_windows_result(
             if ca_descriptor is not None
             else None
         )
+        trainer_trust_descriptor = request["inputs"].get("trainer_trust")
+        trainer_trust_path = (
+            verify_file(
+                extracted,
+                trainer_trust_descriptor,
+                "强化组件可信公钥配置",
+            )
+            if trainer_trust_descriptor is not None
+            else None
+        )
         build_arguments = [
             "-BaseUrl",
             request["base_url"],
@@ -694,6 +742,10 @@ def build_windows_result(
         ]
         if ca_path is not None:
             build_arguments.extend(["-CaBundle", str(ca_path)])
+        if trainer_trust_path is not None:
+            build_arguments.extend(
+                ["-TrainerTrustFile", str(trainer_trust_path)]
+            )
         if request["delta_from_version"]:
             build_arguments.extend(
                 ["-DeltaFromVersion", request["delta_from_version"]]
@@ -766,6 +818,7 @@ def build_windows_result(
         for key, label in (
             ("ca_bundle", "CA 根证书"),
             ("baseline_snapshot", "Windows 增量基线快照"),
+            ("trainer_trust", "强化组件可信公钥配置"),
         ):
             descriptor = request["inputs"].get(key)
             if descriptor is None:
@@ -791,6 +844,11 @@ def build_windows_result(
             "source_commit": commit,
             "base_url": request["base_url"],
             "channel": request["channel"],
+            "trainer_trust_sha256": (
+                ""
+                if trainer_trust_descriptor is None
+                else str(trainer_trust_descriptor["sha256"])
+            ),
             "delta_from_version": request["delta_from_version"],
             "build_portable": request["build_portable"],
             "tests_passed": bool(run_tests or tests_prevalidated),
@@ -825,6 +883,7 @@ def build_local_windows_result(
     github_remote: str,
     inno_compiler: str,
     tests_prevalidated: bool,
+    trainer_trust_file: str = "",
 ) -> Path:
     request_archive = create_windows_request(
         root,
@@ -835,6 +894,7 @@ def build_local_windows_result(
         delta_from_version=delta_from_version,
         build_portable=build_portable,
         github_remote=github_remote,
+        trainer_trust_file=trainer_trust_file,
     )
     result_archive = (
         root
@@ -858,6 +918,7 @@ def build_local_windows_result(
         base_url=base_url,
         channel=channel,
         ca_bundle=ca_bundle,
+        trainer_trust_file=trainer_trust_file,
         delta_from_version=delta_from_version,
         build_portable=build_portable,
     )
@@ -865,6 +926,11 @@ def build_local_windows_result(
 
 def expected_ca_hash(request: dict[str, Any]) -> str:
     descriptor = request["inputs"].get("ca_bundle")
+    return "" if descriptor is None else str(descriptor["sha256"])
+
+
+def expected_trainer_trust_hash(request: dict[str, Any]) -> str:
+    descriptor = request["inputs"].get("trainer_trust")
     return "" if descriptor is None else str(descriptor["sha256"])
 
 
@@ -887,11 +953,15 @@ def validate_result_payload(payload: Any) -> dict[str, Any]:
         raise ReleaseTaskError("Windows 构建结果的便携包选项无效")
     if not isinstance(artifacts, dict):
         raise ReleaseTaskError("Windows 构建结果缺少 artifacts")
+    trainer_trust_hash = str(payload.get("trainer_trust_sha256") or "").casefold()
+    if trainer_trust_hash and not re.fullmatch(r"[0-9a-f]{64}", trainer_trust_hash):
+        raise ReleaseTaskError("Windows 构建结果强化组件公钥指纹无效")
     return {
         **payload,
         "request_id": request_id,
         "request_sha256": request_hash,
         "source_commit": source_commit,
+        "trainer_trust_sha256": trainer_trust_hash,
         "artifacts": artifacts,
     }
 
@@ -942,10 +1012,17 @@ def detect_windows_result_portable(result_archive: str | Path) -> bool:
                     raise ReleaseTaskError(
                         f"Windows 结果元数据 {key} 与构建任务不一致"
                     )
+            if result.get("trainer_trust_sha256", "") != (
+                expected_trainer_trust_hash(request)
+            ):
+                raise ReleaseTaskError(
+                    "Windows 结果元数据 trainer_trust_sha256 与构建任务不一致"
+                )
 
             for key, label in (
                 ("ca_bundle", "CA 根证书"),
                 ("baseline_snapshot", "Windows 增量基线快照"),
+                ("trainer_trust", "强化组件可信公钥配置"),
             ):
                 descriptor = request["inputs"].get(key)
                 if descriptor is None:
@@ -1007,6 +1084,7 @@ def compare_request_to_expected(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    trainer_trust_file: str,
     delta_from_version: str,
     build_portable: bool,
 ) -> None:
@@ -1026,6 +1104,12 @@ def compare_request_to_expected(
             )
     if expected_ca_hash(request) != ca_fingerprint(ca_bundle):
         raise ReleaseTaskError("Windows 结果内的 CA 根证书与当前发布配置不一致")
+    if expected_trainer_trust_hash(request) != trainer_trust_fingerprint(
+        trainer_trust_file
+    ):
+        raise ReleaseTaskError(
+            "Windows 结果内的强化组件可信公钥配置与当前发布配置不一致"
+        )
 
 
 def receipt_artifact(root: Path, path: Path) -> dict[str, Any]:
@@ -1053,6 +1137,7 @@ def import_windows_result(
     ca_bundle: str,
     delta_from_version: str,
     build_portable: bool,
+    trainer_trust_file: str = "",
 ) -> Path:
     _branch, commit = source_state(root)
     result_archive = result_archive.expanduser().resolve()
@@ -1081,6 +1166,7 @@ def import_windows_result(
             base_url=base_url,
             channel=channel,
             ca_bundle=ca_bundle,
+            trainer_trust_file=trainer_trust_file,
             delta_from_version=delta_from_version,
             build_portable=build_portable,
         )
@@ -1094,6 +1180,12 @@ def import_windows_result(
         ):
             if result.get(key) != request.get(key):
                 raise ReleaseTaskError(f"Windows 结果元数据 {key} 与构建任务不一致")
+        if result.get("trainer_trust_sha256", "") != (
+            expected_trainer_trust_hash(request)
+        ):
+            raise ReleaseTaskError(
+                "Windows 结果元数据 trainer_trust_sha256 与构建任务不一致"
+            )
 
         required = {"windows_installer", "windows_snapshot"}
         if delta_from_version:
@@ -1155,6 +1247,7 @@ def import_windows_result(
             "base_url": request["base_url"],
             "channel": channel,
             "ca_sha256": expected_ca_hash(request),
+            "trainer_trust_sha256": expected_trainer_trust_hash(request),
             "delta_from_version": delta_from_version,
             "build_portable": build_portable,
             "request_id": request["request_id"],
@@ -1209,6 +1302,7 @@ def validate_uos_payload(
     channel: str,
     ca_hash: str,
     label: str,
+    trainer_trust_hash: str = "",
 ) -> None:
     build_info = parse_build_info(payload_root / "build-info.txt")
     if build_info.get("version") != version:
@@ -1246,6 +1340,10 @@ def validate_uos_payload(
         packaged_ca = ""
     if packaged_ca != ca_hash:
         raise ReleaseTaskError(f"{label}CA 根证书与当前配置不一致")
+    trainer_trust = payload_root / "trainer-trust.json"
+    packaged_trainer_trust = sha256(trainer_trust) if trainer_trust.is_file() else ""
+    if packaged_trainer_trust != trainer_trust_hash:
+        raise ReleaseTaskError(f"{label}强化组件可信公钥配置与当前配置不一致")
 
 
 def validate_uos_deb_payload(
@@ -1257,6 +1355,7 @@ def validate_uos_deb_payload(
     base_url: str,
     channel: str,
     ca_hash: str,
+    trainer_trust_hash: str = "",
 ) -> None:
     if not artifact.is_file():
         raise ReleaseTaskError(f"UOS DEB 不存在：{artifact}")
@@ -1276,6 +1375,7 @@ def validate_uos_deb_payload(
             channel=channel,
             ca_hash=ca_hash,
             label="UOS DEB ",
+            trainer_trust_hash=trainer_trust_hash,
         )
 
 
@@ -1286,6 +1386,7 @@ def record_uos_result(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    trainer_trust_file: str = "",
     allow_detached: bool = False,
 ) -> Path:
     _branch, commit = source_state(root, allow_detached=allow_detached)
@@ -1303,6 +1404,7 @@ def record_uos_result(
     )
     artifact = root / "dist" / "uos-arm64" / f"IntDemo-UOS-arm64-{version}.deb"
     expected_ca = ca_fingerprint(ca_bundle)
+    expected_trainer_trust = trainer_trust_fingerprint(trainer_trust_file)
     validate_uos_payload(
         package_root,
         version=version,
@@ -1311,6 +1413,7 @@ def record_uos_result(
         channel=channel,
         ca_hash=expected_ca,
         label="UOS 候选包",
+        trainer_trust_hash=expected_trainer_trust,
     )
     validate_uos_deb_payload(
         root,
@@ -1320,6 +1423,7 @@ def record_uos_result(
         base_url=normalized_url,
         channel=channel,
         ca_hash=expected_ca,
+        trainer_trust_hash=expected_trainer_trust,
     )
     receipt = {
         "schema_version": 1,
@@ -1329,6 +1433,7 @@ def record_uos_result(
         "base_url": normalized_url,
         "channel": channel,
         "ca_sha256": expected_ca,
+        "trainer_trust_sha256": expected_trainer_trust,
         "validated_at": utc_now(),
         "artifacts": {
             "uos_installer": receipt_artifact(root, artifact),
@@ -1351,6 +1456,7 @@ def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
     base_url = normalize_base_url(str(payload.get("base_url") or ""))
     channel = str(payload.get("channel") or "")
     ca_hash = str(payload.get("ca_sha256") or "").casefold()
+    trainer_trust_hash = str(payload.get("trainer_trust_sha256") or "").casefold()
     artifacts = payload.get("artifacts")
     if platform_key != "linux-aarch64":
         raise ReleaseTaskError("UOS 构建结果平台必须是 linux-aarch64")
@@ -1361,6 +1467,8 @@ def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
         raise ReleaseTaskError("UOS 构建结果通道无效")
     if ca_hash and not re.fullmatch(r"[0-9a-f]{64}", ca_hash):
         raise ReleaseTaskError("UOS 构建结果 CA 指纹无效")
+    if trainer_trust_hash and not re.fullmatch(r"[0-9a-f]{64}", trainer_trust_hash):
+        raise ReleaseTaskError("UOS 构建结果强化组件公钥指纹无效")
     if payload.get("payload_validated") is not True:
         raise ReleaseTaskError("UOS 构建结果未声明已完成安装内容校验")
     if not isinstance(artifacts, dict):
@@ -1376,6 +1484,7 @@ def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
         "base_url": base_url,
         "channel": channel,
         "ca_sha256": ca_hash,
+        "trainer_trust_sha256": trainer_trust_hash,
         "artifacts": artifacts,
         "builder": builder,
     }
@@ -1398,6 +1507,7 @@ def export_uos_result(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    trainer_trust_file: str = "",
     output: Path | None = None,
     allow_detached: bool = False,
 ) -> Path:
@@ -1407,6 +1517,7 @@ def export_uos_result(
         base_url=base_url,
         channel=channel,
         ca_bundle=ca_bundle,
+        trainer_trust_file=trainer_trust_file,
         allow_detached=allow_detached,
     )
     receipt = load_json_object(validated_receipt_path, "UOS 构建收据")
@@ -1435,6 +1546,7 @@ def export_uos_result(
                 "base_url": receipt["base_url"],
                 "channel": receipt["channel"],
                 "ca_sha256": receipt["ca_sha256"],
+                "trainer_trust_sha256": receipt.get("trainer_trust_sha256", ""),
                 "payload_validated": True,
                 "built_at": receipt.get("validated_at") or utc_now(),
                 "builder": {
@@ -1470,6 +1582,7 @@ def import_uos_result(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    trainer_trust_file: str = "",
 ) -> Path:
     _branch, commit = source_state(root)
     result_archive = result_archive.expanduser().resolve()
@@ -1489,6 +1602,7 @@ def import_uos_result(
             "base_url": normalize_base_url(base_url),
             "channel": channel,
             "ca_sha256": ca_fingerprint(ca_bundle),
+            "trainer_trust_sha256": trainer_trust_fingerprint(trainer_trust_file),
         }
         for key, value in expected.items():
             if result.get(key) != value:
@@ -1517,6 +1631,7 @@ def import_uos_result(
                 base_url=expected["base_url"],
                 channel=channel,
                 ca_hash=expected["ca_sha256"],
+                trainer_trust_hash=expected["trainer_trust_sha256"],
             )
         write_bytes_atomic(
             target.with_suffix(target.suffix + ".sha256"),
@@ -1530,6 +1645,7 @@ def import_uos_result(
             "base_url": expected["base_url"],
             "channel": channel,
             "ca_sha256": expected["ca_sha256"],
+            "trainer_trust_sha256": expected["trainer_trust_sha256"],
             "result_archive_sha256": sha256(result_archive),
             "validated_at": utc_now(),
             "builder": result["builder"],
@@ -1589,6 +1705,7 @@ def validate_platform_receipt(
     base_url: str,
     channel: str,
     ca_hash: str,
+    trainer_trust_hash: str = "",
 ) -> tuple[dict[str, Any], dict[str, Path]]:
     receipt = load_json_object(path, f"{platform_key} 构建收据")
     expected = {
@@ -1599,9 +1716,13 @@ def validate_platform_receipt(
         "base_url": normalize_base_url(base_url),
         "channel": channel,
         "ca_sha256": ca_hash,
+        "trainer_trust_sha256": trainer_trust_hash,
     }
     for key, value in expected.items():
-        if receipt.get(key) != value:
+        actual = receipt.get(key)
+        if key == "trainer_trust_sha256":
+            actual = str(actual or "").casefold()
+        if actual != value:
             raise ReleaseTaskError(
                 f"{platform_key} 构建收据 {key} 不匹配："
                 f"{receipt.get(key)!r} != {value!r}"
@@ -1623,6 +1744,7 @@ def load_release_candidates(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    trainer_trust_file: str = "",
     delta_from_version: str,
     build_portable: bool,
 ) -> tuple[dict[str, Any], dict[str, Path], dict[str, Any], dict[str, Path]]:
@@ -1630,6 +1752,7 @@ def load_release_candidates(
     if current_version(root) != version:
         raise ReleaseTaskError("当前项目版本与待发布版本不一致")
     ca_hash = ca_fingerprint(ca_bundle)
+    trainer_trust_hash = trainer_trust_fingerprint(trainer_trust_file)
     windows_receipt, windows_paths = validate_platform_receipt(
         root,
         path=(
@@ -1645,6 +1768,7 @@ def load_release_candidates(
         base_url=base_url,
         channel=channel,
         ca_hash=ca_hash,
+        trainer_trust_hash=trainer_trust_hash,
     )
     uos_receipt, uos_paths = validate_platform_receipt(
         root,
@@ -1657,6 +1781,7 @@ def load_release_candidates(
         base_url=base_url,
         channel=channel,
         ca_hash=ca_hash,
+        trainer_trust_hash=trainer_trust_hash,
     )
     if windows_receipt.get("delta_from_version") != delta_from_version:
         raise ReleaseTaskError("Windows 构建收据的增量来源与当前发布配置不一致")
@@ -2353,6 +2478,7 @@ def publish_release(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    trainer_trust_file: str = "",
     delta_from_version: str,
     build_portable: bool,
     notes: str,
@@ -2394,6 +2520,7 @@ def publish_release(
             base_url=normalized_url,
             channel=channel,
             ca_bundle=ca_bundle,
+            trainer_trust_file=trainer_trust_file,
             delta_from_version=delta_from_version,
             build_portable=build_portable,
         )
@@ -2675,6 +2802,7 @@ def github_windows_build(
     base_url: str,
     channel: str,
     ca_bundle: str,
+    trainer_trust_file: str = "",
     delta_from_version: str,
     build_portable: bool,
     github_remote: str,
@@ -2688,6 +2816,7 @@ def github_windows_build(
         base_url=base_url,
         channel=channel,
         ca_bundle=ca_bundle,
+        trainer_trust_file=trainer_trust_file,
         delta_from_version=delta_from_version,
         build_portable=build_portable,
         github_remote=github_remote,
@@ -2840,6 +2969,7 @@ def github_windows_build(
             base_url=base_url,
             channel=channel,
             ca_bundle=ca_bundle,
+            trainer_trust_file=trainer_trust_file,
             delta_from_version=delta_from_version,
             build_portable=build_portable,
         )
@@ -2858,6 +2988,7 @@ def add_common_build_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--base-url", required=True)
     parser.add_argument("--channel", choices=("test", "stable"), default="test")
     parser.add_argument("--ca-bundle", default="")
+    parser.add_argument("--trainer-trust-file", default="")
     parser.add_argument("--delta-from-version", default="")
     parser.add_argument("--build-portable", action="store_true")
 
@@ -2907,12 +3038,14 @@ def build_parser() -> argparse.ArgumentParser:
     record_uos.add_argument("--base-url", required=True)
     record_uos.add_argument("--channel", choices=("test", "stable"), default="test")
     record_uos.add_argument("--ca-bundle", default="")
+    record_uos.add_argument("--trainer-trust-file", default="")
 
     export_uos = commands.add_parser("export-uos-result")
     export_uos.add_argument("--version", required=True)
     export_uos.add_argument("--base-url", required=True)
     export_uos.add_argument("--channel", choices=("test", "stable"), default="test")
     export_uos.add_argument("--ca-bundle", default="")
+    export_uos.add_argument("--trainer-trust-file", default="")
     export_uos.add_argument("--output", default="")
     export_uos.add_argument("--allow-detached", action="store_true")
 
@@ -2921,6 +3054,7 @@ def build_parser() -> argparse.ArgumentParser:
     import_uos.add_argument("--base-url", required=True)
     import_uos.add_argument("--channel", choices=("test", "stable"), default="test")
     import_uos.add_argument("--ca-bundle", default="")
+    import_uos.add_argument("--trainer-trust-file", default="")
     import_uos.add_argument("--result-archive", required=True)
 
     publish = commands.add_parser("publish")
@@ -2955,6 +3089,7 @@ def main(argv: list[str] | None = None) -> int:
                 delta_from_version=args.delta_from_version,
                 build_portable=args.build_portable,
                 github_remote=args.github_remote,
+                trainer_trust_file=args.trainer_trust_file,
             )
         elif args.command == "windows-github":
             github_windows_build(
@@ -2963,6 +3098,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 channel=args.channel,
                 ca_bundle=args.ca_bundle,
+                trainer_trust_file=args.trainer_trust_file,
                 delta_from_version=args.delta_from_version,
                 build_portable=args.build_portable,
                 github_remote=args.github_remote,
@@ -2992,6 +3128,7 @@ def main(argv: list[str] | None = None) -> int:
                 github_remote=args.github_remote,
                 inno_compiler=args.inno_compiler,
                 tests_prevalidated=args.tests_prevalidated,
+                trainer_trust_file=args.trainer_trust_file,
             )
         elif args.command == "import-windows-result":
             import_windows_result(
@@ -3003,6 +3140,7 @@ def main(argv: list[str] | None = None) -> int:
                 ca_bundle=args.ca_bundle,
                 delta_from_version=args.delta_from_version,
                 build_portable=args.build_portable,
+                trainer_trust_file=args.trainer_trust_file,
             )
         elif args.command == "record-uos-result":
             record_uos_result(
@@ -3011,6 +3149,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 channel=args.channel,
                 ca_bundle=args.ca_bundle,
+                trainer_trust_file=args.trainer_trust_file,
             )
         elif args.command == "export-uos-result":
             export_uos_result(
@@ -3019,6 +3158,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 channel=args.channel,
                 ca_bundle=args.ca_bundle,
+                trainer_trust_file=args.trainer_trust_file,
                 output=Path(args.output) if args.output else None,
                 allow_detached=args.allow_detached,
             )
@@ -3030,6 +3170,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 channel=args.channel,
                 ca_bundle=args.ca_bundle,
+                trainer_trust_file=args.trainer_trust_file,
             )
         elif args.command == "publish":
             publish_release(
@@ -3038,6 +3179,7 @@ def main(argv: list[str] | None = None) -> int:
                 base_url=args.base_url,
                 channel=args.channel,
                 ca_bundle=args.ca_bundle,
+                trainer_trust_file=args.trainer_trust_file,
                 delta_from_version=args.delta_from_version,
                 build_portable=args.build_portable,
                 notes=args.notes,

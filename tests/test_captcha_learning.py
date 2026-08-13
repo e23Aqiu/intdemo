@@ -20,6 +20,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 from integrated_client.captcha_models import (
     CaptchaModelManager,
     CaptchaTrainingError,
+    HogLinearSvmCaptchaModel,
     KnnCaptchaModel,
     train_candidate,
 )
@@ -34,6 +35,84 @@ from integrated_client.tools.transport_tool import (
 )
 from integrated_client.ui.machine_learning_page import MachineLearningPage
 from integrated_client.ui.main_window import MainWindow
+from integrated_client.trainer_trust import TrainerTrustConfigurationError
+
+
+class _FakeTrainerStatus:
+    def __init__(
+        self,
+        *,
+        code="not_installed",
+        version="",
+        platform="",
+        installed_size=0,
+        maintenance_required=False,
+        cleanup_available=False,
+        maintenance_message="",
+    ):
+        self.code = code
+        self.version = version
+        self.platform = platform
+        self.installed_size = installed_size
+        self.maintenance_required = maintenance_required
+        self.cleanup_available = cleanup_available
+        self.maintenance_message = maintenance_message
+        self.last_self_test_at = ""
+        self.detail = "测试状态"
+
+    @property
+    def available(self):
+        return self.code == "available"
+
+    @property
+    def installed(self):
+        return self.code != "not_installed"
+
+
+class _FakeTrainerManager:
+    def __init__(self, *, available=False, mode="standard"):
+        self._status = _FakeTrainerStatus(
+            code="available" if available else "not_installed",
+            version="1.2.3" if available else "",
+            platform="windows-x86_64" if available else "",
+            installed_size=1024 if available else 0,
+        )
+        self.mode = mode if available else "standard"
+        self.installed_sources = []
+        self.self_test_count = 0
+        self.uninstall_count = 0
+
+    def status(self, *, verify_files=True):
+        return self._status
+
+    def preferred_mode(self):
+        return self.mode
+
+    def set_preferred_mode(self, mode):
+        if mode == "enhanced" and not self._status.available:
+            raise RuntimeError("强化组件不可用")
+        self.mode = mode
+        return mode
+
+    def install(self, source):
+        self.installed_sources.append(Path(source))
+        self._status = _FakeTrainerStatus(
+            code="available",
+            version="1.2.3",
+            platform="windows-x86_64",
+            installed_size=1024,
+        )
+        return SimpleNamespace(status=self._status, replaced_version="")
+
+    def self_test(self):
+        self.self_test_count += 1
+        return self._status
+
+    def uninstall(self):
+        self.uninstall_count += 1
+        self._status = _FakeTrainerStatus()
+        self.mode = "standard"
+        return 1024
 
 
 def _png_bytes(image):
@@ -242,7 +321,8 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(numeric.sample_count, 25)
         self.assertGreater(numeric.test_count, 0)
         self.assertTrue(numeric.artifact.startswith(b"PK"))
-        numeric_model = KnnCaptchaModel.from_bytes(numeric.artifact)
+        self.assertEqual(numeric.algorithm, "hog-linear-svm-v1")
+        numeric_model = HogLinearSvmCaptchaModel.from_bytes(numeric.artifact)
         self.assertEqual(
             len(numeric_model.predict_numeric(_numeric_image("0369"))),
             4,
@@ -254,13 +334,31 @@ class CaptchaLearningTests(unittest.TestCase):
 
         click = train_candidate(self.archive, "click")
         self.assertEqual(click.sample_count, 35)
-        click_model = KnnCaptchaModel.from_bytes(click.artifact)
+        self.assertEqual(click.algorithm, "hog-linear-svm-v1")
+        click_model = HogLinearSvmCaptchaModel.from_bytes(click.artifact)
         positions = click_model.predict_click_regions(
             _click_image(),
             [(18, 18, 42, 42), (78, 18, 102, 42)],
         )
         self.assertTrue(positions)
         self.assertTrue(all(len(point) == 2 for point in positions.values()))
+
+    def test_standard_numeric_training_uses_one_shared_full_image_feature(self):
+        with patch(
+            "integrated_client.captcha_models._numeric_features",
+            side_effect=AssertionError("legacy equal-width slicing must not run"),
+        ):
+            candidate = train_candidate(self.archive, "numeric", mode="standard")
+
+        self.assertEqual(candidate.algorithm, "hog-linear-svm-v1")
+        self.assertIn("-hog-svm-", candidate.version)
+        self.assertEqual(
+            candidate.metrics["classifiers"],
+            "four_position_ovr_linear_svm_shared_full_image",
+        )
+
+        with self.assertRaises(CaptchaTrainingError):
+            train_candidate(self.archive, "numeric", mode="enhanced")
 
     def test_training_rejects_unsafe_or_insufficient_archives(self):
         output = io.BytesIO()
@@ -446,6 +544,7 @@ class CaptchaLearningTests(unittest.TestCase):
                 "numeric",
                 candidate.version,
                 candidate.artifact,
+                algorithm=candidate.algorithm,
             )
             service = CaptchaLearningService(_FakeSession())
             self.assertEqual(
@@ -457,6 +556,7 @@ class CaptchaLearningTests(unittest.TestCase):
                     "numeric",
                     candidate.version,
                     digest,
+                    candidate.algorithm,
                 )
             )
             self.assertEqual(
@@ -468,13 +568,351 @@ class CaptchaLearningTests(unittest.TestCase):
                     "numeric",
                     candidate.version,
                     "0" * 64,
+                    candidate.algorithm,
                 )
+            )
+
+    def test_saving_model_cache_removes_older_versions(self):
+        candidate = train_candidate(self.archive, "numeric")
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            old_cache = CaptchaLearningService._model_cache_path(
+                "numeric", "numeric-old"
+            )
+            old_cache.parent.mkdir(parents=True)
+            old_cache.write_bytes(b"old-model")
+            unrelated = old_cache.parent / "notes.txt"
+            unrelated.write_text("stale", encoding="utf-8")
+
+            CaptchaLearningService._save_model_cache(
+                "numeric",
+                candidate.version,
+                candidate.artifact,
+                algorithm=candidate.algorithm,
+            )
+
+            self.assertFalse(old_cache.exists())
+            self.assertTrue(unrelated.exists())
+            self.assertTrue(
+                CaptchaLearningService._model_cache_path(
+                    "numeric", candidate.version
+                ).exists()
+            )
+            self.assertTrue(
+                CaptchaLearningService._active_model_marker_path(
+                    "numeric"
+                ).exists()
+            )
+
+    def test_saving_model_cache_rejects_oversized_artifact(self):
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ), patch(
+            "integrated_client.online.captcha_learning.MAX_MODEL_CACHE_BYTES",
+            8,
+        ):
+            with self.assertRaises(ValueError):
+                CaptchaLearningService._save_model_cache(
+                    "numeric",
+                    "numeric-too-large",
+                    b"123456789",
+                    algorithm="hog-linear-svm-v1",
+                )
+            self.assertFalse(
+                CaptchaLearningService._model_cache_path(
+                    "numeric", "numeric-too-large"
+                ).exists()
+            )
+
+    def test_restoring_cached_model_removes_older_versions(self):
+        candidate = train_candidate(self.archive, "numeric")
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            CaptchaLearningService._save_model_cache(
+                "numeric",
+                candidate.version,
+                candidate.artifact,
+                algorithm=candidate.algorithm,
+            )
+            stale = CaptchaLearningService._model_cache_path(
+                "numeric", "numeric-stale"
+            )
+            stale.write_bytes(b"stale")
+
+            service = CaptchaLearningService(_FakeSession())
+
+            self.assertEqual(
+                service.model_manager.version("numeric"), candidate.version
+            )
+            self.assertFalse(stale.exists())
+
+    def test_switching_to_builtin_removes_cached_custom_models(self):
+        candidate = train_candidate(self.archive, "numeric")
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            CaptchaLearningService._save_model_cache(
+                "numeric",
+                candidate.version,
+                candidate.artifact,
+                algorithm=candidate.algorithm,
+            )
+            service = CaptchaLearningService(_FakeSession())
+            service.policy = {"active_models": {}}
+
+            service._sync_active_models()
+
+            cache_dir = Path(temp_dir) / "captcha-models" / "numeric"
+            self.assertFalse(any(cache_dir.iterdir()))
+            self.assertEqual(
+                service.model_manager.version("numeric"),
+                "ddddocr-builtin",
+            )
+
+    def test_model_cache_pruning_leaves_symbolic_links_untouched(self):
+        candidate = train_candidate(self.archive, "numeric")
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            external = Path(temp_dir) / "external-model.npz"
+            external.write_bytes(b"external")
+            link = CaptchaLearningService._model_cache_path(
+                "numeric", "linked-model"
+            )
+            link.parent.mkdir(parents=True)
+            try:
+                link.symlink_to(external)
+            except (OSError, NotImplementedError):
+                self.skipTest("symbolic links are unavailable for this account")
+
+            CaptchaLearningService._save_model_cache(
+                "numeric",
+                candidate.version,
+                candidate.artifact,
+                algorithm=candidate.algorithm,
+            )
+
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(external.read_bytes(), b"external")
+
+    def test_cache_load_rejects_algorithm_mismatch(self):
+        candidate = train_candidate(self.archive, "numeric")
+        digest = hashlib.sha256(candidate.artifact).hexdigest()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            service = CaptchaLearningService(
+                _FakeSession(),
+                model_manager=CaptchaModelManager(),
+            )
+            CaptchaLearningService._save_model_cache(
+                "numeric",
+                candidate.version,
+                candidate.artifact,
+                algorithm=candidate.algorithm,
+            )
+
+            self.assertFalse(
+                service._load_model_cache(
+                    "numeric",
+                    candidate.version,
+                    digest,
+                    "tiny-cnn-onnx-v1",
+                )
+            )
+            self.assertEqual(
+                service.model_manager.version("numeric"),
+                "ddddocr-builtin",
+            )
+
+    def test_v110_does_not_restore_legacy_knn_from_local_cache(self):
+        legacy = KnnCaptchaModel(
+            "numeric",
+            "numeric-knn-retired",
+            [[0.0] * (24 * 32), [1.0] * (24 * 32)],
+            ["1", "5"],
+            k=1,
+        )
+        artifact = legacy.to_bytes()
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            CaptchaLearningService._save_model_cache(
+                "numeric",
+                legacy.version,
+                artifact,
+                algorithm=legacy.ALGORITHM,
+            )
+            service = CaptchaLearningService(_FakeSession())
+
+            self.assertEqual(
+                service.model_manager.version("numeric"),
+                "ddddocr-builtin",
+            )
+            self.assertFalse(
+                CaptchaLearningService._active_model_marker_path(
+                    "numeric"
+                ).exists()
+            )
+
+    def test_cache_marker_algorithm_must_match_artifact(self):
+        candidate = train_candidate(self.archive, "numeric")
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            CaptchaLearningService._save_model_cache(
+                "numeric",
+                candidate.version,
+                candidate.artifact,
+                algorithm="tiny-cnn-onnx-v1",
+            )
+
+            service = CaptchaLearningService(_FakeSession())
+
+            self.assertEqual(
+                service.model_manager.version("numeric"),
+                "ddddocr-builtin",
+            )
+            self.assertFalse(
+                CaptchaLearningService._active_model_marker_path(
+                    "numeric"
+                ).exists()
+            )
+            self.assertFalse(
+                CaptchaLearningService._model_cache_path(
+                    "numeric", candidate.version
+                ).exists()
+            )
+
+    def test_downloaded_model_algorithm_must_match_policy(self):
+        candidate = train_candidate(self.archive, "numeric")
+        metadata = {
+            "version": candidate.version,
+            "algorithm": "tiny-cnn-onnx-v1",
+            "artifact_sha256": hashlib.sha256(candidate.artifact).hexdigest(),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            service = CaptchaLearningService(_FakeSession())
+            service._stopped = False
+            service.policy = {"active_models": {"numeric": metadata}}
+
+            service._model_downloaded(
+                "numeric",
+                metadata,
+                candidate.artifact,
+                None,
+            )
+
+            self.assertEqual(
+                service.model_manager.version("numeric"),
+                "ddddocr-builtin",
+            )
+            self.assertFalse(
+                CaptchaLearningService._active_model_marker_path(
+                    "numeric"
+                ).exists()
+            )
+
+    def test_downloaded_legacy_knn_is_rejected_under_standard_policy(self):
+        legacy = KnnCaptchaModel(
+            "numeric",
+            "numeric-knn-retired",
+            [[0.0] * (24 * 32), [1.0] * (24 * 32)],
+            ["1", "5"],
+            k=1,
+        )
+        artifact = legacy.to_bytes()
+        metadata = {
+            "version": legacy.version,
+            "algorithm": "hog-linear-svm-v1",
+            "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            service = CaptchaLearningService(_FakeSession())
+            service._stopped = False
+            service.policy = {"active_models": {"numeric": metadata}}
+
+            service._model_downloaded("numeric", metadata, artifact, None)
+
+            self.assertEqual(
+                service.model_manager.version("numeric"),
+                "ddddocr-builtin",
+            )
+            self.assertFalse(
+                CaptchaLearningService._model_cache_path(
+                    "numeric", legacy.version
+                ).exists()
+            )
+
+    def test_same_version_with_changed_algorithm_is_not_treated_as_current(self):
+        candidate = train_candidate(self.archive, "numeric")
+        standard_metadata = {
+            "version": candidate.version,
+            "algorithm": candidate.algorithm,
+            "artifact_sha256": hashlib.sha256(candidate.artifact).hexdigest(),
+        }
+        changed_metadata = {
+            **standard_metadata,
+            "algorithm": "tiny-cnn-onnx-v1",
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            service = CaptchaLearningService(_FakeSession())
+            service._stopped = False
+            service.model_manager.install(
+                "numeric",
+                candidate.version,
+                candidate.artifact,
+                expected_algorithm=candidate.algorithm,
+            )
+            service._active_model_identities["numeric"] = (
+                "numeric",
+                candidate.version,
+                candidate.algorithm,
+                standard_metadata["artifact_sha256"],
+            )
+            service.policy = {"active_models": {"numeric": changed_metadata}}
+            started = []
+            service._start_task = lambda function, completed: started.append(
+                (function, completed)
+            )
+
+            service._sync_active_models()
+
+            self.assertEqual(len(started), 1)
+            self.assertEqual(
+                service._downloading_models.get("numeric"),
+                (
+                    "numeric",
+                    candidate.version,
+                    "tiny-cnn-onnx-v1",
+                    changed_metadata["artifact_sha256"],
+                ),
             )
 
     def test_stale_model_download_is_not_installed_after_policy_changes(self):
         candidate = train_candidate(self.archive, "numeric")
         metadata = {
             "version": candidate.version,
+            "algorithm": candidate.algorithm,
             "artifact_sha256": hashlib.sha256(candidate.artifact).hexdigest(),
         }
         with tempfile.TemporaryDirectory() as temp_dir, patch(
@@ -489,12 +927,54 @@ class CaptchaLearningTests(unittest.TestCase):
                 "revision": 2,
                 "active_models": {},
             }
-            service._downloading_models.add("numeric")
             service._model_downloaded(
                 "numeric",
                 metadata,
                 candidate.artifact,
                 None,
+            )
+            self.assertEqual(
+                service.model_manager.version("numeric"),
+                "ddddocr-builtin",
+            )
+
+    def test_older_download_cannot_remove_newer_download_identity(self):
+        candidate = train_candidate(self.archive, "numeric")
+        old_metadata = {
+            "version": candidate.version,
+            "algorithm": candidate.algorithm,
+            "artifact_sha256": hashlib.sha256(candidate.artifact).hexdigest(),
+        }
+        new_metadata = {
+            **old_metadata,
+            "version": f"{candidate.version}-new",
+            "artifact_sha256": "1" * 64,
+        }
+        new_identity = (
+            "numeric",
+            new_metadata["version"],
+            new_metadata["algorithm"],
+            new_metadata["artifact_sha256"],
+        )
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            service = CaptchaLearningService(_FakeSession())
+            service._stopped = False
+            service.policy = {"active_models": {"numeric": new_metadata}}
+            service._downloading_models["numeric"] = new_identity
+
+            service._model_downloaded(
+                "numeric",
+                old_metadata,
+                candidate.artifact,
+                None,
+            )
+
+            self.assertEqual(
+                service._downloading_models.get("numeric"),
+                new_identity,
             )
             self.assertEqual(
                 service.model_manager.version("numeric"),
@@ -1560,6 +2040,228 @@ class CaptchaLearningTests(unittest.TestCase):
 
         page.deleteLater()
 
+    def test_machine_learning_page_displays_training_mode_and_algorithm(self):
+        manager = _FakeTrainerManager(available=True, mode="enhanced")
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(
+                _FakeSession(),
+                trainer_manager=manager,
+            )
+        page.refresh_timer.stop()
+
+        self.assertEqual(page.training_mode_combo.currentData(), "enhanced")
+        self.assertIn("强化模式", page.training_method_label.text())
+        self.assertIn("tiny-cnn-onnx-v1", page.training_method_label.text())
+        self.assertIn("已安装", page.trainer_status_label.text())
+        self.assertIn("1.2.3", page.trainer_status_label.text())
+        self.assertTrue(page.self_test_trainer_btn.isEnabled())
+        self.assertTrue(page.uninstall_trainer_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_disables_enhanced_mode_without_component(self):
+        manager = _FakeTrainerManager(available=False)
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(
+                _FakeSession(),
+                trainer_manager=manager,
+            )
+        page.refresh_timer.stop()
+
+        enhanced_index = page.training_mode_combo.findData("enhanced")
+        self.assertEqual(page.training_mode_combo.currentData(), "standard")
+        self.assertFalse(
+            page.training_mode_combo.model().item(enhanced_index).isEnabled()
+        )
+        self.assertIn("hog-linear-svm-v1", page.training_method_label.text())
+        self.assertIn("未安装", page.trainer_status_label.text())
+        self.assertTrue(page.install_trainer_btn.isEnabled())
+        self.assertFalse(page.self_test_trainer_btn.isEnabled())
+        self.assertFalse(page.uninstall_trainer_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_allows_cleaning_confirmed_residuals(self):
+        manager = _FakeTrainerManager(available=False)
+        manager._status = _FakeTrainerStatus(
+            maintenance_required=True,
+            cleanup_available=True,
+            maintenance_message="有 1 个卸载临时目录待清理",
+            installed_size=2048,
+        )
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(
+                _FakeSession(),
+                trainer_manager=manager,
+            )
+        page.refresh_timer.stop()
+
+        self.assertIn("检测到组件残留", page.trainer_status_label.text())
+        self.assertTrue(page.uninstall_trainer_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_survives_invalid_trainer_trust_config(self):
+        with patch.object(MachineLearningPage, "refresh"), patch(
+            "integrated_client.ui.machine_learning_page."
+            "create_trainer_component_manager",
+            side_effect=TrainerTrustConfigurationError("公钥配置损坏"),
+        ):
+            page = MachineLearningPage(_FakeSession())
+        page.refresh_timer.stop()
+
+        self.assertEqual(page.training_mode_combo.currentData(), "standard")
+        self.assertIn("公钥配置损坏", page.trainer_status_label.text())
+        self.assertIn("标准模式仍可使用", page.trainer_status_label.text())
+        self.assertFalse(page.install_trainer_btn.isEnabled())
+        self.assertTrue(page.training_mode_combo.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_survives_deeply_nested_trust_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trust_file = Path(directory) / "trainer-trust.json"
+            trust_file.write_text(
+                "[" * 1_500 + "0" + "]" * 1_500,
+                encoding="utf-8",
+            )
+            with patch.object(MachineLearningPage, "refresh"), patch.dict(
+                os.environ,
+                {"INTDEMO_TRAINER_TRUST_FILE": str(trust_file)},
+                clear=False,
+            ):
+                page = MachineLearningPage(_FakeSession())
+        page.refresh_timer.stop()
+
+        self.assertEqual(page.training_mode_combo.currentData(), "standard")
+        self.assertIn("标准模式仍可使用", page.trainer_status_label.text())
+        self.assertFalse(page.install_trainer_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_runs_trainer_component_lifecycle(self):
+        manager = _FakeTrainerManager(available=False)
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(
+                _FakeSession(),
+                trainer_manager=manager,
+            )
+        page.refresh_timer.stop()
+
+        def immediate(function, completed):
+            completed(function(), None)
+            return object()
+
+        package_path = Path("test-trainer.inttrainer")
+        with patch.object(page, "_start", side_effect=immediate), patch(
+            "integrated_client.ui.machine_learning_page.QFileDialog.getOpenFileName",
+            return_value=(str(package_path), "IntDemo 强化组件"),
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.question",
+            return_value=QMessageBox.Yes,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.information",
+        ):
+            page._install_trainer_component()
+            self.assertEqual(manager.installed_sources, [package_path])
+            self.assertTrue(page.self_test_trainer_btn.isEnabled())
+            self.assertTrue(page.uninstall_trainer_btn.isEnabled())
+
+            page._self_test_trainer_component()
+            self.assertEqual(manager.self_test_count, 1)
+
+            page._uninstall_trainer_component()
+
+        self.assertEqual(manager.uninstall_count, 1)
+        self.assertEqual(page.training_mode_combo.currentData(), "standard")
+        self.assertIn("未安装", page.trainer_status_label.text())
+        self.assertFalse(page.self_test_trainer_btn.isEnabled())
+        self.assertFalse(page.uninstall_trainer_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_trainer_controls_do_not_overlap(self):
+        manager = _FakeTrainerManager(available=True, mode="enhanced")
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(
+                _FakeSession(),
+                trainer_manager=manager,
+            )
+        page.refresh_timer.stop()
+        page.resize(800, 600)
+        page.show()
+        self.app.processEvents()
+
+        controls = [
+            page.training_mode_combo,
+            page.install_trainer_btn,
+            page.self_test_trainer_btn,
+            page.uninstall_trainer_btn,
+        ]
+        geometries = [control.geometry() for control in controls]
+        self.assertTrue(
+            all(
+                control.width() >= control.sizeHint().width()
+                for control in controls
+            )
+        )
+        self.assertTrue(
+            all(
+                not first.intersects(second)
+                for index, first in enumerate(geometries)
+                for second in geometries[index + 1 :]
+            )
+        )
+        self.assertLess(
+            page.trainer_status_label.geometry().bottom(),
+            min(geometry.top() for geometry in geometries),
+        )
+        page.close()
+        page.deleteLater()
+
+    def test_machine_learning_page_uses_selected_training_backend(self):
+        session = _FakeSession()
+        manager = _FakeTrainerManager(available=True, mode="enhanced")
+        session.api.admin_export_captcha_dataset = lambda _token, _kind: b"dataset"
+        session.api.admin_create_captcha_model = lambda _token, payload: payload
+        candidate = SimpleNamespace(
+            captcha_type="numeric",
+            version="numeric-enhanced-test",
+            algorithm="tiny-cnn-onnx-v1",
+            artifact=b"onnx",
+            sample_count=25,
+            test_count=5,
+            correct_count=4,
+            metrics={
+                "training_mode": "enhanced",
+                "trainer_version": "1.2.3",
+            },
+        )
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session, trainer_manager=manager)
+        page.refresh_timer.stop()
+
+        def immediate(function, completed):
+            completed(function(), None)
+            return object()
+
+        with patch.object(
+            page,
+            "_start",
+            side_effect=immediate,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.question",
+            return_value=QMessageBox.Yes,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.information",
+        ), patch(
+            "integrated_client.ui.machine_learning_page.train_enhanced_candidate",
+            return_value=candidate,
+        ) as enhanced, patch(
+            "integrated_client.ui.machine_learning_page.train_candidate",
+        ) as standard:
+            page._train_model("numeric")
+
+        enhanced.assert_called_once_with(b"dataset", "numeric", manager)
+        standard.assert_not_called()
+        self.assertTrue(page.train_numeric_btn.isEnabled())
+        self.assertTrue(page.train_click_btn.isEnabled())
+        page.deleteLater()
+
     def test_workers_emit_success_metrics_without_sample_data(self):
         numeric_worker = Worker(
             "unused.xlsx",
@@ -1694,6 +2396,164 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(len(click_model.calls), 1)
         self.assertTrue(any("当前点选验证码模型" in line for line in logs))
 
+    def test_builtin_numeric_ocr_returns_unprocessed_capture_for_sample(self):
+        original_image = _numeric_image("4826")
+
+        class Locator:
+            @staticmethod
+            def screenshot():
+                return original_image
+
+        class Page:
+            @staticmethod
+            def locator(_selector):
+                return Locator()
+
+        class BuiltinOcr:
+            def __init__(self):
+                self.inputs = []
+
+            def classification(self, image):
+                self.inputs.append(image)
+                return "4826"
+
+        builtin_ocr = BuiltinOcr()
+        with patch(
+            "integrated_client.tools.transport_tool.ocr",
+            builtin_ocr,
+        ):
+            code, sample_image, version = ocr_code(
+                Page(),
+                ".captcha",
+                return_details=True,
+            )
+
+        self.assertEqual((code, version), ("4826", "ddddocr-builtin"))
+        self.assertEqual(sample_image, original_image)
+        self.assertEqual(len(builtin_ocr.inputs), 12)
+        with Image.open(io.BytesIO(original_image)) as original:
+            self.assertEqual(original.size, (96, 32))
+        for recognition_image in builtin_ocr.inputs:
+            self.assertNotEqual(recognition_image, original_image)
+            with Image.open(io.BytesIO(recognition_image)) as processed:
+                self.assertEqual(processed.size, (136, 32))
+
+    def test_automatic_click_captcha_sample_uses_unprocessed_capture(self):
+        original_image = _click_image(3)
+        recognition_calls = {"count": 0}
+        detection_inputs = []
+
+        class ClickModel:
+            version = "click-current-raw-image"
+
+            def __init__(self):
+                self.calls = []
+
+            def predict_click_regions(self, image, bboxes):
+                self.calls.append((image, bboxes))
+                return {"甲": (30, 30), "乙": (90, 30)}
+
+        click_model = ClickModel()
+
+        class Manager:
+            @staticmethod
+            def get(captcha_type):
+                return click_model if captcha_type == "click" else None
+
+        class FakeDdddOcr:
+            def __init__(self, *, det=False, ocr=True, show_ad=False):
+                self.detector = det and not ocr
+
+            @staticmethod
+            def detection(image):
+                detection_inputs.append(image)
+                return [[12, 12, 48, 48], [72, 12, 108, 48]]
+
+            @staticmethod
+            def classification(_image):
+                index = recognition_calls["count"]
+                recognition_calls["count"] += 1
+                return "甲" if index < 8 else "乙"
+
+        class Prompt:
+            @staticmethod
+            def count():
+                return 1
+
+            @staticmethod
+            def inner_text():
+                return "请依次点击【甲,乙】"
+
+            @staticmethod
+            def is_visible():
+                return False
+
+        class CaptchaImage:
+            first = None
+
+            def __init__(self):
+                self.first = self
+                self.clicks = []
+
+            @staticmethod
+            def screenshot():
+                return original_image
+
+            def click(self, *, position, timeout):
+                self.clicks.append((position, timeout))
+
+        captcha_image = CaptchaImage()
+
+        class Page:
+            @staticmethod
+            def locator(selector):
+                if selector == ".verify-msg":
+                    return Prompt()
+                if selector == ".back-img":
+                    return captcha_image
+                raise AssertionError(f"unexpected selector: {selector}")
+
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            True,
+            1,
+            False,
+            captcha_collection_enabled=lambda: True,
+            captcha_model_manager=Manager(),
+        )
+        worker.page = Page()
+        events = []
+        worker.captcha_attempt_signal.connect(events.append)
+
+        with patch(
+            "integrated_client.tools.transport_tool.DdddOcr",
+            FakeDdddOcr,
+        ), patch(
+            "integrated_client.tools.transport_tool.get_pinyin",
+            side_effect=lambda value: value,
+        ), patch("integrated_client.tools.transport_tool.time.sleep"):
+            self.assertTrue(worker.solve_captcha())
+
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["success"])
+        self.assertFalse(events[0]["assisted"])
+        self.assertEqual(events[0]["image_bytes"], original_image)
+        self.assertEqual(events[0]["answer"]["prompt"], ["甲", "乙"])
+        self.assertEqual(len(events[0]["answer"]["points"]), 2)
+        self.assertEqual(len(captcha_image.clicks), 2)
+        self.assertEqual(len(detection_inputs), 1)
+        self.assertNotEqual(detection_inputs[0], original_image)
+        self.assertEqual(click_model.calls[0][0], original_image)
+        self.assertEqual(
+            click_model.calls[0][1],
+            [[12, 12, 48, 48], [72, 12, 108, 48]],
+        )
+
     def test_numeric_custom_model_failure_is_counted_before_builtin_fallback(self):
         class Locator:
             @staticmethod
@@ -1802,8 +2662,8 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertIn("50.0%", page.click_current_value.text())
         self.assertEqual(page.model_table.rowCount(), 2)
         self.assertEqual(page.model_table.item(0, 1).text(), "ddddocr-builtin")
-        self.assertEqual(page.model_table.item(0, 4).text(), "75.0%")
-        self.assertEqual(page.model_table.item(1, 4).text(), "50.0%")
+        self.assertEqual(page.model_table.item(0, 5).text(), "75.0%")
+        self.assertEqual(page.model_table.item(1, 5).text(), "50.0%")
         versions = [
             page.model_table.item(row, 1).text()
             for row in range(page.model_table.rowCount())
@@ -2278,9 +3138,83 @@ class CaptchaLearningTests(unittest.TestCase):
             ["ddddocr-builtin", "ddddocr-builtin", "click-knn-1"],
         )
         click_row = versions.index("click-knn-1")
-        self.assertEqual(page.model_table.item(click_row, 4).text(), "80.0%")
-        self.assertEqual(page.model_table.item(click_row, 5).text(), "4 / 5")
-        self.assertEqual(page.model_table.item(0, 4).text(), "75.0%")
+        self.assertEqual(page.model_table.item(click_row, 5).text(), "80.0%")
+        self.assertEqual(page.model_table.item(click_row, 6).text(), "4 / 5")
+        self.assertEqual(page.model_table.item(0, 5).text(), "75.0%")
+        page.deleteLater()
+
+    def test_machine_learning_page_blocks_retired_knn_activation(self):
+        session = _FakeSession()
+        activation_calls = []
+        session.api.admin_activate_captcha_model = (
+            lambda _token, model_id: activation_calls.append(model_id)
+        )
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        legacy_model = {
+            "id": "legacy-knn-model",
+            "captcha_type": "numeric",
+            "version": "numeric-knn-retired",
+            "algorithm": "knn-pixels-v1",
+            "status": "archived",
+            "accuracy": 0.8,
+            "sample_count": 30,
+            "test_count": 6,
+            "correct_count": 5,
+            "artifact_size": 1024,
+        }
+        page._populate_models([legacy_model], [], {})
+
+        legacy_row = next(
+            row
+            for row in range(page.model_table.rowCount())
+            if page.model_table.item(row, 1).text() == "numeric-knn-retired"
+        )
+        page.model_table.selectRow(legacy_row)
+
+        self.assertFalse(page.activate_model_btn.isEnabled())
+        self.assertIn("不能再应用", page.activate_model_btn.toolTip())
+        self.assertIn("仅供历史记录查看", page.model_hint.text())
+        with patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning, patch.object(page, "_start") as start:
+            page._activate_selected_model()
+
+        self.assertEqual(warning.call_args.args[1], "不能应用模型")
+        self.assertIn("旧版 KNN", warning.call_args.args[2])
+        start.assert_not_called()
+        self.assertEqual(activation_calls, [])
+        page.deleteLater()
+
+    def test_machine_learning_page_allows_supported_candidate_activation(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        candidate = {
+            "id": "numeric-hog-model",
+            "captcha_type": "numeric",
+            "version": "numeric-hog-svm-test",
+            "algorithm": "hog-linear-svm-v1",
+            "status": "candidate",
+            "accuracy": 0.8,
+            "sample_count": 30,
+            "test_count": 6,
+            "correct_count": 5,
+            "artifact_size": 1024,
+        }
+        page._populate_models([candidate], [], {})
+
+        candidate_row = next(
+            row
+            for row in range(page.model_table.rowCount())
+            if page.model_table.item(row, 1).text() == "numeric-hog-svm-test"
+        )
+        page.model_table.selectRow(candidate_row)
+
+        self.assertTrue(page.activate_model_btn.isEnabled())
+        self.assertEqual(page.activate_model_btn.toolTip(), "")
         page.deleteLater()
 
     def test_machine_learning_page_can_rename_selected_custom_model(self):

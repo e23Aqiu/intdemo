@@ -20,6 +20,8 @@ param(
 
     [string]$CaBundle = "",
 
+    [string]$TrainerTrustFile = "",
+
     [string]$IdentityFile = "",
 
     [switch]$ExportResult
@@ -107,6 +109,27 @@ if ($CaBundle) {
     }
     $remoteCaArgument = " --ca-bundle " + (Quote-Posix $remoteCaBundle)
 }
+$remoteTrainerTrustArgument = ""
+if ($TrainerTrustFile) {
+    $resolvedTrainerTrust = (Resolve-Path -LiteralPath $TrainerTrustFile).Path
+    $remoteInputDirectory = (
+        "$BuilderRepoPath/dist/uos-arm64/build-input-$sourceCommit"
+    )
+    $remoteTrainerTrust = "$remoteInputDirectory/trainer-trust.json"
+    if (-not $CaBundle) {
+        & ssh @sshArgs $BuilderHost (
+            "mkdir -p " + (Quote-Posix $remoteInputDirectory)
+        )
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not create the UOS builder input directory"
+        }
+    }
+    & scp @scpArgs $resolvedTrainerTrust "${BuilderHost}:$remoteTrainerTrust"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not upload the trainer trust configuration to the UOS build host"
+    }
+    $remoteTrainerTrustArgument = " --trainer-trust-file " + (Quote-Posix $remoteTrainerTrust)
+}
 $remoteCommand = (
     "cd $quotedRepo" +
     " && test -z `"`$(git status --porcelain=v1)`"" +
@@ -117,12 +140,14 @@ $remoteCommand = (
     " && bash scripts/uos-arm64/build.sh" +
     " --base-url $quotedBaseUrl --channel $quotedChannel" +
     $remoteCaArgument +
+    $remoteTrainerTrustArgument +
     $(
         if ($ExportResult) {
             " && ./.conda-uos-arm64/bin/python -m release_publisher.release_tasks" +
             " export-uos-result --version " + (Quote-Posix $Version) +
             " --base-url $quotedBaseUrl --channel $quotedChannel" +
             $remoteCaArgument +
+            $remoteTrainerTrustArgument +
             " --output $quotedResultArchive --allow-detached"
         } else {
             ""

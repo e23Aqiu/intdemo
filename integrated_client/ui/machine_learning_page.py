@@ -27,7 +27,19 @@ from ..captcha_models import (
     CaptchaTrainingError,
     train_candidate,
 )
+from ..enhanced_training import train_enhanced_candidate
 from ..online.api import ApiResponseError
+from ..trainer_component import (
+    STATUS_AVAILABLE,
+    STATUS_DAMAGED,
+    STATUS_INCOMPATIBLE,
+    TrainerComponentError,
+    TrainerComponentManager,
+)
+from ..trainer_trust import (
+    TrainerTrustConfigurationError,
+    create_trainer_component_manager,
+)
 from .announcement_page import ImagePreviewDialog, start_api_task
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
@@ -39,6 +51,18 @@ UPLOAD_MODES = (
     ("采集样本并统计", "samples_and_metrics"),
 )
 UPLOAD_MODE_LABELS = {mode: label for label, mode in UPLOAD_MODES}
+TRAINING_MODES = (
+    ("标准模式", "standard"),
+    ("强化模式", "enhanced"),
+)
+TRAINING_METHODS = {
+    "standard": "OpenCV HOG + 线性 SVM（hog-linear-svm-v1）",
+    "enhanced": "Tiny CNN + ONNX（tiny-cnn-onnx-v1）",
+}
+ACTIVATABLE_MODEL_ALGORITHMS = frozenset(
+    {"hog-linear-svm-v1", "tiny-cnn-onnx-v1"}
+)
+RETIRED_KNN_ALGORITHM = "knn-pixels-v1"
 
 
 def _format_size(size):
@@ -75,10 +99,30 @@ class MachineLearningPage(QWidget):
     REFRESH_INTERVAL_MS = 5_000
     MANUAL_MODEL_PREFIXES = ("human-", "human_")
 
-    def __init__(self, session_manager, learning_service=None, parent=None):
+    def __init__(
+        self,
+        session_manager,
+        learning_service=None,
+        parent=None,
+        trainer_manager=None,
+    ):
         super().__init__(parent)
         self.session_manager = session_manager
         self.learning_service = learning_service
+        self._trainer_configuration_error = ""
+        if trainer_manager is not None:
+            self.trainer_manager = trainer_manager
+        else:
+            try:
+                self.trainer_manager = create_trainer_component_manager()
+            except TrainerTrustConfigurationError as exc:
+                # A malformed optional trust file must not make the admin UI
+                # unusable. Standard training remains available; component
+                # installation is disabled until the public config is fixed.
+                self._trainer_configuration_error = str(exc)
+                self.trainer_manager = TrainerComponentManager(
+                    signature_verifier=None,
+                )
         self._tasks = []
         self._task_callbacks = {}
         self._refresh_task = None
@@ -87,6 +131,9 @@ class MachineLearningPage(QWidget):
         self._sample_image_loading = False
         self._shutting_down = False
         self._loading_policy = False
+        self._loading_training_mode = False
+        self._component_task_running = False
+        self._training_in_progress = False
         self._confirmed_upload_mode = "off"
         self._model_rows = []
         self._all_model_rows = []
@@ -98,6 +145,7 @@ class MachineLearningPage(QWidget):
         self._sample_offset = 0
         self._sample_limit = 100
         self._build_ui()
+        self._refresh_training_component()
         if self.learning_service is not None:
             self.learning_service.model_changed.connect(
                 self._active_model_ready
@@ -153,6 +201,48 @@ class MachineLearningPage(QWidget):
         )
         policy_layout.addWidget(self.upload_mode_combo)
         root.addWidget(policy_card)
+
+        self.trainer_card = QFrame()
+        self.trainer_card.setObjectName("Card")
+        trainer_layout = QVBoxLayout(self.trainer_card)
+        trainer_layout.setContentsMargins(18, 14, 18, 14)
+        trainer_text = QVBoxLayout()
+        trainer_title = QLabel("本机训练方式")
+        trainer_title.setObjectName("SectionTitle")
+        self.training_method_label = QLabel("正在读取训练组件状态")
+        self.training_method_label.setObjectName("Muted")
+        self.training_method_label.setWordWrap(True)
+        self.trainer_status_label = QLabel("--")
+        self.trainer_status_label.setObjectName("Muted")
+        self.trainer_status_label.setWordWrap(True)
+        trainer_text.addWidget(trainer_title)
+        trainer_text.addWidget(self.training_method_label)
+        trainer_text.addWidget(self.trainer_status_label)
+        trainer_layout.addLayout(trainer_text)
+        trainer_controls = QHBoxLayout()
+        trainer_controls.addStretch()
+        self.training_mode_combo = QComboBox()
+        for label, mode in TRAINING_MODES:
+            self.training_mode_combo.addItem(label, mode)
+        self.training_mode_combo.setMinimumWidth(120)
+        self.training_mode_combo.currentIndexChanged.connect(
+            self._change_training_mode
+        )
+        trainer_controls.addWidget(self.training_mode_combo)
+        self.install_trainer_btn = QPushButton("安装强化组件")
+        self.install_trainer_btn.clicked.connect(self._install_trainer_component)
+        self.self_test_trainer_btn = QPushButton("组件自检")
+        self.self_test_trainer_btn.clicked.connect(self._self_test_trainer_component)
+        self.uninstall_trainer_btn = QPushButton("卸载强化组件")
+        self.uninstall_trainer_btn.setObjectName("DangerButton")
+        self.uninstall_trainer_btn.clicked.connect(
+            self._uninstall_trainer_component
+        )
+        trainer_controls.addWidget(self.install_trainer_btn)
+        trainer_controls.addWidget(self.self_test_trainer_btn)
+        trainer_controls.addWidget(self.uninstall_trainer_btn)
+        trainer_layout.addLayout(trainer_controls)
+        root.addWidget(self.trainer_card)
 
         stats_layout = QGridLayout()
         stats_layout.setHorizontalSpacing(12)
@@ -311,11 +401,12 @@ class MachineLearningPage(QWidget):
         )
         model_header.addWidget(self.recalculate_model_btn)
         root.addLayout(model_header)
-        self.model_table = QTableWidget(0, 10)
+        self.model_table = QTableWidget(0, 11)
         self.model_table.setHorizontalHeaderLabels(
             [
                 "类型",
                 "模型名称",
+                "算法",
                 "状态",
                 "离线准确率",
                 "自动识别准确率",
@@ -355,6 +446,7 @@ class MachineLearningPage(QWidget):
         self.rename_model_btn.clicked.connect(self._rename_selected_model)
         self.activate_model_btn = QPushButton("应用所选模型")
         self.activate_model_btn.setObjectName("PrimaryButton")
+        self.activate_model_btn.setEnabled(False)
         self.activate_model_btn.clicked.connect(self._activate_selected_model)
         model_actions.addWidget(self.use_builtin_btn)
         model_actions.addWidget(self.rename_model_btn)
@@ -377,6 +469,198 @@ class MachineLearningPage(QWidget):
         card_layout.addWidget(value)
         layout.addWidget(card, row, column)
         return value
+
+    def _set_component_controls_enabled(self, enabled):
+        available = bool(enabled) and not self._training_in_progress
+        self.training_mode_combo.setEnabled(available)
+        self.install_trainer_btn.setEnabled(
+            available and not self._trainer_configuration_error
+        )
+        status = self.trainer_manager.status(verify_files=False)
+        self.self_test_trainer_btn.setEnabled(available and status.available)
+        self.uninstall_trainer_btn.setEnabled(
+            available
+            and (
+                status.installed
+                or bool(getattr(status, "cleanup_available", False))
+            )
+        )
+
+    def _refresh_training_component(self):
+        status = self.trainer_manager.status(verify_files=False)
+        mode = self.trainer_manager.preferred_mode()
+        self._loading_training_mode = True
+        self.training_mode_combo.setCurrentIndex(
+            max(0, self.training_mode_combo.findData(mode))
+        )
+        self._loading_training_mode = False
+        enhanced_index = self.training_mode_combo.findData("enhanced")
+        if enhanced_index >= 0:
+            item = self.training_mode_combo.model().item(enhanced_index)
+            if item is not None:
+                item.setEnabled(status.available)
+
+        self.training_method_label.setText(
+            f"当前模式：{'强化模式' if mode == 'enhanced' else '标准模式'} · "
+            f"当前方法：{TRAINING_METHODS[mode]}"
+        )
+        platform_labels = {
+            "windows-x86_64": "Windows x64",
+            "linux-aarch64": "统信 UOS ARM64",
+        }
+        if self._trainer_configuration_error:
+            self.trainer_status_label.setText(
+                "强化组件：可信公钥配置错误；标准模式仍可使用 · "
+                f"{self._trainer_configuration_error}"
+            )
+            self.install_trainer_btn.setToolTip(
+                "请先修复 trainer-trust.json，再安装强化组件"
+            )
+        elif status.code == STATUS_AVAILABLE:
+            details = [
+                "强化组件：已安装",
+                f"版本 {status.version or '-'}",
+                platform_labels.get(status.platform, status.platform or "未知平台"),
+                f"占用 {_format_size(status.installed_size)}",
+            ]
+            if status.last_self_test_at:
+                details.append(
+                    f"上次自检 {_display_time(status.last_self_test_at)}"
+                )
+            if getattr(status, "maintenance_required", False):
+                details.append(
+                    f"需要维护：{getattr(status, 'maintenance_message', '')}"
+                )
+            self.trainer_status_label.setText(" · ".join(details))
+        elif status.code == STATUS_DAMAGED:
+            self.trainer_status_label.setText(
+                f"强化组件：已损坏或不完整 · {status.detail}"
+            )
+        elif status.code == STATUS_INCOMPATIBLE:
+            self.trainer_status_label.setText(
+                f"强化组件：不兼容 · {status.detail}"
+            )
+        else:
+            message = (
+                "强化组件：未安装；可由管理员选择本机对应平台的 "
+                ".inttrainer 文件安装"
+            )
+            if getattr(status, "maintenance_required", False):
+                message += (
+                    " · 检测到组件残留："
+                    f"{getattr(status, 'maintenance_message', '')}"
+                )
+            self.trainer_status_label.setText(message)
+            self.install_trainer_btn.setToolTip("")
+        self._set_component_controls_enabled(not self._component_task_running)
+
+    def _change_training_mode(self, _index):
+        if self._loading_training_mode:
+            return
+        mode = str(self.training_mode_combo.currentData() or "standard")
+        try:
+            self.trainer_manager.set_preferred_mode(mode)
+        except (TrainerComponentError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "无法切换训练模式", str(exc))
+        self._refresh_training_component()
+
+    def _install_trainer_component(self):
+        source, _ = QFileDialog.getOpenFileName(
+            self,
+            "安装本机强化训练组件",
+            "",
+            "IntDemo 强化组件 (*.inttrainer)",
+        )
+        if not source:
+            return
+        self._component_task_running = True
+        self._set_component_controls_enabled(False)
+
+        def install():
+            return self.trainer_manager.install(Path(source))
+
+        task = self._start(install, self._trainer_component_installed)
+        if task is None:
+            self._component_task_running = False
+            self._refresh_training_component()
+
+    def _trainer_component_installed(self, result, error):
+        self._component_task_running = False
+        self._refresh_training_component()
+        if error is not None:
+            QMessageBox.warning(self, "强化组件安装失败", str(error))
+            return
+        status = result.status
+        replaced = (
+            f"，已替换版本 {result.replaced_version}"
+            if result.replaced_version
+            else ""
+        )
+        QMessageBox.information(
+            self,
+            "强化组件安装完成",
+            f"已安装版本 {status.version}{replaced}。组件自检已通过。",
+        )
+
+    def _self_test_trainer_component(self):
+        self._component_task_running = True
+        self._set_component_controls_enabled(False)
+        task = self._start(
+            self.trainer_manager.self_test,
+            self._trainer_component_tested,
+        )
+        if task is None:
+            self._component_task_running = False
+            self._refresh_training_component()
+
+    def _trainer_component_tested(self, _result, error):
+        self._component_task_running = False
+        self._refresh_training_component()
+        if error is not None:
+            QMessageBox.warning(self, "强化组件自检失败", str(error))
+            return
+        QMessageBox.information(self, "强化组件自检", "组件自检通过。")
+
+    def _uninstall_trainer_component(self):
+        status = self.trainer_manager.status(verify_files=False)
+        cleanup_only = not status.installed and bool(
+            getattr(status, "cleanup_available", False)
+        )
+        reply = QMessageBox.question(
+            self,
+            "清理强化组件残留" if cleanup_only else "卸载强化组件",
+            (
+                "只会清理程序可确认的强化组件残留，不会删除验证码样本或模型。"
+                if cleanup_only
+                else "只会删除本机强化训练组件，不会删除验证码样本、候选模型或已训练的 "
+                "ONNX 模型。卸载后训练模式自动回落为标准模式。"
+            )
+            + "\n\n是否继续？",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self._component_task_running = True
+        self._set_component_controls_enabled(False)
+        task = self._start(
+            self.trainer_manager.uninstall,
+            self._trainer_component_uninstalled,
+        )
+        if task is None:
+            self._component_task_running = False
+            self._refresh_training_component()
+
+    def _trainer_component_uninstalled(self, result, error):
+        self._component_task_running = False
+        self._refresh_training_component()
+        if error is not None:
+            QMessageBox.warning(self, "强化组件卸载失败", str(error))
+            return
+        QMessageBox.information(
+            self,
+            "强化组件已卸载",
+            f"已释放 {_format_size(result)}；验证码样本和模型未受影响。",
+        )
 
     def _start(self, function, completed):
         if self._shutting_down:
@@ -632,6 +916,12 @@ class MachineLearningPage(QWidget):
                 "archived": "历史",
                 "builtin": "内置备用",
             }
+            algorithm_labels = {
+                "ddddocr": "ddddocr（内置）",
+                "hog-linear-svm-v1": "HOG + 线性 SVM",
+                "tiny-cnn-onnx-v1": "Tiny CNN + ONNX",
+                "knn-pixels-v1": "KNN（旧版）",
+            }
             for row, model in enumerate(self._model_rows):
                 captcha_type = str(model.get("captcha_type") or "")
                 version = str(model.get("version") or "-")
@@ -658,6 +948,10 @@ class MachineLearningPage(QWidget):
                 values = [
                     type_labels.get(captcha_type, "-"),
                     label,
+                    algorithm_labels.get(
+                        str(model.get("algorithm") or ""),
+                        str(model.get("algorithm") or "-"),
+                    ),
                     status_labels.get(model.get("status"), "-"),
                     (
                         "--"
@@ -698,7 +992,7 @@ class MachineLearningPage(QWidget):
                         if display_name:
                             tooltip = f"显示名称：{display_name}\n{tooltip}"
                         item.setToolTip(tooltip)
-                    if column in {0, 2, 3, 4, 5, 6, 7, 8}:
+                    if column in {0, 2, 3, 4, 5, 6, 7, 8, 9}:
                         item.setTextAlignment(Qt.AlignCenter)
                     self.model_table.setItem(row, column, item)
         finally:
@@ -728,6 +1022,7 @@ class MachineLearningPage(QWidget):
         self._selected_model_key = None
         self.recalculate_model_btn.setEnabled(False)
         self.rename_model_btn.setEnabled(False)
+        self.activate_model_btn.setEnabled(False)
         self._restore_active_accuracy_values()
         self._render_models()
 
@@ -751,6 +1046,21 @@ class MachineLearningPage(QWidget):
             return self._model_rows[row]
         return None
 
+    @staticmethod
+    def _model_activation_block_reason(model):
+        if model.get("is_builtin"):
+            return "" if model.get("status") != "current" else "该内置模型已在使用。"
+        algorithm = str(model.get("algorithm") or "").strip()
+        if algorithm == RETIRED_KNN_ALGORITHM:
+            return "旧版 KNN 模型仅供历史记录查看，v1.1.0 起不能再应用。"
+        if algorithm not in ACTIVATABLE_MODEL_ALGORITHMS:
+            return "该模型算法不受当前客户端支持，不能应用。"
+        if model.get("status") == "current":
+            return "该模型已经是当前应用版本。"
+        if not model.get("id"):
+            return "该模型缺少有效标识，不能应用。"
+        return ""
+
     def _model_selection_changed(self):
         self._restore_active_accuracy_values()
         model = self._current_model()
@@ -758,6 +1068,8 @@ class MachineLearningPage(QWidget):
             self._selected_model_key = None
             self.recalculate_model_btn.setEnabled(False)
             self.rename_model_btn.setEnabled(False)
+            self.activate_model_btn.setEnabled(False)
+            self.activate_model_btn.setToolTip("请先选择一个模型版本")
             return
         version = str(model.get("version") or "")
         captcha_type = str(model.get("captcha_type") or "")
@@ -776,6 +1088,9 @@ class MachineLearningPage(QWidget):
                 )
             )
         )
+        activation_block_reason = self._model_activation_block_reason(model)
+        self.activate_model_btn.setEnabled(not activation_block_reason)
+        self.activate_model_btn.setToolTip(activation_block_reason)
         self._show_selected_model_metric(model)
 
     def _show_selected_model_metric(self, model):
@@ -790,6 +1105,11 @@ class MachineLearningPage(QWidget):
             )
         else:
             self.model_hint.setText(f"已选择 {label}：暂无自动识别记录。")
+        activation_block_reason = self._model_activation_block_reason(model)
+        if str(model.get("algorithm") or "") == RETIRED_KNN_ALGORITHM:
+            self.model_hint.setText(
+                f"{self.model_hint.text()} {activation_block_reason}"
+            )
 
     def _recalculate_selected_model(self):
         model = self._current_model()
@@ -1333,11 +1653,15 @@ class MachineLearningPage(QWidget):
 
     def _train_model(self, captcha_type):
         type_name = "数字验证码" if captcha_type == "numeric" else "文字点选验证码"
+        mode = self.trainer_manager.preferred_mode()
+        mode_name = "强化模式" if mode == "enhanced" else "标准模式"
+        method_name = TRAINING_METHODS[mode]
         reply = QMessageBox.question(
             self,
             "训练候选模型",
             f"将下载当前{type_name}成功样本，在本机划分训练集和固定留出集，"
-            "生成候选模型并上传评估结果。\n\n是否继续？",
+            f"使用{mode_name}生成候选模型并上传模型及评估结果。\n"
+            f"当前方法：{method_name}\n\n是否继续？",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -1349,6 +1673,10 @@ class MachineLearningPage(QWidget):
         )
         button.setEnabled(False)
         button.setText("训练中…")
+        self._training_in_progress = True
+        self.train_numeric_btn.setEnabled(False)
+        self.train_click_btn.setEnabled(False)
+        self._set_component_controls_enabled(False)
 
         def train():
             token = self.session_manager.access_token()
@@ -1356,7 +1684,15 @@ class MachineLearningPage(QWidget):
                 token,
                 captcha_type,
             )
-            candidate = train_candidate(archive, captcha_type)
+            candidate = (
+                train_enhanced_candidate(
+                    archive,
+                    captcha_type,
+                    self.trainer_manager,
+                )
+                if mode == "enhanced"
+                else train_candidate(archive, captcha_type, mode="standard")
+            )
             model = self.session_manager.api.admin_create_captcha_model(
                 token,
                 {
@@ -1387,7 +1723,10 @@ class MachineLearningPage(QWidget):
             if captcha_type == "numeric"
             else self.train_click_btn
         )
-        button.setEnabled(True)
+        self._training_in_progress = False
+        self.train_numeric_btn.setEnabled(True)
+        self.train_click_btn.setEnabled(True)
+        self._refresh_training_component()
         button.setText(
             "训练数字候选模型"
             if captcha_type == "numeric"
@@ -1507,6 +1846,10 @@ class MachineLearningPage(QWidget):
             return
         if model.get("status") == "current":
             QMessageBox.information(self, "已经应用", "该模型已经是当前应用版本。")
+            return
+        activation_block_reason = self._model_activation_block_reason(model)
+        if activation_block_reason:
+            QMessageBox.warning(self, "不能应用模型", activation_block_reason)
             return
         reply = QMessageBox.question(
             self,

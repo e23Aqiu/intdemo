@@ -6,16 +6,21 @@ import json
 import os
 import uuid
 from datetime import datetime
+from pathlib import Path
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
 
-from ..captcha_models import CaptchaModelManager
+from ..captcha_models import (
+    ENHANCED_ONNX_ALGORITHM,
+    HOG_SVM_ALGORITHM,
+    CaptchaModelManager,
+)
 from ..config import get_data_dir
 from ..diagnostics import get_logger
 
 MAX_MODEL_CACHE_BYTES = 20 * 1024 * 1024
 MAX_SAMPLE_UPLOAD_BYTES = 1 * 1024 * 1024
-MODEL_CACHE_SCHEMA_VERSION = 1
+MODEL_CACHE_SCHEMA_VERSION = 2
 MAX_BACKGROUND_TASKS = 64
 MANUAL_MODEL_PREFIXES = ("human-", "human_")
 UPLOAD_MODE_OFF = "off"
@@ -25,6 +30,10 @@ UPLOAD_MODES = {
     UPLOAD_MODE_OFF,
     UPLOAD_MODE_METRICS_ONLY,
     UPLOAD_MODE_SAMPLES_AND_METRICS,
+}
+SUPPORTED_REMOTE_MODEL_ALGORITHMS = {
+    HOG_SVM_ALGORITHM,
+    ENHANCED_ONNX_ALGORITHM,
 }
 
 
@@ -81,7 +90,8 @@ class CaptchaLearningService(QObject):
         self._stopped = True
         self._loading_policy = False
         self._refresh_pending = False
-        self._downloading_models = set()
+        self._downloading_models = {}
+        self._active_model_identities = {}
         self._uploading_outbox_ids = set()
         self._timer = QTimer(self)
         self._timer.setInterval(60_000)
@@ -191,22 +201,27 @@ class CaptchaLearningService(QObject):
         active = self.policy.get("active_models") or {}
         for captcha_type in ("numeric", "click"):
             metadata = active.get(captcha_type)
-            if not metadata:
-                self.model_manager.clear(captcha_type)
-                self._clear_active_model_marker(captcha_type)
+            identity = self._model_identity(captcha_type, metadata)
+            if identity is None:
+                self._clear_installed_model(captcha_type)
                 continue
-            version = str(metadata.get("version") or "")
-            digest = str(metadata.get("artifact_sha256") or "")
+            _, version, algorithm, digest = identity
             if (
-                not version
-                or len(digest) != 64
-                or self.model_manager.version(captcha_type) == version
-                or captcha_type in self._downloading_models
+                self._active_model_identities.get(captcha_type) == identity
+                and self.model_manager.version(captcha_type) == version
+                and self.model_manager.algorithm(captcha_type) == algorithm
             ):
                 continue
-            if self._load_model_cache(captcha_type, version, digest):
+            if self._downloading_models.get(captcha_type) == identity:
                 continue
-            self._downloading_models.add(captcha_type)
+            if self._load_model_cache(
+                captcha_type,
+                version,
+                digest,
+                algorithm,
+            ):
+                continue
+            self._downloading_models[captcha_type] = identity
 
             def download(kind=captcha_type):
                 token = self.session_manager.access_token()
@@ -220,21 +235,23 @@ class CaptchaLearningService(QObject):
             )
 
     def _model_downloaded(self, captcha_type, metadata, artifact, error):
-        self._downloading_models.discard(captcha_type)
+        requested_identity = self._model_identity(captcha_type, metadata)
+        current_download = self._downloading_models.get(captcha_type)
         if self._stopped:
             return
         active_metadata = (self.policy.get("active_models") or {}).get(
             captcha_type
         )
-        if (
-            not active_metadata
-            or str(active_metadata.get("version") or "")
-            != str(metadata.get("version") or "")
-            or str(active_metadata.get("artifact_sha256") or "")
-            != str(metadata.get("artifact_sha256") or "")
-        ):
+        active_identity = self._model_identity(captcha_type, active_metadata)
+        if requested_identity is None or active_identity != requested_identity:
+            if current_download == requested_identity:
+                self._downloading_models.pop(captcha_type, None)
             self._sync_active_models()
             return
+        if current_download not in {None, requested_identity}:
+            return
+        if current_download == requested_identity:
+            self._downloading_models.pop(captcha_type, None)
         if error is not None:
             get_logger().warning(
                 "Could not download CAPTCHA model %s: %s",
@@ -242,20 +259,32 @@ class CaptchaLearningService(QObject):
                 error,
             )
             return
+        _, version, algorithm, expected = requested_identity
         artifact = bytes(artifact or b"")
-        expected = str(metadata.get("artifact_sha256") or "")
         if hashlib.sha256(artifact).hexdigest() != expected:
             get_logger().error("CAPTCHA model checksum mismatch: %s", captcha_type)
+            self._reject_model_artifact(captcha_type, version)
             return
-        version = str(metadata.get("version") or "")
         try:
-            self.model_manager.install(captcha_type, version, artifact)
+            self.model_manager.install(
+                captcha_type,
+                version,
+                artifact,
+                expected_algorithm=algorithm,
+            )
         except Exception as exc:  # noqa: BLE001 - invalid remote artifact
             get_logger().exception("Could not install CAPTCHA model: %s", exc)
+            self._reject_model_artifact(captcha_type, version)
             return
+        self._active_model_identities[captcha_type] = requested_identity
         try:
-            self._save_model_cache(captcha_type, version, artifact)
-        except OSError as exc:
+            self._save_model_cache(
+                captcha_type,
+                version,
+                artifact,
+                algorithm=algorithm,
+            )
+        except (OSError, ValueError) as exc:
             get_logger().warning("Could not cache CAPTCHA model: %s", exc)
         self.model_changed.emit(captcha_type, version)
 
@@ -271,25 +300,44 @@ class CaptchaLearningService(QObject):
             safe_version = hashlib.sha256(str(version).encode("utf-8")).hexdigest()[:16]
         return directory / f"{safe_version}.npz"
 
-    def _load_model_cache(self, captcha_type, version, expected_digest):
+    def _load_model_cache(
+        self,
+        captcha_type,
+        version,
+        expected_digest,
+        expected_algorithm,
+    ):
         target = self._model_cache_path(captcha_type, version)
         try:
             if target.stat().st_size > MAX_MODEL_CACHE_BYTES:
-                return False
+                raise ValueError("cached model exceeds the size limit")
             artifact = target.read_bytes()
             if hashlib.sha256(artifact).hexdigest() != expected_digest:
-                return False
-            self.model_manager.install(captcha_type, version, artifact)
+                raise ValueError("cached model checksum mismatch")
+            self.model_manager.install(
+                captcha_type,
+                version,
+                artifact,
+                expected_algorithm=expected_algorithm,
+            )
         except (OSError, ValueError):
             return False
         except Exception as exc:  # noqa: BLE001 - invalid local cache
             get_logger().warning("Could not load cached CAPTCHA model: %s", exc)
             return False
+        identity = (
+            captcha_type,
+            version,
+            expected_algorithm,
+            expected_digest,
+        )
+        self._active_model_identities[captcha_type] = identity
         try:
             self._write_active_model_marker(
                 captcha_type,
                 version,
                 expected_digest,
+                algorithm=expected_algorithm,
             )
         except OSError as exc:
             get_logger().warning(
@@ -300,11 +348,80 @@ class CaptchaLearningService(QObject):
         return True
 
     @staticmethod
+    def _model_identity(captcha_type, metadata):
+        if not isinstance(metadata, dict):
+            return None
+        version = str(metadata.get("version") or "")
+        algorithm = str(metadata.get("algorithm") or "")
+        digest = str(metadata.get("artifact_sha256") or "").lower()
+        if (
+            captcha_type not in {"numeric", "click"}
+            or not version
+            or len(version) > 128
+            or algorithm not in SUPPORTED_REMOTE_MODEL_ALGORITHMS
+            or len(digest) != 64
+            or any(character not in "0123456789abcdef" for character in digest)
+        ):
+            return None
+        return captcha_type, version, algorithm, digest
+
+    def _clear_installed_model(self, captcha_type):
+        self.model_manager.clear(captcha_type)
+        self._active_model_identities.pop(captcha_type, None)
+        self._clear_active_model_marker(captcha_type)
+        self._prune_model_cache(captcha_type)
+
+    def _reject_model_artifact(self, captcha_type, version):
+        self._clear_installed_model(captcha_type)
+        try:
+            self._model_cache_path(captcha_type, version).unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            get_logger().warning("Could not remove invalid CAPTCHA model: %s", exc)
+
+    @staticmethod
     def _active_model_marker_path(captcha_type):
         return get_data_dir() / "captcha-models" / captcha_type / "active.json"
 
     @classmethod
-    def _write_active_model_marker(cls, captcha_type, version, digest):
+    def _prune_model_cache(cls, captcha_type, *, keep=None):
+        directory = cls._active_model_marker_path(captcha_type).parent
+        try:
+            entries = tuple(directory.iterdir())
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            get_logger().warning("Could not inspect CAPTCHA model cache: %s", exc)
+            return
+        keep_path = None if keep is None else Path(keep)
+        for entry in entries:
+            if (
+                not entry.is_file()
+                or entry.is_symlink()
+                or entry.suffix.lower() != ".npz"
+                or entry == keep_path
+            ):
+                continue
+            try:
+                entry.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                get_logger().warning(
+                    "Could not remove old CAPTCHA model cache %s: %s",
+                    entry,
+                    exc,
+                )
+
+    @classmethod
+    def _write_active_model_marker(
+        cls,
+        captcha_type,
+        version,
+        digest,
+        algorithm="",
+    ):
         target = cls._active_model_marker_path(captcha_type)
         target.parent.mkdir(parents=True, exist_ok=True)
         temporary = target.with_name(f".active.{uuid.uuid4().hex}.tmp")
@@ -313,6 +430,7 @@ class CaptchaLearningService(QObject):
             "captcha_type": captcha_type,
             "version": version,
             "artifact_sha256": digest,
+            "algorithm": str(algorithm or ""),
         }
         try:
             temporary.write_text(
@@ -350,30 +468,57 @@ class CaptchaLearningService(QObject):
                     payload.get("schema_version") != MODEL_CACHE_SCHEMA_VERSION
                     or payload.get("captcha_type") != captcha_type
                 ):
+                    self._clear_active_model_marker(captcha_type)
                     continue
                 version = str(payload.get("version") or "")
-                digest = str(payload.get("artifact_sha256") or "")
+                digest = str(payload.get("artifact_sha256") or "").lower()
+                algorithm = str(payload.get("algorithm") or "")
+                identity = self._model_identity(captcha_type, payload)
+                if identity is None:
+                    self._reject_model_artifact(captcha_type, version)
+                    continue
                 target = self._model_cache_path(captcha_type, version)
                 if (
                     not version
                     or len(digest) != 64
                     or target.stat().st_size > MAX_MODEL_CACHE_BYTES
                 ):
+                    self._reject_model_artifact(captcha_type, version)
                     continue
                 artifact = target.read_bytes()
                 if hashlib.sha256(artifact).hexdigest() != digest:
+                    self._reject_model_artifact(captcha_type, version)
                     continue
-                self.model_manager.install(captcha_type, version, artifact)
+                self.model_manager.install(
+                    captcha_type,
+                    version,
+                    artifact,
+                    expected_algorithm=algorithm,
+                )
+                self._active_model_identities[captcha_type] = identity
+                self._prune_model_cache(captcha_type, keep=target)
             except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                self._clear_installed_model(captcha_type)
                 continue
             except Exception as exc:  # noqa: BLE001 - invalid local cache
                 get_logger().warning(
                     "Could not restore cached CAPTCHA model: %s",
                     exc,
                 )
+                self._reject_model_artifact(captcha_type, version)
 
     @classmethod
-    def _save_model_cache(cls, captcha_type, version, artifact):
+    def _save_model_cache(
+        cls,
+        captcha_type,
+        version,
+        artifact,
+        *,
+        algorithm="",
+    ):
+        artifact = bytes(artifact or b"")
+        if not artifact or len(artifact) > MAX_MODEL_CACHE_BYTES:
+            raise ValueError("CAPTCHA model cache artifact exceeds the size limit")
         target = cls._model_cache_path(captcha_type, version)
         directory = target.parent
         directory.mkdir(parents=True, exist_ok=True)
@@ -385,7 +530,9 @@ class CaptchaLearningService(QObject):
                 captcha_type,
                 version,
                 hashlib.sha256(artifact).hexdigest(),
+                algorithm=algorithm,
             )
+            cls._prune_model_cache(captcha_type, keep=target)
         finally:
             if temporary.exists():
                 try:

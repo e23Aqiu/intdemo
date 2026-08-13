@@ -138,6 +138,9 @@ cp -a "$package_root/app" "$files_root/"
 cp -a "$package_root/browser" "$files_root/"
 mkdir -p "$files_root/certs"
 cp "$package_root/client-online.json" "$files_root/"
+if [[ -f "$package_root/trainer-trust.json" ]]; then
+  cp "$package_root/trainer-trust.json" "$files_root/"
+fi
 if [[ -d "$package_root/certs" ]]; then
   cp -a "$package_root/certs/." "$files_root/certs/"
 fi
@@ -164,6 +167,9 @@ chmod 0644 \
   "$files_root/UOS_ARM64.md" \
   "$files_root/app-icon.png" \
   "$files_root/build-info.txt"
+if [[ -f "$files_root/trainer-trust.json" ]]; then
+  chmod 0644 "$files_root/trainer-trust.json"
+fi
 find "$files_root/certs" -type f -exec chmod 0644 {} +
 find "$deb_root" -type d -exec chmod 0755 {} +
 

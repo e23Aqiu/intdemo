@@ -5,8 +5,10 @@ param(
 
     [string]$CaBundle = "",
 
+    [string]$TrainerTrustFile = "",
+
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.0.8",
+    [string]$Version = "1.1.0",
     [switch]$SkipBuild
 )
 
@@ -16,6 +18,9 @@ $arguments = @{
     BaseUrl = $BaseUrl
     CaBundle = $CaBundle
     Version = $Version
+}
+if ($TrainerTrustFile) {
+    $arguments.TrainerTrustFile = $TrainerTrustFile
 }
 if ($SkipBuild) {
     $arguments.SkipPyInstaller = $true

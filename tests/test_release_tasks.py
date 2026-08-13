@@ -48,10 +48,20 @@ def create_result_archive(
     channel: str = "test",
     build_portable: bool = False,
     tamper_installer: bool = False,
+    trainer_trust: bytes | None = None,
 ) -> Path:
     staging = root / "result-source"
     artifacts_root = staging / "artifacts"
     artifacts_root.mkdir(parents=True)
+    inputs = {"ca_bundle": None, "baseline_snapshot": None}
+    if trainer_trust is not None:
+        trust_path = staging / "inputs" / "trainer-trust.json"
+        trust_path.parent.mkdir(parents=True)
+        trust_path.write_bytes(trainer_trust)
+        inputs["trainer_trust"] = tasks.artifact_descriptor(
+            trust_path,
+            "inputs/trainer-trust.json",
+        )
     request = tasks.validate_request(
         {
             "schema_version": 1,
@@ -65,7 +75,7 @@ def create_result_archive(
             "build_portable": build_portable,
             "delta_from_version": "",
             "created_at": "2026-08-05T00:00:00Z",
-            "inputs": {"ca_bundle": None, "baseline_snapshot": None},
+            "inputs": inputs,
         }
     )
     request_path = staging / tasks.REQUEST_FILE
@@ -100,6 +110,7 @@ def create_result_archive(
         "source_commit": commit,
         "base_url": base_url,
         "channel": channel,
+        "trainer_trust_sha256": tasks.expected_trainer_trust_hash(request),
         "delta_from_version": "",
         "build_portable": build_portable,
         "tests_passed": True,
@@ -299,6 +310,36 @@ class ReleaseTasksTests(unittest.TestCase):
             )
             self.assertTrue(tasks.detect_windows_result_portable(with_portable))
 
+    def test_windows_result_binds_trainer_trust_input(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trust = b'{"schema_version":1,"keys":{"production":"key"}}'
+            archive = create_result_archive(root, trainer_trust=trust)
+            configured = root / "trainer-trust.json"
+            configured.write_bytes(trust)
+
+            self.assertFalse(tasks.detect_windows_result_portable(archive))
+            with (
+                patch.object(tasks, "source_state", return_value=("release/v1", COMMIT)),
+                patch.object(tasks, "current_version", return_value="1.2.3"),
+            ):
+                receipt_path = tasks.import_windows_result(
+                    root,
+                    result_archive=archive,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                    delta_from_version="",
+                    build_portable=False,
+                    trainer_trust_file=str(configured),
+                )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(
+                receipt["trainer_trust_sha256"],
+                tasks.sha256(configured),
+            )
+
     def test_windows_result_portable_detection_rejects_missing_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -486,7 +527,10 @@ class ReleaseTasksTests(unittest.TestCase):
             receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
             installer = root / receipt["artifacts"]["uos_installer"]["path"]
             self.assertEqual(receipt["platform"], "linux-aarch64")
-            self.assertEqual(tasks.sha256(installer), receipt["artifacts"]["uos_installer"]["sha256"])
+            self.assertEqual(
+                tasks.sha256(installer),
+                receipt["artifacts"]["uos_installer"]["sha256"],
+            )
             self.assertTrue(installer.with_suffix(".deb.sha256").is_file())
 
     def test_uos_result_import_rejects_tampering_and_config_mismatch(self):

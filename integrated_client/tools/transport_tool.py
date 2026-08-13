@@ -351,20 +351,25 @@ def ocr_code(
     return_details=False,
     model_failure_callback=None,
 ):
-    img_bytes = b""
+    # Keep the browser capture immutable. Recognition may freely transform a
+    # separate copy, but successful learning samples must contain the image
+    # exactly as it appeared on the page.
+    original_img_bytes = b""
 
     def result(code, version):
         if return_details:
-            return code, img_bytes, version
+            return code, original_img_bytes, version
         return code
 
     try:
         # 1. 仅截图获取字节流，不保存本地图片
-        img_bytes = page.locator(selector).screenshot()
+        original_img_bytes = page.locator(selector).screenshot()
 
         if model is not None:
             try:
-                custom_code = str(model.predict_numeric(img_bytes) or "")
+                custom_code = str(
+                    model.predict_numeric(original_img_bytes) or ""
+                )
             except Exception:
                 custom_code = ""
             if re.fullmatch(r"[0-9]{4}", custom_code):
@@ -380,7 +385,7 @@ def ocr_code(
             return result("", "ddddocr-unavailable")
 
         # 2. 转灰度图
-        pil_img = Image.open(io.BytesIO(img_bytes)).convert('L')
+        pil_img = Image.open(io.BytesIO(original_img_bytes)).convert('L')
 
         # 3. 右侧补边+水平拉伸
         pil_img = ImageOps.expand(pil_img, border=(0, 0, 25, 0), fill=255)
@@ -445,7 +450,7 @@ def ocr_code(
         # 转字节流用于OCR
         buf = io.BytesIO()
         pil_img_final.save(buf, format='PNG')
-        img_bytes = buf.getvalue()
+        recognition_img_bytes = buf.getvalue()
         # ==================================================================
 
         # 11. 错误替换字典
@@ -463,7 +468,7 @@ def ocr_code(
         # 12. 多次识别投票
         results = []
         for _ in range(12):
-            raw = ocr.classification(img_bytes)
+            raw = ocr.classification(recognition_img_bytes)
             raw = replace_common_errors(raw)
             code = re.sub(r'[^0-9]', '', raw)
             if 3 <= len(code) <= 4:
@@ -2915,10 +2920,15 @@ class BusinessBackfillWorker(QThread):
                     self.log.emit(f"🎯 系统需要依次点击的文字：{target_chars}")
 
                     img_el = self.page.locator(".back-img").first
-                    img_bytes = img_el.screenshot()
+                    # Preserve the page capture for learning. Detection and
+                    # recognition use a sharpened copy below, while a
+                    # successful sample must remain untouched.
+                    original_img_bytes = img_el.screenshot()
 
                     # 整图锐化
-                    pil_img_original = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+                    pil_img_original = Image.open(
+                        io.BytesIO(original_img_bytes)
+                    ).convert("RGB")
                     pil_img_sharpen = pil_img_original.filter(
                         ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
                     img_byte_sharpen = io.BytesIO()
@@ -3036,7 +3046,7 @@ class BusinessBackfillWorker(QThread):
                     self.log.emit(f"✅ 文字识别完成：{char_position_map}")
 
                     custom_prediction = self._predict_with_active_click_model(
-                        img_bytes_final,
+                        original_img_bytes,
                         bboxes,
                         len(target_chars),
                     )
@@ -3105,7 +3115,7 @@ class BusinessBackfillWorker(QThread):
                         ]
                         self._report_successful_click_captcha(
                             {
-                                "image_bytes": img_bytes,
+                                "image_bytes": original_img_bytes,
                                 "prompt": target_chars,
                             },
                             normalized_points,

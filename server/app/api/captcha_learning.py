@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import ast
 import base64
 import binascii
 import hashlib
 import io
 import json
+import math
 import re
+import struct
 import unicodedata
 import uuid
 import zipfile
@@ -16,6 +19,18 @@ from fastapi import APIRouter, Query, Request, Response
 from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 
+from ..captcha_model_algorithms import (
+    ARTIFACT_FORMAT_BY_ALGORITHM,
+    HOG_LINEAR_SVM_ALGORITHM,
+    LEGACY_KNN_PIXELS_ALGORITHM,
+    MAX_ARTIFACT_BYTES_BY_ALGORITHM,
+    MAX_CAPTCHA_MODEL_BYTES,
+    SUPPORTED_CAPTCHA_MODEL_ALGORITHMS,
+    TINY_CNN_ONNX_ALGORITHM,
+    TRAINING_MODE_BY_ALGORITHM,
+    is_supported_model,
+    supported_algorithms,
+)
 from ..database import utcnow
 from ..dependencies import AdminContext, BusinessContext, Db
 from ..errors import ApiError
@@ -47,7 +62,16 @@ MAX_IMAGE_BYTES = 1 * 1024 * 1024
 MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
 MAX_ARCHIVE_FILES = 50_003
 MAX_MANIFEST_BYTES = 10 * 1024 * 1024
-MAX_MODEL_BYTES = 20 * 1024 * 1024
+MAX_MODEL_BYTES = MAX_CAPTCHA_MODEL_BYTES
+MAX_MODEL_EXPANDED_BYTES = 128 * 1024 * 1024
+MAX_MODEL_ARCHIVE_FILES = 128
+MAX_TRAINER_VERSION_LENGTH = 80
+MAX_NPY_HEADER_BYTES = 64 * 1024
+HOG_FEATURE_WIDTH = 1_764
+MAX_ONNX_NESTING_DEPTH = 24
+MAX_ONNX_PROTO_FIELDS = 200_000
+MAX_ONNX_METADATA_BYTES = 64 * 1024
+ONNX_TENSOR_FLOAT = 1
 DATASET_SCHEMA_VERSION = 1
 CAPTCHA_TYPES = {"numeric", "click"}
 UPLOAD_MODE_OFF = "off"
@@ -68,6 +92,14 @@ DATASET_DIRECTORY_BY_TYPE = {
 }
 MANUAL_MODEL_PREFIXES = ("human-", "human_")
 ARCHIVE_DRIVE_PREFIX = re.compile(r"^[A-Za-z]:")
+TRAINER_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]*$")
+
+
+def _all_supported_model_algorithms() -> frozenset[str]:
+    return frozenset().union(*SUPPORTED_CAPTCHA_MODEL_ALGORITHMS.values())
+
+
+SUPPORTED_MODEL_ALGORITHMS = _all_supported_model_algorithms()
 
 
 def _is_manual_model_version(value: Any) -> bool:
@@ -173,6 +205,32 @@ def _model_view(model: CaptchaModel) -> dict[str, Any]:
     }
 
 
+def _stored_model_contract_is_valid(model: CaptchaModel) -> bool:
+    try:
+        artifact = bytes(model.artifact or b"")
+        maximum = MAX_ARTIFACT_BYTES_BY_ALGORITHM.get(
+            str(model.algorithm or ""),
+            MAX_MODEL_BYTES,
+        )
+        if (
+            not artifact
+            or len(artifact) > maximum
+            or int(model.artifact_size) != len(artifact)
+            or str(model.artifact_sha256 or "")
+            != hashlib.sha256(artifact).hexdigest()
+        ):
+            return False
+        _validate_model_contract(
+            str(model.captcha_type or ""),
+            str(model.version or ""),
+            str(model.algorithm or ""),
+            artifact,
+        )
+        return True
+    except (ApiError, TypeError, ValueError, OverflowError):
+        return False
+
+
 def _sample_view(sample: CaptchaSample) -> dict[str, Any]:
     captcha_type = str(sample.captcha_type or "")
     image_data = bytes(sample.image_data or b"")
@@ -203,13 +261,35 @@ def _sample_view(sample: CaptchaSample) -> dict[str, Any]:
 
 
 def _active_models(db: Db) -> dict[str, dict[str, Any]]:
-    rows = db.scalars(
-        select(CaptchaModel).where(CaptchaModel.status == "current")
-    ).all()
+    rows = db.execute(
+        select(
+            CaptchaModel.id,
+            CaptchaModel.captcha_type,
+            CaptchaModel.version,
+            CaptchaModel.display_name,
+            CaptchaModel.algorithm,
+            CaptchaModel.status,
+            CaptchaModel.artifact_sha256,
+            CaptchaModel.artifact_size,
+            CaptchaModel.sample_count,
+            CaptchaModel.test_count,
+            CaptchaModel.correct_count,
+            CaptchaModel.accuracy,
+            CaptchaModel.metrics,
+            CaptchaModel.created_at,
+            CaptchaModel.activated_at,
+        ).where(
+            CaptchaModel.status == "current",
+            CaptchaModel.algorithm.in_(SUPPORTED_MODEL_ALGORITHMS),
+        )
+    ).mappings()
     return {
-        row.captcha_type: _model_view(row)
+        str(row["captcha_type"]): dict(row)
         for row in rows
-        if not _is_manual_model_version(row.version)
+        if (
+            not _is_manual_model_version(row["version"])
+            and is_supported_model(row["captcha_type"], row["algorithm"])
+        )
     }
 
 
@@ -240,6 +320,687 @@ def _decode_base64(value: str, *, label: str, maximum: int) -> bytes:
             status_code=413,
         )
     return decoded
+
+
+def _normalize_model_metrics(
+    metrics: dict[str, Any],
+    *,
+    algorithm: str,
+) -> dict[str, Any]:
+    """Validate reserved metadata while leaving existing metrics extensible."""
+
+    normalized = dict(metrics)
+    expected_mode = TRAINING_MODE_BY_ALGORITHM[algorithm]
+    supplied_mode = normalized.get("training_mode")
+    if supplied_mode is None:
+        normalized["training_mode"] = expected_mode
+    elif supplied_mode != expected_mode:
+        raise ApiError(
+            "invalid_captcha_model_metadata",
+            "模型训练模式与算法不匹配",
+            status_code=422,
+            details={
+                "algorithm": algorithm,
+                "expected_training_mode": expected_mode,
+            },
+        )
+
+    if "trainer_version" in normalized:
+        trainer_version = normalized["trainer_version"]
+        if not isinstance(trainer_version, str):
+            raise ApiError(
+                "invalid_captcha_model_metadata",
+                "训练器版本必须是字符串",
+                status_code=422,
+            )
+        trainer_version = trainer_version.strip()
+        if (
+            not trainer_version
+            or len(trainer_version) > MAX_TRAINER_VERSION_LENGTH
+            or TRAINER_VERSION_PATTERN.fullmatch(trainer_version) is None
+        ):
+            raise ApiError(
+                "invalid_captcha_model_metadata",
+                "训练器版本格式无效",
+                status_code=422,
+            )
+        normalized["trainer_version"] = trainer_version
+    return normalized
+
+
+def _read_protobuf_varint(data: bytes, offset: int) -> tuple[int, int]:
+    value = 0
+    for shift in range(0, 70, 7):
+        if offset >= len(data):
+            raise ValueError("truncated protobuf varint")
+        byte = data[offset]
+        offset += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, offset
+    raise ValueError("protobuf varint is too long")
+
+
+def _protobuf_fields(
+    data: bytes,
+    *,
+    depth: int = 0,
+) -> list[tuple[int, int, int | bytes]]:
+    """Decode a bounded protobuf message without accepting groups."""
+
+    if depth > MAX_ONNX_NESTING_DEPTH:
+        raise ValueError("protobuf nesting exceeds limit")
+    fields: list[tuple[int, int, int | bytes]] = []
+    offset = 0
+    while offset < len(data):
+        if len(fields) >= MAX_ONNX_PROTO_FIELDS:
+            raise ValueError("protobuf field count exceeds limit")
+        key, offset = _read_protobuf_varint(data, offset)
+        field_number = key >> 3
+        wire_type = key & 0x07
+        if field_number == 0:
+            raise ValueError("invalid protobuf field")
+        if wire_type == 0:
+            value, offset = _read_protobuf_varint(data, offset)
+        elif wire_type == 1:
+            end = offset + 8
+            if end > len(data):
+                raise ValueError("truncated protobuf fixed64")
+            value = data[offset:end]
+            offset = end
+        elif wire_type == 2:
+            length, offset = _read_protobuf_varint(data, offset)
+            end = offset + length
+            if end > len(data):
+                raise ValueError("truncated protobuf bytes")
+            value = data[offset:end]
+            offset = end
+        elif wire_type == 5:
+            end = offset + 4
+            if end > len(data):
+                raise ValueError("truncated protobuf fixed32")
+            value = data[offset:end]
+            offset = end
+        else:
+            raise ValueError("unsupported protobuf wire type")
+        fields.append((field_number, wire_type, value))
+    return fields
+
+
+def _protobuf_values(
+    fields: list[tuple[int, int, int | bytes]],
+    number: int,
+    wire_type: int,
+) -> list[int | bytes]:
+    return [value for field, wire, value in fields if field == number and wire == wire_type]
+
+
+def _protobuf_text(value: int | bytes, *, maximum: int = 1_024) -> str:
+    if not isinstance(value, bytes) or len(value) > maximum:
+        raise ValueError("protobuf string size outside limit")
+    text = value.decode("utf-8")
+    if not text or "\x00" in text:
+        raise ValueError("invalid protobuf string")
+    return text
+
+
+def _onnx_tensor_shape(value_info: bytes) -> tuple[str, tuple[int | str | None, ...]]:
+    fields = _protobuf_fields(value_info, depth=1)
+    names = _protobuf_values(fields, 1, 2)
+    types = _protobuf_values(fields, 2, 2)
+    if len(names) != 1 or len(types) != 1:
+        raise ValueError("ONNX value info is incomplete")
+    name = _protobuf_text(names[0], maximum=256)
+    type_fields = _protobuf_fields(types[0], depth=2)  # type: ignore[arg-type]
+    tensors = _protobuf_values(type_fields, 1, 2)
+    if len(tensors) != 1:
+        raise ValueError("ONNX value is not a tensor")
+    tensor_fields = _protobuf_fields(tensors[0], depth=3)  # type: ignore[arg-type]
+    element_types = _protobuf_values(tensor_fields, 1, 0)
+    shapes = _protobuf_values(tensor_fields, 2, 2)
+    if element_types != [ONNX_TENSOR_FLOAT] or len(shapes) != 1:
+        raise ValueError("ONNX tensor type is unsupported")
+    shape_fields = _protobuf_fields(shapes[0], depth=4)  # type: ignore[arg-type]
+    dimensions: list[int | str | None] = []
+    for raw_dimension in _protobuf_values(shape_fields, 1, 2):
+        dimension_fields = _protobuf_fields(raw_dimension, depth=5)  # type: ignore[arg-type]
+        numeric = _protobuf_values(dimension_fields, 1, 0)
+        symbolic = _protobuf_values(dimension_fields, 2, 2)
+        if numeric and symbolic:
+            raise ValueError("ONNX dimension has conflicting values")
+        if len(numeric) == 1 and isinstance(numeric[0], int) and numeric[0] > 0:
+            dimensions.append(numeric[0])
+        elif len(symbolic) == 1:
+            dimensions.append(_protobuf_text(symbolic[0], maximum=128))
+        elif not numeric and not symbolic:
+            dimensions.append(None)
+        else:
+            raise ValueError("ONNX dimension is invalid")
+    return name, tuple(dimensions)
+
+
+def _onnx_metadata(fields: list[tuple[int, int, int | bytes]]) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    total_size = 0
+    for raw_entry in _protobuf_values(fields, 14, 2):
+        entry = _protobuf_fields(raw_entry, depth=1)  # type: ignore[arg-type]
+        keys = _protobuf_values(entry, 1, 2)
+        values = _protobuf_values(entry, 2, 2)
+        if len(keys) != 1 or len(values) != 1:
+            raise ValueError("ONNX metadata entry is invalid")
+        key = _protobuf_text(keys[0], maximum=256)
+        value = _protobuf_text(values[0], maximum=16 * 1024)
+        total_size += len(key.encode("utf-8")) + len(value.encode("utf-8"))
+        if total_size > MAX_ONNX_METADATA_BYTES or key in metadata:
+            raise ValueError("ONNX metadata exceeds limits")
+        metadata[key] = value
+    return metadata
+
+
+def _onnx_default_opset(fields: list[tuple[int, int, int | bytes]]) -> int:
+    default_versions: list[int] = []
+    for raw_opset in _protobuf_values(fields, 8, 2):
+        opset = _protobuf_fields(raw_opset, depth=1)  # type: ignore[arg-type]
+        domains = _protobuf_values(opset, 1, 2)
+        versions = _protobuf_values(opset, 2, 0)
+        domain = "" if not domains else _protobuf_text(domains[0], maximum=256)
+        if len(domains) > 1 or len(versions) != 1 or not isinstance(versions[0], int):
+            raise ValueError("ONNX opset entry is invalid")
+        if not domain:
+            default_versions.append(versions[0])
+    if len(default_versions) != 1:
+        raise ValueError("ONNX default opset is missing")
+    return default_versions[0]
+
+
+def _onnx_graph_is_structurally_valid(
+    graph_fields: list[tuple[int, int, int | bytes]],
+    *,
+    input_name: str,
+    output_name: str,
+) -> bool:
+    nodes = _protobuf_values(graph_fields, 1, 2)
+    if not nodes:
+        return False
+    produced: set[str] = set()
+    consumes_input = False
+    for raw_node in nodes:
+        node = _protobuf_fields(raw_node, depth=2)  # type: ignore[arg-type]
+        inputs = [
+            _protobuf_text(value, maximum=256)
+            for value in _protobuf_values(node, 1, 2)
+        ]
+        outputs = [
+            _protobuf_text(value, maximum=256)
+            for value in _protobuf_values(node, 2, 2)
+        ]
+        operations = _protobuf_values(node, 4, 2)
+        if (
+            not outputs
+            or len(set(outputs)) != len(outputs)
+            or any(value in produced for value in outputs)
+            or len(operations) != 1
+        ):
+            return False
+        _protobuf_text(operations[0], maximum=128)
+        consumes_input = consumes_input or input_name in inputs
+        produced.update(outputs)
+    for raw_initializer in _protobuf_values(graph_fields, 5, 2):
+        initializer = _protobuf_fields(raw_initializer, depth=2)  # type: ignore[arg-type]
+        if _protobuf_values(initializer, 13, 2) or _protobuf_values(initializer, 14, 0):
+            return False
+    return consumes_input and output_name in produced
+
+
+def _is_safe_onnx_model(
+    data: bytes,
+    *,
+    captcha_type: str,
+    version: str,
+    algorithm: str,
+) -> bool:
+    """Validate the ONNX graph identity and I/O contract without ONNX packages."""
+
+    try:
+        fields = _protobuf_fields(data)
+        ir_versions = _protobuf_values(fields, 1, 0)
+        graphs = _protobuf_values(fields, 7, 2)
+        if (
+            len(ir_versions) != 1
+            or not isinstance(ir_versions[0], int)
+            or ir_versions[0] <= 0
+            or len(graphs) != 1
+        ):
+            return False
+        metadata = _onnx_metadata(fields)
+        opset = _onnx_default_opset(fields)
+        if (
+            metadata.get("algorithm") != algorithm
+            or metadata.get("captcha_type") != captcha_type
+            or metadata.get("version") != version
+            or metadata.get("training_mode") != "enhanced"
+            or metadata.get("onnx_opset") != str(opset)
+            or opset != 17
+        ):
+            return False
+        graph_fields = _protobuf_fields(graphs[0], depth=1)  # type: ignore[arg-type]
+        if not _protobuf_values(graph_fields, 1, 2):
+            return False
+        graph_names = _protobuf_values(graph_fields, 2, 2)
+        inputs = _protobuf_values(graph_fields, 11, 2)
+        outputs = _protobuf_values(graph_fields, 12, 2)
+        if len(graph_names) != 1 or len(inputs) != 1 or len(outputs) != 1:
+            return False
+        _protobuf_text(graph_names[0], maximum=256)
+        input_name, input_shape = _onnx_tensor_shape(inputs[0])  # type: ignore[arg-type]
+        output_name, output_shape = _onnx_tensor_shape(outputs[0])  # type: ignore[arg-type]
+        if input_name == output_name or not _onnx_graph_is_structurally_valid(
+            graph_fields,
+            input_name=input_name,
+            output_name=output_name,
+        ):
+            return False
+        if captcha_type == "numeric":
+            return (
+                input_shape == (1, 1, 48, 112)
+                and output_shape == (1, 4, 10)
+                and metadata.get("output_layout") == "batch,position,digit"
+            )
+        if (
+            len(input_shape) != 4
+            or input_shape[1:] != (3, 64, 64)
+            or len(output_shape) != 2
+            or not isinstance(output_shape[1], int)
+            or not 2 <= output_shape[1] <= 1_024
+            or input_shape[0] != output_shape[0]
+            or not isinstance(input_shape[0], str)
+            or metadata.get("output_layout") != "batch,class"
+        ):
+            return False
+        labels = json.loads(metadata.get("labels_json") or "")
+        return (
+            isinstance(labels, list)
+            and len(labels) == output_shape[1]
+            and len(set(labels)) == len(labels)
+            and all(isinstance(label, str) and 0 < len(label) <= 4 for label in labels)
+        )
+    except (TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _onnx_runtime_contract_is_valid(
+    data: bytes,
+    *,
+    captcha_type: str,
+    version: str,
+    algorithm: str,
+) -> bool:
+    """Load and exercise an ONNX model using the client's runtime contract."""
+
+    try:
+        import numpy as np
+        import onnxruntime as ort
+
+        options = ort.SessionOptions()
+        options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+        session = ort.InferenceSession(
+            data,
+            sess_options=options,
+            providers=["CPUExecutionProvider"],
+        )
+        inputs = session.get_inputs()
+        outputs = session.get_outputs()
+        metadata = dict(session.get_modelmeta().custom_metadata_map or {})
+        if (
+            len(inputs) != 1
+            or len(outputs) != 1
+            or inputs[0].type != "tensor(float)"
+            or outputs[0].type != "tensor(float)"
+            or metadata.get("algorithm") != algorithm
+            or metadata.get("captcha_type") != captcha_type
+            or metadata.get("version") != version
+        ):
+            return False
+        if captcha_type == "numeric":
+            tensors = (np.zeros((1, 1, 48, 112), dtype=np.float32),)
+            expected_shapes = ((1, 4, 10),)
+        else:
+            labels = json.loads(metadata.get("labels_json") or "")
+            if not isinstance(labels, list) or not 2 <= len(labels) <= 1_024:
+                return False
+            tensors = (
+                np.zeros((1, 3, 64, 64), dtype=np.float32),
+                np.zeros((2, 3, 64, 64), dtype=np.float32),
+            )
+            expected_shapes = ((1, len(labels)), (2, len(labels)))
+        for tensor, expected_shape in zip(tensors, expected_shapes):
+            result = session.run(
+                [outputs[0].name],
+                {inputs[0].name: tensor},
+            )
+            if not isinstance(result, (list, tuple)) or len(result) != 1:
+                return False
+            output = np.asarray(result[0])
+            if (
+                output.shape != expected_shape
+                or output.dtype != np.dtype(np.float32)
+                or not np.isfinite(output).all()
+            ):
+                return False
+        return True
+    except (
+        ImportError,
+        TypeError,
+        ValueError,
+        RuntimeError,
+        json.JSONDecodeError,
+    ):
+        return False
+    except Exception:
+        return False
+
+
+def _npy_item_size(descriptor: str) -> int:
+    match = re.fullmatch(r"[<|]([ifUS])(\d+)", descriptor)
+    if match is None:
+        raise ValueError("unsupported NPY descriptor")
+    kind, raw_size = match.groups()
+    size = int(raw_size)
+    if size <= 0:
+        raise ValueError("invalid NPY item size")
+    if kind == "U":
+        size *= 4
+    return size
+
+
+def _read_npy_array(
+    archive: zipfile.ZipFile,
+    item: zipfile.ZipInfo,
+) -> tuple[str, tuple[int, ...], bytes]:
+    """Read a bounded NPY header without importing NumPy on the API server."""
+
+    if item.file_size <= 0 or item.file_size > MAX_MODEL_EXPANDED_BYTES:
+        raise ValueError("NPY member size outside limit")
+    raw_array = archive.read(item)
+    if len(raw_array) != item.file_size:
+        raise ValueError("NPY member size changed")
+    stream = io.BytesIO(raw_array)
+    if stream.read(6) != b"\x93NUMPY":
+        raise ValueError("invalid NPY magic")
+    version = stream.read(2)
+    if version == b"\x01\x00":
+        raw_length = stream.read(2)
+        if len(raw_length) != 2:
+            raise ValueError("truncated NPY header")
+        header_length = struct.unpack("<H", raw_length)[0]
+        encoding = "latin1"
+    elif version in {b"\x02\x00", b"\x03\x00"}:
+        raw_length = stream.read(4)
+        if len(raw_length) != 4:
+            raise ValueError("truncated NPY header")
+        header_length = struct.unpack("<I", raw_length)[0]
+        encoding = "utf-8" if version == b"\x03\x00" else "latin1"
+    else:
+        raise ValueError("unsupported NPY version")
+    if not 0 < header_length <= MAX_NPY_HEADER_BYTES:
+        raise ValueError("NPY header size outside limit")
+    raw_header = stream.read(header_length)
+    if len(raw_header) != header_length:
+        raise ValueError("truncated NPY header")
+    header = ast.literal_eval(raw_header.decode(encoding).strip())
+    if (
+        not isinstance(header, dict)
+        or set(header) != {"descr", "fortran_order", "shape"}
+        or header.get("fortran_order") is not False
+        or not isinstance(header.get("descr"), str)
+        or not isinstance(header.get("shape"), tuple)
+        or any(type(value) is not int or value < 0 for value in header["shape"])
+    ):
+        raise ValueError("invalid NPY header")
+    shape = tuple(header["shape"])
+    if len(shape) > 4:
+        raise ValueError("NPY rank outside limit")
+    item_count = math.prod(shape)
+    expected_size = item_count * _npy_item_size(header["descr"])
+    payload = stream.read()
+    if expected_size > MAX_MODEL_EXPANDED_BYTES or len(payload) != expected_size:
+        raise ValueError("NPY payload length mismatch")
+    return header["descr"], shape, payload
+
+
+def _npy_scalar_text(array: tuple[str, tuple[int, ...], bytes]) -> str:
+    descriptor, shape, payload = array
+    match = re.fullmatch(r"<([US])(\d+)", descriptor)
+    if shape != (1,) or match is None:
+        raise ValueError("NPY text scalar is invalid")
+    encoding = "utf-32-le" if match.group(1) == "U" else "latin1"
+    return payload.decode(encoding).rstrip("\x00")
+
+
+def _npy_scalar_integer(
+    array: tuple[str, tuple[int, ...], bytes],
+    *,
+    descriptor: str,
+) -> int:
+    actual_descriptor, shape, payload = array
+    if actual_descriptor != descriptor or shape != (1,):
+        raise ValueError("NPY integer scalar is invalid")
+    return int.from_bytes(payload, "little", signed=descriptor.endswith(("i2", "i4")))
+
+
+def _is_safe_hog_npz_model(
+    data: bytes,
+    *,
+    captcha_type: str,
+    version: str,
+    algorithm: str,
+) -> bool:
+    expected_members = {
+        "schema_version.npy",
+        "captcha_type.npy",
+        "version.npy",
+        "algorithm.npy",
+        "feature_width.npy",
+        "labels.npy",
+        "class_counts.npy",
+        "weights.npy",
+        "biases.npy",
+    }
+    try:
+        with zipfile.ZipFile(io.BytesIO(data)) as archive:
+            members = [item for item in archive.infolist() if not item.is_dir()]
+            if len(members) != len(expected_members):
+                return False
+            expanded_size = 0
+            normalized_members: dict[str, zipfile.ZipInfo] = {}
+            for item in members:
+                normalized = _normalize_archive_member(item.filename)
+                if (
+                    normalized in normalized_members
+                    or normalized not in expected_members
+                    or item.flag_bits & 0x1
+                    or item.compress_type
+                    not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                ):
+                    return False
+                normalized_members[normalized] = item
+                expanded_size += item.file_size
+                if expanded_size > MAX_MODEL_EXPANDED_BYTES:
+                    return False
+            if set(normalized_members) != expected_members:
+                return False
+
+            arrays = {
+                name: _read_npy_array(archive, item)
+                for name, item in normalized_members.items()
+            }
+            positions = 4 if captcha_type == "numeric" else 1
+            maximum_classes = 10 if captcha_type == "numeric" else 1_024
+            labels_descr, labels_shape, labels_payload = arrays["labels.npy"]
+            if (
+                _npy_scalar_text(arrays["captcha_type.npy"]) != captcha_type
+                or _npy_scalar_text(arrays["version.npy"]) != version
+                or _npy_scalar_text(arrays["algorithm.npy"]) != algorithm
+                or
+                _npy_scalar_integer(
+                    arrays["schema_version.npy"], descriptor="<i2"
+                )
+                != 2
+                or _npy_scalar_integer(
+                    arrays["feature_width.npy"], descriptor="<i4"
+                )
+                != HOG_FEATURE_WIDTH
+                or arrays["class_counts.npy"][:2] != ("<i4", (positions,))
+                or not re.fullmatch(r"<[US][1-9][0-9]*", labels_descr)
+                or len(labels_shape) != 2
+                or labels_shape[0] != positions
+                or not 2 <= labels_shape[1] <= maximum_classes
+                or arrays["weights.npy"][:2]
+                != ("<f4", (positions, labels_shape[1], HOG_FEATURE_WIDTH))
+                or arrays["biases.npy"][:2]
+                != ("<f4", (positions, labels_shape[1]))
+            ):
+                return False
+            class_counts = struct.unpack(
+                f"<{positions}i",
+                arrays["class_counts.npy"][2],
+            )
+            if any(not 2 <= count <= labels_shape[1] for count in class_counts):
+                return False
+            character_width = _npy_item_size(labels_descr)
+            labels = [
+                labels_payload[index : index + character_width]
+                .decode("utf-32-le" if labels_descr.startswith("<U") else "latin1")
+                .rstrip("\x00")
+                for index in range(0, len(labels_payload), character_width)
+            ]
+            for position, count in enumerate(class_counts):
+                row = labels[
+                    position * labels_shape[1] : (position + 1) * labels_shape[1]
+                ]
+                active_labels = row[:count]
+                if (
+                    len(set(active_labels)) != count
+                    or any(not label or len(label) > 4 for label in active_labels)
+                    or any(row[count:])
+                    or (
+                        captcha_type == "numeric"
+                        and any(
+                            len(label) != 1 or label not in "0123456789"
+                            for label in active_labels
+                        )
+                    )
+                ):
+                    return False
+            weights_payload = arrays["weights.npy"][2]
+            biases_payload = arrays["biases.npy"][2]
+            for position, count in enumerate(class_counts):
+                for classifier in range(labels_shape[1]):
+                    vector_offset = (
+                        (position * labels_shape[1] + classifier)
+                        * HOG_FEATURE_WIDTH
+                        * 4
+                    )
+                    vector = struct.iter_unpack(
+                        "<f",
+                        weights_payload[
+                            vector_offset : vector_offset + HOG_FEATURE_WIDTH * 4
+                        ],
+                    )
+                    squared_weights = []
+                    for (weight,) in vector:
+                        if not math.isfinite(weight):
+                            return False
+                        squared_weights.append(weight * weight)
+                    if classifier < count:
+                        if math.sqrt(math.fsum(squared_weights)) <= 1e-12:
+                            return False
+                    elif any(squared_weights):
+                        return False
+
+                bias_offset = position * labels_shape[1] * 4
+                row_biases = struct.unpack_from(
+                    f"<{labels_shape[1]}f",
+                    biases_payload,
+                    bias_offset,
+                )
+                if any(not math.isfinite(value) for value in row_biases):
+                    return False
+                if any(value != 0.0 for value in row_biases[count:]):
+                    return False
+            return archive.testzip() is None
+    except (
+        OSError,
+        SyntaxError,
+        UnicodeError,
+        ValueError,
+        zipfile.BadZipFile,
+        RuntimeError,
+    ):
+        return False
+
+
+def _validate_model_contract(
+    captcha_type: str,
+    version: str,
+    algorithm: str,
+    artifact: bytes,
+) -> None:
+    _validate_model_algorithm(captcha_type, algorithm)
+
+    artifact_format = ARTIFACT_FORMAT_BY_ALGORITHM[algorithm]
+    valid_artifact = (
+        _is_safe_hog_npz_model(
+            artifact,
+            captcha_type=captcha_type,
+            version=version,
+            algorithm=algorithm,
+        )
+        if algorithm == HOG_LINEAR_SVM_ALGORITHM
+        else (
+            _is_safe_onnx_model(
+                artifact,
+                captcha_type=captcha_type,
+                version=version,
+                algorithm=algorithm,
+            )
+            and _onnx_runtime_contract_is_valid(
+                artifact,
+                captcha_type=captcha_type,
+                version=version,
+                algorithm=algorithm,
+            )
+        )
+        if algorithm == TINY_CNN_ONNX_ALGORITHM
+        else False
+    )
+    if not valid_artifact:
+        raise ApiError(
+            "invalid_captcha_model",
+            f"候选模型不是有效的 {artifact_format.upper()} 文件",
+            status_code=422,
+            details={"algorithm": algorithm, "artifact_format": artifact_format},
+        )
+
+
+def _validate_model_algorithm(captcha_type: str, algorithm: str) -> None:
+    if algorithm not in TRAINING_MODE_BY_ALGORITHM:
+        raise ApiError(
+            "unsupported_captcha_model_algorithm",
+            "不支持该验证码模型算法",
+            status_code=422,
+            details={"algorithm": algorithm},
+        )
+    if not is_supported_model(captcha_type, algorithm):
+        raise ApiError(
+            "invalid_captcha_model_algorithm",
+            "验证码类型与模型算法不匹配",
+            status_code=422,
+            details={"captcha_type": captcha_type, "algorithm": algorithm},
+        )
 
 
 def _image_mime(data: bytes) -> str:
@@ -510,18 +1271,34 @@ def download_current_captcha_model(
         select(CaptchaModel).where(
             CaptchaModel.captcha_type == captcha_type,
             CaptchaModel.status == "current",
+            CaptchaModel.algorithm.in_(supported_algorithms(captcha_type)),
         )
     )
-    if model is None:
+    if (
+        model is None
+        or not is_supported_model(model.captcha_type, model.algorithm)
+        or not _stored_model_contract_is_valid(model)
+    ):
         raise ApiError("captcha_model_not_found", "当前没有自定义模型", status_code=404)
+    metrics = model.metrics if isinstance(model.metrics, dict) else {}
+    training_mode = str(
+        metrics.get("training_mode")
+        or TRAINING_MODE_BY_ALGORITHM[model.algorithm]
+    )
+    headers = {
+        "X-Captcha-Model-Version": model.version,
+        "X-Captcha-Model-Algorithm": model.algorithm,
+        "X-Captcha-Training-Mode": training_mode,
+        "X-Content-SHA256": model.artifact_sha256,
+        "Cache-Control": "no-store",
+    }
+    trainer_version = metrics.get("trainer_version")
+    if isinstance(trainer_version, str) and trainer_version:
+        headers["X-Captcha-Trainer-Version"] = trainer_version
     return Response(
         content=model.artifact,
         media_type="application/octet-stream",
-        headers={
-            "X-Captcha-Model-Version": model.version,
-            "X-Content-SHA256": model.artifact_sha256,
-            "Cache-Control": "no-store",
-        },
+        headers=headers,
     )
 
 
@@ -1145,19 +1922,22 @@ def create_captcha_model(
     context: AdminContext,
     db: Db,
 ) -> dict[str, Any]:
+    algorithm = payload.algorithm.strip()
     artifact = _decode_base64(
         payload.artifact_base64,
         label="模型文件",
-        maximum=MAX_MODEL_BYTES,
+        maximum=MAX_ARTIFACT_BYTES_BY_ALGORITHM.get(algorithm, MAX_MODEL_BYTES),
     )
-    if not artifact.startswith(b"PK"):
-        raise ApiError(
-            "invalid_captcha_model",
-            "候选模型必须使用受支持的 NPZ 格式",
-            status_code=422,
-        )
+    _validate_model_algorithm(payload.captcha_type, algorithm)
+    metrics = _normalize_model_metrics(payload.metrics, algorithm=algorithm)
+    _validate_model_contract(
+        payload.captcha_type,
+        payload.version,
+        algorithm,
+        artifact,
+    )
     metrics_encoded = json.dumps(
-        payload.metrics,
+        metrics,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -1171,7 +1951,7 @@ def create_captcha_model(
         captcha_type=payload.captcha_type,
         version=payload.version,
         display_name=payload.version,
-        algorithm=payload.algorithm.strip(),
+        algorithm=algorithm,
         status="candidate",
         artifact_sha256=hashlib.sha256(artifact).hexdigest(),
         artifact_size=len(artifact),
@@ -1180,7 +1960,7 @@ def create_captcha_model(
         test_count=payload.test_count,
         correct_count=payload.correct_count,
         accuracy=payload.correct_count / payload.test_count,
-        metrics=payload.metrics,
+        metrics=metrics,
         created_by_id=context.account.id,
     )
     db.add(model)
@@ -1193,6 +1973,9 @@ def create_captcha_model(
         target_id=payload.version,
         details={
             "captcha_type": payload.captcha_type,
+            "algorithm": algorithm,
+            "training_mode": metrics["training_mode"],
+            "trainer_version": metrics.get("trainer_version"),
             "sample_count": payload.sample_count,
             "accuracy": model.accuracy,
         },
@@ -1258,6 +2041,33 @@ def activate_captcha_model(
     model = db.get(CaptchaModel, model_id)
     if model is None:
         raise ApiError("captcha_model_not_found", "候选模型不存在", status_code=404)
+    if model.algorithm == LEGACY_KNN_PIXELS_ALGORITHM:
+        raise ApiError(
+            "captcha_model_algorithm_retired",
+            "KNN 验证码模型已停用，不能再次激活",
+            status_code=409,
+        )
+    if not is_supported_model(model.captcha_type, model.algorithm):
+        raise ApiError(
+            "unsupported_captcha_model_algorithm",
+            "模型算法不受当前版本支持",
+            status_code=409,
+            details={
+                "captcha_type": model.captcha_type,
+                "algorithm": model.algorithm,
+            },
+        )
+    if not _stored_model_contract_is_valid(model):
+        raise ApiError(
+            "invalid_captcha_model",
+            "模型文件校验失败，不能激活",
+            status_code=409,
+            details={
+                "captcha_type": model.captcha_type,
+                "algorithm": model.algorithm,
+                "version": model.version,
+            },
+        )
     db.execute(
         update(CaptchaModel)
         .where(
@@ -1283,6 +2093,7 @@ def activate_captcha_model(
         details={
             "captcha_type": model.captcha_type,
             "version": model.version,
+            "algorithm": model.algorithm,
         },
     )
     db.commit()

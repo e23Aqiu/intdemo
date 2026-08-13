@@ -9,9 +9,9 @@ import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Mapping
 from urllib.parse import urlparse
 
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
@@ -44,6 +44,7 @@ def _version_key(value: str) -> tuple[int, int, int]:
 class PublisherSettings:
     base_url: str = ""
     ca_bundle: str = ""
+    trainer_trust_file: str = ""
     control_username: str = "admin"
     inno_compiler: str = ""
     remote_host: str = ""
@@ -126,6 +127,7 @@ class ReleaseOptions:
     base_url: str
     notes: str
     ca_bundle: str = ""
+    trainer_trust_file: str = ""
     delta_from_version: str = ""
     channel: str = "test"
     mandatory: bool = False
@@ -261,6 +263,7 @@ def _candidate_receipt_matches(
     platform_key: str,
     source_commit: str,
     ca_digest: str,
+    trainer_trust_digest: str,
 ) -> bool:
     try:
         receipt = json.loads(path.read_text(encoding="utf-8"))
@@ -278,6 +281,8 @@ def _candidate_receipt_matches(
         "ca_sha256": ca_digest,
     }
     if any(receipt.get(key) != value for key, value in expected.items()):
+        return False
+    if str(receipt.get("trainer_trust_sha256") or "") != trainer_trust_digest:
         return False
     if platform_key == "windows-x86_64" and (
         receipt.get("delta_from_version") != options.delta_from_version
@@ -349,12 +354,21 @@ def release_readiness(options: ReleaseOptions) -> ReleaseReadiness:
                 ca_digest = _file_sha256(ca_path)
             except OSError:
                 ca_digest = ""
+    trainer_trust_digest = ""
+    if options.trainer_trust_file:
+        trust_path = Path(options.trainer_trust_file).expanduser()
+        if trust_path.is_file():
+            try:
+                trainer_trust_digest = _file_sha256(trust_path)
+            except OSError:
+                trainer_trust_digest = ""
     windows_ready = _candidate_receipt_matches(
         options.windows_result_receipt,
         options=options,
         platform_key="windows-x86_64",
         source_commit=source_commit,
         ca_digest=ca_digest,
+        trainer_trust_digest=trainer_trust_digest,
     )
     uos_ready = _candidate_receipt_matches(
         options.uos_result_receipt,
@@ -362,6 +376,7 @@ def release_readiness(options: ReleaseOptions) -> ReleaseReadiness:
         platform_key="linux-aarch64",
         source_commit=source_commit,
         ca_digest=ca_digest,
+        trainer_trust_digest=trainer_trust_digest,
     )
     if windows_ready and uos_ready:
         return ReleaseReadiness(
@@ -385,7 +400,7 @@ def release_readiness(options: ReleaseOptions) -> ReleaseReadiness:
     if receipts_exist:
         return ReleaseReadiness(
             "mismatch",
-            f"v{version} 存在与当前服务地址、CA、通道或提交不一致的构建结果",
+            f"v{version} 存在与当前服务地址、CA、强化组件公钥、通道或提交不一致的构建结果",
         )
     return ReleaseReadiness("empty", f"v{version} 暂无待发布构建结果")
 
@@ -1094,9 +1109,15 @@ def set_project_version(
 
 
 def find_inno_compiler(configured: str = "") -> Path | None:
+    def resolve_file(path: Path) -> Path | None:
+        try:
+            return path.resolve() if path.is_file() else None
+        except OSError:
+            return None
+
     if configured:
         path = Path(configured).expanduser()
-        return path.resolve() if path.is_file() else None
+        return resolve_file(path)
     candidates: list[Path] = []
     local_app_data = os.environ.get("LOCALAPPDATA")
     program_files = os.environ.get("ProgramFiles")
@@ -1109,7 +1130,10 @@ def find_inno_compiler(configured: str = "") -> Path | None:
         candidates.append(Path(program_files) / "Inno Setup 6" / "ISCC.exe")
     if program_files_x86:
         candidates.append(Path(program_files_x86) / "Inno Setup 6" / "ISCC.exe")
-    return next((path.resolve() for path in candidates if path.is_file()), None)
+    return next(
+        (resolved for path in candidates if (resolved := resolve_file(path))),
+        None,
+    )
 
 
 def is_native_uos_arm64_builder() -> bool:
@@ -1177,6 +1201,22 @@ def validate_release_options(
 
     if options.ca_bundle and not Path(options.ca_bundle).expanduser().is_file():
         errors.append(f"CA 根证书不存在：{options.ca_bundle}")
+    if (
+        options.trainer_trust_file
+        and not Path(options.trainer_trust_file).expanduser().is_file()
+    ):
+        errors.append(
+            f"强化组件可信公钥配置不存在：{options.trainer_trust_file}"
+        )
+    elif options.trainer_trust_file:
+        try:
+            from integrated_client.trainer_trust import (
+                load_trainer_trusted_public_keys,
+            )
+
+            load_trainer_trusted_public_keys(options.trainer_trust_file)
+        except (OSError, ValueError) as exc:
+            errors.append(f"强化组件可信公钥配置无效：{exc}")
     if options.channel not in {"test", "stable"}:
         errors.append("发布通道只能是 test 或 stable")
     if options.windows_build_mode not in {"auto", "github", "manual"}:
@@ -1495,6 +1535,10 @@ def build_package_steps(
             ]
             if options.ca_bundle:
                 arguments.extend(["--ca-bundle", options.ca_bundle])
+            if options.trainer_trust_file:
+                arguments.extend(
+                    ["--trainer-trust-file", options.trainer_trust_file]
+                )
             if options.delta_from_version:
                 arguments.extend(
                     ["--delta-from-version", options.delta_from_version]
@@ -1547,6 +1591,10 @@ def build_package_steps(
             ]
             if options.ca_bundle:
                 arguments.extend(["--ca-bundle", options.ca_bundle])
+            if options.trainer_trust_file:
+                arguments.extend(
+                    ["--trainer-trust-file", options.trainer_trust_file]
+                )
             if options.delta_from_version:
                 arguments.extend(
                     ["--delta-from-version", options.delta_from_version]
@@ -1582,6 +1630,10 @@ def build_package_steps(
                 ]
                 if options.ca_bundle:
                     native_arguments.extend(["-CaBundle", options.ca_bundle])
+                if options.trainer_trust_file:
+                    native_arguments.extend(
+                        ["-TrainerTrustFile", options.trainer_trust_file]
+                    )
                 if options.delta_from_version:
                     native_arguments.extend(
                         ["-DeltaFromVersion", options.delta_from_version]
@@ -1620,6 +1672,10 @@ def build_package_steps(
                 uos_arguments.extend(["--ca-bundle", options.ca_bundle])
             else:
                 uos_arguments.append("--no-ca-bundle")
+            if options.trainer_trust_file:
+                uos_arguments.extend(
+                    ["--trainer-trust-file", options.trainer_trust_file]
+                )
             if output_mode in {"native", "both"}:
                 uos_steps.append(
                     CommandStep(
@@ -1640,6 +1696,10 @@ def build_package_steps(
             ]
             if options.ca_bundle:
                 record_arguments.extend(["--ca-bundle", options.ca_bundle])
+            if options.trainer_trust_file:
+                record_arguments.extend(
+                    ["--trainer-trust-file", options.trainer_trust_file]
+                )
             if output_mode in {"result", "both"}:
                 uos_steps.append(
                     _release_task_step(
@@ -1667,6 +1727,10 @@ def build_package_steps(
                 remote_arguments.extend(["-IdentityFile", options.identity_file])
             if options.ca_bundle:
                 remote_arguments.extend(["-CaBundle", options.ca_bundle])
+            if options.trainer_trust_file:
+                remote_arguments.extend(
+                    ["-TrainerTrustFile", options.trainer_trust_file]
+                )
             if output_mode in {"result", "both"}:
                 remote_arguments.append("-ExportResult")
             uos_steps.append(
@@ -1707,6 +1771,8 @@ def _windows_task_arguments(options: ReleaseOptions) -> list[str]:
     ]
     if options.ca_bundle:
         arguments.extend(["--ca-bundle", options.ca_bundle])
+    if options.trainer_trust_file:
+        arguments.extend(["--trainer-trust-file", options.trainer_trust_file])
     if options.delta_from_version:
         arguments.extend(["--delta-from-version", options.delta_from_version])
     if options.build_portable:
@@ -1767,6 +1833,8 @@ def build_uos_result_import_steps(
     ]
     if options.ca_bundle:
         arguments.extend(["--ca-bundle", options.ca_bundle])
+    if options.trainer_trust_file:
+        arguments.extend(["--trainer-trust-file", options.trainer_trust_file])
     return [
         _release_task_step(
             options,
@@ -1797,6 +1865,8 @@ def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
     ]
     if options.ca_bundle:
         arguments.extend(["--ca-bundle", options.ca_bundle])
+    if options.trainer_trust_file:
+        arguments.extend(["--trainer-trust-file", options.trainer_trust_file])
     if options.delta_from_version:
         arguments.extend(["--delta-from-version", options.delta_from_version])
     if options.build_portable:

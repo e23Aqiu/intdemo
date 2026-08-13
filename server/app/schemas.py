@@ -44,7 +44,7 @@ class LoginRequest(StrictModel):
     password: str = Field(min_length=1, max_length=256)
     device_uid: uuid.UUID
     device_name: str = Field(default="Windows device", min_length=1, max_length=160)
-    client_version: str = Field(default="1.0.8", min_length=1, max_length=40)
+    client_version: str = Field(default="1.1.0", min_length=1, max_length=40)
     control_client: bool = False
 
     @field_validator("username")
@@ -467,7 +467,10 @@ class CaptchaModelCreate(StrictModel):
         max_length=80,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]*$",
     )
-    algorithm: Literal["knn-pixels-v1"]
+    # Kept as a string so retired/future identifiers receive the API's stable
+    # domain error instead of a generic request-validation error.  The endpoint
+    # enforces the explicit category/algorithm allowlist.
+    algorithm: str = Field(min_length=1, max_length=80)
     artifact_base64: str = Field(min_length=1, max_length=28_000_000)
     sample_count: int = Field(ge=1, le=10_000_000)
     test_count: int = Field(ge=1, le=10_000_000)

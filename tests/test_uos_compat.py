@@ -861,6 +861,7 @@ class UosCompatibilityTests(unittest.TestCase):
             deb_builder,
         )
         self.assertIn('cp "$package_root/client-online.json"', deb_builder)
+        self.assertIn('cp "$package_root/trainer-trust.json"', deb_builder)
         self.assertIn('cp -a "$package_root/certs/."', deb_builder)
         self.assertNotIn(
             'cp "$repo_root/packaging/uos-arm64/client-online.json"',
@@ -871,6 +872,11 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertNotIn("postinst", deb_builder.lower())
         self.assertIn('bash "$script_dir/build-deb.sh"', build_script)
         self.assertIn("--skip-deb", build_script)
+        self.assertIn("--trainer-trust-file", build_script)
+        self.assertIn(
+            'cp "$trainer_trust_file" "$package_root/trainer-trust.json"',
+            build_script,
+        )
         self.assertIn("Package: com.e23aqiu.intdemo", control)
         self.assertIn("Architecture: arm64", control)
         self.assertIn("libsecret-tools", control)

@@ -5,11 +5,13 @@ param(
 
     [string]$CaBundle = "",
 
+    [string]$TrainerTrustFile = "",
+
     [ValidateSet("test", "stable")]
     [string]$Channel = "test",
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.0.8",
+    [string]$Version = "1.1.0",
     [switch]$SkipPyInstaller
 )
 
@@ -68,6 +70,13 @@ try {
 
     Reset-DirectoryWithinDist $stage
     Copy-Item -LiteralPath $executable -Destination $stage -Force
+
+    if ($TrainerTrustFile) {
+        $resolvedTrainerTrust = (Resolve-Path -LiteralPath $TrainerTrustFile).Path
+        Copy-Item -LiteralPath $resolvedTrainerTrust `
+            -Destination (Join-Path $stage "trainer-trust.json") `
+            -Force
+    }
 
     $relativeCa = $null
     if ($CaBundle) {

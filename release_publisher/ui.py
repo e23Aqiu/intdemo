@@ -34,7 +34,6 @@ from .connection_control import (
     ConnectionControlClient,
     ConnectionControlError,
 )
-from .release_tasks import ReleaseTaskError, detect_windows_result_portable
 from .core import (
     CommandStep,
     PublisherError,
@@ -58,6 +57,7 @@ from .core import (
     validate_release_options,
     validate_test_environment,
 )
+from .release_tasks import ReleaseTaskError, detect_windows_result_portable
 
 
 class ReleasePublisherWindow(QMainWindow):
@@ -212,6 +212,15 @@ class ReleasePublisherWindow(QMainWindow):
             "证书文件 (*.crt *.pem);;所有文件 (*)",
         )
         connection_form.addRow("私有 CA", ca_row)
+        self.trainer_trust_edit, trainer_trust_row = self._path_input(
+            "选择 trainer-trust.json",
+            "强化组件可信配置 (trainer-trust.json);;JSON 文件 (*.json);;"
+            "所有文件 (*)",
+        )
+        self.trainer_trust_edit.setToolTip(
+            "可选。构建 Windows/UOS 安装包时随包写入强化组件签名公钥；不上传服务器。"
+        )
+        connection_form.addRow("强化组件公钥", trainer_trust_row)
         self.windows_build_mode_combo = QComboBox()
         self.windows_build_mode_combo.addItem(
             "自动（GitHub 优先，不可用时导出真机任务）",
@@ -509,6 +518,7 @@ class ReleasePublisherWindow(QMainWindow):
         settings = self.settings_store.load()
         self.base_url_edit.setText(settings.base_url)
         self.ca_edit.setText(settings.ca_bundle)
+        self.trainer_trust_edit.setText(settings.trainer_trust_file)
         self.control_username_edit.setText(settings.control_username)
         self.inno_edit.setText(settings.inno_compiler)
         self.windows_check.setChecked(settings.build_windows)
@@ -565,6 +575,7 @@ class ReleasePublisherWindow(QMainWindow):
             self.delta_edit,
             self.base_url_edit,
             self.ca_edit,
+            self.trainer_trust_edit,
         ):
             edit.editingFinished.connect(self._refresh_release_readiness)
         self.channel_combo.currentIndexChanged.connect(
@@ -841,6 +852,7 @@ class ReleasePublisherWindow(QMainWindow):
         settings = PublisherSettings(
             base_url=self.base_url_edit.text().strip(),
             ca_bundle=self.ca_edit.text().strip(),
+            trainer_trust_file=self.trainer_trust_edit.text().strip(),
             control_username=self.control_username_edit.text().strip(),
             inno_compiler=self.inno_edit.text().strip(),
             remote_host=self.remote_host_edit.text().strip(),
@@ -888,6 +900,7 @@ class ReleasePublisherWindow(QMainWindow):
             base_url=self.base_url_edit.text().strip(),
             notes=self.notes_edit.toPlainText().strip(),
             ca_bundle=self.ca_edit.text().strip(),
+            trainer_trust_file=self.trainer_trust_edit.text().strip(),
             delta_from_version=self.delta_edit.text().strip(),
             channel=str(self.channel_combo.currentData()),
             mandatory=self.mandatory_check.isChecked(),
@@ -932,9 +945,13 @@ class ReleasePublisherWindow(QMainWindow):
         if options is None:
             return
         self._save_settings()
+        if options.build_windows and options.build_uos:
+            platform_label = "Windows x64 + UOS ARM64"
+        else:
+            platform_label = "Windows x64" if options.build_windows else "UOS ARM64"
         message = (
             f"环境检查通过。\n\n目标版本：{options.version}\n"
-            f"构建平台：{'Windows x64 + UOS ARM64' if options.build_windows and options.build_uos else ('Windows x64' if options.build_windows else 'UOS ARM64')}\n"
+            f"构建平台：{platform_label}\n"
             f"输出类型：{self.output_mode_combo.currentText()}\n"
             f"通道：{options.channel}\n"
             f"增量来源：{options.delta_from_version or '无'}\n"
