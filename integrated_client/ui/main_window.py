@@ -167,7 +167,8 @@ class MainWindow(FramelessMainWindow):
         content_layout.addWidget(self._build_top_bar())
 
         self.stack = QStackedWidget()
-        self.stack.setMinimumSize(self.PAGE_CANVAS_SIZE)
+        self.stack.setMinimumWidth(self.PAGE_CANVAS_SIZE.width())
+        self.stack.setMinimumHeight(self.PAGE_CANVAS_SIZE.height())
         self.page_scroll_area = QScrollArea()
         self.page_scroll_area.setObjectName("PageScrollArea")
         self.page_scroll_area.setFrameShape(QFrame.NoFrame)
@@ -1353,6 +1354,16 @@ class MainWindow(FramelessMainWindow):
                 self.data_nav_toggle.setChecked(True)
                 self._toggle_data_navigation(True)
         self.stack.setCurrentWidget(self._pages[page_key])
+        # Settings is a compact page. Let it use its size hint so its primary
+        # actions stay visible in a normal small window; data-heavy pages keep
+        # the established canvas height and scrolling behavior.
+        compact_page = page_key == "personal"
+        self.stack.setMinimumWidth(
+            0 if compact_page else self.PAGE_CANVAS_SIZE.width()
+        )
+        self.stack.setMinimumHeight(
+            0 if compact_page else self.PAGE_CANVAS_SIZE.height()
+        )
         for page_key, button in self._nav_buttons.items():
             button.setChecked(page_key == key)
         self._set_data_navigation_active(bool(data_view))

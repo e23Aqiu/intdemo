@@ -133,9 +133,10 @@ class PersonalCenterPage(QWidget):
         update_layout.addWidget(notes_caption)
         self.update_notes = QTextBrowser()
         self.update_notes.setObjectName("UpdateNotes")
-        self.update_notes.setMinimumHeight(120)
+        self.update_notes.setMinimumHeight(72)
+        self.update_notes.setMaximumHeight(120)
         self.update_notes.setPlainText("检查更新后将在这里显示版本说明。")
-        update_layout.addWidget(self.update_notes, 1)
+        update_layout.addWidget(self.update_notes)
 
         self.update_progress = QProgressBar()
         self.update_progress.setObjectName("UpdateProgress")

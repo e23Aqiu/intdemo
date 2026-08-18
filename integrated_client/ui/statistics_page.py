@@ -369,6 +369,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         self._values = {}
         self._scope = ""
         self._bar_rects = []
+        self._bar_payloads = []
         self.setMinimumHeight(280)
 
     def set_values(self, values, scope=""):
@@ -379,6 +380,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
     def paintEvent(self, event):
         self._slice_hitboxes = []
         self._bar_rects = []
+        self._bar_payloads = []
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
@@ -456,7 +458,11 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         legend_left = pie_rect.right() + 42
         legend_width = max(120, self.width() - legend_left - 28)
         row_height = 34
-        for index, ((_, label, color), value) in enumerate(zip(self.SEGMENTS, segment_values)):
+        legend_rows = sorted(
+            zip(self.SEGMENTS, segment_values),
+            key=lambda item: (-int(item[1]), str(item[0][1])),
+        )
+        for index, ((metric_key, label, color), value) in enumerate(legend_rows):
             top = 50 + index * row_height
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
@@ -476,6 +482,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
                 legend_left, top + 20, legend_width, self.BAR_HEIGHT
             )
             self._bar_rects.append(QRectF(bar_rect))
+            self._bar_payloads.append((metric_key, label, color))
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor("#e8f1ef"))
             painter.drawRoundedRect(bar_rect, 5, 5)
@@ -519,7 +526,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
                 if self._hovered_slice is not None:
                     self._hovered_slice = None
                     self.update()
-                metric_key, label, color = self.SEGMENTS[bar_index]
+                metric_key, label, color = self._bar_payloads[bar_index]
                 self._show_category_details(
                     label,
                     self._values.get(metric_key, 0),
@@ -571,6 +578,11 @@ class ViolationReasonChart(AnimatedDonutChart):
     def set_rows(self, rows, scope=""):
         self._rows = list(rows)
         self._scope = scope
+        # Keep enough vertical room for every reason bar. The page-level
+        # scroll area then handles long lists instead of clipping rows.
+        self.setMinimumHeight(
+            max(280, 82 + len(self._rows) * self.BAR_ROW_HEIGHT + 18)
+        )
         self.update()
 
     def set_bar_mode(self, mode):
@@ -695,7 +707,7 @@ class ViolationReasonChart(AnimatedDonutChart):
             "原因条目",
         )
 
-        rows = self._rows[:7]
+        rows = self._rows
         legend_left = pie_rect.right() + 46
         legend_width = max(120, self.width() - legend_left - 28)
         label_width = max(90, int(legend_width * 0.56))
@@ -759,15 +771,6 @@ class ViolationReasonChart(AnimatedDonutChart):
                     painter.setBrush(color)
                     painter.drawPath(value_path)
                     self._draw_flow_highlight(painter, value_path, value_rect)
-
-        if len(self._rows) > len(rows):
-            painter.setPen(QColor("#8a98aa"))
-            painter.setFont(QFont("Microsoft YaHei UI", 8))
-            painter.drawText(
-                legend_left,
-                self.height() - 7,
-                f"图表显示前 7 项，完整 {len(self._rows)} 项见下方表格",
-            )
 
     def mouseMoveEvent(self, event):
         slice_index, slice_row = self._slice_at(event.pos())
@@ -2644,6 +2647,13 @@ class StatisticsPage(QWidget):
             users_only=(user_id is None),
             start_date=start_date,
             end_date=end_date,
+        )
+        rows = sorted(
+            rows,
+            key=lambda row: (
+                -int(row.get("total") or 0),
+                str(row.get("reason") or ""),
+            ),
         )
         self.distribution_chart.hide()
         self.violation_chart.show()

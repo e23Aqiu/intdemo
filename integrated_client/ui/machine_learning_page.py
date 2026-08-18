@@ -148,6 +148,7 @@ class MachineLearningPage(QWidget):
         self._sample_rows = []
         self._sample_offset = 0
         self._sample_limit = 100
+        self._samples_loaded_once = False
         self._build_ui()
         self._refresh_training_component()
         if self.learning_service is not None:
@@ -157,7 +158,7 @@ class MachineLearningPage(QWidget):
 
         self.refresh_timer = QTimer(self)
         self.refresh_timer.setInterval(self.REFRESH_INTERVAL_MS)
-        self.refresh_timer.timeout.connect(self.refresh)
+        self.refresh_timer.timeout.connect(self._poll_refresh)
         self.refresh_timer.start()
         QTimer.singleShot(0, self.refresh)
 
@@ -715,6 +716,12 @@ class MachineLearningPage(QWidget):
 
         self._refresh_task = self._start(load, self._overview_loaded)
 
+    def _poll_refresh(self):
+        """Refresh visible overview data without rebuilding the sample table."""
+        if not self.isVisible():
+            return
+        self.refresh()
+
     def _overview_loaded(self, result, error):
         self._refresh_task = None
         self.refresh_btn.setEnabled(True)
@@ -778,7 +785,8 @@ class MachineLearningPage(QWidget):
         self._set_accuracy_values("numeric", active, attempts, models)
         self._set_accuracy_values("click", active, attempts, models)
         self._populate_models(models, attempts, active)
-        self._refresh_samples()
+        if not self._samples_loaded_once:
+            self._refresh_samples()
 
     @classmethod
     def _is_manual_model_version(cls, version):
@@ -1270,6 +1278,7 @@ class MachineLearningPage(QWidget):
             self._refresh_samples()
             return
         if error is not None:
+            self._samples_loaded_once = True
             self._sample_rows = []
             self.sample_table.clearContents()
             self.sample_table.setRowCount(0)
@@ -1310,6 +1319,7 @@ class MachineLearningPage(QWidget):
                 item for item in raw_items if isinstance(item, dict)
             ]
         except (TypeError, ValueError, OverflowError) as exc:
+            self._samples_loaded_once = True
             self._sample_rows = []
             self.sample_table.clearContents()
             self.sample_table.setRowCount(0)
@@ -1320,6 +1330,7 @@ class MachineLearningPage(QWidget):
             return
         self._sample_limit = limit
         self._sample_offset = offset
+        self._samples_loaded_once = True
         self.delete_samples_btn.setEnabled(True)
         self.sample_table.setRowCount(len(self._sample_rows))
         type_labels = {"numeric": "数字", "click": "文字点选"}
@@ -1670,6 +1681,7 @@ class MachineLearningPage(QWidget):
             f"重复 {int(result.get('duplicate_count') or 0)}，"
             f"跳过 {int(result.get('skipped_count') or 0)}。",
         )
+        self._request_sample_refresh()
         self.refresh()
 
     def _begin_training_terminal(
