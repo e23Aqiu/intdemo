@@ -7,6 +7,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QTextBrowser,
     QVBoxLayout,
     QWidget,
@@ -86,6 +87,7 @@ class PersonalCenterPage(QWidget):
 
         update_card = QFrame()
         update_card.setObjectName("SettingCard")
+        update_card.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         update_layout = QVBoxLayout(update_card)
         update_layout.setContentsMargins(22, 20, 22, 20)
         update_layout.setSpacing(12)
@@ -164,8 +166,8 @@ class PersonalCenterPage(QWidget):
         self.update_action_btn.clicked.connect(self._update_action)
         update_actions.addWidget(self.update_action_btn)
         update_layout.addLayout(update_actions)
-        layout.addWidget(update_card, 1)
-        layout.addStretch()
+        layout.addWidget(update_card)
+        layout.addStretch(1)
 
     @staticmethod
     def _add_info_item(layout, caption_text, value):

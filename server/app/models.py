@@ -327,7 +327,10 @@ class AnnouncementReceipt(Base):
 
 class AdminContactMessage(Base):
     __tablename__ = "admin_contact_messages"
-    __table_args__ = (Index("ix_admin_messages_read_created", "read_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_admin_messages_read_created", "read_at", "created_at"),
+        Index("ix_admin_messages_thread_created", "thread_id", "created_at"),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     sender_account_id: Mapped[uuid.UUID] = mapped_column(
@@ -338,9 +341,28 @@ class AdminContactMessage(Base):
         ForeignKey("announcements.id", ondelete="SET NULL"),
         index=True,
     )
+    thread_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, index=True)
+    status: Mapped[str] = mapped_column(String(16), default="open", index=True)
     message: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    read_by_user_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ContactMessageAttachment(Base):
+    __tablename__ = "contact_message_attachments"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    message_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("admin_contact_messages.id", ondelete="CASCADE"),
+        index=True,
+    )
+    file_name: Mapped[str] = mapped_column(String(255))
+    content_type: Mapped[str] = mapped_column(String(160))
+    kind: Mapped[str] = mapped_column(String(16), default="file")
+    size: Mapped[int] = mapped_column(Integer)
+    content: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class CaptchaLearningPolicy(Base):

@@ -54,6 +54,7 @@ from .loading_dialog import run_with_loading
 
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_ANNOUNCEMENT_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_CONTACT_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENTS = 8
 ASSET_DIRECTORY = Path(__file__).with_name("assets")
 
@@ -97,6 +98,49 @@ def _format_size(size):
 
 def _display_time(value):
     return str(value or "").replace("T", " ")[:19] or "-"
+
+
+def _encode_attachment_item(item):
+    path = Path(item["path"])
+    return {
+        "file_name": item["file_name"],
+        "content_type": item["content_type"],
+        "kind": item["kind"],
+        "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
+    }
+
+
+def _open_contact_attachment(parent, session, attachment):
+    file_name = str(attachment.get("file_name") or "消息附件")
+    try:
+        data = run_with_loading(
+            parent,
+            "正在读取附件…",
+            lambda: session.api.download_contact_attachment(
+                session.access_token(),
+                str(attachment.get("id")),
+            ),
+        )
+    except (ApiResponseError, NetworkUnavailable) as exc:
+        QMessageBox.warning(parent, "附件读取失败", str(exc))
+        return
+    if attachment.get("kind") == "image":
+        ImagePreviewDialog(
+            data,
+            file_name,
+            parent,
+            save_caption="保存消息图片",
+        ).exec_()
+        return
+    target, _ = QFileDialog.getSaveFileName(parent, "保存消息附件", file_name, "所有文件 (*.*)")
+    if not target:
+        return
+    try:
+        Path(target).write_bytes(data)
+    except OSError as exc:
+        QMessageBox.warning(parent, "保存失败", str(exc))
+        return
+    QMessageBox.information(parent, "保存完成", f"附件已保存到：\n{target}")
 
 
 class AnnouncementHoverCard(QFrame):
@@ -555,6 +599,344 @@ class ContactAdminDialog(FramelessDialog):
         return self.message_edit.toPlainText().strip()
 
 
+class ContactAttachmentPicker(QWidget):
+    """Small reusable picker for contact-message images and files."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._items = []
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+        actions = QHBoxLayout()
+        add_image_btn = QPushButton("添加图片")
+        add_image_btn.clicked.connect(self._add_images)
+        add_file_btn = QPushButton("添加附件")
+        add_file_btn.clicked.connect(self._add_files)
+        remove_btn = QPushButton("移除")
+        remove_btn.clicked.connect(self._remove_selected)
+        actions.addWidget(add_image_btn)
+        actions.addWidget(add_file_btn)
+        actions.addWidget(remove_btn)
+        actions.addStretch()
+        self.summary = QLabel("未添加附件")
+        self.summary.setObjectName("Muted")
+        actions.addWidget(self.summary)
+        layout.addLayout(actions)
+        self.list_widget = QListWidget()
+        self.list_widget.setMaximumHeight(82)
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.hide()
+        layout.addWidget(self.list_widget)
+
+    def _add_images(self, *_args):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择消息图片",
+            "",
+            "图片文件 (*.png *.jpg *.jpeg *.gif *.bmp *.webp);;所有文件 (*.*)",
+        )
+        self._add_paths(paths, "image")
+
+    def _add_files(self, *_args):
+        paths, _ = QFileDialog.getOpenFileNames(
+            self,
+            "选择消息附件",
+            "",
+            "所有文件 (*.*)",
+        )
+        self._add_paths(paths, "file")
+
+    def _add_paths(self, paths, kind):
+        known_paths = {str(item.get("path")) for item in self._items}
+        for raw_path in paths:
+            if len(self._items) >= MAX_ATTACHMENTS:
+                QMessageBox.warning(
+                    self,
+                    "附件数量超限",
+                    f"单条消息最多上传 {MAX_ATTACHMENTS} 个附件。",
+                )
+                return
+            path = Path(raw_path)
+            try:
+                resolved = str(path.resolve())
+                size = path.stat().st_size
+            except OSError as exc:
+                QMessageBox.warning(self, "无法读取附件", str(exc))
+                continue
+            if resolved in known_paths:
+                continue
+            if size > MAX_ATTACHMENT_BYTES:
+                QMessageBox.warning(self, "附件过大", f"{path.name} 超过 10 MB，未添加。")
+                continue
+            if self.total_size() + size > MAX_CONTACT_ATTACHMENT_BYTES:
+                QMessageBox.warning(
+                    self,
+                    "附件总大小超限",
+                    "单条消息的附件总大小不能超过 25 MB。",
+                )
+                return
+            content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+            actual_kind = (
+                "image"
+                if kind == "image" and content_type.startswith("image/")
+                else "file"
+            )
+            item = {
+                "path": resolved,
+                "file_name": path.name,
+                "kind": actual_kind,
+                "content_type": content_type,
+                "size": size,
+            }
+            self._items.append(item)
+            known_paths.add(resolved)
+            row = QListWidgetItem(
+                f"{'图片' if actual_kind == 'image' else '文件'}  ·  "
+                f"{path.name}  ({_format_size(size)})"
+            )
+            row.setData(Qt.UserRole, resolved)
+            self.list_widget.addItem(row)
+        self._refresh()
+
+    def _remove_selected(self, *_args):
+        row = self.list_widget.currentRow()
+        if row < 0:
+            return
+        path = str(self.list_widget.item(row).data(Qt.UserRole) or "")
+        self.list_widget.takeItem(row)
+        self._items = [item for item in self._items if str(item.get("path")) != path]
+        self._refresh()
+
+    def _refresh(self):
+        count = len(self._items)
+        self.list_widget.setVisible(bool(count))
+        self.summary.setText(
+            f"{count} 个 · {_format_size(self.total_size())}"
+            if count
+            else "未添加附件"
+        )
+
+    def total_size(self):
+        return sum(int(item.get("size") or 0) for item in self._items)
+
+    def has_attachments(self):
+        return bool(self._items)
+
+    def payloads(self):
+        return [_encode_attachment_item(item) for item in self._items]
+
+    def clear(self):
+        self._items.clear()
+        self.list_widget.clear()
+        self._refresh()
+
+
+class ContactConversationDialog(FramelessDialog):
+    """User-side conversation history, reply composer and resolution controls."""
+
+    MAX_LENGTH = 2_000
+
+    def __init__(self, announcement, session, parent=None):
+        super().__init__(
+            parent,
+            resizable=True,
+            show_minimize=True,
+            show_maximize=True,
+        )
+        self.announcement = announcement
+        self.session = session
+        self.conversation = None
+        self.setWindowTitle("联系管理员")
+        self.setModal(True)
+        self.resize(760, 620)
+        self.setMinimumSize(620, 500)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(26, 44, 26, 22)
+        layout.setSpacing(10)
+        title = QLabel("联系管理员")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+        related = QLabel(f"关联公告：{announcement.get('title') or '公告'}")
+        related.setObjectName("Muted")
+        related.setWordWrap(True)
+        layout.addWidget(related)
+        self.status_label = QLabel("正在读取会话…")
+        self.status_label.setObjectName("Muted")
+        layout.addWidget(self.status_label)
+
+        self.history = QPlainTextEdit()
+        self.history.setReadOnly(True)
+        self.history.setPlaceholderText("尚未联系管理员。")
+        layout.addWidget(self.history, 1)
+
+        self.received_attachments = QListWidget()
+        self.received_attachments.setMaximumHeight(96)
+        self.received_attachments.setAlternatingRowColors(True)
+        self.received_attachments.itemDoubleClicked.connect(
+            lambda item: _open_contact_attachment(
+                self,
+                self.session,
+                item.data(Qt.UserRole) or {},
+            )
+        )
+        self.received_attachments.hide()
+        layout.addWidget(self.received_attachments)
+
+        self.message_edit = QPlainTextEdit()
+        self.message_edit.setMaximumHeight(120)
+        self.message_edit.setPlaceholderText("输入需要发送给管理员的内容…")
+        self.message_edit.textChanged.connect(self._limit_message)
+        layout.addWidget(self.message_edit)
+        self.attachment_picker = ContactAttachmentPicker(self)
+        layout.addWidget(self.attachment_picker)
+        self.count_label = QLabel(f"0 / {self.MAX_LENGTH}")
+        self.count_label.setObjectName("Muted")
+        self.count_label.setAlignment(Qt.AlignRight)
+        layout.addWidget(self.count_label)
+
+        buttons = QHBoxLayout()
+        self.unresolved_btn = QPushButton("未解决，继续沟通")
+        self.unresolved_btn.clicked.connect(lambda: self._set_status("open"))
+        self.resolved_btn = QPushButton("已解决，结束会话")
+        self.resolved_btn.clicked.connect(lambda: self._set_status("resolved"))
+        buttons.addWidget(self.unresolved_btn)
+        buttons.addWidget(self.resolved_btn)
+        buttons.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        self.send_btn = QPushButton("发送消息")
+        self.send_btn.setObjectName("PrimaryButton")
+        self.send_btn.clicked.connect(self._send)
+        buttons.addWidget(close_btn)
+        buttons.addWidget(self.send_btn)
+        layout.addLayout(buttons)
+        self._load()
+
+    def _call(self, message, function):
+        try:
+            return run_with_loading(self, message, function)
+        except (ApiResponseError, NetworkUnavailable) as exc:
+            QMessageBox.warning(self, "消息操作失败", str(exc))
+            return None
+
+    def _load(self):
+        result = self._call(
+            "正在读取会话…",
+            lambda: self.session.api.contact_conversations(
+                self.session.access_token(),
+                announcement_id=str(self.announcement.get("id") or ""),
+            ),
+        )
+        if result is None:
+            self._render()
+            return
+        conversations = list((result or {}).get("items") or [])
+        self.conversation = next(
+            (item for item in conversations if item.get("status") == "open"),
+            conversations[0] if conversations else None,
+        )
+        self._render()
+
+    def _render(self):
+        conversation = self.conversation
+        messages = list((conversation or {}).get("messages") or [])
+        lines = []
+        self.received_attachments.clear()
+        for message in messages:
+            role = "管理员" if message.get("sender_role") == "admin" else "我"
+            text = str(message.get("message") or "").strip()
+            attachments = list(message.get("attachments") or [])
+            body = text or "（仅附件）"
+            lines.append(f"{role}  ·  {_display_time(message.get('created_at'))}\n{body}")
+            for attachment in attachments:
+                item = QListWidgetItem(
+                    f"{role} · {attachment.get('file_name') or '附件'}  "
+                    f"({_format_size(attachment.get('size'))})"
+                )
+                item.setData(Qt.UserRole, attachment)
+                self.received_attachments.addItem(item)
+        self.history.setPlainText("\n\n".join(lines))
+        self.received_attachments.setVisible(self.received_attachments.count() > 0)
+        status = str((conversation or {}).get("status") or "")
+        if not conversation:
+            self.status_label.setText("尚未发起会话")
+            self.unresolved_btn.setEnabled(False)
+            self.resolved_btn.setEnabled(False)
+            self.send_btn.setText("发送消息")
+        elif status == "resolved":
+            self.status_label.setText("该会话已解决；继续发送将发起新会话。")
+            self.unresolved_btn.setEnabled(True)
+            self.resolved_btn.setEnabled(False)
+            self.send_btn.setText("发起新会话")
+        else:
+            self.status_label.setText("会话处理中，可继续回复管理员。")
+            self.unresolved_btn.setEnabled(True)
+            self.resolved_btn.setEnabled(True)
+            self.send_btn.setText("发送回复")
+        self.history.moveCursor(self.history.textCursor().End)
+
+    def _limit_message(self):
+        text = self.message_edit.toPlainText()
+        if len(text) > self.MAX_LENGTH:
+            self.message_edit.setPlainText(text[: self.MAX_LENGTH])
+            text = self.message_edit.toPlainText()
+        self.count_label.setText(f"{len(text)} / {self.MAX_LENGTH}")
+
+    def _send(self):
+        message = self.message_edit.toPlainText().strip()
+        if not message and not self.attachment_picker.has_attachments():
+            QMessageBox.warning(self, "消息为空", "请输入文字或添加附件。")
+            return
+        try:
+            attachments = self.attachment_picker.payloads()
+        except OSError as exc:
+            QMessageBox.warning(self, "附件读取失败", str(exc))
+            return
+        conversation = self.conversation
+        if conversation and conversation.get("status") == "open":
+            action = lambda: self.session.api.reply_admin_message(
+                self.session.access_token(),
+                str(conversation.get("id")),
+                message,
+                attachments,
+            )
+        else:
+            action = lambda: self.session.api.send_admin_message(
+                self.session.access_token(),
+                str(self.announcement.get("id")),
+                message,
+                attachments,
+            )
+        result = self._call("正在发送消息…", action)
+        if result is None:
+            return
+        self.conversation = result
+        self.message_edit.clear()
+        self.attachment_picker.clear()
+        self._render()
+
+    def _set_status(self, status):
+        conversation = self.conversation
+        if not conversation:
+            return
+        result = self._call(
+            "正在更新会话状态…",
+            lambda: self.session.api.update_contact_status(
+                self.session.access_token(),
+                str(conversation.get("id")),
+                status,
+            ),
+        )
+        if result is None:
+            return
+        self.conversation = result
+        self._render()
+        if status == "open":
+            self.message_edit.setFocus()
+
+
 class ImagePreviewDialog(FramelessDialog):
     def __init__(self, data, file_name, parent=None, *, save_caption="保存公告图片"):
         super().__init__(
@@ -617,6 +999,8 @@ class ImagePreviewDialog(FramelessDialog):
 
 
 class AnnouncementDetailDialog(FramelessDialog):
+    read_confirmed = pyqtSignal()
+
     def __init__(self, announcement, session, account, parent=None):
         super().__init__(
             parent,
@@ -672,13 +1056,20 @@ class AnnouncementDetailDialog(FramelessDialog):
         buttons = QHBoxLayout()
         if not account.is_admin:
             contact_btn = QPushButton("联系管理员")
+            contact_btn.setToolTip("查看历史会话、继续回复或发起新会话")
             contact_btn.clicked.connect(self._contact_admin)
             buttons.addWidget(contact_btn)
         buttons.addStretch()
         close_btn = QPushButton("关闭弹窗")
-        close_btn.setObjectName("PrimaryButton")
         close_btn.clicked.connect(self.accept)
         buttons.addWidget(close_btn)
+        if not account.is_admin and not announcement.get("read_at"):
+            confirm_btn = QPushButton("确认已读")
+            confirm_btn.setObjectName("PrimaryButton")
+            confirm_btn.clicked.connect(self._confirm_and_close)
+            buttons.addWidget(confirm_btn)
+        else:
+            close_btn.setObjectName("PrimaryButton")
         root.addLayout(buttons)
 
     def _download(self, attachment):
@@ -731,23 +1122,13 @@ class AnnouncementDetailDialog(FramelessDialog):
         QMessageBox.information(self, "保存完成", f"附件已保存到：\n{target}")
 
     def _contact_admin(self):
-        dialog = ContactAdminDialog(self.announcement, self)
-        if dialog.exec_() != dialog.Accepted:
-            return
-        try:
-            run_with_loading(
-                self,
-                "正在发送消息…",
-                lambda: self.session.api.send_admin_message(
-                    self.session.access_token(),
-                    str(self.announcement.get("id")),
-                    dialog.message(),
-                ),
-            )
-        except (ApiResponseError, NetworkUnavailable) as exc:
-            QMessageBox.warning(self, "消息发送失败", str(exc))
-            return
-        QMessageBox.information(self, "发送成功", "消息已发送给管理员。")
+        ContactConversationDialog(self.announcement, self.session, self).exec_()
+
+    def _confirm_and_close(self):
+        if not self.account.is_admin and not self.announcement.get("read_at"):
+            self.announcement["read_at"] = True
+            self.read_confirmed.emit()
+        self.accept()
 
 
 class AnnouncementEditorDialog(FramelessDialog):
@@ -1268,9 +1649,9 @@ class AnnouncementAdminPage(QWidget):
         management_layout.addLayout(actions)
 
         splitter = QSplitter(Qt.Vertical)
-        self.announcement_table = QTableWidget(0, 7)
+        self.announcement_table = QTableWidget(0, 8)
         self.announcement_table.setHorizontalHeaderLabels(
-            ["标题", "接收范围", "开屏", "状态", "附件", "版本", "更新时间"]
+            ["标题", "接收范围", "已读/未读", "开屏", "状态", "附件", "版本", "更新时间"]
         )
         self.announcement_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.announcement_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1285,14 +1666,21 @@ class AnnouncementAdminPage(QWidget):
         header_view = self.announcement_table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.Stretch)
         header_view.setSectionResizeMode(1, QHeaderView.Stretch)
-        for column in range(2, 7):
+        for column in range(2, 8):
             header_view.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         splitter.addWidget(self.announcement_table)
         self.announcement_preview = QTextBrowser()
         self.announcement_preview.setOpenExternalLinks(False)
         self.announcement_preview.setPlaceholderText("选择公告后在这里预览正文。")
         splitter.addWidget(self.announcement_preview)
-        splitter.setSizes([420, 230])
+        self.announcement_receipt_detail = QPlainTextEdit()
+        self.announcement_receipt_detail.setReadOnly(True)
+        self.announcement_receipt_detail.setMaximumHeight(130)
+        self.announcement_receipt_detail.setPlaceholderText(
+            "选择公告后查看已读与未读用户名单。"
+        )
+        splitter.addWidget(self.announcement_receipt_detail)
+        splitter.setSizes([380, 220, 120])
         management_layout.addWidget(splitter, 1)
         self.tabs.addTab(management, "公告管理")
 
@@ -1315,9 +1703,9 @@ class AnnouncementAdminPage(QWidget):
         inbox_layout.addLayout(inbox_actions)
 
         inbox_splitter = QSplitter(Qt.Vertical)
-        self.message_table = QTableWidget(0, 5)
+        self.message_table = QTableWidget(0, 6)
         self.message_table.setHorizontalHeaderLabels(
-            ["状态", "发送用户", "关联公告", "消息摘要", "发送时间"]
+            ["未读", "会话状态", "发送用户", "关联公告", "最新消息", "更新时间"]
         )
         self.message_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.message_table.setSelectionMode(QAbstractItemView.SingleSelection)
@@ -1330,9 +1718,10 @@ class AnnouncementAdminPage(QWidget):
         message_header = self.message_table.horizontalHeader()
         message_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         message_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        message_header.setSectionResizeMode(2, QHeaderView.Stretch)
+        message_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         message_header.setSectionResizeMode(3, QHeaderView.Stretch)
-        message_header.setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        message_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        message_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
         inbox_splitter.addWidget(self.message_table)
         self.message_detail = QPlainTextEdit()
         self.message_detail.setReadOnly(True)
@@ -1340,6 +1729,32 @@ class AnnouncementAdminPage(QWidget):
         inbox_splitter.addWidget(self.message_detail)
         inbox_splitter.setSizes([430, 210])
         inbox_layout.addWidget(inbox_splitter, 1)
+        self.message_attachments = QListWidget()
+        self.message_attachments.setMaximumHeight(92)
+        self.message_attachments.setAlternatingRowColors(True)
+        self.message_attachments.itemDoubleClicked.connect(
+            lambda item: _open_contact_attachment(
+                self,
+                self.session,
+                item.data(Qt.UserRole) or {},
+            )
+        )
+        self.message_attachments.hide()
+        inbox_layout.addWidget(self.message_attachments)
+        reply_row = QHBoxLayout()
+        reply_box = QVBoxLayout()
+        self.admin_reply_edit = QPlainTextEdit()
+        self.admin_reply_edit.setMaximumHeight(88)
+        self.admin_reply_edit.setPlaceholderText("选择会话后输入回复内容…")
+        reply_box.addWidget(self.admin_reply_edit)
+        self.admin_attachment_picker = ContactAttachmentPicker(self)
+        reply_box.addWidget(self.admin_attachment_picker)
+        reply_row.addLayout(reply_box, 1)
+        self.admin_reply_btn = QPushButton("回复用户")
+        self.admin_reply_btn.setObjectName("PrimaryButton")
+        self.admin_reply_btn.clicked.connect(self._reply_message)
+        reply_row.addWidget(self.admin_reply_btn)
+        inbox_layout.addLayout(reply_row)
         self.tabs.addTab(inbox, "用户消息")
         self._selection_state()
 
@@ -1398,6 +1813,10 @@ class AnnouncementAdminPage(QWidget):
             values = [
                 str(announcement.get("title") or ""),
                 scope,
+                (
+                    f"{int(announcement.get('read_count') or 0)} / "
+                    f"{int(announcement.get('unread_count') or 0)}"
+                ),
                 "是" if announcement.get("show_on_startup") else "否",
                 "已启用" if announcement.get("is_active") else "已停用",
                 str(len(announcement.get("attachments") or [])),
@@ -1407,9 +1826,9 @@ class AnnouncementAdminPage(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.UserRole, str(announcement.get("id")))
-                if column in {2, 3, 4, 5}:
+                if column in {2, 3, 4, 5, 6}:
                     item.setTextAlignment(Qt.AlignCenter)
-                if column == 3:
+                if column == 4:
                     item.setForeground(
                         QColor(
                             "#16806f"
@@ -1420,30 +1839,38 @@ class AnnouncementAdminPage(QWidget):
                 self.announcement_table.setItem(row, column, item)
         self.announcement_table.clearSelection()
         self.announcement_preview.clear()
+        self.announcement_receipt_detail.clear()
         self._selection_state()
 
     def _fill_messages(self, unread_count):
         self.message_table.setRowCount(len(self.messages))
         for row, message in enumerate(self.messages):
-            summary = str(message.get("message") or "").replace("\n", " ")
+            latest = message.get("last_message") or {}
+            summary = str(
+                latest.get("message") or message.get("message") or ""
+            ).replace("\n", " ")
+            if not summary and latest.get("attachments"):
+                first_attachment = latest["attachments"][0]
+                summary = f"[附件] {first_attachment.get('file_name') or '文件'}"
             if len(summary) > 80:
                 summary = summary[:77] + "…"
             values = [
-                "未读" if not message.get("read_at") else "已读",
+                str(int(message.get("unread_count") or 0)),
+                "已解决" if message.get("status") == "resolved" else "处理中",
                 (
                     f"{message.get('sender_display_name') or '-'}"
                     f" · {message.get('sender_username') or '-'}"
                 ),
                 str(message.get("announcement_title") or "公告已删除"),
                 summary,
-                _display_time(message.get("created_at")),
+                _display_time(message.get("updated_at") or message.get("created_at")),
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.UserRole, str(message.get("id")))
                 if column == 0:
                     item.setTextAlignment(Qt.AlignCenter)
-                    if not message.get("read_at"):
+                    if int(message.get("unread_count") or 0):
                         font = item.font()
                         font.setBold(True)
                         item.setFont(font)
@@ -1453,6 +1880,10 @@ class AnnouncementAdminPage(QWidget):
         self.unread_messages_changed.emit(unread_count)
         self.message_table.clearSelection()
         self.message_detail.clear()
+        self.message_attachments.clear()
+        self.message_attachments.hide()
+        self.admin_reply_edit.clear()
+        self.admin_attachment_picker.clear()
         self._selection_state()
 
     def _selected_announcement(self):
@@ -1494,6 +1925,11 @@ class AnnouncementAdminPage(QWidget):
             self.delete_message_btn.setEnabled(
                 self._selected_message() is not None
             )
+        if hasattr(self, "admin_reply_btn"):
+            has_message = self._selected_message() is not None
+            self.admin_reply_btn.setEnabled(has_message)
+            self.admin_reply_edit.setEnabled(has_message)
+            self.admin_attachment_picker.setEnabled(has_message)
 
     def _announcement_selection_changed(self):
         announcement = self._selected_announcement()
@@ -1501,20 +1937,68 @@ class AnnouncementAdminPage(QWidget):
         self.announcement_preview.setHtml(
             str(announcement.get("body_html") or "") if announcement else ""
         )
+        if not announcement:
+            self.announcement_receipt_detail.clear()
+            return
+        read_users = list(announcement.get("read_users") or [])
+        unread_users = list(announcement.get("unread_users") or [])
+
+        def display(item):
+            return str(item.get("display_name") or item.get("username") or "-")
+
+        self.announcement_receipt_detail.setPlainText(
+            f"已读用户（{len(read_users)}）："
+            f"{('、'.join(display(item) for item in read_users) or '无')}\n\n"
+            f"未读用户（{len(unread_users)}）："
+            f"{('、'.join(display(item) for item in unread_users) or '无')}"
+        )
 
     def _message_selection_changed(self):
         message = self._selected_message()
         self._selection_state()
         if not message:
             self.message_detail.clear()
+            self.message_attachments.clear()
+            self.message_attachments.hide()
             return
-        self.message_detail.setPlainText(
+        lines = [
             f"发送用户：{message.get('sender_display_name') or '-'}"
-            f"（{message.get('sender_username') or '-'}）\n"
-            f"关联公告：{message.get('announcement_title') or '公告已删除'}\n"
-            f"发送时间：{_display_time(message.get('created_at'))}\n\n"
-            f"{message.get('message') or ''}"
-        )
+            f"（{message.get('sender_username') or '-'}）",
+            f"关联公告：{message.get('announcement_title') or '公告已删除'}",
+            f"会话状态：{'已解决' if message.get('status') == 'resolved' else '处理中'}",
+            "",
+        ]
+        history = list(message.get("messages") or [])
+        if not history and message.get("message"):
+            history = [
+                {
+                    "sender_role": "user",
+                    "created_at": message.get("created_at"),
+                    "message": message.get("message"),
+                }
+            ]
+        for item in history:
+            role = "管理员" if item.get("sender_role") == "admin" else "用户"
+            text = str(item.get("message") or "").strip() or "（仅附件）"
+            lines.extend(
+                [
+                    f"{role} · {_display_time(item.get('created_at'))}",
+                    text,
+                    "",
+                ]
+            )
+        self.message_detail.setPlainText("\n".join(lines).rstrip())
+        self.message_attachments.clear()
+        for history_item in history:
+            role = "管理员" if history_item.get("sender_role") == "admin" else "用户"
+            for attachment in history_item.get("attachments") or []:
+                row = QListWidgetItem(
+                    f"{role} · {attachment.get('file_name') or '附件'}  "
+                    f"({_format_size(attachment.get('size'))})"
+                )
+                row.setData(Qt.UserRole, attachment)
+                self.message_attachments.addItem(row)
+        self.message_attachments.setVisible(self.message_attachments.count() > 0)
 
     def _create(self):
         dialog = AnnouncementEditorDialog(self.accounts, parent=self)
@@ -1645,15 +2129,45 @@ class AnnouncementAdminPage(QWidget):
         if result is not None:
             self.refresh()
 
+    def _reply_message(self):
+        message = self._selected_message()
+        reply = self.admin_reply_edit.toPlainText().strip()
+        if not message:
+            return
+        if not reply and not self.admin_attachment_picker.has_attachments():
+            QMessageBox.warning(self, "回复为空", "请输入文字或添加附件。")
+            return
+        if len(reply) > 2_000:
+            QMessageBox.warning(self, "回复过长", "回复内容不能超过 2000 个字符。")
+            return
+        try:
+            attachments = self.admin_attachment_picker.payloads()
+        except OSError as exc:
+            QMessageBox.warning(self, "附件读取失败", str(exc))
+            return
+        result = self._call(
+            "正在发送回复…",
+            lambda: self.session.api.admin_reply_message(
+                self.session.access_token(),
+                str(message.get("id")),
+                reply,
+                attachments,
+            ),
+        )
+        if result is not None:
+            self.admin_reply_edit.clear()
+            self.admin_attachment_picker.clear()
+            self.refresh()
+
     def _delete_message(self):
         message = self._selected_message()
         if not message:
             return
         reply = QMessageBox.question(
             self,
-            "确认删除消息",
-            "删除后无法恢复。\n\n"
-            f"确定删除来自“{message.get('sender_display_name') or '-'}”的消息吗？",
+            "确认删除会话",
+            "删除后整段会话都无法恢复。\n\n"
+            f"确定删除来自“{message.get('sender_display_name') or '-'}”的会话吗？",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:

@@ -27,6 +27,7 @@ from PyQt5.QtGui import QFont
 
 USING_PYQT6 = False
 from ..browser import get_builtin_chromium_path
+from ..excel_files import is_excel_file_open, is_excel_file_read_only
 from ..platform_support import chromium_launch_args
 from ..ui.file_dialogs import SystemFileDialog as QFileDialog
 from playwright.sync_api import sync_playwright, Page, Browser
@@ -3477,37 +3478,6 @@ class BusinessBackfillWorker(QThread):
 
 # ====================== 主界面 ======================
 
-def is_excel_file_open(file_path):
-    """
-    跨平台终极检测：
-    - Windows: 尝试打开（锁检测）
-    - Linux/统信UOS: 调用 lsof 查是否被进程打开
-    完全不修改、不写入、不破坏文件
-    """
-    if not file_path or not os.path.isfile(file_path):
-        return False
-
-    # Windows 逻辑（最准）
-    if sys.platform.startswith("win"):
-        try:
-            with open(file_path, "r+"):
-                pass
-            return False
-        except PermissionError:
-            return True
-
-    # Linux / 统信 UOS 逻辑（lsof 最准）
-    else:
-        try:
-            result = subprocess.run(
-                ["lsof", file_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            return len(result.stdout.strip()) > 0
-        except:
-            return False
 class MainWindow(QMainWindow):
     def __init__(self, stats_recorder=None):
         super().__init__()
@@ -3668,9 +3638,22 @@ class MainWindow(QMainWindow):
     # ====================== 新增：实时检测Excel状态（核心） ======================
     def check_excel_status(self):
         src_path = self.src_edit.text().strip()
+        src_read_only = is_excel_file_read_only(src_path)
         src_open = is_excel_file_open(src_path)
 
-        if src_open:
+        if src_read_only:
+            self.excel_status_label.setText("当前表格为只读，请先另存为可编辑表格")
+            self.excel_status_label.setStyleSheet("""
+                QLabel {
+                    font-size: 14px;
+                    font-weight: bold;
+                    padding: 6px;
+                    color: #9A6700;
+                    background-color: #fff8df;
+                    border-radius: 6px;
+                }
+            """)
+        elif src_open:
             self.excel_status_label.setText("当前导入Excel表格正在被打开，开始查询请先关闭Excel表格")
             self.excel_status_label.setStyleSheet("""
                 QLabel {

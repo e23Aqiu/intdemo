@@ -78,20 +78,39 @@ def test_global_announcement_attachment_and_startup_receipt(client):
     assert row["startup_pending"] is True
     assert row["read_at"] is None
 
-    read = client.post(
+    displayed = client.post(
         f"/api/v1/announcements/{announcement['id']}/read",
         headers=auth_header(station),
-        json={"startup_shown": True},
+        json={"startup_shown": True, "confirmed": False},
     )
-    assert read.status_code == 200, read.text
-    assert read.json()["startup_shown_at"] is not None
+    assert displayed.status_code == 200, displayed.text
+    assert displayed.json()["startup_shown_at"] is not None
+    assert displayed.json()["read_at"] is None
 
     visible_again = client.get(
         "/api/v1/announcements",
         headers=auth_header(station),
     ).json()[0]
     assert visible_again["startup_pending"] is False
-    assert visible_again["read_at"] is not None
+    assert visible_again["read_at"] is None
+
+    read = client.post(
+        f"/api/v1/announcements/{announcement['id']}/read",
+        headers=auth_header(station),
+        json={"startup_shown": False, "confirmed": True},
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["read_at"] is not None
+    managed_receipts = client.get(
+        "/api/v1/admin/announcements",
+        headers=auth_header(admin),
+    ).json()[0]
+    assert managed_receipts["read_count"] == 1
+    assert managed_receipts["unread_count"] >= 1
+    assert managed_receipts["read_users"][0]["username"] == "stationa"
+    assert "stationa" not in {
+        item["username"] for item in managed_receipts["unread_users"]
+    }
 
     updated = client.patch(
         f"/api/v1/admin/announcements/{announcement['id']}",
@@ -237,10 +256,32 @@ def test_user_text_messages_are_visible_and_readable_by_admin(client):
     sent = client.post(
         f"/api/v1/announcements/{announcement['id']}/messages",
         headers=auth_header(first),
-        json={"message": "  我已收到，请问维护期间能否继续录入？  "},
+        json={
+            "message": "  我已收到，请问维护期间能否继续录入？  ",
+            "attachments": [
+                {
+                    "file_name": "现场.png",
+                    "content_type": "image/png",
+                    "kind": "image",
+                    "content_base64": base64.b64encode(b"message-image").decode(),
+                }
+            ],
+        },
     )
     assert sent.status_code == 201, sent.text
     assert sent.json()["message"] == "我已收到，请问维护期间能否继续录入？"
+    sent_attachment = sent.json()["messages"][0]["attachments"][0]
+    assert sent_attachment["file_name"] == "现场.png"
+    downloaded = client.get(
+        f"/api/v1/messages/attachments/{sent_attachment['id']}",
+        headers=auth_header(first),
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.content == b"message-image"
+    assert client.get(
+        f"/api/v1/messages/attachments/{sent_attachment['id']}",
+        headers=auth_header(second),
+    ).status_code == 404
 
     outsider = client.post(
         f"/api/v1/announcements/{announcement['id']}/messages",
@@ -278,6 +319,79 @@ def test_user_text_messages_are_visible_and_readable_by_admin(client):
         "/api/v1/admin/messages?unread_only=true",
         headers=auth_header(admin),
     ).json() == {"items": [], "unread_count": 0}
+
+    replied = client.post(
+        f"/api/v1/admin/messages/{body['items'][0]['id']}/reply",
+        headers=auth_header(admin),
+        json={
+            "message": "可以继续录入，维护期间同步会自动重试。",
+            "attachments": [
+                {
+                    "file_name": "说明.txt",
+                    "content_type": "text/plain",
+                    "kind": "file",
+                    "content_base64": base64.b64encode(b"retry help").decode(),
+                }
+            ],
+        },
+    )
+    assert replied.status_code == 201, replied.text
+    assert replied.json()["messages"][-1]["sender_role"] == "admin"
+    admin_attachment = replied.json()["messages"][-1]["attachments"][0]
+    assert client.get(
+        f"/api/v1/messages/attachments/{admin_attachment['id']}",
+        headers=auth_header(admin),
+    ).content == b"retry help"
+
+    user_conversations = client.get(
+        f"/api/v1/messages?announcement_id={announcement['id']}",
+        headers=auth_header(first),
+    )
+    assert user_conversations.status_code == 200, user_conversations.text
+    conversation = user_conversations.json()["items"][0]
+    assert conversation["messages"][-1]["message"].startswith("可以继续录入")
+
+    continued = client.post(
+        f"/api/v1/messages/{conversation['id']}/replies",
+        headers=auth_header(first),
+        json={"message": "问题仍未解决，请继续协助。"},
+    )
+    assert continued.status_code == 201, continued.text
+    assert continued.json()["status"] == "open"
+    assert client.get(
+        "/api/v1/admin/messages",
+        headers=auth_header(admin),
+    ).json()["unread_count"] == 1
+
+    attachment_only = client.post(
+        f"/api/v1/messages/{conversation['id']}/replies",
+        headers=auth_header(first),
+        json={
+            "message": "",
+            "attachments": [
+                {
+                    "file_name": "补充材料.pdf",
+                    "content_type": "application/pdf",
+                    "kind": "file",
+                    "content_base64": base64.b64encode(b"pdf-content").decode(),
+                }
+            ],
+        },
+    )
+    assert attachment_only.status_code == 201, attachment_only.text
+    assert attachment_only.json()["messages"][-1]["message"] == ""
+    assert (
+        attachment_only.json()["messages"][-1]["attachments"][0]["file_name"]
+        == "补充材料.pdf"
+    )
+
+    resolved = client.post(
+        f"/api/v1/messages/{conversation['id']}/status",
+        headers=auth_header(first),
+        json={"status": "resolved"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["status"] == "resolved"
 
     deleted = client.delete(
         f"/api/v1/admin/messages/{body['items'][0]['id']}",

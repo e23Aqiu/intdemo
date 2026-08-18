@@ -886,15 +886,32 @@ class MainWindow(FramelessMainWindow):
                 self.announcement_dialog = None
 
         dialog.finished.connect(clear_dialog)
+        dialog.read_confirmed.connect(
+            lambda current=announcement: self._confirm_announcement_read(current)
+        )
         self.announcement_dialog = dialog
-        announcement["read_at"] = announcement.get("read_at") or True
         if startup_shown:
             announcement["startup_pending"] = False
+        self._mark_announcement_read(
+            announcement,
+            startup_shown=bool(startup_shown),
+            confirmed=False,
+        )
         self._update_announcement_ticker()
         dialog.open()
-        self._mark_announcement_read(announcement, startup_shown)
 
-    def _mark_announcement_read(self, announcement, startup_shown):
+    def _confirm_announcement_read(self, announcement):
+        announcement["read_at"] = announcement.get("read_at") or True
+        self._update_announcement_ticker()
+        if self.announcement_list_dialog is not None:
+            self.announcement_list_dialog.set_announcements(self.announcements)
+        self._mark_announcement_read(
+            announcement,
+            startup_shown=False,
+            confirmed=True,
+        )
+
+    def _mark_announcement_read(self, announcement, startup_shown, confirmed=True):
         announcement_id = str(announcement.get("id") or "")
         if not announcement_id:
             return
@@ -905,12 +922,23 @@ class MainWindow(FramelessMainWindow):
             if task in self._announcement_action_tasks:
                 self._announcement_action_tasks.remove(task)
 
+        def mark_read():
+            try:
+                return self.session_manager.api.mark_announcement_read(
+                    self.session_manager.access_token(),
+                    announcement_id,
+                    startup_shown=bool(startup_shown),
+                    confirmed=bool(confirmed),
+                )
+            except TypeError:
+                return self.session_manager.api.mark_announcement_read(
+                    self.session_manager.access_token(),
+                    announcement_id,
+                    startup_shown=bool(startup_shown),
+                )
+
         task = start_api_task(
-            lambda: self.session_manager.api.mark_announcement_read(
-                self.session_manager.access_token(),
-                announcement_id,
-                startup_shown=bool(startup_shown),
-            ),
+            mark_read,
             completed,
         )
         self._announcement_action_tasks.append(task)

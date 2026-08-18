@@ -55,6 +55,11 @@ from ..database import (
     WORKFLOW_TOTAL_METRIC,
     split_violation_reasons,
 )
+from ..excel_files import (
+    copy_excel_as_writable,
+    is_excel_file_open,
+    is_excel_file_read_only,
+)
 from ..tencent_docs import (
     TencentDocsImportResult,
     TencentDocsImportWorker,
@@ -74,7 +79,6 @@ from ..tools.transport_tool import (
     ASSISTED_PAYMENT_COLUMNS,
     BusinessBackfillWorker,
     Worker,
-    is_excel_file_open,
     resolve_assisted_payment_column,
 )
 from .frameless import FramelessMessageBox as QMessageBox
@@ -404,10 +408,14 @@ class WorkflowPage(QWidget):
         )
         reload_btn = QPushButton("刷新预览")
         reload_btn.clicked.connect(lambda: self._reload_preview(force=True))
+        save_writable_btn = QPushButton("另存为可写表格")
+        save_writable_btn.setToolTip("将只读业务表格复制为可读写的 .xlsx 文件")
+        save_writable_btn.clicked.connect(self._save_workbook_as_writable)
         self.choose_btn = choose_btn
         self.tencent_docs_btn = tencent_docs_btn
         self.open_tencent_docs_folder_btn = open_tencent_docs_folder_btn
         self.reload_btn = reload_btn
+        self.save_writable_btn = save_writable_btn
         file_layout.addWidget(self.file_edit, 1)
         file_layout.addWidget(choose_btn)
         file_layout.addWidget(tencent_docs_btn)
@@ -627,6 +635,7 @@ class WorkflowPage(QWidget):
         )
         self.preview_panel.add_header_widget(self.open_workbook_btn)
         self.preview_panel.add_header_widget(self.open_workbook_folder_btn)
+        self.preview_panel.add_header_widget(self.save_writable_btn)
         self.preview_toggle_btn = self.preview_panel.toggle_button
         self.preview_panel.expanded_changed.connect(self._rebalance_content_panels)
         splitter.addWidget(self.preview_panel)
@@ -956,6 +965,7 @@ class WorkflowPage(QWidget):
         enabled = path_exists and not self.pipeline_running and not import_running
         self.open_workbook_btn.setEnabled(enabled)
         self.open_workbook_folder_btn.setEnabled(enabled)
+        self.save_writable_btn.setEnabled(enabled)
 
     def _refresh_tencent_task_controls(self):
         task_busy = self.tencent_import_worker is not None
@@ -1006,6 +1016,38 @@ class WorkflowPage(QWidget):
         if not path:
             return
         self._load_workbook_path(path)
+
+    def _save_workbook_as_writable(self):
+        source = Path(self.file_path) if self.file_path else None
+        if source is None or not source.is_file():
+            QMessageBox.warning(self, "无法另存", "请先选择业务表格。")
+            return False
+        default_name = source.with_name(f"{source.stem}_可编辑{source.suffix}")
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "另存为可写表格",
+            str(default_name),
+            "Excel 工作簿 (*.xlsx)",
+        )
+        if not target:
+            return False
+        target_path = Path(target)
+        if target_path.suffix.casefold() != ".xlsx":
+            target_path = target_path.with_suffix(".xlsx")
+        try:
+            saved_path = copy_excel_as_writable(source, target_path)
+        except (OSError, ValueError) as exc:
+            QMessageBox.warning(self, "另存失败", str(exc))
+            return False
+        if not self._load_workbook_path(saved_path):
+            return False
+        self._log(f"只读表格已另存并切换到：{saved_path}")
+        QMessageBox.information(
+            self,
+            "另存完成",
+            f"已切换到可读写表格：\n{saved_path}",
+        )
+        return True
 
     def _load_workbook_path(self, path):
         if self.pipeline_running or self.tencent_import_worker is not None:
@@ -1391,6 +1433,16 @@ class WorkflowPage(QWidget):
         if not self.file_path or not os.path.exists(self.file_path):
             QMessageBox.warning(self, "缺少表格", "请先选择业务表格。")
             return
+        if is_excel_file_read_only(self.file_path):
+            reply = QMessageBox.question(
+                self,
+                "表格为只读",
+                "当前业务表格为只读，无法写入处理结果。\n\n"
+                "是否现在另存为可读写表格？",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes or not self._save_workbook_as_writable():
+                return
         if is_excel_file_open(self.file_path):
             QMessageBox.warning(self, "表格被占用", "请先关闭 Excel/WPS 中打开的业务表格。")
             return

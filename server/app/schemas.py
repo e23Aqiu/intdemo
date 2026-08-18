@@ -285,18 +285,30 @@ class AnnouncementUpdate(StrictModel):
 
 class AnnouncementReadRequest(StrictModel):
     startup_shown: bool = False
+    confirmed: bool = True
 
 
 class AdminContactMessageCreate(StrictModel):
-    message: str = Field(min_length=1, max_length=2_000)
+    message: str = Field(default="", max_length=2_000)
+    attachments: list[AnnouncementAttachmentInput] = Field(
+        default_factory=list,
+        max_length=8,
+    )
 
     @field_validator("message")
     @classmethod
     def strip_message(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("消息内容不能为空")
-        return value
+        return value.strip()
+
+    @model_validator(mode="after")
+    def require_message_content(self) -> AdminContactMessageCreate:
+        if not self.message and not self.attachments:
+            raise ValueError("消息文字和附件不能同时为空")
+        return self
+
+
+class ContactConversationStatusUpdate(StrictModel):
+    status: Literal["open", "resolved"]
 
 
 class CaptchaModelView(StrictModel):

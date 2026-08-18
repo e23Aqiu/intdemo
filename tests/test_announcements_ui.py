@@ -18,6 +18,7 @@ from integrated_client.ui.announcement_page import (
     AnnouncementEditorDialog,
     AnnouncementListDialog,
     AnnouncementTickerButton,
+    ContactAttachmentPicker,
     ContactAdminDialog,
 )
 from integrated_client.ui.main_window import MainWindow
@@ -27,6 +28,7 @@ class FakeAnnouncementApi:
     def __init__(self):
         self.read_calls = []
         self.sent_messages = []
+        self.admin_replies = []
         self.visible_announcements = []
         self.managed_announcements = []
         self.inbox = {"items": [], "unread_count": 0}
@@ -110,6 +112,10 @@ class FakeAnnouncementApi:
         self.inbox["unread_count"] = sum(
             not item.get("read_at") for item in self.inbox["items"]
         )
+
+    def admin_reply_message(self, _token, message_id, message, attachments=None):
+        self.admin_replies.append((message_id, message, list(attachments or [])))
+        return {"id": message_id}
 
     def admin_accounts(self, _token):
         return list(self.accounts)
@@ -344,6 +350,18 @@ class AnnouncementUiTests(unittest.TestCase):
         composer.message_edit.setPlainText("<b>这是纯文字</b>")
         self.assertEqual(composer.message(), "<b>这是纯文字</b>")
 
+    def test_contact_attachment_picker_encodes_files(self):
+        path = Path(self.temp_dir.name) / "现场.txt"
+        path.write_bytes(b"contact attachment")
+        picker = ContactAttachmentPicker()
+        picker._add_paths([str(path)], "file")
+
+        self.assertTrue(picker.has_attachments())
+        self.assertEqual(picker.list_widget.count(), 1)
+        payload = picker.payloads()[0]
+        self.assertEqual(payload["file_name"], "现场.txt")
+        self.assertEqual(payload["content_base64"], "Y29udGFjdCBhdHRhY2htZW50")
+
     def test_editor_preserves_rich_text_targets_and_startup_option(self):
         accounts = [
             {
@@ -401,6 +419,21 @@ class AnnouncementUiTests(unittest.TestCase):
                     "sender_username": "station01",
                     "announcement_title": "系统维护公告",
                     "message": "<b>这里按纯文字显示</b>",
+                    "messages": [
+                        {
+                            "sender_role": "user",
+                            "message": "<b>这里按纯文字显示</b>",
+                            "created_at": "2026-07-28T11:00:00",
+                            "attachments": [
+                                {
+                                    "id": "attachment-id",
+                                    "file_name": "现场.png",
+                                    "kind": "image",
+                                    "size": 120,
+                                }
+                            ],
+                        }
+                    ],
                     "created_at": "2026-07-28T11:00:00",
                     "read_at": None,
                 }
@@ -424,6 +457,14 @@ class AnnouncementUiTests(unittest.TestCase):
             page.message_detail.toPlainText().splitlines()[-1],
             "<b>这里按纯文字显示</b>",
         )
+        self.assertEqual(page.message_attachments.count(), 1)
+        page.admin_reply_edit.setPlainText("管理员回复")
+        with patch(
+            "integrated_client.ui.announcement_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            page._reply_message()
+        self.assertEqual(api.admin_replies[0][:2], ("message-id", "管理员回复"))
 
 
 if __name__ == "__main__":

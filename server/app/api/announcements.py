@@ -19,6 +19,7 @@ from ..models import (
     AnnouncementAttachment,
     AnnouncementReceipt,
     AnnouncementTarget,
+    ContactMessageAttachment,
 )
 from ..schemas import (
     AdminContactMessageCreate,
@@ -26,6 +27,7 @@ from ..schemas import (
     AnnouncementCreate,
     AnnouncementReadRequest,
     AnnouncementUpdate,
+    ContactConversationStatusUpdate,
 )
 from ..services import audit
 
@@ -33,6 +35,7 @@ router = APIRouter(tags=["announcements"])
 
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_ANNOUNCEMENT_ATTACHMENT_BYTES = 25 * 1024 * 1024
+MAX_CONTACT_ATTACHMENT_BYTES = 25 * 1024 * 1024
 
 
 def _target_visibility_clause(account_id: uuid.UUID):
@@ -87,6 +90,17 @@ def _attachment_view(attachment: AnnouncementAttachment) -> dict:
     }
 
 
+def _contact_attachment_view(attachment: ContactMessageAttachment) -> dict:
+    return {
+        "id": attachment.id,
+        "file_name": attachment.file_name,
+        "content_type": attachment.content_type,
+        "kind": attachment.kind,
+        "size": attachment.size,
+        "created_at": attachment.created_at,
+    }
+
+
 def _announcement_view(
     db: Db,
     announcement: Announcement,
@@ -115,6 +129,34 @@ def _announcement_view(
         if account_id is not None
         else None
     )
+    read_users = []
+    unread_users = []
+    viewer = db.get(Account, account_id) if account_id is not None else None
+    if viewer is not None and viewer.role == "admin":
+        target_ids = [row.account_id for row in targets]
+        recipient_statement = (
+            select(Account)
+            .where(Account.role == "user", Account.is_archived.is_(False))
+            .order_by(Account.username)
+        )
+        if target_ids:
+            recipient_statement = recipient_statement.where(Account.id.in_(target_ids))
+        recipients = db.scalars(recipient_statement).all()
+        receipt_rows = db.scalars(
+            select(AnnouncementReceipt).where(
+                AnnouncementReceipt.announcement_id == announcement.id
+            )
+        ).all()
+        receipts_by_account = {item.account_id: item for item in receipt_rows}
+        for recipient in recipients:
+            recipient_receipt = receipts_by_account.get(recipient.id)
+            item = {
+                "id": recipient.id,
+                "username": recipient.username,
+                "display_name": recipient.display_name,
+                "read_at": recipient_receipt.read_at if recipient_receipt else None,
+            }
+            (read_users if item["read_at"] else unread_users).append(item)
     return {
         "id": announcement.id,
         "title": announcement.title,
@@ -140,6 +182,10 @@ def _announcement_view(
         ],
         "target_account_ids": [row.account_id for row in targets],
         "attachments": [_attachment_view(item) for item in attachments],
+        "read_count": len(read_users),
+        "unread_count": len(unread_users),
+        "read_users": read_users,
+        "unread_users": unread_users,
         "read_at": receipt.read_at if receipt else None,
         "created_at": announcement.created_at,
         "updated_at": announcement.updated_at,
@@ -218,10 +264,138 @@ def _new_attachment(
     )
 
 
+def _new_contact_attachment(
+    message_id: uuid.UUID,
+    payload: AnnouncementAttachmentInput,
+) -> ContactMessageAttachment:
+    file_name, content = _decode_attachment(payload)
+    content_type = payload.content_type.strip().lower()
+    kind = "image" if payload.kind == "image" and content_type.startswith("image/") else "file"
+    return ContactMessageAttachment(
+        message_id=message_id,
+        file_name=file_name,
+        content_type=content_type,
+        kind=kind,
+        size=len(content),
+        content=content,
+    )
+
+
+def _add_contact_attachments(
+    db: Db,
+    message_id: uuid.UUID,
+    payloads: list[AnnouncementAttachmentInput],
+) -> None:
+    attachments = [_new_contact_attachment(message_id, item) for item in payloads]
+    if sum(item.size for item in attachments) > MAX_CONTACT_ATTACHMENT_BYTES:
+        raise ApiError(
+            "contact_attachments_too_large",
+            "单条消息的附件总大小不能超过 25 MB",
+            status_code=413,
+        )
+    db.add_all(attachments)
+
+
 def _clear_receipts(db: Db, announcement_id: uuid.UUID) -> None:
     db.execute(
         delete(AnnouncementReceipt).where(AnnouncementReceipt.announcement_id == announcement_id)
     )
+
+
+def _contact_thread_root(
+    db: Db,
+    message_id: uuid.UUID,
+) -> AdminContactMessage:
+    row = db.get(AdminContactMessage, message_id)
+    if row is None:
+        raise ApiError("message_not_found", "消息会话不存在", status_code=404)
+    root_id = row.thread_id or row.id
+    root = db.get(AdminContactMessage, root_id)
+    if root is None:
+        raise ApiError("message_not_found", "消息会话不存在", status_code=404)
+    return root
+
+
+def _contact_thread_rows(
+    db: Db,
+    root: AdminContactMessage,
+) -> list[AdminContactMessage]:
+    return list(
+        db.scalars(
+            select(AdminContactMessage)
+            .where(
+                or_(
+                    AdminContactMessage.id == root.id,
+                    AdminContactMessage.thread_id == root.id,
+                )
+            )
+            .order_by(AdminContactMessage.created_at, AdminContactMessage.id)
+        ).all()
+    )
+
+
+def _contact_conversation_view(
+    db: Db,
+    root: AdminContactMessage,
+) -> dict:
+    rows = _contact_thread_rows(db, root)
+    account_ids = {row.sender_account_id for row in rows}
+    accounts = db.scalars(select(Account).where(Account.id.in_(account_ids))).all()
+    accounts_by_id = {account.id: account for account in accounts}
+    owner = accounts_by_id.get(root.sender_account_id)
+    announcement = db.get(Announcement, root.announcement_id) if root.announcement_id else None
+    messages = []
+    attachment_rows = db.scalars(
+        select(ContactMessageAttachment)
+        .where(ContactMessageAttachment.message_id.in_([row.id for row in rows]))
+        .order_by(ContactMessageAttachment.created_at, ContactMessageAttachment.file_name)
+    ).all() if rows else []
+    attachments_by_message = {}
+    for attachment in attachment_rows:
+        attachments_by_message.setdefault(attachment.message_id, []).append(
+            _contact_attachment_view(attachment)
+        )
+    for row in rows:
+        sender = accounts_by_id.get(row.sender_account_id)
+        messages.append(
+            {
+                "id": row.id,
+                "sender_account_id": row.sender_account_id,
+                "sender_role": sender.role if sender else "unknown",
+                "sender_username": sender.username if sender else "已删除账号",
+                "sender_display_name": sender.display_name if sender else "已删除账号",
+                "message": row.message,
+                "attachments": attachments_by_message.get(row.id, []),
+                "created_at": row.created_at,
+                "admin_read_at": row.read_at,
+                "user_read_at": row.read_by_user_at,
+            }
+        )
+    last_message = messages[-1] if messages else None
+    unread_for_admin = sum(
+        1
+        for row in rows
+        if accounts_by_id.get(row.sender_account_id)
+        and accounts_by_id[row.sender_account_id].role == "user"
+        and row.read_at is None
+    )
+    return {
+        "id": root.id,
+        "thread_id": root.id,
+        "sender_account_id": root.sender_account_id,
+        "sender_username": owner.username if owner else "已删除账号",
+        "sender_display_name": owner.display_name if owner else "已删除账号",
+        "announcement_id": root.announcement_id,
+        "announcement_title": announcement.title if announcement else None,
+        "message": root.message,
+        "created_at": root.created_at,
+        "updated_at": rows[-1].created_at if rows else root.created_at,
+        "read_at": None if unread_for_admin else root.read_at or root.created_at,
+        "unread_count": unread_for_admin,
+        "status": root.status or "open",
+        "last_message": last_message,
+        "messages": messages,
+    }
 
 
 @router.get("/announcements")
@@ -272,7 +446,7 @@ def mark_announcement_read(
             account_id=context.account.id,
         )
         db.add(receipt)
-    if receipt.read_at is None:
+    if payload.confirmed and receipt.read_at is None:
         receipt.read_at = now
     if payload.startup_shown and receipt.startup_shown_at is None:
         receipt.startup_shown_at = now
@@ -307,6 +481,34 @@ def download_announcement_attachment(
     )
 
 
+@router.get("/messages/attachments/{attachment_id}")
+def download_contact_message_attachment(
+    attachment_id: uuid.UUID,
+    context: BusinessContext,
+    db: Db,
+) -> Response:
+    attachment = db.get(ContactMessageAttachment, attachment_id)
+    if attachment is None:
+        raise ApiError("attachment_not_found", "附件不存在", status_code=404)
+    message = db.get(AdminContactMessage, attachment.message_id)
+    if message is None:
+        raise ApiError("attachment_not_found", "附件不存在", status_code=404)
+    root = _contact_thread_root(db, message.id)
+    if context.account.role != "admin" and root.sender_account_id != context.account.id:
+        raise ApiError("attachment_not_found", "附件不存在", status_code=404)
+    encoded_name = quote(attachment.file_name, safe="")
+    return Response(
+        content=attachment.content,
+        media_type=attachment.content_type,
+        headers={
+            "Content-Disposition": (
+                f"attachment; filename=\"download\"; filename*=UTF-8''{encoded_name}"
+            ),
+            "Content-Length": str(attachment.size),
+        },
+    )
+
+
 @router.post("/announcements/{announcement_id}/messages", status_code=201)
 def contact_administrator(
     announcement_id: uuid.UUID,
@@ -325,15 +527,105 @@ def contact_administrator(
         sender_account_id=context.account.id,
         announcement_id=announcement.id,
         message=payload.message,
+        status="open",
+        read_by_user_at=utcnow(),
     )
     db.add(row)
+    db.flush()
+    row.thread_id = row.id
+    _add_contact_attachments(db, row.id, payload.attachments)
     db.commit()
-    return {
-        "id": row.id,
-        "announcement_id": row.announcement_id,
-        "message": row.message,
-        "created_at": row.created_at,
-    }
+    return _contact_conversation_view(db, row)
+
+
+@router.get("/messages")
+def list_contact_conversations(
+    context: BusinessContext,
+    db: Db,
+    announcement_id: uuid.UUID | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    if context.account.role != "user":
+        raise ApiError("user_message_only", "仅普通用户可以查看消息会话", status_code=403)
+    statement = (
+        select(AdminContactMessage)
+        .where(
+            AdminContactMessage.sender_account_id == context.account.id,
+            or_(
+                AdminContactMessage.thread_id.is_(None),
+                AdminContactMessage.thread_id == AdminContactMessage.id,
+            ),
+        )
+        .order_by(AdminContactMessage.created_at.desc())
+        .limit(limit)
+    )
+    if announcement_id is not None:
+        statement = statement.where(AdminContactMessage.announcement_id == announcement_id)
+    roots = list(db.scalars(statement).all())
+    now = utcnow()
+    changed = False
+    conversations = []
+    for root in roots:
+        rows = _contact_thread_rows(db, root)
+        accounts = db.scalars(
+            select(Account).where(
+                Account.id.in_({row.sender_account_id for row in rows})
+            )
+        ).all()
+        roles = {account.id: account.role for account in accounts}
+        for row in rows:
+            if roles.get(row.sender_account_id) == "admin" and row.read_by_user_at is None:
+                row.read_by_user_at = now
+                changed = True
+        conversations.append(_contact_conversation_view(db, root))
+    if changed:
+        db.commit()
+    return {"items": conversations}
+
+
+@router.post("/messages/{message_id}/replies", status_code=201)
+def reply_to_administrator(
+    message_id: uuid.UUID,
+    payload: AdminContactMessageCreate,
+    context: BusinessContext,
+    db: Db,
+) -> dict:
+    if context.account.role != "user":
+        raise ApiError("user_message_only", "仅普通用户可以回复消息", status_code=403)
+    root = _contact_thread_root(db, message_id)
+    if root.sender_account_id != context.account.id:
+        raise ApiError("message_not_found", "消息会话不存在", status_code=404)
+    row = AdminContactMessage(
+        sender_account_id=context.account.id,
+        announcement_id=root.announcement_id,
+        thread_id=root.id,
+        status="open",
+        message=payload.message,
+        read_by_user_at=utcnow(),
+    )
+    root.status = "open"
+    db.add(row)
+    db.flush()
+    _add_contact_attachments(db, row.id, payload.attachments)
+    db.commit()
+    return _contact_conversation_view(db, root)
+
+
+@router.post("/messages/{message_id}/status")
+def update_contact_conversation_status(
+    message_id: uuid.UUID,
+    payload: ContactConversationStatusUpdate,
+    context: BusinessContext,
+    db: Db,
+) -> dict:
+    if context.account.role != "user":
+        raise ApiError("user_message_only", "仅普通用户可以更新会话状态", status_code=403)
+    root = _contact_thread_root(db, message_id)
+    if root.sender_account_id != context.account.id:
+        raise ApiError("message_not_found", "消息会话不存在", status_code=404)
+    root.status = payload.status
+    db.commit()
+    return _contact_conversation_view(db, root)
 
 
 @router.get("/admin/announcements")
@@ -580,35 +872,37 @@ def admin_list_contact_messages(
     limit: int = Query(default=200, ge=1, le=500),
 ) -> dict:
     statement = (
-        select(AdminContactMessage).order_by(AdminContactMessage.created_at.desc()).limit(limit)
+        select(AdminContactMessage)
+        .where(
+            or_(
+                AdminContactMessage.thread_id.is_(None),
+                AdminContactMessage.thread_id == AdminContactMessage.id,
+            )
+        )
+        .order_by(AdminContactMessage.created_at.desc())
+        .limit(limit)
     )
     if unread_only:
-        statement = statement.where(AdminContactMessage.read_at.is_(None))
-    rows = db.scalars(statement).all()
+        unread_threads = select(AdminContactMessage.thread_id).where(
+            AdminContactMessage.read_at.is_(None)
+        )
+        statement = statement.where(
+            or_(
+                AdminContactMessage.read_at.is_(None),
+                AdminContactMessage.id.in_(unread_threads),
+            )
+        )
+    roots = db.scalars(statement).all()
     unread_count = int(
         db.scalar(
             select(func.count(AdminContactMessage.id)).where(AdminContactMessage.read_at.is_(None))
         )
         or 0
     )
-    items = []
-    for row in rows:
-        sender = db.get(Account, row.sender_account_id)
-        announcement = db.get(Announcement, row.announcement_id) if row.announcement_id else None
-        items.append(
-            {
-                "id": row.id,
-                "sender_account_id": row.sender_account_id,
-                "sender_username": sender.username if sender else "已删除账号",
-                "sender_display_name": (sender.display_name if sender else "已删除账号"),
-                "announcement_id": row.announcement_id,
-                "announcement_title": announcement.title if announcement else None,
-                "message": row.message,
-                "created_at": row.created_at,
-                "read_at": row.read_at,
-            }
-        )
-    return {"items": items, "unread_count": unread_count}
+    return {
+        "items": [_contact_conversation_view(db, root) for root in roots],
+        "unread_count": unread_count,
+    }
 
 
 @router.post("/admin/messages/{message_id}/read")
@@ -617,13 +911,45 @@ def admin_mark_contact_message_read(
     context: AdminContext,
     db: Db,
 ) -> dict:
-    row = db.get(AdminContactMessage, message_id)
-    if not row:
-        raise ApiError("message_not_found", "消息不存在", status_code=404)
-    if row.read_at is None:
-        row.read_at = utcnow()
+    root = _contact_thread_root(db, message_id)
+    rows = _contact_thread_rows(db, root)
+    accounts = db.scalars(
+        select(Account).where(Account.id.in_({row.sender_account_id for row in rows}))
+    ).all()
+    roles = {account.id: account.role for account in accounts}
+    now = utcnow()
+    changed = False
+    for row in rows:
+        if roles.get(row.sender_account_id) == "user" and row.read_at is None:
+            row.read_at = now
+            changed = True
+    if changed:
         db.commit()
-    return {"id": row.id, "read_at": row.read_at}
+    return {"id": root.id, "read_at": now}
+
+
+@router.post("/admin/messages/{message_id}/reply", status_code=201)
+def admin_reply_contact_message(
+    message_id: uuid.UUID,
+    payload: AdminContactMessageCreate,
+    context: AdminContext,
+    db: Db,
+) -> dict:
+    root = _contact_thread_root(db, message_id)
+    row = AdminContactMessage(
+        sender_account_id=context.account.id,
+        announcement_id=root.announcement_id,
+        thread_id=root.id,
+        status="open",
+        message=payload.message,
+        read_at=utcnow(),
+    )
+    root.status = "open"
+    db.add(row)
+    db.flush()
+    _add_contact_attachments(db, row.id, payload.attachments)
+    db.commit()
+    return _contact_conversation_view(db, root)
 
 
 @router.delete("/admin/messages/{message_id}", status_code=204)
@@ -633,23 +959,22 @@ def admin_delete_contact_message(
     context: AdminContext,
     db: Db,
 ) -> Response:
-    row = db.get(AdminContactMessage, message_id)
-    if not row:
-        raise ApiError("message_not_found", "消息不存在", status_code=404)
+    root = _contact_thread_root(db, message_id)
     audit(
         db,
         request,
         actor_id=context.account.id,
         action="message.delete",
         target_type="admin_contact_message",
-        target_id=str(row.id),
+        target_id=str(root.id),
         details={
-            "sender_account_id": str(row.sender_account_id),
+            "sender_account_id": str(root.sender_account_id),
             "announcement_id": (
-                str(row.announcement_id) if row.announcement_id else None
+                str(root.announcement_id) if root.announcement_id else None
             ),
         },
     )
-    db.delete(row)
+    for row in _contact_thread_rows(db, root):
+        db.delete(row)
     db.commit()
     return Response(status_code=204)

@@ -456,12 +456,16 @@ class ApiClient:
         announcement_id: str,
         *,
         startup_shown: bool = False,
+        confirmed: bool = True,
     ) -> dict:
+        payload = {"startup_shown": bool(startup_shown)}
+        if not confirmed:
+            payload["confirmed"] = False
         return self._request(
             "POST",
             f"/announcements/{announcement_id}/read",
             token=access_token,
-            json_body={"startup_shown": bool(startup_shown)},
+            json_body=payload,
         )
 
     def send_admin_message(
@@ -469,12 +473,63 @@ class ApiClient:
         access_token: str,
         announcement_id: str,
         message: str,
+        attachments: list[dict] | None = None,
     ) -> dict:
+        payload = {"message": str(message)}
+        if attachments:
+            payload["attachments"] = list(attachments)
         return self._request(
             "POST",
             f"/announcements/{announcement_id}/messages",
             token=access_token,
-            json_body={"message": str(message)},
+            json_body=payload,
+        )
+
+    def contact_conversations(
+        self,
+        access_token: str,
+        *,
+        announcement_id: str | None = None,
+        limit: int = 50,
+    ) -> dict:
+        params = {"limit": int(limit)}
+        if announcement_id:
+            params["announcement_id"] = str(announcement_id)
+        return self._request(
+            "GET",
+            "/messages",
+            token=access_token,
+            params=params,
+        )
+
+    def reply_admin_message(
+        self,
+        access_token: str,
+        message_id: str,
+        message: str,
+        attachments: list[dict] | None = None,
+    ) -> dict:
+        payload = {"message": str(message)}
+        if attachments:
+            payload["attachments"] = list(attachments)
+        return self._request(
+            "POST",
+            f"/messages/{message_id}/replies",
+            token=access_token,
+            json_body=payload,
+        )
+
+    def update_contact_status(
+        self,
+        access_token: str,
+        message_id: str,
+        status: str,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/messages/{message_id}/status",
+            token=access_token,
+            json_body={"status": str(status)},
         )
 
     def download_announcement_attachment(
@@ -485,6 +540,19 @@ class ApiClient:
         response = self._request(
             "GET",
             f"/announcements/attachments/{attachment_id}",
+            token=access_token,
+            raw_response=True,
+        )
+        return bytes(response.content)
+
+    def download_contact_attachment(
+        self,
+        access_token: str,
+        attachment_id: str,
+    ) -> bytes:
+        response = self._request(
+            "GET",
+            f"/messages/attachments/{attachment_id}",
             token=access_token,
             raw_response=True,
         )
@@ -589,6 +657,23 @@ class ApiClient:
             "POST",
             f"/admin/messages/{message_id}/read",
             token=access_token,
+        )
+
+    def admin_reply_message(
+        self,
+        access_token: str,
+        message_id: str,
+        message: str,
+        attachments: list[dict] | None = None,
+    ) -> dict:
+        payload = {"message": str(message)}
+        if attachments:
+            payload["attachments"] = list(attachments)
+        return self._request(
+            "POST",
+            f"/admin/messages/{message_id}/reply",
+            token=access_token,
+            json_body=payload,
         )
 
     def admin_delete_message(

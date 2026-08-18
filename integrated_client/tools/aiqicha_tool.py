@@ -37,6 +37,7 @@ from ..browser import (
     get_builtin_chromium_path,
     get_compatible_browser_path,
 )
+from ..excel_files import is_excel_file_read_only
 from ..platform_support import (
     chromium_launch_args,
     system_application_environment,
@@ -1253,6 +1254,12 @@ class MainWindow(QMainWindow):
             self.file_status_label.setStyleSheet("color: gray; font-weight: bold; font-size: 13px;")
             return
 
+        if is_excel_file_read_only(self.file_path):
+            self.file_status_label.setText("📊 表格为只读，请另存为可编辑表格")
+            self.file_status_label.setStyleSheet(
+                "color: #9A6700; font-weight: bold; font-size: 13px;"
+            )
+            return
         if sys.platform.startswith("win"):
             locked = self._is_file_locked_win(self.file_path)
         else:
@@ -1268,6 +1275,8 @@ class MainWindow(QMainWindow):
     @staticmethod
     def _is_file_locked_win(filepath):
         """Windows: 尝试独占打开文件，失败则说明被占用"""
+        if is_excel_file_read_only(filepath):
+            return False
         try:
             import msvcrt
             fd = os.open(filepath, os.O_RDWR | os.O_EXCL)
