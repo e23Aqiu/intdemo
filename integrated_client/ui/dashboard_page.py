@@ -15,7 +15,6 @@ from PyQt5.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QPushButton,
     QStackedWidget,
@@ -38,6 +37,8 @@ from .statistics_page import (
     format_hours,
     format_precise_duration,
 )
+from .loading_dialog import run_ui_with_loading
+from .table_utils import make_table_columns_resizable
 
 
 MILLISECONDS_PER_HOUR = 60 * 60 * 1000
@@ -829,7 +830,7 @@ class DashboardPage(QWidget):
         self.updated_label.setObjectName("Muted")
         header.addWidget(self.updated_label)
         refresh_button = QPushButton("刷新数据")
-        refresh_button.clicked.connect(self.refresh)
+        refresh_button.clicked.connect(self._refresh_with_loading)
         header.addWidget(refresh_button)
         layout.addLayout(header)
 
@@ -905,6 +906,9 @@ class DashboardPage(QWidget):
 
         self.refresh()
 
+    def _refresh_with_loading(self, _checked=False):
+        return run_ui_with_loading(self, "正在加载数据…", self.refresh)
+
     @staticmethod
     def _panel(title, action=None):
         panel = QFrame()
@@ -952,8 +956,7 @@ class DashboardPage(QWidget):
         table.verticalHeader().setVisible(False)
         table.verticalHeader().setDefaultSectionSize(34)
         table.horizontalHeader().setMinimumHeight(34)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        table.horizontalHeader().setStretchLastSection(True)
+        make_table_columns_resizable(table)
         return table
 
     def _populate_station_filter(self):

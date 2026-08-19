@@ -2039,6 +2039,81 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(dialog.values()["stats_scope"], "all")
         dialog.deleteLater()
 
+    def test_online_account_mutations_omit_test_marker_for_legacy_servers(self):
+        captured = []
+
+        class Api:
+            def admin_create_account(self, _token, payload):
+                captured.append(("create", dict(payload)))
+                return {}
+
+            def admin_update_account(self, _token, account_id, payload):
+                captured.append(("update", account_id, dict(payload)))
+                return {}
+
+        class Session:
+            api = Api()
+
+            @staticmethod
+            def access_token():
+                return "test-token"
+
+        page = OnlineAccountPage(self.db, self.admin, Session())
+        page_refresh = patch.object(page, "refresh")
+
+        class Dialog:
+            Accepted = 1
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def exec_(self):
+                return self.Accepted
+
+            def values(self):
+                return {
+                    "username": "legacy-user",
+                    "display_name": "旧服务站",
+                    "role": "user",
+                    "is_test": False,
+                    "stats_scope": "own",
+                    "device_limit": 10000,
+                    "is_active": True,
+                }
+
+        with patch(
+            "integrated_client.ui.online_account_page._AccountSettingsDialog",
+            Dialog,
+        ), patch(
+            "integrated_client.ui.online_account_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ), patch(
+            "integrated_client.ui.online_account_page.QMessageBox.information",
+        ), page_refresh:
+            page._create_account()
+        self.assertEqual(captured[0][0], "create")
+        self.assertNotIn("is_test", captured[0][1])
+
+        target = self.db.create_account(
+            "legacy-target",
+            "Legacy@123",
+            "user",
+            self.admin.id,
+            display_name="旧目标站",
+        )
+        page._selected_account = lambda: target
+        with patch(
+            "integrated_client.ui.online_account_page._AccountSettingsDialog",
+            Dialog,
+        ), patch(
+            "integrated_client.ui.online_account_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ), page_refresh:
+            page._change_permission()
+        self.assertEqual(captured[1][0], "update")
+        self.assertNotIn("is_test", captured[1][2])
+        page.deleteLater()
+
     def test_sync_coordinator_uses_pyqt5_socket_state_without_crashing(self):
         class Engine:
             pass
@@ -2963,10 +3038,10 @@ class ToolAndUiTests(unittest.TestCase):
             [
                 "总计数",
                 "有电话（有公司名）",
-                "无电话（有公司名）",
+                "无运输证号",
                 "个体经营",
                 "无营运信息",
-                "无运输证号",
+                "无电话（有公司名）",
             ],
         )
         self.assertTrue(
@@ -4777,43 +4852,15 @@ class ToolAndUiTests(unittest.TestCase):
         page.station_distribution_chart.resize(1000, 280)
         page.station_distribution_chart.grab()
         self.app.processEvents()
-        self.assertEqual(len(page.station_distribution_chart._slice_hitboxes), 4)
-        self.assertEqual(
-            {
-                item["payload"]["series"]
-                for item in page.station_distribution_chart._slice_hitboxes
-            },
-            {
-                "各站总计数占比",
-                "各站有电话数占比",
-            },
-        )
         chart = page.station_distribution_chart
-        slice_item = chart._slice_hitboxes[0]
-        outer = slice_item["outer"]
-        inner = slice_item["inner"]
-        slice_local = QPoint(
-            int(outer.center().x() + (outer.width() + inner.width()) / 4),
-            int(outer.center().y()),
-        )
-        slice_event = QMouseEvent(
-            QEvent.MouseMove,
-            slice_local,
-            chart.mapToGlobal(slice_local),
-            Qt.NoButton,
-            Qt.NoButton,
-            Qt.NoModifier,
-        )
-        chart.mouseMoveEvent(slice_event)
-        slice_payload = slice_item["payload"]
+        self.assertEqual(chart._slice_hitboxes, [])
+        self.assertEqual(chart._count_metric, "total")
+        self.assertTrue(chart.total_count_button.isChecked())
         self.assertEqual(
-            chart._hover_card.details,
-            [
-                ("数量", f'{slice_payload["value"]} 条'),
-                ("占比", chart._format_share(slice_payload["share"])),
-            ],
+            [row["total"] for row in chart._rows],
+            sorted([row["total"] for row in chart._rows], reverse=True),
         )
-        self.assertEqual(chart._hover_card.width(), 240)
+        self.assertEqual(len(chart._bar_rects), len(chart._rows))
 
         legend_rect, legend_row = chart._legend_hitboxes[0]
         legend_local = legend_rect.center().toPoint()
@@ -4948,6 +4995,15 @@ class ToolAndUiTests(unittest.TestCase):
             ],
         )
         self.assertEqual(chart._hover_card.width(), 340)
+        chart.phone_count_button.click()
+        chart.grab()
+        self.app.processEvents()
+        self.assertEqual(chart._count_metric, "has_phone")
+        self.assertTrue(chart.phone_count_button.isChecked())
+        self.assertEqual(
+            [row["has_phone"] for row in chart._rows],
+            sorted([row["has_phone"] for row in chart._rows], reverse=True),
+        )
         for index in range(chart._hover_card._details_layout.count()):
             detail_label = chart._hover_card._details_layout.itemAt(index).widget()
             self.assertGreaterEqual(detail_label.width(), detail_label.sizeHint().width())
@@ -5045,15 +5101,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(page.table.showGrid())
         self.assertFalse(page.table.verticalHeader().isVisible())
         table_header = page.table.horizontalHeader()
-        for column in (0, 1, 4, 5):
+        for column in range(page.table.columnCount()):
             self.assertEqual(
                 table_header.sectionResizeMode(column),
-                QHeaderView.Stretch,
-            )
-        for column in (2, 3, 6):
-            self.assertEqual(
-                table_header.sectionResizeMode(column),
-                QHeaderView.ResizeToContents,
+                QHeaderView.Interactive,
             )
 
         luogang_row = next(
@@ -5499,10 +5550,10 @@ class ToolAndUiTests(unittest.TestCase):
             [metric_key for metric_key, _, _ in chart.SEGMENTS],
             [
                 WORKFLOW_HAS_PHONE_METRIC,
-                WORKFLOW_NO_PHONE_METRIC,
+                WORKFLOW_NO_TRANSPORT_METRIC,
                 WORKFLOW_INDIVIDUAL_METRIC,
                 WORKFLOW_NO_OPERATION_METRIC,
-                WORKFLOW_NO_TRANSPORT_METRIC,
+                WORKFLOW_NO_PHONE_METRIC,
             ],
         )
         chart.resize(900, 280)

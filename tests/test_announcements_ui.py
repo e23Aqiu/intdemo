@@ -8,11 +8,11 @@ from unittest.mock import patch
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt5.QtCore import QCoreApplication, QEvent, Qt
-from PyQt5.QtWidgets import QApplication, QPlainTextEdit, QPushButton
+from PyQt5.QtWidgets import QApplication, QLabel, QPlainTextEdit, QPushButton
 
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import Database
-from integrated_client.online.api import ApiResponseError
+from integrated_client.online.api import ApiResponseError, NetworkUnavailable
 from integrated_client.ui.announcement_page import (
     AnnouncementAdminPage,
     AnnouncementDetailDialog,
@@ -24,6 +24,7 @@ from integrated_client.ui.announcement_page import (
     ContactAttachmentPicker,
     ContactConversationDialog,
     ContactHistoryDialog,
+    ConversationTimeline,
 )
 from integrated_client.ui.main_window import MainWindow
 
@@ -802,6 +803,116 @@ class AnnouncementUiTests(unittest.TestCase):
         window._show_contact_history()
         self.assertTrue(self._wait_until(lambda: api.user_read_calls == ["conversation-1"]))
         self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
+
+    def test_chat_failed_messages_can_be_retried_for_user_and_admin(self):
+        api = FakeAnnouncementApi()
+        session = FakeSession(api)
+        user_attempts = []
+        original_user_send = api.send_admin_message
+
+        def flaky_user_send(*args, **kwargs):
+            user_attempts.append(1)
+            if len(user_attempts) == 1:
+                raise NetworkUnavailable("网络暂时不可用")
+            return original_user_send(*args, **kwargs)
+
+        api.send_admin_message = flaky_user_send
+        with patch(
+            "integrated_client.ui.announcement_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            user_chat = ContactConversationDialog(self._announcement(), session)
+            user_chat.message_edit.setPlainText("稍后重发的用户消息")
+            user_chat._send()
+            self.assertEqual(len(user_chat._failed_messages), 1)
+            self.assertIn("发送失败", user_chat.status_label.text())
+            retry = user_chat.findChild(QPushButton, "ChatRetryButton")
+            self.assertIsNotNone(retry)
+            retry.click()
+            self.assertEqual(len(user_attempts), 2)
+            self.assertEqual(user_chat._failed_messages, [])
+            self.assertEqual(api.sent_messages[-1][1], "稍后重发的用户消息")
+
+        conversation = {
+            "id": "admin-retry-conversation",
+            "sender_display_name": "测试站",
+            "sender_username": "station01",
+            "announcement_title": "公告",
+            "status": "open",
+            "messages": [],
+        }
+        admin_attempts = []
+        original_admin_send = api.admin_reply_message
+
+        def flaky_admin_send(*args, **kwargs):
+            admin_attempts.append(1)
+            if len(admin_attempts) == 1:
+                raise NetworkUnavailable("服务器暂时不可用")
+            return original_admin_send(*args, **kwargs)
+
+        api.admin_reply_message = flaky_admin_send
+        with patch(
+            "integrated_client.ui.announcement_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            admin_chat = AdminConversationDialog(conversation, session)
+            admin_chat.message_edit.setPlainText("稍后重发的管理员回复")
+            admin_chat._send()
+            self.assertEqual(len(admin_chat._failed_messages), 1)
+            retry = admin_chat.findChild(QPushButton, "ChatRetryButton")
+            self.assertIsNotNone(retry)
+            retry.click()
+            self.assertEqual(len(admin_attempts), 2)
+            self.assertEqual(admin_chat._failed_messages, [])
+            self.assertEqual(api.admin_replies[-1][1], "稍后重发的管理员回复")
+
+        user_chat.close()
+        admin_chat.close()
+
+    def test_chat_outgoing_bubbles_show_peer_read_receipts(self):
+        timeline = ConversationTimeline(lambda _attachment: None)
+        timeline.set_messages(
+            [
+                {
+                    "sender_role": "user",
+                    "message": "已读消息",
+                    "created_at": "2026-08-19T10:00:00",
+                    "admin_read_at": "2026-08-19T10:01:00",
+                },
+                {
+                    "sender_role": "user",
+                    "message": "未读消息",
+                    "created_at": "2026-08-19T10:02:00",
+                    "admin_read_at": None,
+                },
+            ],
+            own_role="user",
+        )
+        receipt_texts = [
+            label.text()
+            for label in timeline.findChildren(QLabel, "ChatBubbleTime")
+        ]
+        self.assertTrue(any("已读" in text for text in receipt_texts))
+        self.assertTrue(any("未读" in text for text in receipt_texts))
+
+        timeline.set_messages(
+            [
+                {
+                    "sender_role": "admin",
+                    "message": "管理员消息",
+                    "created_at": "2026-08-19T10:03:00",
+                    "user_read_at": "2026-08-19T10:04:00",
+                }
+            ],
+            own_role="admin",
+            peer_label="用户",
+        )
+        receipt_texts = [
+            label.text()
+            for label in timeline.findChildren(QLabel, "ChatBubbleTime")
+        ]
+        self.assertTrue(any("已读" in text for text in receipt_texts))
+        timeline.close()
 
 
 if __name__ == "__main__":

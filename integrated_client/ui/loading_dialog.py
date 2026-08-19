@@ -3,8 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
-from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, pyqtSignal
-from PyQt5.QtWidgets import QLabel, QProgressBar, QVBoxLayout
+from PyQt5.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, pyqtSignal
+from PyQt5.QtWidgets import QApplication, QLabel, QProgressBar, QVBoxLayout
 
 from .frameless import FramelessDialog
 
@@ -84,7 +84,40 @@ def run_with_loading(
         dialog.finish()
 
     task.signals.finished.connect(completed)
+    dialog.show()
+    QApplication.processEvents()
     QThreadPool.globalInstance().start(task)
+    dialog.exec_()
+    error = outcome.get("error")
+    if error is not None:
+        raise error
+    return outcome.get("result")
+
+
+def run_ui_with_loading(
+    parent,
+    message: str,
+    function: Callable[[], Any],
+) -> Any:
+    """Show feedback before a GUI-thread-only render or local data rebuild."""
+
+    dialog = LoadingDialog(message, parent)
+    outcome: dict[str, Any] = {}
+
+    def perform():
+        try:
+            outcome["result"] = function()
+        except Exception as exc:  # noqa: BLE001 - re-raised after modal closes
+            outcome["error"] = exc
+        finally:
+            dialog.finish()
+
+    # Give the modal feedback a paint opportunity before a GUI-thread-bound
+    # rebuild starts.  Without this, a fast local refresh can finish before
+    # the user ever sees the loading window.
+    dialog.show()
+    QApplication.processEvents()
+    QTimer.singleShot(0, perform)
     dialog.exec_()
     error = outcome.get("error")
     if error is not None:

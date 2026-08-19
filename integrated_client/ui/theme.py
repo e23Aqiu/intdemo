@@ -620,6 +620,26 @@ QLabel#ChatBubbleTime {
     background: transparent;
     font-size: 10px;
 }
+QLabel#ChatDeliveryFailed {
+    color: #c53b45;
+    background: transparent;
+    font-size: 11px;
+    font-weight: 700;
+}
+QPushButton#ChatRetryButton {
+    color: #b52f3a;
+    background: #fff3f4;
+    border: 1px solid #e7aeb3;
+    border-radius: 4px;
+    padding: 3px 8px;
+    font-size: 11px;
+    font-weight: 700;
+}
+QPushButton#ChatRetryButton:hover {
+    color: #8e2029;
+    background: #ffe7e9;
+    border-color: #d9838a;
+}
 QPushButton#ChatAttachmentButton {
     color: #285d67;
     background: rgba(255, 255, 255, 150);
@@ -1162,6 +1182,25 @@ QPushButton#ViolationModeButton:checked {
 }
 QPushButton#ViolationModeButton:checked:hover {
     background: #2868db;
+}
+QPushButton#StationMetricSegment {
+    color: #52656d;
+    background: #f4f7f8;
+    border: 1px solid #cddadd;
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    font-weight: 600;
+}
+QPushButton#StationMetricSegment:hover {
+    color: #245f5a;
+    background: #eaf4f1;
+    border-color: #9fc9c1;
+}
+QPushButton#StationMetricSegment:checked {
+    color: #ffffff;
+    background: #1d8178;
+    border-color: #1d8178;
 }
 QPushButton#PrimaryButton {
     color: white;

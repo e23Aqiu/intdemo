@@ -6,7 +6,6 @@ from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QFrame,
-    QHeaderView,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -27,6 +26,7 @@ from .auth_dialogs import (
 from .date_range import DateRangeSelector
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
+from .table_utils import make_table_columns_resizable
 
 
 class AccountPage(QWidget):
@@ -168,11 +168,10 @@ class AccountPage(QWidget):
         self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(42)
-        header_view = self.table.horizontalHeader()
-        for column in (0, 1, 4, 5):
-            header_view.setSectionResizeMode(column, QHeaderView.Stretch)
-        for column in (2, 3, 6):
-            header_view.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        make_table_columns_resizable(
+            self.table,
+            [170, 135, 105, 95, 170, 170, 110],
+        )
         self.table.itemSelectionChanged.connect(self._selection_changed)
         card_layout.addWidget(self.table, 1)
         layout.addWidget(list_card, 1)

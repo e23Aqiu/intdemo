@@ -12,7 +12,6 @@ from PyQt5.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QPushButton,
@@ -40,7 +39,9 @@ from ..trainer_component import (
 from .announcement_page import ImagePreviewDialog, start_api_task
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
+from .loading_dialog import LoadingDialog, run_with_loading
 from .training_terminal_dialog import TrainingTerminalDialog
+from .table_utils import make_table_columns_resizable
 
 MAX_IMPORT_BYTES = 100 * 1024 * 1024
 UPLOAD_MODES = (
@@ -132,6 +133,9 @@ class MachineLearningPage(QWidget):
         self._training_in_progress = False
         self._training_id = ""
         self._training_terminal = None
+        self._loading_dialog = None
+        self._overview_loading_visible = False
+        self._sample_loading_visible = False
         self._training_progress_signals = TrainingProgressSignals(self)
         self._training_progress_signals.event_received.connect(
             self._training_progress_received
@@ -383,10 +387,10 @@ class MachineLearningPage(QWidget):
         self.sample_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.sample_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.sample_table.verticalHeader().setVisible(False)
-        sample_table_header = self.sample_table.horizontalHeader()
-        sample_table_header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        sample_table_header.setSectionResizeMode(2, QHeaderView.Stretch)
-        sample_table_header.setSectionResizeMode(4, QHeaderView.Stretch)
+        make_table_columns_resizable(
+            self.sample_table,
+            [210, 95, 150, 120, 190, 90, 170],
+        )
         self.sample_table.setMinimumHeight(170)
         self.sample_table.setMaximumHeight(260)
         self.sample_table.cellDoubleClicked.connect(self._view_sample_image)
@@ -435,9 +439,10 @@ class MachineLearningPage(QWidget):
             self._model_selection_changed
         )
         self.model_table.verticalHeader().setVisible(False)
-        header = self.model_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
+        make_table_columns_resizable(
+            self.model_table,
+            [95, 190, 170, 105, 110, 135, 120, 105, 105, 105, 170],
+        )
         root.addWidget(self.model_table, 1)
 
         model_actions = QHBoxLayout()
@@ -560,10 +565,31 @@ class MachineLearningPage(QWidget):
             return
         mode = str(self.training_mode_combo.currentData() or "standard")
         try:
-            self.trainer_manager.set_preferred_mode(mode)
+            run_with_loading(
+                self,
+                "正在切换训练模式…",
+                lambda: self.trainer_manager.set_preferred_mode(mode),
+            )
         except (TrainerComponentError, OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法切换训练模式", str(exc))
         self._refresh_training_component()
+
+    def _begin_loading(self, message):
+        if self._loading_dialog is not None:
+            self._loading_dialog.setWindowTitle(message)
+            self._loading_dialog.message_label.setText(message)
+            return
+        dialog = LoadingDialog(message, self)
+        self._loading_dialog = dialog
+        dialog.show()
+        dialog.raise_()
+
+    def _finish_loading(self):
+        dialog = self._loading_dialog
+        self._loading_dialog = None
+        if dialog is not None:
+            dialog.finish()
+            dialog.deleteLater()
 
     def _install_trainer_component(self):
         source, _ = QFileDialog.getOpenFileName(
@@ -693,6 +719,7 @@ class MachineLearningPage(QWidget):
         self._sample_refresh_pending = False
         self._sample_image_loading = False
         self._training_id = ""
+        self._finish_loading()
         terminal = self._training_terminal
         if terminal is not None:
             terminal.hide()
@@ -705,9 +732,12 @@ class MachineLearningPage(QWidget):
         self.shutdown()
         super().closeEvent(event)
 
-    def refresh(self):
+    def refresh(self, _checked=False, *, show_loading=True):
         if self._shutting_down or self._refresh_task is not None:
             return
+        if show_loading:
+            self._overview_loading_visible = True
+            self._begin_loading("正在加载机器学习数据…")
         self.refresh_btn.setEnabled(False)
 
         def load():
@@ -715,16 +745,23 @@ class MachineLearningPage(QWidget):
             return self.session_manager.api.admin_captcha_learning_overview(token)
 
         self._refresh_task = self._start(load, self._overview_loaded)
+        if self._refresh_task is None:
+            if self._overview_loading_visible:
+                self._overview_loading_visible = False
+                self._finish_loading()
 
     def _poll_refresh(self):
         """Refresh visible overview data without rebuilding the sample table."""
         if not self.isVisible():
             return
-        self.refresh()
+        self.refresh(show_loading=False)
 
     def _overview_loaded(self, result, error):
         self._refresh_task = None
         self.refresh_btn.setEnabled(True)
+        if self._overview_loading_visible:
+            self._overview_loading_visible = False
+            self._finish_loading()
         if error is not None:
             self.policy_detail.setText(f"读取失败：{error}")
             return
@@ -1241,6 +1278,8 @@ class MachineLearningPage(QWidget):
     def _refresh_samples(self):
         if self._shutting_down or self._sample_refresh_task is not None:
             return
+        self._sample_loading_visible = True
+        self._begin_loading("正在加载已采集样本…")
         captcha_type = self.sample_type_combo.currentData()
 
         def load_samples():
@@ -1256,6 +1295,9 @@ class MachineLearningPage(QWidget):
             load_samples,
             self._samples_loaded,
         )
+        if self._sample_refresh_task is None:
+            self._sample_loading_visible = False
+            self._finish_loading()
 
     def _request_sample_refresh(self):
         if self._sample_refresh_task is not None:
@@ -1277,6 +1319,9 @@ class MachineLearningPage(QWidget):
             self._sample_refresh_pending = False
             self._refresh_samples()
             return
+        if self._sample_loading_visible:
+            self._sample_loading_visible = False
+            self._finish_loading()
         if error is not None:
             self._samples_loaded_once = True
             self._sample_rows = []

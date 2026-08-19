@@ -58,6 +58,7 @@ from .frameless import (
     FramelessMessageBox as QMessageBox,
 )
 from .machine_learning_page import MachineLearningPage
+from .loading_dialog import run_ui_with_loading
 from .online_account_page import OnlineAccountPage
 from .personal_center_page import PersonalCenterPage
 from .statistics_page import StatisticsPage
@@ -1701,7 +1702,11 @@ class MainWindow(FramelessMainWindow):
         if page_key not in self._pages:
             return
         if data_view:
-            self.statistics_page.set_navigation_view(data_view)
+            run_ui_with_loading(
+                self,
+                "正在加载统计数据…",
+                lambda: self.statistics_page.set_navigation_view(data_view),
+            )
             if not self.data_nav_toggle.isChecked():
                 self.data_nav_toggle.setChecked(True)
                 self._toggle_data_navigation(True)
@@ -1720,7 +1725,11 @@ class MainWindow(FramelessMainWindow):
             button.setChecked(page_key == key)
         self._set_data_navigation_active(bool(data_view))
         if key == "home":
-            self.dashboard_page.refresh()
+            run_ui_with_loading(
+                self,
+                "正在加载数据…",
+                self.dashboard_page.refresh,
+            )
         elif key == "accounts" and self.account_page:
             self.account_page.refresh()
         elif key == "announcements_admin" and self.announcement_admin_page:

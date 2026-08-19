@@ -18,10 +18,10 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QComboBox,
     QFrame,
     QGridLayout,
-    QHeaderView,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -48,10 +48,17 @@ from ..models import Account
 from .date_range import DateRangeSelector
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
+from .loading_dialog import run_ui_with_loading
+from .table_utils import make_table_columns_resizable
 
 
 MILLISECONDS_PER_HOUR = 60 * 60 * 1000
 DISTRIBUTION_CHART_HEIGHT = 300
+DISTRIBUTION_PANEL_RADIUS = 8
+DISTRIBUTION_TITLE_LEFT = 20
+DISTRIBUTION_TITLE_BASELINE = 29
+DISTRIBUTION_CHART_LEFT = 32
+DISTRIBUTION_CHART_TOP = 56
 
 
 def format_hours(milliseconds):
@@ -415,11 +422,12 @@ class WorkflowDistributionChart(AnimatedDonutChart):
 
     SEGMENTS = (
         (WORKFLOW_HAS_PHONE_METRIC, "有公司名、有电话", QColor("#1d9a84")),
-        (WORKFLOW_NO_PHONE_METRIC, "有公司名、无电话", QColor("#e2a64a")),
+        (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", QColor("#d86464")),
         (WORKFLOW_INDIVIDUAL_METRIC, "个体经营", QColor("#6f8f89")),
         (WORKFLOW_NO_OPERATION_METRIC, "无营运信息", QColor("#df8b55")),
-        (WORKFLOW_NO_TRANSPORT_METRIC, "无运输证号", QColor("#d86464")),
+        (WORKFLOW_NO_PHONE_METRIC, "有公司名、无电话", QColor("#e2a64a")),
     )
+    BAR_ROW_HEIGHT = 38
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -444,17 +452,30 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         painter.setPen(QPen(QColor("#d8e7e3"), 1))
         painter.setBrush(QColor("#ffffff"))
-        painter.drawRoundedRect(bounds, 10, 10)
+        painter.drawRoundedRect(
+            bounds,
+            DISTRIBUTION_PANEL_RADIUS,
+            DISTRIBUTION_PANEL_RADIUS,
+        )
 
         painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
-        painter.drawText(20, 29, "完整流程结果分布")
+        painter.drawText(
+            DISTRIBUTION_TITLE_LEFT,
+            DISTRIBUTION_TITLE_BASELINE,
+            "完整流程结果分布",
+        )
         painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
         painter.drawText(160, 29, self._scope)
 
         chart_size = min(190, max(150, self.height() - 82))
-        pie_rect = QRectF(32, 56, chart_size, chart_size)
+        pie_rect = QRectF(
+            DISTRIBUTION_CHART_LEFT,
+            DISTRIBUTION_CHART_TOP,
+            chart_size,
+            chart_size,
+        )
         inner = pie_rect.adjusted(
             chart_size * 0.28,
             chart_size * 0.28,
@@ -515,16 +536,16 @@ class WorkflowDistributionChart(AnimatedDonutChart):
 
         legend_left = pie_rect.right() + 42
         legend_width = max(120, self.width() - legend_left - 28)
-        row_height = 34
+        row_height = self.BAR_ROW_HEIGHT
         legend_rows = sorted(
             zip(self.SEGMENTS, segment_values),
             key=lambda item: (-int(item[1]), str(item[0][1])),
         )
         meter_viewport = QRectF(
             legend_left,
-            50,
+            DISTRIBUTION_CHART_TOP,
             max(0, self.width() - legend_left - 22),
-            max(0, self.height() - 64),
+            max(0, self.height() - DISTRIBUTION_CHART_TOP - 14),
         )
         scroll_offset = self._configure_meter_scroll(
             meter_viewport,
@@ -534,7 +555,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         painter.save()
         painter.setClipRect(meter_viewport)
         for index, ((metric_key, label, color), value) in enumerate(legend_rows):
-            top = 50 + index * row_height - scroll_offset
+            top = DISTRIBUTION_CHART_TOP + index * row_height - scroll_offset
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(QRectF(legend_left, top + 2, 10, 10), 3, 3)
@@ -703,11 +724,19 @@ class ViolationReasonChart(AnimatedDonutChart):
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         painter.setPen(QPen(QColor("#d8e7e3"), 1))
         painter.setBrush(QColor("#ffffff"))
-        painter.drawRoundedRect(bounds, 10, 10)
+        painter.drawRoundedRect(
+            bounds,
+            DISTRIBUTION_PANEL_RADIUS,
+            DISTRIBUTION_PANEL_RADIUS,
+        )
 
         painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
-        painter.drawText(20, 29, "违规原因分布")
+        painter.drawText(
+            DISTRIBUTION_TITLE_LEFT,
+            DISTRIBUTION_TITLE_BASELINE,
+            "违规原因分布",
+        )
         painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
         painter.drawText(130, 29, self._scope)
@@ -744,7 +773,12 @@ class ViolationReasonChart(AnimatedDonutChart):
 
         total = sum(int(row["total"]) for row in self._rows)
         chart_size = min(190, max(150, self.height() - 82))
-        pie_rect = QRectF(32, 56, chart_size, chart_size)
+        pie_rect = QRectF(
+            DISTRIBUTION_CHART_LEFT,
+            DISTRIBUTION_CHART_TOP,
+            chart_size,
+            chart_size,
+        )
         inner = pie_rect.adjusted(
             chart_size * 0.28,
             chart_size * 0.28,
@@ -910,7 +944,7 @@ class ViolationReasonChart(AnimatedDonutChart):
 
 
 class StationDistributionChart(AnimatedDonutChart):
-    """用环形图对比各站业务量与耗时在全部站点中的占比。"""
+    """Compare station counts with bars and station timing with one donut."""
 
     TOTAL_COLOR = QColor("#1d8178")
     PHONE_COLOR = QColor("#f0a45d")
@@ -923,7 +957,7 @@ class StationDistributionChart(AnimatedDonutChart):
         QColor("#df8b55"),
         QColor("#4a9c91"),
     )
-    COUNT_ROW_HEIGHT = 30
+    COUNT_ROW_HEIGHT = 42
     TIMING_ROW_HEIGHT = 34
 
     def __init__(self, parent=None):
@@ -933,6 +967,24 @@ class StationDistributionChart(AnimatedDonutChart):
         self._bar_rects = []
         self._series_mode = "counts"
         self._timing_basis = "total"
+        self._count_metric = "total"
+        self.count_metric_group = QButtonGroup(self)
+        self.count_metric_group.setExclusive(True)
+        self.total_count_button = QPushButton("总计数", self)
+        self.phone_count_button = QPushButton("有电话计数", self)
+        for button, metric in (
+            (self.total_count_button, "total"),
+            (self.phone_count_button, "has_phone"),
+        ):
+            button.setObjectName("StationMetricSegment")
+            button.setCheckable(True)
+            button.setProperty("metric", metric)
+            button.setFixedHeight(30)
+            self.count_metric_group.addButton(button)
+            button.clicked.connect(
+                lambda _checked=False, value=metric: self.set_count_metric(value)
+            )
+        self.total_count_button.setChecked(True)
         self.setMinimumHeight(280)
 
     def set_rows(self, rows):
@@ -950,8 +1002,8 @@ class StationDistributionChart(AnimatedDonutChart):
             )
             tie_key = "total"
         else:
-            value_key = "total"
-            tie_key = "has_phone"
+            value_key = self._count_metric
+            tie_key = "has_phone" if value_key == "total" else "total"
         self._rows.sort(
             key=lambda row: (
                 -int(row.get(value_key) or 0),
@@ -964,11 +1016,49 @@ class StationDistributionChart(AnimatedDonutChart):
         if mode not in {"counts", "timing"}:
             raise ValueError(f"Unsupported station distribution mode: {mode}")
         self._series_mode = mode
+        show_count_switch = mode == "counts"
+        self.total_count_button.setVisible(show_count_switch)
+        self.phone_count_button.setVisible(show_count_switch)
         self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
         self._reset_meter_scroll()
         self.update()
+
+    def set_count_metric(self, metric):
+        if metric not in {"total", "has_phone"}:
+            raise ValueError(f"Unsupported station count metric: {metric}")
+        self._count_metric = metric
+        target = (
+            self.total_count_button
+            if metric == "total"
+            else self.phone_count_button
+        )
+        target.setChecked(True)
+        self._sort_rows()
+        self._hover_card.hide()
+        self._reset_meter_scroll()
+        self.update()
+
+    def resizeEvent(self, event):
+        right = self.width() - 18
+        phone_width = 108
+        total_width = 82
+        self.phone_count_button.setGeometry(
+            right - phone_width,
+            8,
+            phone_width,
+            30,
+        )
+        self.total_count_button.setGeometry(
+            right - phone_width - total_width + 1,
+            8,
+            total_width,
+            30,
+        )
+        self.total_count_button.raise_()
+        self.phone_count_button.raise_()
+        super().resizeEvent(event)
 
     def set_timing_basis(self, basis):
         if basis not in {"total", "active"}:
@@ -1071,6 +1161,92 @@ class StationDistributionChart(AnimatedDonutChart):
             center_label,
         )
 
+    def _paint_count_bars(self, painter):
+        value_key = self._count_metric
+        share_key = "total_share" if value_key == "total" else "phone_share"
+        metric_label = "总计数" if value_key == "total" else "有电话计数"
+        maximum = max(
+            (max(0, int(row.get(value_key) or 0)) for row in self._rows),
+            default=0,
+        )
+        left = DISTRIBUTION_CHART_LEFT
+        right = self.width() - 22
+        width = max(120, right - left)
+        top = DISTRIBUTION_CHART_TOP
+        viewport = QRectF(
+            left,
+            top,
+            width,
+            max(0, self.height() - top - 14),
+        )
+        scroll_offset = self._configure_meter_scroll(
+            viewport,
+            len(self._rows) * self.COUNT_ROW_HEIGHT,
+            self.COUNT_ROW_HEIGHT,
+        )
+        painter.save()
+        painter.setClipRect(viewport)
+        for index, row in enumerate(self._rows):
+            row_top = top + index * self.COUNT_ROW_HEIGHT - scroll_offset
+            row_rect = QRectF(
+                left,
+                row_top,
+                width,
+                self.COUNT_ROW_HEIGHT - 3,
+            )
+            if row_rect.intersects(viewport):
+                self._legend_hitboxes.append((QRectF(row_rect), dict(row)))
+            if index % 2:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#f5f8f7"))
+                painter.drawRoundedRect(row_rect, 5, 5)
+
+            color = self.COLORS[index % len(self.COLORS)]
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(left + 2, row_top + 4, 10, 10), 3, 3)
+            painter.setPen(QColor("#526e6d"))
+            painter.setFont(QFont("Microsoft YaHei UI", 9))
+            station_width = max(120, int(width * 0.58))
+            station = painter.fontMetrics().elidedText(
+                str(row.get("station") or "-"),
+                Qt.ElideRight,
+                station_width,
+            )
+            painter.drawText(
+                QRectF(left + 20, row_top, station_width, 19),
+                Qt.AlignLeft | Qt.AlignVCenter,
+                station,
+            )
+            value = max(0, int(row.get(value_key) or 0))
+            share = float(row.get(share_key) or 0)
+            painter.setPen(QColor("#173a3d"))
+            painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
+            painter.drawText(
+                QRectF(left, row_top, width - 8, 19),
+                Qt.AlignRight | Qt.AlignVCenter,
+                f"{value} 条  ·  {share:.1f}%",
+            )
+            bar_rect = QRectF(left, row_top + 23, width, self.BAR_HEIGHT)
+            if bar_rect.intersects(viewport):
+                self._bar_rects.append(QRectF(bar_rect))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#e8f1ef"))
+            painter.drawRoundedRect(bar_rect, 5, 5)
+            if maximum and value:
+                value_rect = QRectF(bar_rect)
+                value_rect.setWidth(max(10, bar_rect.width() * value / maximum))
+                value_path = QPainterPath()
+                value_path.addRoundedRect(value_rect, 5, 5)
+                painter.setBrush(color)
+                painter.drawPath(value_path)
+                self._draw_flow_highlight(painter, value_path, value_rect)
+        painter.restore()
+
+        painter.setPen(QColor("#647c7b"))
+        painter.setFont(QFont("Microsoft YaHei UI", 9))
+        painter.drawText(155, DISTRIBUTION_TITLE_BASELINE, f"{metric_label}降序")
+
     def paintEvent(self, event):
         self._slice_hitboxes = []
         self._legend_hitboxes = []
@@ -1080,22 +1256,27 @@ class StationDistributionChart(AnimatedDonutChart):
         bounds = QRectF(self.rect()).adjusted(1, 1, -1, -1)
         painter.setPen(QPen(QColor("#d8e7e3"), 1))
         painter.setBrush(QColor("#ffffff"))
-        painter.drawRoundedRect(bounds, 10, 10)
+        painter.drawRoundedRect(
+            bounds,
+            DISTRIBUTION_PANEL_RADIUS,
+            DISTRIBUTION_PANEL_RADIUS,
+        )
 
         is_timing_mode = self._series_mode == "timing"
         panel_title = "各站用时效率分布" if is_timing_mode else "各站业务分布"
         timing_label = "有效用时" if self._timing_basis == "active" else "总用时"
-        panel_subtitle = (
-            f"{timing_label}占比"
-            if is_timing_mode
-            else "总计数与有电话数占全部站点对应指标的比例"
-        )
+        panel_subtitle = f"{timing_label}占比" if is_timing_mode else ""
         painter.setPen(QColor("#173a3d"))
         painter.setFont(QFont("Microsoft YaHei UI", 11, QFont.Bold))
-        painter.drawText(20, 29, panel_title)
+        painter.drawText(
+            DISTRIBUTION_TITLE_LEFT,
+            DISTRIBUTION_TITLE_BASELINE,
+            panel_title,
+        )
         painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
-        painter.drawText(155, 29, panel_subtitle)
+        if panel_subtitle:
+            painter.drawText(155, DISTRIBUTION_TITLE_BASELINE, panel_subtitle)
 
         if not self._rows:
             self._configure_meter_scroll(
@@ -1107,48 +1288,37 @@ class StationDistributionChart(AnimatedDonutChart):
             painter.drawText(self.rect(), Qt.AlignCenter, "暂无站点数据")
             return
 
-        chart_area_width = min(470, max(350, int(self.width() * 0.43)))
-        chart_gap = 24
-        if is_timing_mode:
-            if self._timing_basis == "active":
-                series = (
-                    (
-                        "active_ms",
-                        "active_time_share",
-                        "各站有效耗时占比",
-                        "小时",
-                        True,
-                    ),
-                )
-            else:
-                series = (
-                    (
-                        "total_time_ms",
-                        "total_time_share",
-                        "各站总耗时占比",
-                        "小时",
-                        True,
-                    ),
-                )
-            # Match WorkflowDistributionChart: the donut starts at the same
-            # left/top position and the meter list follows it directly.
-            chart_size = min(190, max(150, self.height() - 82))
-            chart_top = 56
-            first_left = 32
+        if not is_timing_mode:
+            self._paint_count_bars(painter)
+            return
+
+        if self._timing_basis == "active":
+            series = (
+                (
+                    "active_ms",
+                    "active_time_share",
+                    "各站有效耗时占比",
+                    "小时",
+                    True,
+                ),
+            )
         else:
             series = (
-                ("total", "total_share", "各站总计数占比", "总计数", False),
-                ("has_phone", "phone_share", "各站有电话数占比", "有电话数", False),
+                (
+                    "total_time_ms",
+                    "total_time_share",
+                    "各站总耗时占比",
+                    "小时",
+                    True,
+                ),
             )
-            chart_size = min(
-                168,
-                max(112, self.height() - 112),
-                max(112, int((chart_area_width - 44) / 2)),
-            )
-            chart_top = 82
-            first_left = 20
+        # Match WorkflowDistributionChart: the donut starts at the same
+        # left/top position and the meter list follows it directly.
+        chart_size = min(190, max(150, self.height() - 82))
+        chart_top = DISTRIBUTION_CHART_TOP
+        first_left = DISTRIBUTION_CHART_LEFT
         for index, (value_key, share_key, title, center_label, is_duration) in enumerate(series):
-            left = first_left + index * (chart_size + chart_gap)
+            left = first_left + index * (chart_size + 24)
             self._draw_series_donut(
                 painter,
                 QRectF(left, chart_top, chart_size, chart_size),
@@ -1157,53 +1327,22 @@ class StationDistributionChart(AnimatedDonutChart):
                 title,
                 center_label,
                 is_duration=is_duration,
-                show_title=not is_timing_mode,
+                show_title=False,
             )
 
-        legend_left = (
-            first_left + chart_size + 42
-            if is_timing_mode
-            else chart_area_width + 34
-        )
+        legend_left = first_left + chart_size + 42
         legend_width = max(
-            180 if is_timing_mode else 270,
-            self.width() - legend_left - (28 if is_timing_mode else 22),
+            180,
+            self.width() - legend_left - 28,
         )
-        if is_timing_mode:
-            first_column_width = min(
-                180,
-                max(118, int(legend_width * 0.48)),
-            )
-            first_column = legend_left + legend_width - first_column_width
-            second_column = None
-        else:
-            first_column_width = 145
-            first_column = legend_left + legend_width - 300
-            second_column = legend_left + legend_width - 145
+        first_column_width = min(
+            180,
+            max(118, int(legend_width * 0.48)),
+        )
+        first_column = legend_left + legend_width - first_column_width
         painter.setFont(QFont("Microsoft YaHei UI", 8, QFont.Bold))
-        if not is_timing_mode:
-            painter.setPen(QColor("#718096"))
-            painter.drawText(legend_left + 18, 52, "站点")
-            painter.setPen(self.TOTAL_COLOR)
-            painter.drawText(
-                QRectF(first_column, 40, first_column_width, 18),
-                Qt.AlignRight | Qt.AlignVCenter,
-                "总计数 / 占比",
-            )
-        if second_column is not None:
-            painter.setPen(self.PHONE_COLOR)
-            painter.drawText(
-                QRectF(second_column, 40, 145, 18),
-                Qt.AlignRight | Qt.AlignVCenter,
-                "有电话数 / 占比",
-            )
-
-        if is_timing_mode:
-            row_height = self.TIMING_ROW_HEIGHT
-            top = 50
-        else:
-            row_height = self.COUNT_ROW_HEIGHT
-            top = 59
+        row_height = self.TIMING_ROW_HEIGHT
+        top = 50
         meter_viewport = QRectF(
             legend_left,
             top,
@@ -1227,13 +1366,8 @@ class StationDistributionChart(AnimatedDonutChart):
             )
             if hitbox.intersects(meter_viewport):
                 self._legend_hitboxes.append((hitbox, dict(row)))
-            if not is_timing_mode and index % 2:
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor("#f5f8f7"))
-                painter.drawRoundedRect(hitbox, 6, 6)
-
             color = self.COLORS[index % len(self.COLORS)]
-            label_height = 20 if is_timing_mode else row_height - 2
+            label_height = 20
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(
@@ -1250,49 +1384,33 @@ class StationDistributionChart(AnimatedDonutChart):
                 Qt.AlignLeft | Qt.AlignVCenter,
                 station,
             )
-            painter.setPen(
-                QColor("#173a3d") if is_timing_mode else self.TOTAL_COLOR
-            )
+            painter.setPen(QColor("#173a3d"))
             painter.drawText(
                 QRectF(first_column, row_top, first_column_width, label_height),
                 Qt.AlignRight | Qt.AlignVCenter,
-                (
-                    f'{format_hours(row[series[0][0]])} · '
-                    f'{self._format_share(row[series[0][1]])}'
-                    if is_timing_mode
-                    else f'{row["total"]} 条 · '
-                    f'{self._format_share(row["total_share"])}'
-                ),
+                f'{format_hours(row[series[0][0]])} · '
+                f'{self._format_share(row[series[0][1]])}',
             )
-            if is_timing_mode:
-                bar_rect = QRectF(
-                    legend_left,
-                    row_top + 20,
-                    legend_width,
-                    self.BAR_HEIGHT,
-                )
-                if bar_rect.intersects(meter_viewport):
-                    self._bar_rects.append(QRectF(bar_rect))
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QColor("#e8f1ef"))
-                painter.drawRoundedRect(bar_rect, 5, 5)
-                share = max(0.0, min(100.0, float(row[series[0][1]])))
-                if share:
-                    value_rect = QRectF(bar_rect)
-                    value_rect.setWidth(max(10, bar_rect.width() * share / 100))
-                    painter.setBrush(color)
-                    value_path = QPainterPath()
-                    value_path.addRoundedRect(value_rect, 5, 5)
-                    painter.drawPath(value_path)
-                    self._draw_flow_highlight(painter, value_path, value_rect)
-            if second_column is not None:
-                painter.setPen(self.PHONE_COLOR)
-                painter.drawText(
-                    QRectF(second_column, row_top, 145, row_height - 2),
-                    Qt.AlignRight | Qt.AlignVCenter,
-                    f'{row["has_phone"]} 条 · '
-                    f'{self._format_share(row["phone_share"])}',
-                )
+            bar_rect = QRectF(
+                legend_left,
+                row_top + 20,
+                legend_width,
+                self.BAR_HEIGHT,
+            )
+            if bar_rect.intersects(meter_viewport):
+                self._bar_rects.append(QRectF(bar_rect))
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor("#e8f1ef"))
+            painter.drawRoundedRect(bar_rect, 5, 5)
+            share = max(0.0, min(100.0, float(row[series[0][1]])))
+            if share:
+                value_rect = QRectF(bar_rect)
+                value_rect.setWidth(max(10, bar_rect.width() * share / 100))
+                painter.setBrush(color)
+                value_path = QPainterPath()
+                value_path.addRoundedRect(value_rect, 5, 5)
+                painter.drawPath(value_path)
+                self._draw_flow_highlight(painter, value_path, value_rect)
         painter.restore()
 
     def mouseMoveEvent(self, event):
@@ -1443,7 +1561,7 @@ class StatisticsPage(QWidget):
         self.export_btn.clicked.connect(self._export_dashboard_excel)
         header.addWidget(self.export_btn)
         refresh = QPushButton("刷新统计")
-        refresh.clicked.connect(self.refresh)
+        refresh.clicked.connect(self._refresh_with_loading)
         header.addWidget(refresh)
         layout.addLayout(header)
 
@@ -1674,6 +1792,9 @@ class StatisticsPage(QWidget):
         if self._showing_anomalies:
             return "anomaly"
         return self.category_combo.currentData() or "station_distribution"
+
+    def _refresh_with_loading(self, _checked=False):
+        return run_ui_with_loading(self, "正在加载统计数据…", self.refresh)
 
     def set_sidebar_navigation(self, enabled=True):
         """由主窗口的数据中心侧边栏接管详细统计分类。"""
@@ -2499,33 +2620,30 @@ class StatisticsPage(QWidget):
     def _finish_summary_table(self, scope, detail, stretch_columns=(0,)):
         self.data_description.setText(f"{scope} · {detail}")
         self.data_count_label.setText(f"{self.summary_table.rowCount()} 行")
-        header = self.summary_table.horizontalHeader()
-        header.setStretchLastSection(False)
-        for column in range(self.summary_table.columnCount()):
-            mode = (
-                QHeaderView.Stretch
-                if column in stretch_columns
-                else QHeaderView.ResizeToContents
-            )
-            header.setSectionResizeMode(column, mode)
+        make_table_columns_resizable(
+            self.summary_table,
+            {
+                column: 240 if column in stretch_columns else 130
+                for column in range(self.summary_table.columnCount())
+            },
+            minimum_width=80,
+        )
         self.summary_table.scrollToTop()
 
     @staticmethod
     def _ordered_completion_metrics(metrics):
-        """总计保持在首位，其余完成类型与图表使用同一反向顺序。"""
+        """Keep the aggregate first, followed by the five result types."""
         metrics_by_key = {metric["metric_key"]: metric for metric in metrics}
-        metrics_by_key.pop(WORKFLOW_EMPTY_METRIC, None)
         ordered_keys = [WORKFLOW_TOTAL_METRIC]
         ordered_keys.extend(
-            metric_key for metric_key, _, _ in WorkflowDistributionChart.SEGMENTS
+            metric_key
+            for metric_key, _label, _color in WorkflowDistributionChart.SEGMENTS
         )
-        ordered = [
-            metrics_by_key.pop(metric_key)
+        return [
+            metrics_by_key[metric_key]
             for metric_key in ordered_keys
             if metric_key in metrics_by_key
         ]
-        ordered.extend(metrics_by_key.values())
-        return ordered
 
     def _get_station_distribution_rows(self):
         stations = {}

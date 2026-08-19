@@ -10,7 +10,6 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QFormLayout,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QPlainTextEdit,
@@ -27,6 +26,7 @@ from .auth_dialogs import RenameAccountDialog
 from .frameless import FramelessDialog
 from .frameless import FramelessMessageBox as QMessageBox
 from .loading_dialog import run_with_loading
+from .table_utils import make_table_columns_resizable
 
 _CALL_FAILED = object()
 
@@ -139,7 +139,10 @@ class _DevicesDialog(FramelessDialog):
         )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        make_table_columns_resizable(
+            self.table,
+            [160, 130, 170, 170, 95],
+        )
         layout.addWidget(self.table)
         buttons = QHBoxLayout()
         revoke = QPushButton("撤销所选设备")
@@ -290,13 +293,10 @@ class _AuditDialog(FramelessDialog):
         self.table.setShowGrid(False)
         self.table.verticalHeader().setVisible(False)
         self.table.cellDoubleClicked.connect(self._open_detail)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.Stretch)
+        make_table_columns_resizable(
+            self.table,
+            [170, 130, 160, 135, 210, 260],
+        )
         layout.addWidget(self.table, 1)
         buttons = QHBoxLayout()
         refresh = QPushButton("刷新")
@@ -440,11 +440,10 @@ class OnlineAccountPage(AccountPage):
                 "归档",
             ]
         )
-        header = self.table.horizontalHeader()
-        for column in (0, 1, 7, 8):
-            header.setSectionResizeMode(column, QHeaderView.Stretch)
-        for column in (2, 3, 4, 5, 6, 9, 10):
-            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        make_table_columns_resizable(
+            self.table,
+            [160, 130, 105, 110, 90, 110, 85, 170, 170, 105, 90],
+        )
         # Do not perform a blocking HTTPS request while MainWindow is still
         # being constructed. MainWindow calls refresh() when the user opens
         # the account page, after the initial event loop has started.
@@ -654,9 +653,16 @@ class OnlineAccountPage(AccountPage):
         dialog = _AccountSettingsDialog(parent=self)
         if dialog.exec_() != dialog.Accepted:
             return
+        payload = dialog.values()
+        # v1.1.0 servers use strict request schemas and do not know the
+        # v1.1.1-only test-account marker.  Omit the default false value so
+        # ordinary users and administrators can still be managed while the
+        # server is upgraded in place.
+        if not payload.get("is_test"):
+            payload.pop("is_test", None)
         result = self._call(
             self.session.api.admin_create_account,
-            dialog.values(),
+            payload,
         )
         if result is not _CALL_FAILED:
             QMessageBox.information(
@@ -692,6 +698,8 @@ class OnlineAccountPage(AccountPage):
             return
         payload = dialog.values()
         payload.pop("username", None)
+        if bool(payload.get("is_test")) == bool(account.is_test):
+            payload.pop("is_test", None)
         result = self._call(
             self.session.api.admin_update_account,
             account.server_account_id,

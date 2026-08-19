@@ -39,7 +39,6 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -58,11 +57,12 @@ from PyQt5.QtWidgets import (
     QWidget,
 )
 
-from ..online.api import ApiResponseError, NetworkUnavailable
+from ..online.api import ApiResponseError, NetworkUnavailable, OnlineApiError
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessDialog
 from .frameless import FramelessMessageBox as QMessageBox
 from .loading_dialog import run_with_loading
+from .table_utils import make_table_columns_resizable
 
 MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
 MAX_ANNOUNCEMENT_ATTACHMENT_BYTES = 25 * 1024 * 1024
@@ -120,6 +120,24 @@ def _encode_attachment_item(item):
         "kind": item["kind"],
         "content_base64": base64.b64encode(path.read_bytes()).decode("ascii"),
     }
+
+
+def _local_attachment_views(payloads):
+    views = []
+    for payload in payloads or []:
+        encoded = str(payload.get("content_base64") or "")
+        padding = encoded.count("=")
+        size = max(0, len(encoded) * 3 // 4 - padding)
+        views.append(
+            {
+                "file_name": payload.get("file_name") or "附件",
+                "content_type": payload.get("content_type") or "application/octet-stream",
+                "kind": payload.get("kind") or "file",
+                "size": size,
+                "_local_only": True,
+            }
+        )
+    return views
 
 
 def _open_contact_attachment(parent, session, attachment):
@@ -835,9 +853,10 @@ class ContactAttachmentPicker(QWidget):
 class ConversationTimeline(QScrollArea):
     """Scrollable, left/right aligned message bubbles with inline attachments."""
 
-    def __init__(self, attachment_opened, parent=None):
+    def __init__(self, attachment_opened, parent=None, *, retry_message=None):
         super().__init__(parent)
         self._attachment_opened = attachment_opened
+        self._retry_message = retry_message
         self._plain_text = ""
         self.setObjectName("ChatTimeline")
         self.setWidgetResizable(True)
@@ -869,6 +888,7 @@ class ConversationTimeline(QScrollArea):
             created_at = _display_time(message.get("created_at"))
             body = str(message.get("message") or "").strip()
             attachments = list(message.get("attachments") or [])
+            send_state = str(message.get("_send_state") or "")
             display_body = body or "（仅附件）"
             plain_blocks.append(f"{sender}  ·  {created_at}\n{display_body}")
 
@@ -912,11 +932,42 @@ class ConversationTimeline(QScrollArea):
                 attachment_button.setToolTip(
                     f"点击打开附件\n{attachment.get('file_name') or '附件'}"
                 )
-                attachment_button.clicked.connect(
-                    lambda _checked=False, item=attachment: self._attachment_opened(item)
-                )
+                if attachment.get("_local_only"):
+                    attachment_button.setEnabled(False)
+                    attachment_button.setToolTip("消息发送成功后可打开附件")
+                else:
+                    attachment_button.clicked.connect(
+                        lambda _checked=False, item=attachment: self._attachment_opened(item)
+                    )
                 bubble_layout.addWidget(attachment_button)
-            time_label = QLabel(created_at)
+            if own and send_state == "failed":
+                delivery = QWidget(bubble)
+                delivery_layout = QHBoxLayout(delivery)
+                delivery_layout.setContentsMargins(0, 0, 0, 0)
+                delivery_layout.setSpacing(7)
+                failure_label = QLabel("发送失败")
+                failure_label.setObjectName("ChatDeliveryFailed")
+                delivery_layout.addWidget(failure_label)
+                if callable(self._retry_message):
+                    retry_button = QPushButton("重新发送")
+                    retry_button.setObjectName("ChatRetryButton")
+                    retry_button.clicked.connect(
+                        lambda _checked=False, item=message: self._retry_message(item)
+                    )
+                    delivery_layout.addWidget(retry_button)
+                delivery_layout.addStretch(1)
+                bubble_layout.addWidget(delivery)
+            peer_read = False
+            if own:
+                peer_read = bool(
+                    message.get("admin_read_at")
+                    if own_role == "user"
+                    else message.get("user_read_at")
+                )
+            time_text = created_at
+            if own and send_state != "failed":
+                time_text += "  ·  " + ("已读" if peer_read else "未读")
+            time_label = QLabel(time_text)
             time_label.setObjectName("ChatBubbleTime")
             time_label.setAlignment(Qt.AlignRight if own else Qt.AlignLeft)
             bubble_layout.addWidget(time_label)
@@ -977,6 +1028,7 @@ class ContactConversationDialog(FramelessDialog):
         self._read_tasks = []
         self._known_admin_message_ids = set()
         self._message_ids_initialized = False
+        self._failed_messages = []
         self.setWindowTitle("历史会话" if self.history_mode else "联系管理员")
         self.setModal(False)
         self.resize(840, 700)
@@ -1035,6 +1087,7 @@ class ContactConversationDialog(FramelessDialog):
                 attachment,
             ),
             self,
+            retry_message=self._retry_failed_message,
         )
         layout.addWidget(self.history, 1)
 
@@ -1236,7 +1289,18 @@ class ContactConversationDialog(FramelessDialog):
                 )
                 item.setData(Qt.UserRole, attachment)
                 self.received_attachments.addItem(item)
-        self.history.set_messages(messages, own_role="user", peer_label="管理员")
+        conversation_id = str((conversation or {}).get("id") or "")
+        failed_messages = [
+            message
+            for message in self._failed_messages
+            if not message.get("_conversation_id")
+            or str(message.get("_conversation_id")) == conversation_id
+        ]
+        self.history.set_messages(
+            messages + failed_messages,
+            own_role="user",
+            peer_label="管理员",
+        )
         if self.history_mode:
             self._update_related_label()
         status = str((conversation or {}).get("status") or "")
@@ -1399,41 +1463,111 @@ class ContactConversationDialog(FramelessDialog):
             if not announcement_id:
                 QMessageBox.warning(self, "消息操作失败", "当前会话没有关联公告。")
                 return
-
-            def action():
-                return self.session.api.send_admin_message(
-                    self.session.access_token(),
-                    announcement_id,
-                    message,
-                )
-
+            context = {"kind": "legacy", "announcement_id": announcement_id}
         elif conversation and conversation.get("status") == "open":
-
-            def action():
-                return self.session.api.reply_admin_message(
-                    self.session.access_token(),
-                    str(conversation.get("id")),
-                    message,
-                    attachments,
-                )
-
+            context = {
+                "kind": "reply",
+                "conversation_id": str(conversation.get("id") or ""),
+            }
         else:
             if not announcement_id:
                 QMessageBox.warning(self, "消息操作失败", "当前会话没有关联公告。")
                 return
+            context = {"kind": "new", "announcement_id": announcement_id}
+        self._submit_message(message, attachments, context)
 
-            def action():
-                return self.session.api.send_admin_message(
-                    self.session.access_token(),
-                    announcement_id,
-                    message,
-                    attachments,
-                )
+    def _send_action(self, message, attachments, context):
+        kind = str(context.get("kind") or "")
+        if kind == "reply":
+            return self.session.api.reply_admin_message(
+                self.session.access_token(),
+                str(context.get("conversation_id") or ""),
+                message,
+                attachments,
+            )
+        if kind == "legacy":
+            return self.session.api.send_admin_message(
+                self.session.access_token(),
+                str(context.get("announcement_id") or ""),
+                message,
+            )
+        return self.session.api.send_admin_message(
+            self.session.access_token(),
+            str(context.get("announcement_id") or ""),
+            message,
+            attachments,
+        )
 
-        result = self._call("正在发送消息…", action)
-        if result is None:
+    def _record_failed_message(
+        self,
+        message,
+        attachments,
+        context,
+        error,
+        failed_message=None,
+    ):
+        if failed_message is None:
+            failed_message = {
+                "id": f"local-failed-{len(self._failed_messages) + 1}",
+                "sender_role": "user",
+                "message": message,
+                "attachments": _local_attachment_views(attachments),
+                "created_at": "刚刚",
+                "_send_state": "failed",
+                "_retry_attachments": list(attachments),
+                "_retry_context": dict(context),
+                "_conversation_id": str(context.get("conversation_id") or ""),
+            }
+            self._failed_messages.append(failed_message)
+        failed_message["_send_state"] = "failed"
+        failed_message["_send_error"] = str(error)
+        self.message_edit.clear()
+        self.attachment_picker.clear()
+        self._render()
+        self.status_label.setText("消息发送失败，请检查网络后点击“重新发送”。")
+        self.messages_changed.emit()
+
+    def _retry_failed_message(self, failed_message):
+        if failed_message not in self._failed_messages:
             return
-        if self.legacy_mode:
+        self._submit_message(
+            str(failed_message.get("message") or ""),
+            list(failed_message.get("_retry_attachments") or []),
+            dict(failed_message.get("_retry_context") or {}),
+            failed_message=failed_message,
+        )
+
+    def _submit_message(
+        self,
+        message,
+        attachments,
+        context,
+        *,
+        failed_message=None,
+    ):
+        if failed_message is not None:
+            failed_message["_send_state"] = "sending"
+            self._render()
+        try:
+            result = run_with_loading(
+                self,
+                "正在重新发送…" if failed_message is not None else "正在发送消息…",
+                lambda: self._send_action(message, attachments, context),
+            )
+            if result is None:
+                raise ValueError("服务器未返回发送结果")
+        except (OnlineApiError, OSError, ValueError) as exc:
+            self._record_failed_message(
+                message,
+                attachments,
+                context,
+                exc,
+                failed_message,
+            )
+            return
+        if failed_message in self._failed_messages:
+            self._failed_messages.remove(failed_message)
+        if context.get("kind") == "legacy":
             QMessageBox.information(self, "发送成功", "消息已发送给管理员。")
             self.accept()
             return
@@ -1509,6 +1643,7 @@ class AdminConversationDialog(FramelessDialog):
         self._read_tasks = []
         self._known_user_message_ids = set()
         self._message_ids_initialized = False
+        self._failed_messages = []
         self.setWindowTitle(
             f"回复用户 - {self.conversation.get('sender_display_name') or '用户'}"
         )
@@ -1562,6 +1697,7 @@ class AdminConversationDialog(FramelessDialog):
                 attachment,
             ),
             self,
+            retry_message=self._retry_failed_message,
         )
         root.addWidget(self.history, 1)
 
@@ -1608,7 +1744,7 @@ class AdminConversationDialog(FramelessDialog):
     def _call(self, message, function):
         try:
             return run_with_loading(self, message, function)
-        except (ApiResponseError, NetworkUnavailable, OSError, ValueError) as exc:
+        except (OnlineApiError, OSError, ValueError) as exc:
             QMessageBox.warning(self, "消息操作失败", str(exc))
             return None
 
@@ -1631,7 +1767,7 @@ class AdminConversationDialog(FramelessDialog):
             else "会话处理中"
         )
         self.history.set_messages(
-            self.conversation.get("messages") or [],
+            list(self.conversation.get("messages") or []) + self._failed_messages,
             own_role="admin",
             peer_label=display_name,
         )
@@ -1658,18 +1794,73 @@ class AdminConversationDialog(FramelessDialog):
         except OSError as exc:
             QMessageBox.warning(self, "附件读取失败", str(exc))
             return
+        self._submit_message(
+            message,
+            attachments,
+        )
+
+    def _record_failed_message(
+        self,
+        message,
+        attachments,
+        error,
+        failed_message=None,
+    ):
+        if failed_message is None:
+            failed_message = {
+                "id": f"local-failed-{len(self._failed_messages) + 1}",
+                "sender_role": "admin",
+                "message": message,
+                "attachments": _local_attachment_views(attachments),
+                "created_at": "刚刚",
+                "_send_state": "failed",
+                "_retry_attachments": list(attachments),
+            }
+            self._failed_messages.append(failed_message)
+        failed_message["_send_state"] = "failed"
+        failed_message["_send_error"] = str(error)
+        self.message_edit.clear()
+        self.attachment_picker.clear()
+        self._render()
+        self.status_label.setText("回复发送失败，请检查网络后点击“重新发送”。")
+
+    def _retry_failed_message(self, failed_message):
+        if failed_message not in self._failed_messages:
+            return
+        self._submit_message(
+            str(failed_message.get("message") or ""),
+            list(failed_message.get("_retry_attachments") or []),
+            failed_message=failed_message,
+        )
+
+    def _submit_message(self, message, attachments, *, failed_message=None):
+        if failed_message is not None:
+            failed_message["_send_state"] = "sending"
+            self._render()
         conversation_id = str(self.conversation.get("id") or "")
-        result = self._call(
-            "正在发送回复…",
-            lambda: self.session.api.admin_reply_message(
-                self.session.access_token(),
-                conversation_id,
+        try:
+            result = run_with_loading(
+                self,
+                "正在重新发送…" if failed_message is not None else "正在发送回复…",
+                lambda: self.session.api.admin_reply_message(
+                    self.session.access_token(),
+                    conversation_id,
+                    message,
+                    attachments,
+                ),
+            )
+            if result is None:
+                raise ValueError("服务器未返回发送结果")
+        except (OnlineApiError, OSError, ValueError) as exc:
+            self._record_failed_message(
                 message,
                 attachments,
-            ),
-        )
-        if result is None:
+                exc,
+                failed_message,
+            )
             return
+        if failed_message in self._failed_messages:
+            self._failed_messages.remove(failed_message)
         if isinstance(result, dict) and result.get("messages") is not None:
             self.conversation = result
         else:
@@ -1677,7 +1868,7 @@ class AdminConversationDialog(FramelessDialog):
                 "id": f"local-{len(self.conversation.get('messages') or [])}",
                 "sender_role": "admin",
                 "message": message,
-                "attachments": attachments,
+                "attachments": _local_attachment_views(attachments),
                 "created_at": "刚刚",
             }
             self.conversation.setdefault("messages", []).append(local_message)
@@ -1922,7 +2113,7 @@ class AnnouncementDetailDialog(FramelessDialog):
                     "正在加载公告图片…",
                     lambda: self._download(attachment),
                 )
-            except (ApiResponseError, NetworkUnavailable, OSError) as exc:
+            except (OnlineApiError, OSError) as exc:
                 QMessageBox.warning(self, "图片加载失败", str(exc))
                 return
             ImagePreviewDialog(data, file_name, self).exec_()
@@ -1949,7 +2140,7 @@ class AnnouncementDetailDialog(FramelessDialog):
                 os.replace(temporary, destination)
             finally:
                 temporary.unlink(missing_ok=True)
-        except (ApiResponseError, NetworkUnavailable, OSError) as exc:
+        except (OnlineApiError, OSError) as exc:
             QMessageBox.warning(self, "附件保存失败", str(exc))
             return
         QMessageBox.information(self, "保存完成", f"附件已保存到：\n{target}")
@@ -2499,11 +2690,10 @@ class AnnouncementAdminPage(QWidget):
         self.announcement_table.itemSelectionChanged.connect(
             self._announcement_selection_changed
         )
-        header_view = self.announcement_table.horizontalHeader()
-        header_view.setSectionResizeMode(0, QHeaderView.Stretch)
-        header_view.setSectionResizeMode(1, QHeaderView.Stretch)
-        for column in range(2, 8):
-            header_view.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        make_table_columns_resizable(
+            self.announcement_table,
+            [220, 180, 125, 85, 85, 85, 85, 170],
+        )
         splitter.addWidget(self.announcement_table)
         self.announcement_preview = QTextBrowser()
         self.announcement_preview.setOpenExternalLinks(False)
@@ -2554,13 +2744,10 @@ class AnnouncementAdminPage(QWidget):
         self.message_table.itemDoubleClicked.connect(
             lambda _item: self._open_selected_conversation()
         )
-        message_header = self.message_table.horizontalHeader()
-        message_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        message_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        message_header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        message_header.setSectionResizeMode(3, QHeaderView.Stretch)
-        message_header.setSectionResizeMode(4, QHeaderView.Stretch)
-        message_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        make_table_columns_resizable(
+            self.message_table,
+            [80, 105, 145, 200, 280, 170],
+        )
         inbox_layout.addWidget(self.message_table, 1)
         self.tabs.addTab(inbox, "用户消息")
         self._selection_state()
@@ -2582,7 +2769,7 @@ class AnnouncementAdminPage(QWidget):
             return None
         try:
             return run_with_loading(self, message, function)
-        except (ApiResponseError, NetworkUnavailable, OSError, ValueError) as exc:
+        except (OnlineApiError, OSError, ValueError) as exc:
             QMessageBox.warning(self, "公告操作失败", str(exc))
             return None
 
