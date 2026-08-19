@@ -555,6 +555,95 @@ QTextBrowser#AnnouncementBody {
     border-radius: 8px;
     padding: 12px;
 }
+QFrame#ChatHeader {
+    background: #f5f8fa;
+    border: 1px solid #dce5ea;
+    border-radius: 7px;
+}
+QLabel#ChatAvatar {
+    color: #ffffff;
+    background: #1d8178;
+    border: none;
+    border-radius: 21px;
+    font-size: 16px;
+    font-weight: 700;
+}
+QLabel#ChatStatus {
+    color: #52656d;
+    background: transparent;
+    padding: 0 4px;
+}
+QLabel#ChatNewMessageNotice {
+    color: #8a3d0d;
+    background: #fff0dd;
+    border: 1px solid #efbd82;
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-weight: 700;
+}
+QScrollArea#ChatTimeline {
+    background: #eef3f5;
+    border: 1px solid #d8e2e7;
+    border-radius: 7px;
+}
+QScrollArea#ChatTimeline > QWidget > QWidget,
+QWidget#ChatTimelineContent {
+    background: #eef3f5;
+}
+QLabel#ChatEmptyState {
+    color: #7b8b92;
+    background: transparent;
+}
+QFrame#ChatBubble {
+    color: #26343a;
+    background: #ffffff;
+    border: 1px solid #d7e1e5;
+    border-radius: 7px;
+}
+QFrame#ChatBubble[own="true"] {
+    background: #dff3ed;
+    border-color: #b7ddd2;
+}
+QLabel#ChatBubbleSender {
+    color: #526970;
+    background: transparent;
+    font-size: 11px;
+    font-weight: 700;
+}
+QLabel#ChatBubbleBody {
+    color: #26343a;
+    background: transparent;
+    font-size: 14px;
+}
+QLabel#ChatBubbleTime {
+    color: #819097;
+    background: transparent;
+    font-size: 10px;
+}
+QPushButton#ChatAttachmentButton {
+    color: #285d67;
+    background: rgba(255, 255, 255, 150);
+    border: 1px solid #cbdcdf;
+    border-radius: 5px;
+    padding: 7px 9px;
+    text-align: left;
+}
+QPushButton#ChatAttachmentButton:hover {
+    color: #154c55;
+    background: #ffffff;
+    border-color: #8dbfc0;
+}
+QFrame#ChatComposerFrame {
+    background: #ffffff;
+    border: 1px solid #d8e2e7;
+    border-radius: 7px;
+}
+QPlainTextEdit#ChatComposer {
+    color: #26343a;
+    background: #ffffff;
+    border: none;
+    padding: 4px;
+}
 QLabel#AnnouncementListCount {
     color: #176f68;
     background: #e7f6f2;

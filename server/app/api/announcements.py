@@ -379,6 +379,13 @@ def _contact_conversation_view(
         and accounts_by_id[row.sender_account_id].role == "user"
         and row.read_at is None
     )
+    unread_for_user = sum(
+        1
+        for row in rows
+        if accounts_by_id.get(row.sender_account_id)
+        and accounts_by_id[row.sender_account_id].role == "admin"
+        and row.read_by_user_at is None
+    )
     return {
         "id": root.id,
         "thread_id": root.id,
@@ -392,10 +399,32 @@ def _contact_conversation_view(
         "updated_at": rows[-1].created_at if rows else root.created_at,
         "read_at": None if unread_for_admin else root.read_at or root.created_at,
         "unread_count": unread_for_admin,
+        "user_unread_count": unread_for_user,
         "status": root.status or "open",
         "last_message": last_message,
         "messages": messages,
     }
+
+
+def _user_unread_contact_count(db: Db, account_id: uuid.UUID) -> int:
+    owned_root_ids = select(AdminContactMessage.id).where(
+        AdminContactMessage.sender_account_id == account_id,
+        or_(
+            AdminContactMessage.thread_id.is_(None),
+            AdminContactMessage.thread_id == AdminContactMessage.id,
+        ),
+    )
+    admin_account_ids = select(Account.id).where(Account.role == "admin")
+    return int(
+        db.scalar(
+            select(func.count(AdminContactMessage.id)).where(
+                AdminContactMessage.thread_id.in_(owned_root_ids),
+                AdminContactMessage.sender_account_id.in_(admin_account_ids),
+                AdminContactMessage.read_by_user_at.is_(None),
+            )
+        )
+        or 0
+    )
 
 
 @router.get("/announcements")
@@ -544,6 +573,7 @@ def list_contact_conversations(
     db: Db,
     announcement_id: uuid.UUID | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=200),
+    mark_read: bool = Query(default=True),
 ) -> dict:
     if context.account.role != "user":
         raise ApiError("user_message_only", "仅普通用户可以查看消息会话", status_code=403)
@@ -574,13 +604,55 @@ def list_contact_conversations(
         ).all()
         roles = {account.id: account.role for account in accounts}
         for row in rows:
-            if roles.get(row.sender_account_id) == "admin" and row.read_by_user_at is None:
+            if (
+                mark_read
+                and roles.get(row.sender_account_id) == "admin"
+                and row.read_by_user_at is None
+            ):
                 row.read_by_user_at = now
                 changed = True
         conversations.append(_contact_conversation_view(db, root))
     if changed:
         db.commit()
-    return {"items": conversations}
+    unread_count = _user_unread_contact_count(db, context.account.id)
+    return {"items": conversations, "unread_count": unread_count}
+
+
+@router.get("/messages/unread-count")
+def contact_conversation_unread_count(
+    context: BusinessContext,
+    db: Db,
+) -> dict:
+    if context.account.role != "user":
+        raise ApiError("user_message_only", "仅普通用户可以查看消息状态", status_code=403)
+    return {"unread_count": _user_unread_contact_count(db, context.account.id)}
+
+
+@router.post("/messages/{message_id}/read")
+def mark_contact_conversation_read(
+    message_id: uuid.UUID,
+    context: BusinessContext,
+    db: Db,
+) -> dict:
+    if context.account.role != "user":
+        raise ApiError("user_message_only", "仅普通用户可以更新消息状态", status_code=403)
+    root = _contact_thread_root(db, message_id)
+    if root.sender_account_id != context.account.id:
+        raise ApiError("message_not_found", "消息会话不存在", status_code=404)
+    rows = _contact_thread_rows(db, root)
+    accounts = db.scalars(
+        select(Account).where(Account.id.in_({row.sender_account_id for row in rows}))
+    ).all()
+    roles = {account.id: account.role for account in accounts}
+    now = utcnow()
+    changed = False
+    for row in rows:
+        if roles.get(row.sender_account_id) == "admin" and row.read_by_user_at is None:
+            row.read_by_user_at = now
+            changed = True
+    if changed:
+        db.commit()
+    return {"id": root.id, "read_at": now}
 
 
 @router.post("/messages/{message_id}/replies", status_code=201)

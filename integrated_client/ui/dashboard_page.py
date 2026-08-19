@@ -780,10 +780,20 @@ class StationShareChart(AnimatedDonutChart):
 class DashboardPage(QWidget):
     """一眼可读的业务概览，详细统计由侧边栏数据中心承载。"""
 
-    def __init__(self, database: Database, account: Account, parent=None):
+    def __init__(
+        self,
+        database: Database,
+        account: Account,
+        parent=None,
+        *,
+        client_preferences=None,
+        account_key=None,
+    ):
         super().__init__(parent)
         self.database = database
         self.account = account
+        self.client_preferences = client_preferences
+        self.account_key = str(account_key or account.username or "")
         self.metric_cards = {}
 
         layout = QVBoxLayout(self)
@@ -877,6 +887,16 @@ class DashboardPage(QWidget):
         self.station_view_stack.addWidget(self.station_table)
         self.station_view_stack.addWidget(self.station_share_chart)
         station_body.addWidget(self.station_view_stack)
+        saved_station_view = (
+            self.client_preferences.dashboard_station_view(self.account_key)
+            if self.client_preferences is not None
+            else "table"
+        )
+        self.station_view_toggle.setChecked(saved_station_view == "chart")
+        self._toggle_station_view(
+            saved_station_view == "chart",
+            persist=False,
+        )
         self.station_view_toggle.toggled.connect(self._toggle_station_view)
         analysis_layout.addWidget(station_panel, 1, 1)
         analysis_layout.setRowStretch(0, 1)
@@ -908,11 +928,16 @@ class DashboardPage(QWidget):
         layout.addLayout(body, 1)
         return panel, body
 
-    def _toggle_station_view(self, show_charts):
+    def _toggle_station_view(self, show_charts, *, persist=True):
         self.station_view_stack.setCurrentIndex(1 if show_charts else 0)
         self.station_view_toggle.setText(
             "查看数据表" if show_charts else "查看占比图"
         )
+        if persist and self.client_preferences is not None and self.account_key:
+            self.client_preferences.set_dashboard_station_view(
+                self.account_key,
+                "chart" if show_charts else "table",
+            )
 
     @staticmethod
     def _table(headers):

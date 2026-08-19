@@ -4054,6 +4054,40 @@ class ToolAndUiTests(unittest.TestCase):
         restored.close()
         other_account.close()
 
+    def test_dashboard_station_view_is_persisted_per_program_account(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        first = DashboardPage(
+            self.db,
+            self.admin,
+            client_preferences=preferences,
+            account_key="Admin",
+        )
+        self.assertEqual(first.station_view_stack.currentIndex(), 0)
+        first.station_view_toggle.click()
+        self.assertEqual(first.station_view_stack.currentIndex(), 1)
+        first.close()
+
+        restored = DashboardPage(
+            self.db,
+            self.admin,
+            client_preferences=ClientPreferences(self.temp_dir.name),
+            account_key="admin",
+        )
+        self.assertEqual(restored.station_view_stack.currentIndex(), 1)
+        self.assertTrue(restored.station_view_toggle.isChecked())
+        self.assertEqual(restored.station_view_toggle.text(), "查看数据表")
+        restored.close()
+
+        other = DashboardPage(
+            self.db,
+            self.admin,
+            client_preferences=ClientPreferences(self.temp_dir.name),
+            account_key="station01",
+        )
+        self.assertEqual(other.station_view_stack.currentIndex(), 0)
+        self.assertFalse(other.station_view_toggle.isChecked())
+        other.close()
+
     def test_tencent_docs_result_is_automatically_loaded_without_timing(self):
         workbook_path = Path(self.temp_dir.name) / "tencent-pending.xlsx"
         workbook = Workbook()

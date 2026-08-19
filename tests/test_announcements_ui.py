@@ -19,6 +19,7 @@ from integrated_client.ui.announcement_page import (
     AnnouncementEditorDialog,
     AnnouncementListDialog,
     AnnouncementTickerButton,
+    AdminConversationDialog,
     ContactAdminDialog,
     ContactAttachmentPicker,
     ContactConversationDialog,
@@ -37,6 +38,7 @@ class FakeAnnouncementApi:
         self.inbox = {"items": [], "unread_count": 0}
         self.accounts = []
         self.conversations = []
+        self.user_read_calls = []
 
     def announcements(self, _token, limit=50):
         return list(self.visible_announcements[:limit])
@@ -85,6 +87,7 @@ class FakeAnnouncementApi:
         *,
         announcement_id=None,
         limit=50,
+        mark_read=True,
     ):
         items = list(self.conversations)
         if announcement_id:
@@ -93,7 +96,25 @@ class FakeAnnouncementApi:
                 for item in items
                 if str(item.get("announcement_id")) == str(announcement_id)
             ]
-        return {"items": items[:limit]}
+        return {
+            "items": items[:limit],
+            "unread_count": sum(
+                int(item.get("user_unread_count") or 0) for item in items
+            ),
+        }
+
+    def mark_contact_conversation_read(self, _token, message_id):
+        self.user_read_calls.append(message_id)
+        for conversation in self.conversations:
+            if str(conversation.get("id")) == str(message_id):
+                conversation["user_unread_count"] = 0
+        return {"id": message_id, "read_at": "2026-08-19T10:10:00"}
+
+    def contact_conversation_unread_count(self, _token):
+        return sum(
+            int(item.get("user_unread_count") or 0)
+            for item in self.conversations
+        )
 
     @staticmethod
     def reply_admin_message(
@@ -554,7 +575,13 @@ class AnnouncementUiTests(unittest.TestCase):
     def test_contact_dialog_falls_back_to_legacy_text_message_api(self):
         class LegacyApi(FakeAnnouncementApi):
             @staticmethod
-            def contact_conversations(_token, *, announcement_id=None, limit=50):
+            def contact_conversations(
+                _token,
+                *,
+                announcement_id=None,
+                limit=50,
+                mark_read=True,
+            ):
                 raise ApiResponseError(
                     "not_found",
                     "Not Found",
@@ -615,7 +642,7 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(dialog.toolbar_buttons["underline"].text(), "U")
         self.assertTrue(dialog.toolbar_buttons["align_left"].icon().isNull() is False)
 
-    def test_admin_page_loads_announcements_and_plain_text_messages(self):
+    def test_admin_page_opens_independent_chat_and_marks_selection_read(self):
         api = FakeAnnouncementApi()
         api.managed_announcements = [self._announcement()]
         api.accounts = [
@@ -654,6 +681,7 @@ class AnnouncementUiTests(unittest.TestCase):
                     ],
                     "created_at": "2026-07-28T11:00:00",
                     "read_at": None,
+                    "unread_count": 1,
                 }
             ],
         }
@@ -672,18 +700,108 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(unread, [1])
         page.message_table.selectRow(0)
         self.app.processEvents()
-        self.assertEqual(
-            page.message_detail.toPlainText().splitlines()[-1],
-            "<b>这里按纯文字显示</b>",
+        self.assertTrue(
+            self._wait_until(
+                lambda: api.inbox["items"][0].get("read_at") is not None
+                or page.messages[0].get("read_at") is not None
+            )
         )
-        self.assertEqual(page.message_attachments.count(), 1)
-        page.admin_reply_edit.setPlainText("管理员回复")
-        with patch(
-            "integrated_client.ui.announcement_page.run_with_loading",
-            side_effect=lambda _parent, _message, function: function(),
-        ):
-            page._reply_message()
+        self.assertEqual(page.inbox_summary.text(), "未读消息：0")
+        self.assertFalse(
+            any(
+                button.text() == "标记所选为已读"
+                for button in page.findChildren(QPushButton)
+            )
+        )
+        page._reply_message()
+        self.app.processEvents()
+        chat = page._chat_windows["message-id"]
+        self.assertIsInstance(chat, AdminConversationDialog)
+        self.assertFalse(chat.isModal())
+        self.assertIsNone(chat.parent())
+        self.assertTrue(chat.message_edit.isEnabled())
+        self.assertTrue(chat.message_edit.hasFocus())
+        self.assertIn("<b>这里按纯文字显示</b>", chat.history.toPlainText())
+        chat.message_edit.setPlainText("管理员回复")
+        chat._send()
         self.assertEqual(api.admin_replies[0][:2], ("message-id", "管理员回复"))
+
+    def test_detail_contact_closes_announcement_and_opens_independent_chat(self):
+        api = FakeAnnouncementApi()
+        api.visible_announcements = [self._announcement()]
+        user = self.database.create_account(
+            "contact_user",
+            "Contact@123",
+            "user",
+            self.admin.id,
+            display_name="联系用户",
+        )
+        window = MainWindow(
+            self.database,
+            user,
+            session_manager=FakeSession(api),
+        )
+        window.show()
+        self.assertTrue(self._wait_until(lambda: bool(window.announcements)))
+        window._show_current_announcement()
+        detail = window.announcement_dialog
+        detail._contact_admin()
+        self.app.processEvents()
+
+        chat = window.contact_conversation_dialogs["announcement-1"]
+        self.assertFalse(detail.isVisible())
+        self.assertTrue(chat.isVisible())
+        self.assertFalse(chat.isModal())
+        self.assertIsNone(chat.parent())
+        self.assertFalse(
+            any(
+                button.text() == "未解决，继续沟通"
+                for button in chat.findChildren(QPushButton)
+            )
+        )
+
+    def test_user_message_unread_badge_is_cleared_when_chat_opens(self):
+        api = FakeAnnouncementApi()
+        api.visible_announcements = [self._announcement(read_at=True)]
+        api.conversations = [
+            {
+                "id": "conversation-1",
+                "announcement_id": "announcement-1",
+                "announcement_title": "系统维护公告",
+                "status": "open",
+                "user_unread_count": 1,
+                "messages": [
+                    {
+                        "id": "admin-reply-1",
+                        "sender_role": "admin",
+                        "message": "管理员已回复",
+                        "created_at": "2026-08-19T10:00:00",
+                        "attachments": [],
+                    }
+                ],
+            }
+        ]
+        user = self.database.create_account(
+            "badge_user",
+            "BadgeUser@123",
+            "user",
+            self.admin.id,
+            display_name="徽标用户",
+        )
+        window = MainWindow(
+            self.database,
+            user,
+            session_manager=FakeSession(api),
+        )
+        window.show()
+        self.assertTrue(
+            self._wait_until(
+                lambda: window.announcement_horn_button.message_unread_count == 1
+            )
+        )
+        window._show_contact_history()
+        self.assertTrue(self._wait_until(lambda: api.user_read_calls == ["conversation-1"]))
+        self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
 
 
 if __name__ == "__main__":

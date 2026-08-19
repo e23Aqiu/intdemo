@@ -5,10 +5,22 @@ import mimetypes
 import os
 from pathlib import Path
 
-from PyQt5.QtCore import QPoint, QRectF, QObject, QRunnable, QSize, Qt, QThreadPool, pyqtSignal
+from PyQt5.QtCore import (
+    QPoint,
+    QRect,
+    QRectF,
+    QObject,
+    QRunnable,
+    QSize,
+    Qt,
+    QThreadPool,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt5.QtGui import (
     QColor,
     QFont,
+    QFontMetrics,
     QIcon,
     QPainter,
     QPainterPath,
@@ -291,6 +303,47 @@ class AnnouncementHoverCard(QFrame):
         self.move(x, y)
         self.show()
         self.raise_()
+
+
+class AnnouncementHornButton(QPushButton):
+    """Announcement shortcut with a compact unread-message counter."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._message_unread_count = 0
+
+    @property
+    def message_unread_count(self):
+        return self._message_unread_count
+
+    def set_message_unread_count(self, count):
+        count = max(0, int(count or 0))
+        if count == self._message_unread_count:
+            return
+        self._message_unread_count = count
+        self.update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._message_unread_count:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        diameter = 18
+        badge = QRect(self.width() - diameter - 1, 1, diameter, diameter)
+        painter.setPen(QPen(QColor("#ffffff"), 1))
+        painter.setBrush(QColor("#d14f45"))
+        painter.drawEllipse(badge)
+        font = painter.font()
+        font.setPointSize(7)
+        font.setBold(True)
+        painter.setFont(font)
+        painter.setPen(QColor("#ffffff"))
+        label = "99+" if self._message_unread_count > 99 else str(
+            self._message_unread_count
+        )
+        painter.drawText(badge, Qt.AlignCenter, label)
+        painter.end()
 
 
 class AnnouncementTickerButton(QPushButton):
@@ -779,10 +832,131 @@ class ContactAttachmentPicker(QWidget):
         self._refresh()
 
 
+class ConversationTimeline(QScrollArea):
+    """Scrollable, left/right aligned message bubbles with inline attachments."""
+
+    def __init__(self, attachment_opened, parent=None):
+        super().__init__(parent)
+        self._attachment_opened = attachment_opened
+        self._plain_text = ""
+        self.setObjectName("ChatTimeline")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._replace_content([])
+
+    def _replace_content(self, messages, *, own_role="user", peer_label="管理员"):
+        old_content = self.takeWidget()
+        if old_content is not None:
+            old_content.deleteLater()
+        content = QWidget()
+        content.setObjectName("ChatTimelineContent")
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(14, 16, 14, 16)
+        layout.setSpacing(12)
+        plain_blocks = []
+        if not messages:
+            empty = QLabel("还没有消息，发送一条消息开始沟通。")
+            empty.setObjectName("ChatEmptyState")
+            empty.setAlignment(Qt.AlignCenter)
+            layout.addStretch()
+            layout.addWidget(empty)
+            layout.addStretch()
+        for message in messages:
+            sender_role = str(message.get("sender_role") or "")
+            own = sender_role == own_role
+            sender = "我" if own else peer_label
+            created_at = _display_time(message.get("created_at"))
+            body = str(message.get("message") or "").strip()
+            attachments = list(message.get("attachments") or [])
+            display_body = body or "（仅附件）"
+            plain_blocks.append(f"{sender}  ·  {created_at}\n{display_body}")
+
+            row = QWidget(content)
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            row_layout.setSpacing(10)
+            bubble = QFrame(row)
+            bubble.setObjectName("ChatBubble")
+            bubble.setProperty("own", own)
+            bubble.setMaximumWidth(560)
+            bubble_layout = QVBoxLayout(bubble)
+            bubble_layout.setContentsMargins(13, 10, 13, 9)
+            bubble_layout.setSpacing(6)
+            sender_label = QLabel(sender)
+            sender_label.setObjectName("ChatBubbleSender")
+            bubble_layout.addWidget(sender_label)
+            if body:
+                body_label = QLabel(body)
+                body_label.setObjectName("ChatBubbleBody")
+                body_label.setTextFormat(Qt.PlainText)
+                body_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+                body_label.setWordWrap(True)
+                bubble_layout.addWidget(body_label)
+            for attachment in attachments:
+                attachment_text = (
+                    f"{'图片' if attachment.get('kind') == 'image' else '文件'}"
+                    f"  ·  {attachment.get('file_name') or '附件'}"
+                    f"  ({_format_size(attachment.get('size'))})"
+                )
+                attachment_button = QPushButton()
+                attachment_button.setObjectName("ChatAttachmentButton")
+                attachment_button.setMaximumWidth(520)
+                attachment_button.setText(
+                    QFontMetrics(attachment_button.font()).elidedText(
+                        attachment_text,
+                        Qt.ElideMiddle,
+                        485,
+                    )
+                )
+                attachment_button.setToolTip(
+                    f"点击打开附件\n{attachment.get('file_name') or '附件'}"
+                )
+                attachment_button.clicked.connect(
+                    lambda _checked=False, item=attachment: self._attachment_opened(item)
+                )
+                bubble_layout.addWidget(attachment_button)
+            time_label = QLabel(created_at)
+            time_label.setObjectName("ChatBubbleTime")
+            time_label.setAlignment(Qt.AlignRight if own else Qt.AlignLeft)
+            bubble_layout.addWidget(time_label)
+            if own:
+                row_layout.addStretch(1)
+                row_layout.addWidget(bubble)
+            else:
+                row_layout.addWidget(bubble)
+                row_layout.addStretch(1)
+            layout.addWidget(row)
+        if messages:
+            layout.addStretch(1)
+        self._plain_text = "\n\n".join(plain_blocks)
+        self.setWidget(content)
+        QTimer.singleShot(0, self._scroll_to_bottom)
+
+    def set_messages(self, messages, *, own_role="user", peer_label="管理员"):
+        self._replace_content(
+            list(messages or []),
+            own_role=own_role,
+            peer_label=peer_label,
+        )
+
+    def toPlainText(self):
+        return self._plain_text
+
+    def clear(self):
+        self._replace_content([])
+
+    def _scroll_to_bottom(self):
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+
 class ContactConversationDialog(FramelessDialog):
     """User-side conversation history, reply composer and resolution controls."""
 
     MAX_LENGTH = 2_000
+    unread_count_changed = pyqtSignal(int)
+    messages_changed = pyqtSignal()
 
     def __init__(self, announcement, session, parent=None, *, history_mode=False):
         super().__init__(
@@ -796,19 +970,38 @@ class ContactConversationDialog(FramelessDialog):
         self.history_mode = bool(history_mode or not announcement)
         self.conversation = None
         self.conversations = []
+        self.total_unread_count = 0
         self.legacy_mode = False
         self._conversation_picker_updating = False
+        self._refresh_task = None
+        self._read_tasks = []
+        self._known_admin_message_ids = set()
+        self._message_ids_initialized = False
         self.setWindowTitle("历史会话" if self.history_mode else "联系管理员")
-        self.setModal(True)
-        self.resize(760, 620)
-        self.setMinimumSize(620, 500)
+        self.setModal(False)
+        self.resize(840, 700)
+        self.setMinimumSize(680, 540)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(26, 44, 26, 22)
-        layout.setSpacing(10)
-        title = QLabel("历史会话" if self.history_mode else "联系管理员")
+        layout.setContentsMargins(22, 46, 22, 20)
+        layout.setSpacing(12)
+        header = QFrame()
+        header.setObjectName("ChatHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 13, 16, 13)
+        header_layout.setSpacing(12)
+        avatar = QLabel("管")
+        avatar.setObjectName("ChatAvatar")
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedSize(42, 42)
+        header_layout.addWidget(avatar)
+        heading_box = QVBoxLayout()
+        heading_box.setContentsMargins(0, 0, 0, 0)
+        heading_box.setSpacing(3)
+        title = QLabel("与管理员的历史会话" if self.history_mode else "联系管理员")
         title.setObjectName("PageTitle")
-        layout.addWidget(title)
+        heading_box.addWidget(title)
         self.related_label = QLabel(
             "查看与管理员的历史会话"
             if self.history_mode
@@ -816,7 +1009,13 @@ class ContactConversationDialog(FramelessDialog):
         )
         self.related_label.setObjectName("Muted")
         self.related_label.setWordWrap(True)
-        layout.addWidget(self.related_label)
+        heading_box.addWidget(self.related_label)
+        header_layout.addLayout(heading_box, 1)
+        self.notice_label = QLabel("收到管理员新回复")
+        self.notice_label.setObjectName("ChatNewMessageNotice")
+        self.notice_label.hide()
+        header_layout.addWidget(self.notice_label)
+        layout.addWidget(header)
         self.conversation_picker = None
         if self.history_mode:
             self.conversation_picker = QComboBox()
@@ -826,45 +1025,46 @@ class ContactConversationDialog(FramelessDialog):
             )
             layout.addWidget(self.conversation_picker)
         self.status_label = QLabel("正在读取会话…")
-        self.status_label.setObjectName("Muted")
+        self.status_label.setObjectName("ChatStatus")
         layout.addWidget(self.status_label)
 
-        self.history = QPlainTextEdit()
-        self.history.setReadOnly(True)
-        self.history.setPlaceholderText("尚未联系管理员。")
-        layout.addWidget(self.history, 1)
-
-        self.received_attachments = QListWidget()
-        self.received_attachments.setMaximumHeight(96)
-        self.received_attachments.setAlternatingRowColors(True)
-        self.received_attachments.itemDoubleClicked.connect(
-            lambda item: _open_contact_attachment(
+        self.history = ConversationTimeline(
+            lambda attachment: _open_contact_attachment(
                 self,
                 self.session,
-                item.data(Qt.UserRole) or {},
-            )
+                attachment,
+            ),
+            self,
         )
-        self.received_attachments.hide()
-        layout.addWidget(self.received_attachments)
+        layout.addWidget(self.history, 1)
 
+        # Kept as a hidden compatibility surface for older UI automation.
+        self.received_attachments = QListWidget()
+        self.received_attachments.hide()
+
+        composer = QFrame()
+        composer.setObjectName("ChatComposerFrame")
+        composer_layout = QVBoxLayout(composer)
+        composer_layout.setContentsMargins(12, 10, 12, 10)
+        composer_layout.setSpacing(7)
         self.message_edit = QPlainTextEdit()
-        self.message_edit.setMaximumHeight(120)
+        self.message_edit.setObjectName("ChatComposer")
+        self.message_edit.setMinimumHeight(82)
+        self.message_edit.setMaximumHeight(116)
         self.message_edit.setPlaceholderText("输入需要发送给管理员的内容…")
         self.message_edit.textChanged.connect(self._limit_message)
-        layout.addWidget(self.message_edit)
+        composer_layout.addWidget(self.message_edit)
         self.attachment_picker = ContactAttachmentPicker(self)
-        layout.addWidget(self.attachment_picker)
+        composer_layout.addWidget(self.attachment_picker)
         self.count_label = QLabel(f"0 / {self.MAX_LENGTH}")
         self.count_label.setObjectName("Muted")
         self.count_label.setAlignment(Qt.AlignRight)
-        layout.addWidget(self.count_label)
+        composer_layout.addWidget(self.count_label)
+        layout.addWidget(composer)
 
         buttons = QHBoxLayout()
-        self.unresolved_btn = QPushButton("未解决，继续沟通")
-        self.unresolved_btn.clicked.connect(lambda: self._set_status("open"))
         self.resolved_btn = QPushButton("已解决，结束会话")
         self.resolved_btn.clicked.connect(lambda: self._set_status("resolved"))
-        buttons.addWidget(self.unresolved_btn)
         buttons.addWidget(self.resolved_btn)
         buttons.addStretch()
         close_btn = QPushButton("关闭")
@@ -876,6 +1076,11 @@ class ContactConversationDialog(FramelessDialog):
         buttons.addWidget(self.send_btn)
         layout.addLayout(buttons)
         self._load()
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(12_000)
+        self._refresh_timer.timeout.connect(self._refresh_silently)
+        self._refresh_timer.start()
+        QTimer.singleShot(0, self.message_edit.setFocus)
 
     def _call(self, message, function):
         try:
@@ -883,6 +1088,20 @@ class ContactConversationDialog(FramelessDialog):
         except (ApiResponseError, NetworkUnavailable) as exc:
             QMessageBox.warning(self, "消息操作失败", str(exc))
             return None
+
+    def _fetch_conversations(self, **request_kwargs):
+        try:
+            return self.session.api.contact_conversations(
+                self.session.access_token(),
+                mark_read=False,
+                **request_kwargs,
+            )
+        except TypeError:
+            # Older servers and test doubles keep their original read-on-list behavior.
+            return self.session.api.contact_conversations(
+                self.session.access_token(),
+                **request_kwargs,
+            )
 
     def _load(self):
         request_kwargs = {}
@@ -892,10 +1111,7 @@ class ContactConversationDialog(FramelessDialog):
             result = run_with_loading(
                 self,
                 "正在读取会话…",
-                lambda: self.session.api.contact_conversations(
-                    self.session.access_token(),
-                    **request_kwargs,
-                ),
+                lambda: self._fetch_conversations(**request_kwargs),
             )
         except ApiResponseError as exc:
             if exc.status_code == 404:
@@ -909,6 +1125,7 @@ class ContactConversationDialog(FramelessDialog):
             self._render()
             return
         self.conversations = list((result or {}).get("items") or [])
+        self.total_unread_count = int((result or {}).get("unread_count") or 0)
         if self.history_mode:
             self._populate_conversation_picker()
         else:
@@ -917,6 +1134,9 @@ class ContactConversationDialog(FramelessDialog):
                 self.conversations[0] if self.conversations else None,
             )
         self._render()
+        self._remember_admin_messages(notify=False)
+        self.unread_count_changed.emit(self.total_unread_count)
+        self._mark_current_conversation_read()
 
     @staticmethod
     def _conversation_label(conversation):
@@ -976,6 +1196,7 @@ class ContactConversationDialog(FramelessDialog):
         self.conversation = item if isinstance(item, dict) else None
         self._update_related_label()
         self._render()
+        self._mark_current_conversation_read()
 
     def _update_related_label(self):
         if not self.history_mode:
@@ -992,10 +1213,8 @@ class ContactConversationDialog(FramelessDialog):
             else "当前服务暂不支持读取历史会话。"
         )
         self.history.clear()
-        self.history.setPlaceholderText("尚未联系管理员。")
         self.attachment_picker.hide()
         self.received_attachments.hide()
-        self.unresolved_btn.hide()
         self.resolved_btn.hide()
         self.send_btn.setText("发送消息")
         if self.history_mode:
@@ -1006,14 +1225,10 @@ class ContactConversationDialog(FramelessDialog):
     def _render(self):
         conversation = self.conversation
         messages = list((conversation or {}).get("messages") or [])
-        lines = []
         self.received_attachments.clear()
         for message in messages:
             role = "管理员" if message.get("sender_role") == "admin" else "我"
-            text = str(message.get("message") or "").strip()
             attachments = list(message.get("attachments") or [])
-            body = text or "（仅附件）"
-            lines.append(f"{role}  ·  {_display_time(message.get('created_at'))}\n{body}")
             for attachment in attachments:
                 item = QListWidgetItem(
                     f"{role} · {attachment.get('file_name') or '附件'}  "
@@ -1021,8 +1236,7 @@ class ContactConversationDialog(FramelessDialog):
                 )
                 item.setData(Qt.UserRole, attachment)
                 self.received_attachments.addItem(item)
-        self.history.setPlainText("\n\n".join(lines))
-        self.received_attachments.setVisible(self.received_attachments.count() > 0)
+        self.history.set_messages(messages, own_role="user", peer_label="管理员")
         if self.history_mode:
             self._update_related_label()
         status = str((conversation or {}).get("status") or "")
@@ -1034,22 +1248,125 @@ class ContactConversationDialog(FramelessDialog):
             self.status_label.setText(
                 "暂无历史会话" if self.history_mode else "尚未发起会话"
             )
-            self.unresolved_btn.setEnabled(False)
             self.resolved_btn.setEnabled(False)
             self.send_btn.setText("发送消息")
         elif status == "resolved":
             self.status_label.setText("该会话已解决；继续发送将发起新会话。")
-            self.unresolved_btn.setEnabled(True)
             self.resolved_btn.setEnabled(False)
             self.send_btn.setText("发起新会话")
         else:
             self.status_label.setText("会话处理中，可继续回复管理员。")
-            self.unresolved_btn.setEnabled(True)
             self.resolved_btn.setEnabled(True)
             self.send_btn.setText("发送回复")
         if self.history_mode and not conversation:
             self.send_btn.setEnabled(False)
-        self.history.moveCursor(self.history.textCursor().End)
+
+    def _request_kwargs(self):
+        request_kwargs = {"limit": 200 if self.history_mode else 50}
+        if not self.history_mode and self.announcement.get("id"):
+            request_kwargs["announcement_id"] = str(self.announcement["id"])
+        return request_kwargs
+
+    def _refresh_silently(self):
+        if self._refresh_task is not None or not self.isVisible() or self.legacy_mode:
+            return
+
+        def completed(result, error):
+            self._refresh_task = None
+            if error is not None or not isinstance(result, dict):
+                return
+            selected_id = str((self.conversation or {}).get("id") or "")
+            self.conversations = list(result.get("items") or [])
+            self.total_unread_count = int(result.get("unread_count") or 0)
+            if self.history_mode:
+                self._populate_conversation_picker(selected_id=selected_id)
+            else:
+                self.conversation = next(
+                    (
+                        item
+                        for item in self.conversations
+                        if str(item.get("id") or "") == selected_id
+                    ),
+                    next(
+                        (
+                            item
+                            for item in self.conversations
+                            if item.get("status") == "open"
+                        ),
+                        self.conversations[0] if self.conversations else None,
+                    ),
+                )
+            self._render()
+            self._remember_admin_messages(notify=True)
+            self.unread_count_changed.emit(
+                self.total_unread_count
+            )
+            self._mark_current_conversation_read()
+
+        self._refresh_task = start_api_task(
+            lambda: self._fetch_conversations(**self._request_kwargs()),
+            completed,
+        )
+
+    def _remember_admin_messages(self, *, notify):
+        admin_message_ids = {
+            str(message.get("id") or "")
+            for conversation in self.conversations
+            for message in conversation.get("messages") or []
+            if message.get("sender_role") == "admin" and message.get("id")
+        }
+        new_ids = admin_message_ids - self._known_admin_message_ids
+        should_notify = bool(notify and self._message_ids_initialized and new_ids)
+        self._known_admin_message_ids = admin_message_ids
+        self._message_ids_initialized = True
+        if not should_notify:
+            return
+        self.notice_label.show()
+        self.notice_label.raise_()
+        application = QApplication.instance()
+        if application is not None:
+            application.alert(self, 0)
+        QTimer.singleShot(5_000, self.notice_label.hide)
+
+    def _mark_current_conversation_read(self):
+        conversation = self.conversation
+        if not conversation or not int(conversation.get("user_unread_count") or 0):
+            return
+        method = getattr(
+            self.session.api,
+            "mark_contact_conversation_read",
+            None,
+        )
+        if not callable(method):
+            return
+        conversation_id = str(conversation.get("id") or "")
+        if not conversation_id:
+            return
+        conversation_unread = int(conversation.get("user_unread_count") or 0)
+        conversation["user_unread_count"] = 0
+        for message in conversation.get("messages") or []:
+            if message.get("sender_role") == "admin":
+                message["user_read_at"] = message.get("user_read_at") or True
+        self.total_unread_count = max(
+            0,
+            self.total_unread_count - conversation_unread,
+        )
+        self.unread_count_changed.emit(self.total_unread_count)
+        self.messages_changed.emit()
+        task = None
+
+        def completed(_result, _error):
+            if task in self._read_tasks:
+                self._read_tasks.remove(task)
+
+        task = start_api_task(
+            lambda: method(
+                self.session.access_token(),
+                conversation_id,
+            ),
+            completed,
+        )
+        self._read_tasks.append(task)
 
     def _limit_message(self):
         text = self.message_edit.toPlainText()
@@ -1133,6 +1450,7 @@ class ContactConversationDialog(FramelessDialog):
         self.message_edit.clear()
         self.attachment_picker.clear()
         self._render()
+        self.messages_changed.emit()
 
     def _set_status(self, status):
         conversation = self.conversation
@@ -1159,6 +1477,7 @@ class ContactConversationDialog(FramelessDialog):
             self.conversations.insert(0, result)
             self._populate_conversation_picker(selected_id=result_id)
         self._render()
+        self.messages_changed.emit()
         if status == "open":
             self.message_edit.setFocus()
 
@@ -1168,6 +1487,286 @@ class ContactHistoryDialog(ContactConversationDialog):
 
     def __init__(self, session, parent=None):
         super().__init__(None, session, parent, history_mode=True)
+
+
+class AdminConversationDialog(FramelessDialog):
+    """Independent administrator chat window for one user conversation."""
+
+    MAX_LENGTH = 2_000
+    conversation_updated = pyqtSignal(object)
+    unread_count_changed = pyqtSignal(int)
+
+    def __init__(self, conversation, session, parent=None):
+        super().__init__(
+            parent,
+            resizable=True,
+            show_minimize=True,
+            show_maximize=True,
+        )
+        self.conversation = dict(conversation or {})
+        self.session = session
+        self._refresh_task = None
+        self._read_tasks = []
+        self._known_user_message_ids = set()
+        self._message_ids_initialized = False
+        self.setWindowTitle(
+            f"回复用户 - {self.conversation.get('sender_display_name') or '用户'}"
+        )
+        self.setModal(False)
+        self.resize(840, 700)
+        self.setMinimumSize(680, 540)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 46, 22, 20)
+        root.setSpacing(12)
+        header = QFrame()
+        header.setObjectName("ChatHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 13, 16, 13)
+        header_layout.setSpacing(12)
+        avatar_text = str(
+            self.conversation.get("sender_display_name")
+            or self.conversation.get("sender_username")
+            or "用"
+        )[:1]
+        avatar = QLabel(avatar_text)
+        avatar.setObjectName("ChatAvatar")
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setFixedSize(42, 42)
+        header_layout.addWidget(avatar)
+        heading_box = QVBoxLayout()
+        heading_box.setContentsMargins(0, 0, 0, 0)
+        heading_box.setSpacing(3)
+        self.user_label = QLabel()
+        self.user_label.setObjectName("PageTitle")
+        heading_box.addWidget(self.user_label)
+        self.related_label = QLabel()
+        self.related_label.setObjectName("Muted")
+        self.related_label.setWordWrap(True)
+        heading_box.addWidget(self.related_label)
+        header_layout.addLayout(heading_box, 1)
+        self.notice_label = QLabel("收到用户新消息")
+        self.notice_label.setObjectName("ChatNewMessageNotice")
+        self.notice_label.hide()
+        header_layout.addWidget(self.notice_label)
+        root.addWidget(header)
+
+        self.status_label = QLabel()
+        self.status_label.setObjectName("ChatStatus")
+        root.addWidget(self.status_label)
+        self.history = ConversationTimeline(
+            lambda attachment: _open_contact_attachment(
+                self,
+                self.session,
+                attachment,
+            ),
+            self,
+        )
+        root.addWidget(self.history, 1)
+
+        composer = QFrame()
+        composer.setObjectName("ChatComposerFrame")
+        composer_layout = QVBoxLayout(composer)
+        composer_layout.setContentsMargins(12, 10, 12, 10)
+        composer_layout.setSpacing(7)
+        self.message_edit = QPlainTextEdit()
+        self.message_edit.setObjectName("ChatComposer")
+        self.message_edit.setMinimumHeight(82)
+        self.message_edit.setMaximumHeight(116)
+        self.message_edit.setPlaceholderText("输入回复内容…")
+        self.message_edit.textChanged.connect(self._limit_message)
+        composer_layout.addWidget(self.message_edit)
+        self.attachment_picker = ContactAttachmentPicker(self)
+        composer_layout.addWidget(self.attachment_picker)
+        self.count_label = QLabel(f"0 / {self.MAX_LENGTH}")
+        self.count_label.setObjectName("Muted")
+        self.count_label.setAlignment(Qt.AlignRight)
+        composer_layout.addWidget(self.count_label)
+        root.addWidget(composer)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        close_btn = QPushButton("关闭")
+        close_btn.clicked.connect(self.reject)
+        self.send_btn = QPushButton("发送回复")
+        self.send_btn.setObjectName("PrimaryButton")
+        self.send_btn.clicked.connect(self._send)
+        actions.addWidget(close_btn)
+        actions.addWidget(self.send_btn)
+        root.addLayout(actions)
+
+        self._render()
+        self._remember_user_messages(notify=False)
+        self._mark_read()
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(12_000)
+        self._refresh_timer.timeout.connect(self._refresh_silently)
+        self._refresh_timer.start()
+        QTimer.singleShot(0, self.message_edit.setFocus)
+
+    def _call(self, message, function):
+        try:
+            return run_with_loading(self, message, function)
+        except (ApiResponseError, NetworkUnavailable, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "消息操作失败", str(exc))
+            return None
+
+    def _render(self):
+        display_name = str(
+            self.conversation.get("sender_display_name")
+            or self.conversation.get("sender_username")
+            or "用户"
+        )
+        username = str(self.conversation.get("sender_username") or "-")
+        self.user_label.setText(display_name)
+        self.related_label.setText(
+            f"账号：{username}    关联公告："
+            f"{self.conversation.get('announcement_title') or '公告已删除'}"
+        )
+        status = str(self.conversation.get("status") or "open")
+        self.status_label.setText(
+            "用户已结束该会话，仍可发送补充回复。"
+            if status == "resolved"
+            else "会话处理中"
+        )
+        self.history.set_messages(
+            self.conversation.get("messages") or [],
+            own_role="admin",
+            peer_label=display_name,
+        )
+
+    def _limit_message(self):
+        text = self.message_edit.toPlainText()
+        if len(text) > self.MAX_LENGTH:
+            cursor = self.message_edit.textCursor()
+            position = min(cursor.position(), self.MAX_LENGTH)
+            self.message_edit.setPlainText(text[: self.MAX_LENGTH])
+            cursor = self.message_edit.textCursor()
+            cursor.setPosition(position)
+            self.message_edit.setTextCursor(cursor)
+            text = self.message_edit.toPlainText()
+        self.count_label.setText(f"{len(text)} / {self.MAX_LENGTH}")
+
+    def _send(self):
+        message = self.message_edit.toPlainText().strip()
+        if not message and not self.attachment_picker.has_attachments():
+            QMessageBox.warning(self, "回复为空", "请输入文字或添加附件。")
+            return
+        try:
+            attachments = self.attachment_picker.payloads()
+        except OSError as exc:
+            QMessageBox.warning(self, "附件读取失败", str(exc))
+            return
+        conversation_id = str(self.conversation.get("id") or "")
+        result = self._call(
+            "正在发送回复…",
+            lambda: self.session.api.admin_reply_message(
+                self.session.access_token(),
+                conversation_id,
+                message,
+                attachments,
+            ),
+        )
+        if result is None:
+            return
+        if isinstance(result, dict) and result.get("messages") is not None:
+            self.conversation = result
+        else:
+            local_message = {
+                "id": f"local-{len(self.conversation.get('messages') or [])}",
+                "sender_role": "admin",
+                "message": message,
+                "attachments": attachments,
+                "created_at": "刚刚",
+            }
+            self.conversation.setdefault("messages", []).append(local_message)
+            self.conversation["last_message"] = local_message
+        self.message_edit.clear()
+        self.attachment_picker.clear()
+        self._render()
+        self.conversation_updated.emit(self.conversation)
+
+    def _mark_read(self):
+        if not int(self.conversation.get("unread_count") or 0):
+            return
+        conversation_id = str(self.conversation.get("id") or "")
+        if not conversation_id:
+            return
+        self.conversation["unread_count"] = 0
+        self.conversation["read_at"] = self.conversation.get("read_at") or True
+        self.conversation_updated.emit(self.conversation)
+        task = None
+
+        def completed(_result, _error):
+            if task in self._read_tasks:
+                self._read_tasks.remove(task)
+
+        task = start_api_task(
+            lambda: self.session.api.admin_mark_message_read(
+                self.session.access_token(),
+                conversation_id,
+            ),
+            completed,
+        )
+        self._read_tasks.append(task)
+
+    def _refresh_silently(self):
+        if self._refresh_task is not None or not self.isVisible():
+            return
+        conversation_id = str(self.conversation.get("id") or "")
+
+        def completed(result, error):
+            self._refresh_task = None
+            if error is not None or not isinstance(result, dict):
+                return
+            refreshed = next(
+                (
+                    item
+                    for item in result.get("items") or []
+                    if str(item.get("id") or "") == conversation_id
+                ),
+                None,
+            )
+            if refreshed is None:
+                return
+            self.conversation = refreshed
+            self._render()
+            self._remember_user_messages(notify=True)
+            self.unread_count_changed.emit(
+                max(
+                    0,
+                    int(result.get("unread_count") or 0)
+                    - int(refreshed.get("unread_count") or 0),
+                )
+            )
+            self._mark_read()
+
+        self._refresh_task = start_api_task(
+            lambda: self.session.api.admin_messages(
+                self.session.access_token(),
+                limit=200,
+            ),
+            completed,
+        )
+
+    def _remember_user_messages(self, *, notify):
+        user_message_ids = {
+            str(message.get("id") or "")
+            for message in self.conversation.get("messages") or []
+            if message.get("sender_role") == "user" and message.get("id")
+        }
+        new_ids = user_message_ids - self._known_user_message_ids
+        should_notify = bool(notify and self._message_ids_initialized and new_ids)
+        self._known_user_message_ids = user_message_ids
+        self._message_ids_initialized = True
+        if not should_notify:
+            return
+        self.notice_label.show()
+        application = QApplication.instance()
+        if application is not None:
+            application.alert(self, 0)
+        QTimer.singleShot(5_000, self.notice_label.hide)
 
 
 class ImagePreviewDialog(FramelessDialog):
@@ -1233,6 +1832,7 @@ class ImagePreviewDialog(FramelessDialog):
 
 class AnnouncementDetailDialog(FramelessDialog):
     read_confirmed = pyqtSignal()
+    contact_requested = pyqtSignal(object)
 
     def __init__(self, announcement, session, account, parent=None):
         super().__init__(
@@ -1355,7 +1955,8 @@ class AnnouncementDetailDialog(FramelessDialog):
         QMessageBox.information(self, "保存完成", f"附件已保存到：\n{target}")
 
     def _contact_admin(self):
-        ContactConversationDialog(self.announcement, self.session, self).exec_()
+        self.accept()
+        self.contact_requested.emit(self.announcement)
 
     def _confirm_and_close(self):
         if not self.account.is_admin and not self.announcement.get("read_at"):
@@ -1834,6 +2435,8 @@ class AnnouncementAdminPage(QWidget):
         self.announcements = []
         self.accounts = []
         self.messages = []
+        self._message_read_tasks = []
+        self._chat_windows = {}
         self._build_ui()
 
     def _build_ui(self):
@@ -1926,16 +2529,16 @@ class AnnouncementAdminPage(QWidget):
         self.inbox_summary.setStyleSheet("font-weight:700;color:#264b4c;")
         inbox_actions.addWidget(self.inbox_summary)
         inbox_actions.addStretch()
-        mark_btn = QPushButton("标记所选为已读")
-        mark_btn.clicked.connect(self._mark_message_read)
-        inbox_actions.addWidget(mark_btn)
+        self.admin_reply_btn = QPushButton("回复用户")
+        self.admin_reply_btn.setObjectName("PrimaryButton")
+        self.admin_reply_btn.clicked.connect(self._reply_message)
+        inbox_actions.addWidget(self.admin_reply_btn)
         self.delete_message_btn = QPushButton("删除所选消息")
         self.delete_message_btn.setObjectName("DangerButton")
         self.delete_message_btn.clicked.connect(self._delete_message)
         inbox_actions.addWidget(self.delete_message_btn)
         inbox_layout.addLayout(inbox_actions)
 
-        inbox_splitter = QSplitter(Qt.Vertical)
         self.message_table = QTableWidget(0, 6)
         self.message_table.setHorizontalHeaderLabels(
             ["未读", "会话状态", "发送用户", "关联公告", "最新消息", "更新时间"]
@@ -1948,6 +2551,9 @@ class AnnouncementAdminPage(QWidget):
             "AnnouncementMessageTable",
         )
         self.message_table.itemSelectionChanged.connect(self._message_selection_changed)
+        self.message_table.itemDoubleClicked.connect(
+            lambda _item: self._open_selected_conversation()
+        )
         message_header = self.message_table.horizontalHeader()
         message_header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         message_header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
@@ -1955,39 +2561,7 @@ class AnnouncementAdminPage(QWidget):
         message_header.setSectionResizeMode(3, QHeaderView.Stretch)
         message_header.setSectionResizeMode(4, QHeaderView.Stretch)
         message_header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        inbox_splitter.addWidget(self.message_table)
-        self.message_detail = QPlainTextEdit()
-        self.message_detail.setReadOnly(True)
-        self.message_detail.setPlaceholderText("选择消息后查看完整纯文字内容。")
-        inbox_splitter.addWidget(self.message_detail)
-        inbox_splitter.setSizes([430, 210])
-        inbox_layout.addWidget(inbox_splitter, 1)
-        self.message_attachments = QListWidget()
-        self.message_attachments.setMaximumHeight(92)
-        self.message_attachments.setAlternatingRowColors(True)
-        self.message_attachments.itemDoubleClicked.connect(
-            lambda item: _open_contact_attachment(
-                self,
-                self.session,
-                item.data(Qt.UserRole) or {},
-            )
-        )
-        self.message_attachments.hide()
-        inbox_layout.addWidget(self.message_attachments)
-        reply_row = QHBoxLayout()
-        reply_box = QVBoxLayout()
-        self.admin_reply_edit = QPlainTextEdit()
-        self.admin_reply_edit.setMaximumHeight(88)
-        self.admin_reply_edit.setPlaceholderText("选择会话后输入回复内容…")
-        reply_box.addWidget(self.admin_reply_edit)
-        self.admin_attachment_picker = ContactAttachmentPicker(self)
-        reply_box.addWidget(self.admin_attachment_picker)
-        reply_row.addLayout(reply_box, 1)
-        self.admin_reply_btn = QPushButton("回复用户")
-        self.admin_reply_btn.setObjectName("PrimaryButton")
-        self.admin_reply_btn.clicked.connect(self._reply_message)
-        reply_row.addWidget(self.admin_reply_btn)
-        inbox_layout.addLayout(reply_row)
+        inbox_layout.addWidget(self.message_table, 1)
         self.tabs.addTab(inbox, "用户消息")
         self._selection_state()
 
@@ -2118,11 +2692,6 @@ class AnnouncementAdminPage(QWidget):
         self.inbox_summary.setText(f"未读消息：{unread_count}")
         self.unread_messages_changed.emit(unread_count)
         self.message_table.clearSelection()
-        self.message_detail.clear()
-        self.message_attachments.clear()
-        self.message_attachments.hide()
-        self.admin_reply_edit.clear()
-        self.admin_attachment_picker.clear()
         self._selection_state()
 
     def _selected_announcement(self):
@@ -2167,8 +2736,6 @@ class AnnouncementAdminPage(QWidget):
         if hasattr(self, "admin_reply_btn"):
             has_message = self._selected_message() is not None
             self.admin_reply_btn.setEnabled(has_message)
-            self.admin_reply_edit.setEnabled(has_message)
-            self.admin_attachment_picker.setEnabled(has_message)
 
     def _announcement_selection_changed(self):
         announcement = self._selected_announcement()
@@ -2198,49 +2765,8 @@ class AnnouncementAdminPage(QWidget):
     def _message_selection_changed(self):
         message = self._selected_message()
         self._selection_state()
-        if not message:
-            self.message_detail.clear()
-            self.message_attachments.clear()
-            self.message_attachments.hide()
-            return
-        lines = [
-            f"发送用户：{message.get('sender_display_name') or '-'}"
-            f"（{message.get('sender_username') or '-'}）",
-            f"关联公告：{message.get('announcement_title') or '公告已删除'}",
-            f"会话状态：{'已解决' if message.get('status') == 'resolved' else '处理中'}",
-            "",
-        ]
-        history = list(message.get("messages") or [])
-        if not history and message.get("message"):
-            history = [
-                {
-                    "sender_role": "user",
-                    "created_at": message.get("created_at"),
-                    "message": message.get("message"),
-                }
-            ]
-        for item in history:
-            role = "管理员" if item.get("sender_role") == "admin" else "用户"
-            text = str(item.get("message") or "").strip() or "（仅附件）"
-            lines.extend(
-                [
-                    f"{role} · {_display_time(item.get('created_at'))}",
-                    text,
-                    "",
-                ]
-            )
-        self.message_detail.setPlainText("\n".join(lines).rstrip())
-        self.message_attachments.clear()
-        for history_item in history:
-            role = "管理员" if history_item.get("sender_role") == "admin" else "用户"
-            for attachment in history_item.get("attachments") or []:
-                row = QListWidgetItem(
-                    f"{role} · {attachment.get('file_name') or '附件'}  "
-                    f"({_format_size(attachment.get('size'))})"
-                )
-                row.setData(Qt.UserRole, attachment)
-                self.message_attachments.addItem(row)
-        self.message_attachments.setVisible(self.message_attachments.count() > 0)
+        if message and int(message.get("unread_count") or 0):
+            self._mark_message_read(message)
 
     def _create(self):
         dialog = AnnouncementEditorDialog(self.accounts, parent=self)
@@ -2357,49 +2883,93 @@ class AnnouncementAdminPage(QWidget):
             self.announcements_changed.emit()
             self.refresh()
 
-    def _mark_message_read(self):
-        message = self._selected_message()
-        if not message or message.get("read_at"):
+    def _mark_message_read(self, message=None):
+        message = message or self._selected_message()
+        if not message or not int(message.get("unread_count") or 0):
             return
-        result = self._call(
-            "正在更新消息状态…",
+        unread = int(message.get("unread_count") or 0)
+        message["unread_count"] = 0
+        message["read_at"] = message.get("read_at") or True
+        total_unread = sum(
+            int(item.get("unread_count") or 0) for item in self.messages
+        )
+        self._fill_message_row(message)
+        self.inbox_summary.setText(f"未读消息：{total_unread}")
+        self.unread_messages_changed.emit(total_unread)
+        task = None
+
+        def completed(_result, error):
+            if task in self._message_read_tasks:
+                self._message_read_tasks.remove(task)
+            if error is not None:
+                message["unread_count"] = unread
+                message["read_at"] = None
+                restored = sum(
+                    int(item.get("unread_count") or 0) for item in self.messages
+                )
+                self._fill_message_row(message)
+                self.inbox_summary.setText(f"未读消息：{restored}")
+                self.unread_messages_changed.emit(restored)
+
+        task = start_api_task(
             lambda: self.session.api.admin_mark_message_read(
                 self.session.access_token(),
                 str(message.get("id")),
             ),
+            completed,
         )
-        if result is not None:
-            self.refresh()
+        self._message_read_tasks.append(task)
+
+    def _fill_message_row(self, message):
+        message_id = str(message.get("id") or "")
+        for row in range(self.message_table.rowCount()):
+            item = self.message_table.item(row, 0)
+            if item is None or str(item.data(Qt.UserRole) or "") != message_id:
+                continue
+            unread = int(message.get("unread_count") or 0)
+            item.setText(str(unread))
+            font = item.font()
+            font.setBold(bool(unread))
+            item.setFont(font)
+            item.setForeground(QColor("#d14f45" if unread else "#334155"))
+            return
 
     def _reply_message(self):
+        self._open_selected_conversation()
+
+    def _open_selected_conversation(self):
         message = self._selected_message()
-        reply = self.admin_reply_edit.toPlainText().strip()
         if not message:
             return
-        if not reply and not self.admin_attachment_picker.has_attachments():
-            QMessageBox.warning(self, "回复为空", "请输入文字或添加附件。")
+        message_id = str(message.get("id") or "")
+        current = self._chat_windows.get(message_id)
+        if current is not None and current.isVisible():
+            current.raise_()
+            current.activateWindow()
+            current.message_edit.setFocus()
             return
-        if len(reply) > 2_000:
-            QMessageBox.warning(self, "回复过长", "回复内容不能超过 2000 个字符。")
-            return
-        try:
-            attachments = self.admin_attachment_picker.payloads()
-        except OSError as exc:
-            QMessageBox.warning(self, "附件读取失败", str(exc))
-            return
-        result = self._call(
-            "正在发送回复…",
-            lambda: self.session.api.admin_reply_message(
-                self.session.access_token(),
-                str(message.get("id")),
-                reply,
-                attachments,
-            ),
-        )
-        if result is not None:
-            self.admin_reply_edit.clear()
-            self.admin_attachment_picker.clear()
-            self.refresh()
+        self._mark_message_read(message)
+        dialog = AdminConversationDialog(message, self.session, parent=None)
+
+        def update_message(updated):
+            target_id = str((updated or {}).get("id") or "")
+            for index, item in enumerate(self.messages):
+                if str(item.get("id") or "") == target_id:
+                    self.messages[index] = dict(updated)
+                    break
+            self._fill_messages(
+                sum(int(item.get("unread_count") or 0) for item in self.messages)
+            )
+
+        def clear_dialog(*_args):
+            if self._chat_windows.get(message_id) is dialog:
+                self._chat_windows.pop(message_id, None)
+
+        dialog.conversation_updated.connect(update_message)
+        dialog.unread_count_changed.connect(self.unread_messages_changed)
+        dialog.finished.connect(clear_dialog)
+        self._chat_windows[message_id] = dialog
+        dialog.show()
 
     def _delete_message(self):
         message = self._selected_message()
@@ -2427,3 +2997,8 @@ class AnnouncementAdminPage(QWidget):
         )
         if result is sentinel:
             self.refresh()
+
+    def close_chat_windows(self):
+        for dialog in list(self._chat_windows.values()):
+            dialog.close()
+        self._chat_windows.clear()

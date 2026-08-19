@@ -27,6 +27,7 @@ from PyQt5.QtWidgets import (
 from ..config import APP_NAME, APP_VERSION
 from ..database import Database
 from ..models import Account
+from ..online.api import ApiResponseError
 from ..online.captcha_learning import CaptchaLearningService
 from ..platform_support import (
     supports_self_update,
@@ -40,8 +41,10 @@ from .account_page import AccountPage
 from .announcement_page import (
     AnnouncementAdminPage,
     AnnouncementDetailDialog,
+    AnnouncementHornButton,
     AnnouncementListDialog,
     AnnouncementTickerButton,
+    ContactConversationDialog,
     ContactHistoryDialog,
     start_api_task,
 )
@@ -177,6 +180,8 @@ class MainWindow(FramelessMainWindow):
         self.announcement_dialog = None
         self.announcement_list_dialog = None
         self.contact_history_dialog = None
+        self.contact_conversation_dialogs = {}
+        self._announcement_message_unread_count = None
         self._announcement_poll_task = None
         self._announcement_action_tasks = []
         self._announcement_poll_timer = None
@@ -232,7 +237,12 @@ class MainWindow(FramelessMainWindow):
         if not self.offline_business_mode:
             self.statistics_page = StatisticsPage(database, account, warning)
             self.statistics_page.set_sidebar_navigation(True)
-            self.dashboard_page = DashboardPage(database, account)
+            self.dashboard_page = DashboardPage(
+                database,
+                account,
+                client_preferences=self.client_preferences,
+                account_key=account.username,
+            )
         self.workflow_timing = (
             WorkflowTimingService(database, account.id)
             if self.business_metrics_enabled
@@ -718,7 +728,7 @@ class MainWindow(FramelessMainWindow):
         self.offline_mode_badge.setObjectName("OfflineBusinessBadge")
         self.offline_mode_badge.setVisible(self.offline_business_mode)
         layout.addWidget(self.offline_mode_badge)
-        self.announcement_horn_button = QPushButton()
+        self.announcement_horn_button = AnnouncementHornButton()
         self.announcement_horn_button.setObjectName("AnnouncementHornButton")
         self.announcement_horn_button.setIcon(
             QIcon(_control_asset_path("announcement.svg"))
@@ -759,7 +769,7 @@ class MainWindow(FramelessMainWindow):
 
     def _start_announcement_polling(self):
         self._announcement_poll_timer = QTimer(self)
-        self._announcement_poll_timer.setInterval(60_000)
+        self._announcement_poll_timer.setInterval(30_000)
         self._announcement_poll_timer.timeout.connect(self.refresh_announcements)
         self._announcement_poll_timer.start()
 
@@ -792,6 +802,21 @@ class MainWindow(FramelessMainWindow):
                     limit=1,
                 )
                 result["unread_messages"] = int((inbox or {}).get("unread_count") or 0)
+            else:
+                unread_loader = getattr(
+                    self.session_manager.api,
+                    "contact_conversation_unread_count",
+                    None,
+                )
+                if callable(unread_loader):
+                    try:
+                        result["unread_messages"] = int(unread_loader(token))
+                    except ApiResponseError as exc:
+                        if exc.status_code != 404:
+                            raise
+                        result["unread_messages"] = 0
+                else:
+                    result["unread_messages"] = 0
             return result
 
         self._announcement_poll_task = start_api_task(
@@ -855,10 +880,24 @@ class MainWindow(FramelessMainWindow):
         self.announcement_ticker_button.setEnabled(
             controls_available and has_announcements
         )
+        message_unread = (
+            0
+            if self.account.is_admin
+            else max(0, int(self._announcement_message_unread_count or 0))
+        )
         if not has_announcements:
-            self.announcement_horn_button.setProperty("hasUnread", False)
+            self.announcement_horn_button.setProperty(
+                "hasUnread",
+                bool(message_unread),
+            )
             self.announcement_horn_button.setToolTip(
-                "查看历史会话" if not self.account.is_admin else "暂无公告"
+                (
+                    f"有 {message_unread} 条管理员未读回复，点击查看历史会话"
+                    if message_unread
+                    else "查看历史会话"
+                )
+                if not self.account.is_admin
+                else "暂无公告"
             )
             self.announcement_ticker_button.setText("暂无公告")
             self.announcement_ticker_button.setToolTip("")
@@ -871,18 +910,27 @@ class MainWindow(FramelessMainWindow):
                 or announcement.get("title")
                 or "查看公告"
             )
-            unread = bool(
+            unread_announcements = bool(
                 not self.account.is_admin
                 and any(
                     not announcement.get("read_at")
                     for announcement in self.announcements
                 )
             )
+            unread = bool(unread_announcements or message_unread)
             self.announcement_horn_button.setProperty("hasUnread", unread)
             self.announcement_horn_button.setToolTip(
-                "有未读公告，点击查看全部公告"
-                if unread
-                else "点击查看全部公告"
+                (
+                    f"有 {message_unread} 条管理员未读回复"
+                    + ("和未读公告" if unread_announcements else "")
+                    + "，点击查看"
+                )
+                if message_unread
+                else (
+                    "有未读公告，点击查看全部公告"
+                    if unread_announcements
+                    else "点击查看全部公告"
+                )
             )
             self.announcement_ticker_button.setText(ticker_text)
             self.announcement_ticker_button.setToolTip("")
@@ -942,15 +990,46 @@ class MainWindow(FramelessMainWindow):
             current.raise_()
             current.activateWindow()
             return
-        dialog = ContactHistoryDialog(self.session_manager, self)
+        dialog = ContactHistoryDialog(self.session_manager, parent=None)
 
         def clear_dialog(*_args):
             if self.contact_history_dialog is dialog:
                 self.contact_history_dialog = None
 
         dialog.finished.connect(clear_dialog)
+        dialog.unread_count_changed.connect(self._set_announcement_message_indicator)
+        dialog.messages_changed.connect(self.refresh_announcements)
         self.contact_history_dialog = dialog
-        dialog.open()
+        self._set_announcement_message_indicator(dialog.total_unread_count)
+        dialog.show()
+
+    def _show_contact_conversation(self, announcement):
+        if self.account.is_admin or self.session_manager is None:
+            return
+        announcement_id = str((announcement or {}).get("id") or "")
+        key = announcement_id or "new"
+        current = self.contact_conversation_dialogs.get(key)
+        if current is not None and current.isVisible():
+            current.raise_()
+            current.activateWindow()
+            current.message_edit.setFocus()
+            return
+        dialog = ContactConversationDialog(
+            announcement,
+            self.session_manager,
+            parent=None,
+        )
+
+        def clear_dialog(*_args):
+            if self.contact_conversation_dialogs.get(key) is dialog:
+                self.contact_conversation_dialogs.pop(key, None)
+
+        dialog.finished.connect(clear_dialog)
+        dialog.unread_count_changed.connect(self._set_announcement_message_indicator)
+        dialog.messages_changed.connect(self.refresh_announcements)
+        self.contact_conversation_dialogs[key] = dialog
+        self._set_announcement_message_indicator(dialog.total_unread_count)
+        dialog.show()
 
     def _open_announcement(self, announcement, *, startup_shown):
         current = self.announcement_dialog
@@ -973,6 +1052,7 @@ class MainWindow(FramelessMainWindow):
         dialog.read_confirmed.connect(
             lambda current=announcement: self._confirm_announcement_read(current)
         )
+        dialog.contact_requested.connect(self._show_contact_conversation)
         self.announcement_dialog = dialog
         if startup_shown:
             announcement["startup_pending"] = False
@@ -1028,10 +1108,22 @@ class MainWindow(FramelessMainWindow):
         self._announcement_action_tasks.append(task)
 
     def _set_announcement_message_indicator(self, unread_count):
+        unread_count = max(0, int(unread_count or 0))
+        previous = self._announcement_message_unread_count
+        self._announcement_message_unread_count = unread_count
+        if (
+            previous is not None
+            and unread_count > previous
+            and QApplication.instance() is not None
+        ):
+            QApplication.alert(self, 0)
+        if not self.account.is_admin:
+            self.announcement_horn_button.set_message_unread_count(unread_count)
+            self._update_announcement_ticker()
+            return
         button = self._nav_buttons.get("announcements_admin")
         if button is None:
             return
-        unread_count = max(0, int(unread_count or 0))
         button.setProperty("hasMessage", bool(unread_count))
         button.setText(f"公告发布    ● {unread_count}" if unread_count else "公告发布")
         button.setToolTip(f"收到 {unread_count} 条未读用户消息" if unread_count else "")
@@ -1809,6 +1901,14 @@ class MainWindow(FramelessMainWindow):
             self._announcement_poll_timer.stop()
         if self._announcement_rotation_timer is not None:
             self._announcement_rotation_timer.stop()
+        if self.contact_history_dialog is not None:
+            self.contact_history_dialog.close()
+            self.contact_history_dialog = None
+        for dialog in list(self.contact_conversation_dialogs.values()):
+            dialog.close()
+        self.contact_conversation_dialogs.clear()
+        if self.announcement_admin_page is not None:
+            self.announcement_admin_page.close_chat_windows()
         if self.captcha_learning_service is not None:
             self.captcha_learning_service.stop()
         event.accept()

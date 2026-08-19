@@ -491,8 +491,9 @@ class ApiClient:
         *,
         announcement_id: str | None = None,
         limit: int = 50,
+        mark_read: bool = True,
     ) -> dict:
-        params = {"limit": int(limit)}
+        params = {"limit": int(limit), "mark_read": bool(mark_read)}
         if announcement_id:
             params["announcement_id"] = str(announcement_id)
         return self._request(
@@ -501,6 +502,25 @@ class ApiClient:
             token=access_token,
             params=params,
         )
+
+    def mark_contact_conversation_read(
+        self,
+        access_token: str,
+        message_id: str,
+    ) -> dict:
+        return self._request(
+            "POST",
+            f"/messages/{message_id}/read",
+            token=access_token,
+        )
+
+    def contact_conversation_unread_count(self, access_token: str) -> int:
+        result = self._request(
+            "GET",
+            "/messages/unread-count",
+            token=access_token,
+        )
+        return int((result or {}).get("unread_count") or 0)
 
     def reply_admin_message(
         self,

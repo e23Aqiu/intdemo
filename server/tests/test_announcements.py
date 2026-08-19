@@ -389,13 +389,52 @@ def test_user_text_messages_are_visible_and_readable_by_admin(client):
         headers=auth_header(admin),
     ).content == b"retry help"
 
+    polled = client.get(
+        f"/api/v1/messages?announcement_id={announcement['id']}&mark_read=false",
+        headers=auth_header(first),
+    )
+    assert polled.status_code == 200, polled.text
+    assert polled.json()["unread_count"] == 1
+    assert polled.json()["items"][0]["user_unread_count"] == 1
+    assert client.get(
+        "/api/v1/messages/unread-count",
+        headers=auth_header(first),
+    ).json() == {"unread_count": 1}
+
+    marked_for_user = client.post(
+        f"/api/v1/messages/{body['items'][0]['id']}/read",
+        headers=auth_header(first),
+    )
+    assert marked_for_user.status_code == 200, marked_for_user.text
+    after_explicit_read = client.get(
+        f"/api/v1/messages?announcement_id={announcement['id']}&mark_read=false",
+        headers=auth_header(first),
+    ).json()
+    assert after_explicit_read["unread_count"] == 0
+    assert after_explicit_read["items"][0]["user_unread_count"] == 0
+    assert client.get(
+        "/api/v1/messages/unread-count",
+        headers=auth_header(first),
+    ).json() == {"unread_count": 0}
+
+    second_reply = client.post(
+        f"/api/v1/admin/messages/{body['items'][0]['id']}/reply",
+        headers=auth_header(admin),
+        json={"message": "再补充一条提醒。"},
+    )
+    assert second_reply.status_code == 201, second_reply.text
+
     user_conversations = client.get(
         f"/api/v1/messages?announcement_id={announcement['id']}",
         headers=auth_header(first),
     )
     assert user_conversations.status_code == 200, user_conversations.text
     conversation = user_conversations.json()["items"][0]
-    assert conversation["messages"][-1]["message"].startswith("可以继续录入")
+    assert conversation["messages"][-1]["message"] == "再补充一条提醒。"
+    assert client.get(
+        f"/api/v1/messages?announcement_id={announcement['id']}&mark_read=false",
+        headers=auth_header(first),
+    ).json()["unread_count"] == 0
 
     continued = client.post(
         f"/api/v1/messages/{conversation['id']}/replies",

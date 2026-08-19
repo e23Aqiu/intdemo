@@ -199,6 +199,31 @@ class ClientPreferences:
         payload["tencent_document_urls"] = links
         self._save(payload)
 
+    def dashboard_station_view(self, username: str) -> str:
+        account_key = self._account_key(username)
+        if not account_key:
+            return "table"
+        views = self._load().get("dashboard_station_views")
+        if not isinstance(views, dict):
+            return "table"
+        view = str(views.get(account_key) or "").strip().lower()
+        return view if view in {"table", "chart"} else "table"
+
+    def set_dashboard_station_view(self, username: str, view: str) -> None:
+        account_key = self._account_key(username)
+        if not account_key:
+            raise ValueError("无法识别当前登录账号")
+        normalized = str(view or "").strip().lower()
+        if normalized not in {"table", "chart"}:
+            raise ValueError("仪表盘视图必须是 table 或 chart")
+        payload = self._load()
+        views = payload.get("dashboard_station_views")
+        if not isinstance(views, dict):
+            views = {}
+        views[account_key] = normalized
+        payload["dashboard_station_views"] = views
+        self._save(payload)
+
     def workflow_run_settings(self, username: str) -> dict:
         account_key = self._account_key(username)
         if not account_key:
