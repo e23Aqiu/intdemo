@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import csv
 import json
+from datetime import datetime
+from pathlib import Path
+from typing import ClassVar
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor
@@ -23,6 +27,7 @@ from PyQt5.QtWidgets import (
 from ..online.api import ApiResponseError, NetworkUnavailable
 from .account_page import AccountPage
 from .auth_dialogs import RenameAccountDialog
+from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessDialog
 from .frameless import FramelessMessageBox as QMessageBox
 from .loading_dialog import run_with_loading
@@ -252,7 +257,7 @@ class _AuditDetailDialog(FramelessDialog):
 
 
 class _AuditDialog(FramelessDialog):
-    ACTION_LABELS = {
+    ACTION_LABELS: ClassVar = {
         "account.create": "创建账号",
         "account.update": "修改账号",
         "account.archive": "归档账号",
@@ -301,9 +306,14 @@ class _AuditDialog(FramelessDialog):
         buttons = QHBoxLayout()
         refresh = QPushButton("刷新")
         refresh.clicked.connect(self.refresh)
+        self.export_btn = QPushButton("导出记录")
+        self.export_btn.setToolTip("导出当前已加载的审计记录")
+        self.export_btn.clicked.connect(self._export)
+        self.export_btn.setEnabled(False)
         close = QPushButton("关闭")
         close.clicked.connect(self.accept)
         buttons.addWidget(refresh)
+        buttons.addWidget(self.export_btn)
         buttons.addStretch()
         buttons.addWidget(close)
         layout.addLayout(buttons)
@@ -315,6 +325,7 @@ class _AuditDialog(FramelessDialog):
         if payload is _CALL_FAILED:
             return
         self.rows = list(payload.get("items") or [])
+        self.export_btn.setEnabled(bool(self.rows))
         self.table.setRowCount(len(self.rows))
         for row_index, row in enumerate(self.rows):
             details = row.get("details") or {}
@@ -341,6 +352,105 @@ class _AuditDialog(FramelessDialog):
                     column,
                     QTableWidgetItem(value),
                 )
+
+    @staticmethod
+    def _export_row_values(row):
+        details = row.get("details") or {}
+        if isinstance(details, dict):
+            details_text = json.dumps(
+                details,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                default=str,
+            )
+        else:
+            details_text = str(details)
+        return [
+            str(row.get("created_at") or "-").replace("T", " ")[:19],
+            _AuditDialog.ACTION_LABELS.get(
+                str(row.get("action") or ""),
+                str(row.get("action") or "-"),
+            ),
+            str(row.get("target_type") or "-"),
+            str(row.get("target_id") or "-"),
+            str(row.get("actor_account_id") or "-"),
+            str(row.get("ip_address") or "-"),
+            str(row.get("request_id") or "-"),
+            details_text or "-",
+        ]
+
+    def _export(self):
+        if not self.rows:
+            return
+        default_name = (
+            f"审计记录_{datetime.now().astimezone():%Y%m%d_%H%M%S}.xlsx"
+        )
+        target, selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "导出审计记录",
+            default_name,
+            "Excel 工作簿 (*.xlsx);;CSV 文件 (*.csv)",
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        is_csv = "CSV" in str(selected_filter) or target_path.suffix.lower() == ".csv"
+        if is_csv and target_path.suffix.lower() != ".csv":
+            target_path = target_path.with_suffix(".csv")
+        elif not is_csv and target_path.suffix.lower() != ".xlsx":
+            target_path = target_path.with_suffix(".xlsx")
+        headers = [
+            "时间",
+            "操作",
+            "目标类型",
+            "目标编号",
+            "操作账号",
+            "来源 IP",
+            "请求编号",
+            "详情",
+        ]
+        values = [self._export_row_values(row) for row in self.rows]
+        try:
+            if is_csv:
+                with target_path.open(
+                    "w",
+                    encoding="utf-8-sig",
+                    newline="",
+                ) as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(headers)
+                    writer.writerows(values)
+            else:
+                from openpyxl import Workbook
+                from openpyxl.styles import Alignment, Font, PatternFill
+
+                workbook = Workbook()
+                sheet = workbook.active
+                sheet.title = "审计记录"
+                sheet.append(headers)
+                for row_values in values:
+                    sheet.append(row_values)
+                header_fill = PatternFill("solid", fgColor="1D8178")
+                for cell in sheet[1]:
+                    cell.font = Font(bold=True, color="FFFFFF")
+                    cell.fill = header_fill
+                    cell.alignment = Alignment(horizontal="center")
+                widths = [21, 20, 14, 38, 38, 18, 38, 60]
+                for index, width in enumerate(widths, start=1):
+                    sheet.column_dimensions[chr(64 + index)].width = width
+                sheet.freeze_panes = "A2"
+                sheet.auto_filter.ref = sheet.dimensions
+                for row in sheet.iter_rows(min_row=2):
+                    row[-1].alignment = Alignment(wrap_text=True, vertical="top")
+                workbook.save(target_path)
+        except (ImportError, OSError, ValueError) as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "导出完成",
+            f"已导出 {len(values)} 条审计记录：\n{target_path}",
+        )
 
     def _open_detail(self, row_index, _column):
         if 0 <= row_index < len(self.rows):

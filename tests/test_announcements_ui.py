@@ -7,24 +7,26 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QCoreApplication, QEvent, Qt
+from PyQt5.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QIODevice, Qt
+from PyQt5.QtGui import QPixmap
 from PyQt5.QtWidgets import QApplication, QLabel, QPlainTextEdit, QPushButton
 
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import Database
 from integrated_client.online.api import ApiResponseError, NetworkUnavailable
 from integrated_client.ui.announcement_page import (
+    AdminConversationDialog,
     AnnouncementAdminPage,
     AnnouncementDetailDialog,
     AnnouncementEditorDialog,
     AnnouncementListDialog,
     AnnouncementTickerButton,
-    AdminConversationDialog,
     ContactAdminDialog,
     ContactAttachmentPicker,
     ContactConversationDialog,
     ContactHistoryDialog,
     ConversationTimeline,
+    ImagePreviewDialog,
 )
 from integrated_client.ui.main_window import MainWindow
 
@@ -486,6 +488,99 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(history.conversation["id"], "conversation-2")
         self.assertIn("已经解决", history.history.toPlainText())
 
+    def test_user_unread_badges_flow_from_horn_to_history_picker(self):
+        api = FakeAnnouncementApi()
+        api.visible_announcements = [self._announcement(read_at=True)]
+        api.conversations = [
+            {
+                "id": "conversation-current",
+                "announcement_id": "announcement-1",
+                "announcement_title": "当前会话",
+                "status": "open",
+                "user_unread_count": 0,
+                "updated_at": "2026-08-19T10:06:00",
+                "last_message": {"message": "当前正在查看"},
+                "messages": [],
+            },
+            {
+                "id": "conversation-unread",
+                "announcement_id": "announcement-1",
+                "announcement_title": "系统维护公告",
+                "status": "open",
+                "user_unread_count": 2,
+                "updated_at": "2026-08-19T10:05:00",
+                "last_message": {"message": "请查看管理员回复"},
+                "messages": [
+                    {
+                        "id": "admin-reply-unread",
+                        "sender_role": "admin",
+                        "message": "请查看管理员回复",
+                        "created_at": "2026-08-19T10:05:00",
+                        "attachments": [],
+                    }
+                ],
+            }
+        ]
+        user = self.database.create_account(
+            "history_badge_user",
+            "HistoryBadge@123",
+            "user",
+            self.admin.id,
+            display_name="历史气泡用户",
+        )
+        window = MainWindow(
+            self.database,
+            user,
+            session_manager=FakeSession(api),
+        )
+        window.show()
+        self.assertTrue(
+            self._wait_until(
+                lambda: window.announcement_horn_button.message_unread_count == 2
+            )
+        )
+
+        window.announcement_horn_button.click()
+        self.app.processEvents()
+        announcement_list = window.announcement_list_dialog
+        self.assertEqual(announcement_list.history_button.message_unread_count, 2)
+        with patch(
+            "integrated_client.ui.announcement_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            announcement_list.history_button.click()
+        self.app.processEvents()
+
+        history = window.contact_history_dialog
+        self.assertIn("● 未读 2 条", history.conversation_picker.itemText(1))
+        history.conversation_picker.setCurrentIndex(1)
+        self.assertTrue(
+            self._wait_until(lambda: api.user_read_calls == ["conversation-unread"])
+        )
+        self.assertNotIn("未读", history.conversation_picker.itemText(1))
+        self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
+
+    def test_image_preview_supports_fit_zoom_and_actual_size(self):
+        pixmap = QPixmap(1600, 1000)
+        pixmap.fill(Qt.white)
+        encoded = QByteArray()
+        qt_buffer = QBuffer(encoded)
+        qt_buffer.open(QIODevice.WriteOnly)
+        pixmap.save(qt_buffer, "PNG")
+        qt_buffer.close()
+        dialog = ImagePreviewDialog(bytes(encoded), "large.png")
+        dialog.show()
+        self.app.processEvents()
+        dialog.fit_to_window()
+        fitted_zoom = dialog._zoom
+        self.assertLess(fitted_zoom, 1.0)
+        dialog._step_zoom(1)
+        self.assertGreater(dialog._zoom, fitted_zoom)
+        dialog.zoom_actual_btn.click()
+        self.assertEqual(dialog._zoom, 1.0)
+        self.assertEqual(dialog.zoom_label.text(), "100%")
+        dialog.close()
+
     def test_ticker_uses_styled_hover_preview(self):
         api = FakeAnnouncementApi()
         api.visible_announcements = [self._announcement()]
@@ -699,6 +794,8 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(page.announcement_table.item(0, 2).text(), "2 / 3")
         self.assertEqual(page.message_table.rowCount(), 1)
         self.assertEqual(unread, [1])
+        self.assertEqual(page.message_tab_badge.text(), "1")
+        self.assertFalse(page.message_tab_badge.isHidden())
         page.message_table.selectRow(0)
         self.app.processEvents()
         self.assertTrue(
@@ -708,6 +805,7 @@ class AnnouncementUiTests(unittest.TestCase):
             )
         )
         self.assertEqual(page.inbox_summary.text(), "未读消息：0")
+        self.assertTrue(page.message_tab_badge.isHidden())
         self.assertFalse(
             any(
                 button.text() == "标记所选为已读"

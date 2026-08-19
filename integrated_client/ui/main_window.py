@@ -965,6 +965,11 @@ class MainWindow(FramelessMainWindow):
             self.announcements,
             self,
             show_unread=not self.account.is_admin,
+            message_unread_count=(
+                0
+                if self.account.is_admin
+                else self._announcement_message_unread_count or 0
+            ),
         )
 
         def clear_dialog(*_args):
@@ -1120,8 +1125,14 @@ class MainWindow(FramelessMainWindow):
             QApplication.alert(self, 0)
         if not self.account.is_admin:
             self.announcement_horn_button.set_message_unread_count(unread_count)
+            if self.announcement_list_dialog is not None:
+                self.announcement_list_dialog.set_message_unread_count(
+                    unread_count
+                )
             self._update_announcement_ticker()
             return
+        if self.announcement_admin_page is not None:
+            self.announcement_admin_page.set_unread_message_count(unread_count)
         button = self._nav_buttons.get("announcements_admin")
         if button is None:
             return

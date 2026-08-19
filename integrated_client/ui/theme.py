@@ -664,6 +664,96 @@ QPlainTextEdit#ChatComposer {
     border: none;
     padding: 4px;
 }
+QPushButton#HistoryConversationButton {
+    padding-right: 26px;
+}
+QComboBox#ConversationPicker {
+    color: #243a40;
+    background: #ffffff;
+    border: 1px solid #cbdcdf;
+    border-radius: 7px;
+    padding: 7px 38px 7px 12px;
+    font-weight: 600;
+}
+QComboBox#ConversationPicker:hover,
+QComboBox#ConversationPicker:on {
+    border-color: #62a9a1;
+    background: #f8fcfb;
+}
+QLineEdit#ConversationPickerDisplay {
+    color: #243a40;
+    background: transparent;
+    border: none;
+    padding: 0;
+    font-weight: 600;
+}
+QListView#ConversationPickerView {
+    color: #334b51;
+    background: #ffffff;
+    border: 1px solid #bfd5d2;
+    border-radius: 7px;
+    padding: 6px;
+    outline: none;
+}
+QListView#ConversationPickerView::item {
+    border-bottom: 1px solid #e8efef;
+    border-radius: 5px;
+    padding: 7px 10px;
+}
+QListView#ConversationPickerView::item:hover {
+    background: #edf7f4;
+}
+QListView#ConversationPickerView::item:selected {
+    color: #145f58;
+    background: #dff2ed;
+}
+QLabel#AnnouncementTabBadge {
+    color: #ffffff;
+    background: #d14f45;
+    border: 1px solid #ffffff;
+    border-radius: 10px;
+    padding: 1px 5px;
+    font-size: 10px;
+    font-weight: 700;
+}
+QToolButton#ImageZoomButton {
+    min-width: 30px;
+    min-height: 28px;
+    color: #285d67;
+    background: #f2f7f7;
+    border: 1px solid #cbdcdf;
+    border-radius: 5px;
+    font-size: 18px;
+    font-weight: 700;
+}
+QToolButton#ImageZoomButton:hover,
+QPushButton#ImageZoomFitButton:hover {
+    background: #e2f2ef;
+    border-color: #7ebbb3;
+}
+QPushButton#ImageZoomFitButton {
+    color: #285d67;
+    background: #f2f7f7;
+    border: 1px solid #cbdcdf;
+    border-radius: 5px;
+    padding: 6px 12px;
+}
+QLabel#ImageZoomLabel {
+    min-width: 52px;
+    color: #526970;
+    background: transparent;
+    padding: 0 6px;
+    font-weight: 700;
+}
+QScrollArea#ImagePreviewScrollArea {
+    background: #dfe8eb;
+    border: 1px solid #c8d5d9;
+    border-radius: 6px;
+}
+QScrollArea#ImagePreviewScrollArea > QWidget > QWidget,
+QLabel#ImagePreviewLabel {
+    background: #dfe8eb;
+}
 QLabel#AnnouncementListCount {
     color: #176f68;
     background: #e7f6f2;

@@ -105,6 +105,7 @@ from integrated_client.ui.main_window import MainWindow
 from integrated_client.ui.online_account_page import (
     OnlineAccountPage,
     _AccountSettingsDialog,
+    _AuditDialog,
 )
 from integrated_client.ui.statistics_page import (
     AnimatedDonutChart,
@@ -1954,6 +1955,59 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(session.api.account_requests, 0)
         self.assertFalse(page.edit_btn.isEnabled())
         page.deleteLater()
+
+    def test_online_admin_audit_records_can_be_exported(self):
+        payload = {
+            "items": [
+                {
+                    "id": 12,
+                    "created_at": "2026-08-19T10:21:00+08:00",
+                    "action": "account.update",
+                    "target_type": "account",
+                    "target_id": "station-01",
+                    "actor_account_id": "admin-01",
+                    "ip_address": "127.0.0.1",
+                    "request_id": "request-01",
+                    "details": {"display_name": "一号站"},
+                }
+            ]
+        }
+
+        class Api:
+            @staticmethod
+            def admin_audit(_token, _limit):
+                return payload
+
+        class Session:
+            api = Api()
+
+        class Page:
+            session = Session()
+
+            @staticmethod
+            def _call(function, *args):
+                return function("token", *args)
+
+        dialog = _AuditDialog(Page())
+        self.app.processEvents()
+        target = Path(self.temp_dir.name) / "audit.xlsx"
+        with patch(
+            "integrated_client.ui.online_account_page.QFileDialog.getSaveFileName",
+            return_value=(str(target), "Excel 工作簿 (*.xlsx)"),
+        ), patch(
+            "integrated_client.ui.online_account_page.QMessageBox.information",
+        ):
+            dialog._export()
+
+        workbook = load_workbook(target)
+        sheet = workbook["审计记录"]
+        self.assertEqual(sheet.max_row, 2)
+        self.assertEqual(sheet.cell(1, 1).value, "时间")
+        self.assertEqual(sheet.cell(2, 2).value, "修改账号")
+        self.assertEqual(sheet.cell(2, 4).value, "station-01")
+        self.assertIn("一号站", sheet.cell(2, 8).value)
+        workbook.close()
+        dialog.close()
 
     def test_online_admin_refresh_removes_accounts_missing_from_server(self):
         current_payload = {
