@@ -297,6 +297,25 @@ def _process_item(
             status="duplicate",
             server_revision=receipt.server_revision,
         )
+    # Test accounts retain ordinary-user permissions but never contribute
+    # business statistics.  Acknowledge queued items so old clients can
+    # drain their outbox without creating server-side metric rows.
+    if account.is_test:
+        server_revision = latest_revision(db)
+        db.add(
+            SyncReceipt(
+                account_id=account.id,
+                event_uid=item.event_uid,
+                kind=item.kind,
+                entity_id=item.entity_id,
+                server_revision=server_revision,
+            )
+        )
+        return SyncItemResult(
+            event_uid=item.event_uid,
+            status="accepted",
+            server_revision=server_revision,
+        )
     occurred_at = item.occurred_at.astimezone(UTC)
     if aware(account.data_reset_at) and occurred_at <= aware(account.data_reset_at):
         raise ApiError(
@@ -507,6 +526,14 @@ def pull(
     limit: int = Query(default=500, ge=1, le=500),
 ) -> SyncPullResponse:
     query = select(ChangeLog).where(ChangeLog.revision > after_revision)
+    test_account_ids = select(Account.id).where(Account.is_test.is_(True))
+    query = query.where(
+        or_(
+            ChangeLog.account_id.is_(None),
+            ChangeLog.account_id.not_in(test_account_ids),
+            ChangeLog.kind == "account",
+        )
+    )
     if not _can_view_all(context.account):
         query = query.where(
             or_(
@@ -545,6 +572,7 @@ def snapshot(context: BusinessContext, db: Db) -> SnapshotResponse:
     else:
         account_ids = [context.account.id]
     accounts = db.scalars(select(Account).where(Account.id.in_(account_ids))).all()
+    statistic_account_ids = [row.id for row in accounts if not row.is_test]
     metrics = db.scalars(
         select(MetricDefinition)
         .where(MetricDefinition.is_active.is_(True))
@@ -552,19 +580,19 @@ def snapshot(context: BusinessContext, db: Db) -> SnapshotResponse:
     ).all()
     events = db.scalars(
         select(ActivityEvent).where(
-            ActivityEvent.account_id.in_(account_ids),
+            ActivityEvent.account_id.in_(statistic_account_ids),
             ActivityEvent.deleted_at.is_(None),
         )
     ).all()
     batches = db.scalars(
         select(WorkflowBatch).where(
-            WorkflowBatch.account_id.in_(account_ids),
+            WorkflowBatch.account_id.in_(statistic_account_ids),
             WorkflowBatch.deleted_at.is_(None),
         )
     ).all()
     runs = db.scalars(
         select(WorkflowRun).where(
-            WorkflowRun.account_id.in_(account_ids),
+            WorkflowRun.account_id.in_(statistic_account_ids),
             WorkflowRun.deleted_at.is_(None),
         )
     ).all()
@@ -577,6 +605,7 @@ def snapshot(context: BusinessContext, db: Db) -> SnapshotResponse:
                 "username": row.username,
                 "display_name": row.display_name,
                 "role": row.role,
+                "is_test": row.is_test,
                 "stats_scope": row.stats_scope,
                 "is_active": row.is_active,
                 "is_archived": row.is_archived,

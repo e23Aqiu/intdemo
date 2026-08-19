@@ -259,12 +259,13 @@ class AccountPage(QWidget):
         enabled = account is not None
         can_manage = enabled and account.id != self.current_account.id
         is_station = enabled and not account.is_admin
+        has_statistics = is_station and not account.is_test
         self.rename_btn.setEnabled(enabled)
         self.permission_btn.setEnabled(can_manage)
-        self.export_btn.setEnabled(is_station)
-        self.import_btn.setEnabled(is_station)
-        self.reset_stats_btn.setEnabled(is_station)
-        self.data_range_selector.setEnabled(is_station)
+        self.export_btn.setEnabled(has_statistics)
+        self.import_btn.setEnabled(has_statistics)
+        self.reset_stats_btn.setEnabled(has_statistics)
+        self.data_range_selector.setEnabled(has_statistics)
         self.reset_btn.setEnabled(can_manage)
         self.toggle_btn.setEnabled(can_manage)
         self.delete_btn.setEnabled(can_manage)

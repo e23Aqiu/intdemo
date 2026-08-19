@@ -53,6 +53,7 @@ def _account_change_payload(account: Account) -> dict:
         "username": account.username,
         "display_name": account.display_name,
         "role": account.role,
+        "is_test": account.is_test,
         "stats_scope": account.stats_scope,
         "device_limit": account.device_limit,
         "is_active": account.is_active,
@@ -92,6 +93,7 @@ async def create_account(
         display_name=payload.display_name.strip(),
         password_hash=hash_password("123456"),
         role=payload.role,
+        is_test=payload.is_test,
         stats_scope=payload.stats_scope,
         device_limit=payload.device_limit,
         is_active=payload.is_active,
@@ -131,6 +133,18 @@ async def update_account(
 ) -> dict:
     account = _account_or_404(db, account_id)
     changes = payload.model_dump(exclude_unset=True)
+    resulting_role = str(changes.get("role", account.role))
+    resulting_is_test = bool(changes.get("is_test", account.is_test))
+    if resulting_role == "admin":
+        if changes.get("is_test") is True:
+            raise ApiError(
+                "invalid_test_account_role",
+                "测试账号必须使用普通用户权限",
+                status_code=422,
+            )
+        changes["is_test"] = False
+    elif resulting_is_test:
+        changes["role"] = "user"
     if "device_limit" in changes:
         current_active_devices = active_device_count(db, account.id)
         if changes["device_limit"] < current_active_devices:
@@ -144,10 +158,12 @@ async def update_account(
         raise ApiError("cannot_disable_self", "不能停用当前管理员账号", status_code=409)
     if account.id == context.account.id and changes.get("role") == "user":
         raise ApiError("cannot_demote_self", "不能降低当前管理员权限", status_code=409)
+    if account.id == context.account.id and changes.get("is_test") is True:
+        raise ApiError("cannot_mark_self_test", "不能将当前管理员设为测试账号", status_code=409)
 
     security_changed = any(
         name in changes and changes[name] != getattr(account, name)
-        for name in ("role", "stats_scope", "is_active")
+        for name in ("role", "is_test", "stats_scope", "is_active")
     )
     for name, value in changes.items():
         if name == "display_name":

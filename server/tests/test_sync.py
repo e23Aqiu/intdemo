@@ -233,3 +233,89 @@ def test_stats_scope_own_then_all_is_enforced_server_side(client):
         row["account_id"] == producer_account["id"] and row["kind"] == "activity_event"
         for row in all_pull.json()["changes"]
     )
+
+
+def test_test_account_is_user_compatible_but_statistics_are_discarded(client):
+    admin = changed_admin(client)
+    admin_headers = auth_header(admin)
+    created = client.post(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        json={
+            "username": "untracked_test",
+            "display_name": "测试账号",
+            "role": "user",
+            "is_test": True,
+            "stats_scope": "all",
+            "device_limit": 1,
+            "is_active": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["role"] == "user"
+    assert created.json()["is_test"] is True
+    assert created.json()["stats_scope"] == "all"
+
+    first_login = login(client, "untracked_test", "123456", device=77)
+    changed = client.post(
+        "/api/v1/auth/change-password",
+        headers=auth_header(first_login),
+        json={
+            "current_password": "123456",
+            "new_password": "Untracked!234",
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    bundle = changed.json()
+    assert bundle["account"]["role"] == "user"
+    assert bundle["account"]["is_test"] is True
+    assert bundle["account"]["stats_scope"] == "all"
+
+    admin_item = sync_item(entity_id="visible-normal-event")
+    normal_push = client.post(
+        "/api/v1/sync/push",
+        headers=admin_headers,
+        json={"items": [admin_item]},
+    )
+    assert normal_push.json()["items"][0]["status"] == "accepted"
+
+    item = sync_item(entity_id="test-account-event")
+    first = client.post(
+        "/api/v1/sync/push",
+        headers=auth_header(bundle),
+        json={"items": [item]},
+    )
+    duplicate = client.post(
+        "/api/v1/sync/push",
+        headers=auth_header(bundle),
+        json={"items": [item]},
+    )
+    assert first.json()["items"][0]["status"] == "accepted"
+    assert duplicate.json()["items"][0]["status"] == "duplicate"
+
+    snapshot = client.get(
+        "/api/v1/sync/snapshot",
+        headers=admin_headers,
+    )
+    assert snapshot.status_code == 200
+    assert not any(
+        row["account_id"] == created.json()["id"]
+        for row in snapshot.json()["activity_events"]
+    )
+    test_snapshot = client.get(
+        "/api/v1/sync/snapshot",
+        headers=auth_header(bundle),
+    )
+    assert any(
+        row["event_uid"] == admin_item["event_uid"]
+        for row in test_snapshot.json()["activity_events"]
+    )
+    pulled = client.get(
+        "/api/v1/sync/pull?after_revision=0",
+        headers=admin_headers,
+    )
+    assert not any(
+        row["account_id"] == created.json()["id"]
+        and row["kind"] != "account"
+        for row in pulled.json()["changes"]
+    )

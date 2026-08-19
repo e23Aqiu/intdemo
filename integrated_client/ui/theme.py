@@ -343,6 +343,13 @@ QPushButton#NavButton:checked {
     padding-left: 10px;
     font-weight: 700;
 }
+QFrame#SidebarProfile[reconnectAvailable="true"] {
+    border-color: #f0ad69;
+    background: #164247;
+}
+QFrame#SidebarProfile[reconnectAvailable="true"]:hover {
+    background: #1d5055;
+}
 QPushButton#NavButton[hasUpdate="true"] {
     color: #ffd4a3;
     border-color: #8c6541;

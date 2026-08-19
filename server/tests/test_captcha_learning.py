@@ -497,6 +497,50 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert metric["success_rate"] == 3 / 4
 
 
+def test_test_account_captcha_attempts_are_not_stored(client):
+    admin = changed_admin(client)
+    created = client.post(
+        "/api/v1/admin/accounts",
+        headers=auth_header(admin),
+        json={
+            "username": "captcha_test_account",
+            "display_name": "验证码测试账号",
+            "role": "user",
+            "is_test": True,
+            "stats_scope": "own",
+            "device_limit": 1,
+            "is_active": True,
+        },
+    )
+    assert created.status_code == 201, created.text
+    first_login = login(client, "captcha_test_account", "123456", device=211)
+    changed = client.post(
+        "/api/v1/auth/change-password",
+        headers=auth_header(first_login),
+        json={
+            "current_password": "123456",
+            "new_password": "CaptchaTest!234",
+        },
+    )
+    assert changed.status_code == 200, changed.text
+    policy = client.patch(
+        "/api/v1/admin/ml/policy",
+        headers=auth_header(admin),
+        json={"upload_mode": "samples_and_metrics"},
+    )
+    assert policy.status_code == 200, policy.text
+
+    response = client.post(
+        "/api/v1/captcha/attempts",
+        headers=auth_header(changed.json()),
+        json=_numeric_attempt(success=True),
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["stored"] is False
+    assert response.json()["sample_stored"] is False
+
+
 def test_metrics_filter_selected_model_and_hide_human_manual_records(client):
     admin = changed_admin(client)
     user = _changed_user(client)

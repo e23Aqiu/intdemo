@@ -16,6 +16,7 @@ class AccountView(StrictModel):
     username: str
     display_name: str
     role: Literal["admin", "user"]
+    is_test: bool = False
     stats_scope: Literal["own", "all"]
     device_limit: int
     is_active: bool
@@ -24,6 +25,7 @@ class AccountView(StrictModel):
     entitlement_revision: int
     active_device_count: int = 0
     online_device_count: int = 0
+    last_login_at: datetime | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -85,6 +87,7 @@ class AccountCreate(StrictModel):
     username: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
     display_name: str = Field(min_length=1, max_length=120)
     role: Literal["admin", "user"] = "user"
+    is_test: bool = False
     stats_scope: Literal["own", "all"] = "own"
     device_limit: int = Field(default=10000, ge=1, le=10000)
     is_active: bool = True
@@ -102,10 +105,17 @@ class AccountCreate(StrictModel):
             raise ValueError("站点显示名不能为空")
         return value
 
+    @model_validator(mode="after")
+    def validate_test_account(self) -> AccountCreate:
+        if self.is_test and self.role != "user":
+            raise ValueError("测试账号必须使用普通用户权限")
+        return self
+
 
 class AccountUpdate(StrictModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=120)
     role: Literal["admin", "user"] | None = None
+    is_test: bool | None = None
     stats_scope: Literal["own", "all"] | None = None
     device_limit: int | None = Field(default=None, ge=1, le=10000)
     is_active: bool | None = None

@@ -189,18 +189,24 @@ class SyncEngine:
         except ApiResponseError as exc:
             self.database.mark_sync_error(exc.message)
             fatal_session_codes = {
+                "authentication_required",
+                "invalid_access_token",
+                "access_token_expired",
+                "invalid_refresh_token",
                 "session_revoked",
                 "device_revoked",
                 "account_unavailable",
+                "password_change_required",
                 "refresh_token_expired",
                 "refresh_token_reuse",
             }
-            if exc.code in fatal_session_codes:
+            if exc.code in fatal_session_codes or exc.status_code == 401:
                 self.database.enforce_own_cache_for_current_account()
                 self.session.invalidate_credentials()
                 return self.status("reauth_required", exc.message)
             if exc.status_code >= 500 or exc.retryable:
                 self._delay_due_items(exc.code, exc.message)
+                self.session.note_offline()
                 return self.status("offline", exc.message)
             return self.status("error", exc.message)
         except Exception as exc:

@@ -147,6 +147,7 @@ def create_offline_entitlement(
         "username": account.username,
         "display_name": account.display_name,
         "role": account.role,
+        "is_test": account.is_test,
         "stats_scope": account.stats_scope,
         "entitlement_revision": account.entitlement_revision,
         "issued_at": int(now.timestamp()),

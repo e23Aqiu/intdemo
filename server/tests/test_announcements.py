@@ -197,6 +197,20 @@ def test_targeted_visibility_updates_and_admin_management(client):
     )
     assert managed.status_code == 200
     assert managed.json()[0]["targets"][0]["username"] == "first"
+    assert managed.json()[0]["read_count"] == 0
+    assert managed.json()[0]["unread_count"] == 1
+
+    assert client.post(
+        f"/api/v1/announcements/{announcement['id']}/read",
+        headers=auth_header(first),
+        json={"startup_shown": False, "confirmed": True},
+    ).status_code == 200
+    managed_after_read = client.get(
+        "/api/v1/admin/announcements",
+        headers=auth_header(admin),
+    ).json()[0]
+    assert managed_after_read["read_count"] == 1
+    assert managed_after_read["unread_count"] == 0
 
     denied = client.get(
         "/api/v1/admin/announcements",
@@ -236,6 +250,38 @@ def test_targeted_visibility_updates_and_admin_management(client):
         ).json()
         == []
     )
+
+
+def test_v110_announcement_and_text_message_payloads_remain_supported(client):
+    admin = changed_admin(client)
+    account, station = _create_user(client, admin, "legacyclient")
+    announcement = client.post(
+        "/api/v1/admin/announcements",
+        headers=auth_header(admin),
+        json=_announcement_payload(
+            title="兼容公告",
+            ticker_text="旧客户端兼容验证",
+            target_account_ids=[account["id"]],
+            attachments=[],
+        ),
+    ).json()
+
+    read = client.post(
+        f"/api/v1/announcements/{announcement['id']}/read",
+        headers=auth_header(station),
+        json={"startup_shown": True},
+    )
+    assert read.status_code == 200, read.text
+    assert read.json()["read_at"] is not None
+
+    sent = client.post(
+        f"/api/v1/announcements/{announcement['id']}/messages",
+        headers=auth_header(station),
+        json={"message": "旧版客户端纯文字反馈"},
+    )
+    assert sent.status_code == 201, sent.text
+    assert sent.json()["message"] == "旧版客户端纯文字反馈"
+    assert sent.json()["messages"][0]["attachments"] == []
 
 
 def test_user_text_messages_are_visible_and_readable_by_admin(client):

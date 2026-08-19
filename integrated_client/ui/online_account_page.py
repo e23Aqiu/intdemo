@@ -46,6 +46,7 @@ class _AccountSettingsDialog(FramelessDialog):
         self.display_name = QLineEdit(account.name_label if account else "")
         self.role = QComboBox()
         self.role.addItem("普通用户", "user")
+        self.role.addItem("测试账号", "test")
         self.role.addItem("管理员", "admin")
         self.scope = QComboBox()
         self.scope.addItem("仅本人数据", "own")
@@ -58,7 +59,8 @@ class _AccountSettingsDialog(FramelessDialog):
         )
         self.active = QCheckBox("允许登录")
         if account:
-            self.role.setCurrentIndex(self.role.findData(account.role))
+            account_type = "test" if account.is_test else account.role
+            self.role.setCurrentIndex(self.role.findData(account_type))
             self.scope.setCurrentIndex(self.scope.findData(account.stats_scope))
             self.device_limit.setValue(
                 int(getattr(account, "_device_limit", 10000) or 10000)
@@ -101,10 +103,12 @@ class _AccountSettingsDialog(FramelessDialog):
         self.accept()
 
     def values(self) -> dict:
+        account_type = self.role.currentData()
         return {
             "username": self.username.text().strip().lower(),
             "display_name": self.display_name.text().strip(),
-            "role": self.role.currentData(),
+            "role": "admin" if account_type == "admin" else "user",
+            "is_test": account_type == "test",
             "stats_scope": self.scope.currentData(),
             "device_limit": self.device_limit.value(),
             "is_active": self.active.isChecked(),
@@ -587,6 +591,7 @@ class OnlineAccountPage(AccountPage):
         selected = account is not None
         other = selected and account.id != self.current_account.id
         is_station = selected and not account.is_admin
+        has_statistics = is_station and not account.is_test
         self.rename_btn.setEnabled(selected)
         self.permission_btn.setEnabled(selected)
         self.password_btn.setEnabled(other)
@@ -594,10 +599,10 @@ class OnlineAccountPage(AccountPage):
         self.toggle_btn.setEnabled(other and not account.is_archived if account else False)
         self.archive_btn.setEnabled(other)
         self.purge_btn.setEnabled(bool(other and account and account.is_archived))
-        self.export_btn.setEnabled(is_station)
-        self.import_btn.setEnabled(is_station)
-        self.reset_stats_btn.setEnabled(other and is_station)
-        self.data_range_selector.setEnabled(is_station)
+        self.export_btn.setEnabled(has_statistics)
+        self.import_btn.setEnabled(has_statistics)
+        self.reset_stats_btn.setEnabled(other and has_statistics)
+        self.data_range_selector.setEnabled(has_statistics)
         self.archive_btn.setText(
             "恢复账号" if account and account.is_archived else "归档账号"
         )
@@ -629,13 +634,13 @@ class OnlineAccountPage(AccountPage):
             self.toggle_btn.setText("停用/启用")
         self.import_btn.setToolTip(
             "在线版不允许只导入本机缓存；点击可查看说明"
-            if is_station
-            else "请选择普通用户站点"
+            if has_statistics
+            else "测试账号不参与统计" if is_station else "请选择普通用户站点"
         )
         self.export_btn.setToolTip(
             "导出当前客户端已同步到的站点汇总数据"
-            if is_station
-            else "请选择普通用户站点"
+            if has_statistics
+            else "测试账号不参与统计" if is_station else "请选择普通用户站点"
         )
         self.toggle_btn.setObjectName(
             "DangerButton"

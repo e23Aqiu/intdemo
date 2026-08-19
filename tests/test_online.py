@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from integrated_client.config import APP_VERSION
 from integrated_client.database import AuthenticationError, Database
-from integrated_client.online.api import NetworkUnavailable
+from integrated_client.online.api import ApiResponseError, NetworkUnavailable
 from integrated_client.online.config import OnlineConfig, OnlineConfigurationError
 from integrated_client.online.secure import DpapiProtector, Protector
 from integrated_client.online.session import OnlineSessionManager
@@ -55,6 +55,7 @@ class FakeApi:
         self.private_key = Ed25519PrivateKey.generate()
         self.password = "Online!234"
         self.account_id = str(uuid.uuid4())
+        self.last_login_at = "2026-08-19T00:32:47+00:00"
         self.push_calls = []
         self.server_revision = 0
 
@@ -119,6 +120,7 @@ class FakeApi:
                 "is_archived": False,
                 "must_change_password": must_change,
                 "entitlement_revision": 1,
+                "last_login_at": self.last_login_at,
                 "created_at": now.isoformat(),
                 "updated_at": now.isoformat(),
             },
@@ -213,6 +215,7 @@ class OnlineClientTests(unittest.TestCase):
     def test_online_login_then_password_checked_offline_login(self):
         account = self.session.login("station", "Online!234")
         self.assertEqual(account.server_account_id, self.api.account_id)
+        self.assertEqual(account.last_login, self.api.last_login_at)
         self.assertTrue(self.session.state.is_online)
         encrypted = self.database.load_secure_online_profile()
         self.assertNotIn(b"Online!234", encrypted)
@@ -231,6 +234,16 @@ class OnlineClientTests(unittest.TestCase):
         self.api.online = True
         self.assertEqual(offline_session.access_token(), "access-token")
         self.assertTrue(offline_session.state.is_online)
+
+    def test_remote_account_without_last_login_field_preserves_cached_value(self):
+        account = self.session.login("station", "Online!234")
+        payload = self.api._bundle("station", self.session.device_uid)["account"]
+        payload.pop("last_login_at")
+
+        refreshed = self.database.upsert_remote_account(payload)
+
+        self.assertEqual(refreshed.id, account.id)
+        self.assertEqual(refreshed.last_login, self.api.last_login_at)
 
     def test_first_login_cannot_start_offline(self):
         self.api.online = False
@@ -807,6 +820,78 @@ class OnlineClientTests(unittest.TestCase):
         self.assertEqual(len(self.api.push_calls), 1)
         engine.run_once()
         self.assertEqual(len(self.api.push_calls), 1)
+
+    def test_revoked_session_stays_offline_and_uploads_after_reauthentication(self):
+        account = self.session.login("station", "Online!234")
+        encrypted_profile = self.database.load_secure_online_profile()
+        self.database.record_activity(
+            account.id,
+            "workflow_detail_total",
+            2,
+            source="unified_workflow",
+        )
+        original_push = self.api.push
+        self.api.push = Mock(
+            side_effect=ApiResponseError(
+                "session_revoked",
+                "登录会话已失效",
+                status_code=401,
+            )
+        )
+
+        offline = SyncEngine(self.database, self.session).run_once()
+
+        self.assertEqual(offline.state, "reauth_required")
+        self.assertEqual(offline.pending_count, 1)
+        self.assertEqual(self.session.state.account.id, account.id)
+        self.assertEqual(self.session.state.mode, "reauth_required")
+        self.assertEqual(
+            self.database.load_secure_online_profile(),
+            encrypted_profile,
+        )
+        with self.assertRaisesRegex(NetworkUnavailable, "左下角"):
+            self.session.access_token()
+
+        self.api.push = original_push
+        restored = self.session.reauthenticate("Online!234")
+        online = SyncEngine(self.database, self.session).run_once()
+
+        self.assertEqual(restored.id, account.id)
+        self.assertTrue(self.session.state.is_online)
+        self.assertEqual(online.state, "online")
+        self.assertEqual(online.pending_count, 0)
+        self.assertEqual(len(self.api.push_calls), 1)
+
+    def test_test_account_never_records_or_queues_business_statistics(self):
+        bundle = self.api._bundle("station", self.session.device_uid)
+        bundle["account"]["stats_scope"] = "all"
+        regular_account = self.session._save_bundle(bundle, "Online!234")
+        self.database.record_activity(
+            regular_account.id,
+            "workflow_detail_total",
+            3,
+            source="unified_workflow",
+        )
+        self.assertEqual(self.database.get_sync_pending_count(self.api.account_id), 1)
+
+        bundle["account"]["is_test"] = True
+        account = self.session._save_bundle(bundle, "Online!234")
+
+        self.database.record_activity(
+            account.id,
+            "workflow_detail_total",
+            5,
+            source="unified_workflow",
+        )
+
+        self.assertTrue(account.is_test)
+        self.assertFalse(account.statistics_enabled)
+        self.assertEqual(account.role, "user")
+        self.assertTrue(account.can_view_all_stats)
+        self.assertEqual(self.database.get_sync_pending_count(self.api.account_id), 0)
+        self.assertTrue(
+            all(row["total"] == 0 for row in self.database.get_user_totals(account.id))
+        )
 
     def test_sync_receipt_matches_hyphenated_server_uuid(self):
         account = self.session.login("station", "Online!234")

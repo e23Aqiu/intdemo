@@ -350,6 +350,42 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertEqual(selected, ("/tmp/result.xlsx", "Excel (*.xlsx)"))
         qt_dialog.assert_called_once()
 
+    def test_uos_file_selection_without_parent_handle_still_tries_system_chooser(self):
+        parent = Mock()
+        parent.window.return_value.winId.return_value = 0
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            file_dialogs,
+            "is_uos",
+            return_value=True,
+        ), patch.object(
+            file_dialogs,
+            "_find_zenity",
+            return_value="/usr/bin/zenity",
+        ), patch.object(
+            file_dialogs,
+            "system_application_environment",
+            return_value={},
+        ), patch.object(
+            file_dialogs,
+            "_run_process_blocking",
+            return_value=(0, "/tmp/result.xlsx\n"),
+        ) as run_process, patch.object(
+            file_dialogs,
+            "_qt_uos_file_selection",
+        ) as qt_dialog:
+            selected = file_dialogs.SystemFileDialog.getOpenFileName(
+                parent,
+                "选择表格",
+                "",
+                "Excel (*.xlsx)",
+            )
+
+        self.assertEqual(selected, ("/tmp/result.xlsx", ""))
+        arguments, environment = run_process.call_args.args
+        self.assertNotIn("--attach=0", arguments)
+        self.assertEqual(environment["GTK_USE_PORTAL"], "1")
+        qt_dialog.assert_not_called()
+
     def test_uos_qt_fallback_is_application_modal_and_always_on_top(self):
         dialog = Mock()
         dialog.exec_.return_value = 1
@@ -878,6 +914,10 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("Architecture: arm64", control)
         self.assertIn("libsecret-tools", control)
         self.assertIn("fcitx-frontend-qt5", control)
+        depends = next(
+            line for line in control.splitlines() if line.startswith("Depends:")
+        )
+        self.assertIn("zenity", depends)
         self.assertIn("deepin-deb-installer", control)
         self.assertIn("policykit-1", control)
         self.assertEqual(info["appid"], "com.e23aqiu.intdemo")

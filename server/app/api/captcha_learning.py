@@ -1158,8 +1158,15 @@ def record_captcha_attempt(
     context: BusinessContext,
     db: Db,
 ) -> dict[str, Any]:
-    del context
     policy = _policy(db)
+    if context.account.is_test:
+        db.commit()
+        return {
+            "stored": False,
+            "sample_stored": False,
+            "sample_id": None,
+            "policy_revision": policy.revision,
+        }
     mode = _policy_mode(policy)
     if mode == UPLOAD_MODE_OFF:
         db.commit()

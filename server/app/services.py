@@ -60,6 +60,7 @@ def account_view(db: Session, account: Account) -> dict[str, Any]:
         "username": account.username,
         "display_name": account.display_name,
         "role": account.role,
+        "is_test": account.is_test,
         "stats_scope": account.stats_scope,
         "device_limit": account.device_limit,
         "is_active": account.is_active,
@@ -68,6 +69,7 @@ def account_view(db: Session, account: Account) -> dict[str, Any]:
         "entitlement_revision": account.entitlement_revision,
         "active_device_count": active_device_count(db, account.id),
         "online_device_count": online_count,
+        "last_login_at": account.last_login_at,
         "created_at": account.created_at,
         "updated_at": account.updated_at,
     }

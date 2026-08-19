@@ -410,6 +410,10 @@ class Database:
                 conn.execute(
                     "ALTER TABLE accounts ADD COLUMN entitlement_revision INTEGER NOT NULL DEFAULT 0"
                 )
+            if "is_test" not in account_columns:
+                conn.execute(
+                    "ALTER TABLE accounts ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0"
+                )
             conn.execute(
                 "UPDATE accounts SET display_name=username WHERE TRIM(display_name)=''"
             )
@@ -519,6 +523,7 @@ class Database:
                 if "entitlement_revision" in columns
                 else 0
             ),
+            is_test=bool(row["is_test"] if "is_test" in columns else False),
         )
 
     @staticmethod
@@ -626,15 +631,20 @@ class Database:
 
     def create_account(
         self, username: str, password: str, role: str, created_by: int,
-        display_name: str = ""
+        display_name: str = "", is_test: bool = False
     ) -> Account:
         username = self._validate_username(username)
         display_name = (display_name or username).strip()
         if not 1 <= len(display_name) <= 64:
             raise ValueError("用户名称长度需要在 1 到 64 个字符之间")
         validate_password(password)
+        if role == "test":
+            role = "user"
+            is_test = True
         if role not in {"admin", "user"}:
             raise ValueError("无效的账号角色")
+        if is_test and role != "user":
+            raise ValueError("测试账号必须使用普通用户权限")
         salt, digest = hash_password(password)
         now = self._now()
         try:
@@ -643,10 +653,20 @@ class Database:
                     """
                     INSERT INTO accounts(
                         username, display_name, password_salt, password_hash, role, is_active,
-                        must_change_password, created_at, updated_at, created_by
-                    ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?)
+                        must_change_password, created_at, updated_at, created_by, is_test
+                    ) VALUES (?, ?, ?, ?, ?, 1, 1, ?, ?, ?, ?)
                     """,
-                    (username, display_name, salt, digest, role, now, now, created_by),
+                    (
+                        username,
+                        display_name,
+                        salt,
+                        digest,
+                        role,
+                        now,
+                        now,
+                        created_by,
+                        int(bool(is_test)),
+                    ),
                 )
                 conn.execute(
                     "DELETE FROM deleted_default_accounts WHERE username=? COLLATE NOCASE",
@@ -672,6 +692,16 @@ class Database:
             ).fetchone()
             return self._account_from_row(row) if row else None
 
+    def account_statistics_enabled(self, account_id: int) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT is_test FROM accounts WHERE id=?",
+                (int(account_id),),
+            ).fetchone()
+        if not row:
+            raise DatabaseError("账号不存在")
+        return not bool(row["is_test"])
+
     def update_account_display_name(
         self, account_id: int, display_name: str
     ) -> Account:
@@ -696,6 +726,9 @@ class Database:
             return self._account_from_row(row)
 
     def update_account_role(self, account_id: int, role: str) -> Account:
+        is_test = role == "test"
+        if is_test:
+            role = "user"
         if role not in {"admin", "user"}:
             raise ValueError("无效的账号权限")
         with self._connect() as conn:
@@ -705,7 +738,7 @@ class Database:
             ).fetchone()
             if not row:
                 raise DatabaseError("账号不存在")
-            if row["role"] == role:
+            if row["role"] == role and bool(row["is_test"] or 0) == is_test:
                 return self._account_from_row(row)
             if row["role"] == "admin" and role == "user" and row["is_active"]:
                 active_admins = conn.execute(
@@ -714,8 +747,8 @@ class Database:
                 if active_admins <= 1:
                     raise DatabaseError("不能取消最后一个可用管理员的权限")
             conn.execute(
-                "UPDATE accounts SET role=?, updated_at=? WHERE id=?",
-                (role, self._now(), int(account_id)),
+                "UPDATE accounts SET role=?, is_test=?, updated_at=? WHERE id=?",
+                (role, int(is_test), self._now(), int(account_id)),
             )
             updated = conn.execute(
                 "SELECT * FROM accounts WHERE id=?",
@@ -1192,11 +1225,13 @@ class Database:
     @staticmethod
     def _server_account_id(conn, user_id: int) -> Optional[str]:
         row = conn.execute(
-            "SELECT server_account_id FROM accounts WHERE id=?",
+            "SELECT server_account_id, is_test FROM accounts WHERE id=?",
             (int(user_id),),
         ).fetchone()
         if not row:
             raise DatabaseError("账号不存在")
+        if row["is_test"]:
+            return None
         return row["server_account_id"]
 
     @staticmethod
@@ -1274,6 +1309,8 @@ class Database:
             if value:
                 normalized.append((key, value))
         if not normalized:
+            return
+        if not self.account_statistics_enabled(user_id):
             return
 
         payload = json.dumps(details or {}, ensure_ascii=False, separators=(",", ":"))
@@ -1410,6 +1447,9 @@ class Database:
             start_date,
             end_date,
         )
+        effective_user_id = (
+            int(user_id) if self.account_statistics_enabled(user_id) else -1
+        )
         with self._connect() as conn:
             return conn.execute(
                 f"""
@@ -1422,7 +1462,7 @@ class Database:
                 GROUP BY m.metric_key, m.label, m.unit, m.sort_order
                 ORDER BY m.sort_order, m.metric_key
                 """,
-                (user_id, *date_params),
+                (effective_user_id, *date_params),
             ).fetchall()
 
     def get_all_account_totals(
@@ -1445,7 +1485,7 @@ class Database:
                 CROSS JOIN metric_definitions m
                 LEFT JOIN activity_events e
                   ON e.user_id=a.id AND e.metric_key=m.metric_key{date_sql}
-                WHERE m.is_active=1
+                WHERE m.is_active=1 AND a.is_test=0
                 GROUP BY a.id, a.username, a.display_name, a.role, a.is_active,
                          m.metric_key, m.label, m.unit, m.sort_order
                 ORDER BY a.username COLLATE NOCASE, m.sort_order, m.metric_key
@@ -1467,7 +1507,7 @@ class Database:
                    COALESCE(SUM(e.amount), 0) AS total
             FROM activity_events e
             JOIN accounts a ON a.id=e.user_id
-            WHERE e.metric_key=?
+            WHERE e.metric_key=? AND a.is_test=0
         """
         params = [str(metric_key)]
         if user_id is not None:
@@ -1507,6 +1547,7 @@ class Database:
             FROM activity_events e
             JOIN accounts a ON a.id=e.user_id
             WHERE e.metric_key=? AND e.source='unified_workflow'
+              AND a.is_test=0
         """
         params = [WORKFLOW_TOTAL_METRIC]
         if user_id is not None:
@@ -1576,7 +1617,7 @@ class Database:
             FROM activity_events e
             JOIN accounts a ON a.id=e.user_id
             JOIN metric_definitions m ON m.metric_key=e.metric_key
-            WHERE m.is_active=1
+            WHERE m.is_active=1 AND a.is_test=0
         """
         params: Iterable = ()
         if user_id is not None:
@@ -1880,11 +1921,13 @@ class Database:
         heartbeat_ts = time.time()
         with self._connect() as conn:
             account = conn.execute(
-                "SELECT id, is_active FROM accounts WHERE id=?",
+                "SELECT id, is_active, is_test FROM accounts WHERE id=?",
                 (int(user_id),),
             ).fetchone()
             if not account or not account["is_active"]:
                 raise DatabaseError("当前账号不可用于创建计时任务")
+            if account["is_test"]:
+                raise DatabaseError("测试账号不记录业务计时")
 
             signature_placeholders = ",".join("?" for _ in signature_aliases)
             batches = conn.execute(
@@ -2511,6 +2554,7 @@ class Database:
             JOIN accounts a ON a.id=e.user_id
             WHERE e.metric_key=? AND e.source='unified_workflow'
               AND final_run.status='succeeded' AND b.status='succeeded'
+              AND a.is_test=0
         """
         params = [WORKFLOW_TOTAL_METRIC]
 
@@ -2564,6 +2608,7 @@ class Database:
                  AND rb.server_account_id=final_run.server_account_id
                 WHERE e.metric_key=? AND e.source='unified_workflow'
                   AND final_run.status='succeeded' AND rb.status='succeeded'
+                  AND a.is_test=0
                   AND NOT EXISTS (
                       SELECT 1 FROM workflow_runs local_run
                       WHERE local_run.run_id=final_run.entity_id
@@ -2699,6 +2744,14 @@ class Database:
         username = str(payload.get("username") or "").strip().lower()
         if not server_account_id or not username:
             raise DatabaseError("服务器账号资料不完整")
+        last_login_provided = (
+            "last_login_at" in payload or "last_login" in payload
+        )
+        last_login = payload.get("last_login_at", payload.get("last_login"))
+        if last_login is not None:
+            last_login = str(last_login)
+        is_test_provided = "is_test" in payload
+        is_test = int(bool(payload.get("is_test", False)))
         row = conn.execute(
             """
             SELECT id FROM accounts
@@ -2716,7 +2769,10 @@ class Database:
                 UPDATE accounts
                 SET server_account_id=?, username=?, display_name=?, role=?,
                     stats_scope=?, is_active=?, is_archived=?,
-                    must_change_password=?, entitlement_revision=?, updated_at=?
+                    must_change_password=?, entitlement_revision=?,
+                    is_test=CASE WHEN ? THEN ? ELSE is_test END,
+                    last_login=CASE WHEN ? THEN ? ELSE last_login END,
+                    updated_at=?
                 WHERE id=?
                 """,
                 (
@@ -2729,20 +2785,33 @@ class Database:
                     int(bool(payload.get("is_archived", False))),
                     int(bool(payload.get("must_change_password", False))),
                     int(payload.get("entitlement_revision") or 0),
+                    int(is_test_provided),
+                    is_test,
+                    int(last_login_provided),
+                    last_login,
                     now,
                     account_id,
                 ),
             )
+            if is_test_provided and is_test:
+                conn.execute(
+                    "DELETE FROM sync_outbox WHERE server_account_id=?",
+                    (server_account_id,),
+                )
+                conn.execute(
+                    "DELETE FROM captcha_upload_outbox WHERE server_account_id=?",
+                    (server_account_id,),
+                )
             return account_id
         salt, digest = hash_password(uuid.uuid4().hex + uuid.uuid4().hex)
         cursor = conn.execute(
             """
             INSERT INTO accounts(
                 username, display_name, password_salt, password_hash, role,
-                is_active, must_change_password, created_at, updated_at,
+                is_active, must_change_password, last_login, created_at, updated_at,
                 server_account_id, stats_scope, is_archived,
-                entitlement_revision
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entitlement_revision, is_test
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username,
@@ -2752,14 +2821,25 @@ class Database:
                 str(payload.get("role") or "user"),
                 int(bool(payload.get("is_active", True))),
                 int(bool(payload.get("must_change_password", False))),
+                last_login,
                 str(payload.get("created_at") or now),
                 str(payload.get("updated_at") or now),
                 server_account_id,
                 str(payload.get("stats_scope") or "own"),
                 int(bool(payload.get("is_archived", False))),
                 int(payload.get("entitlement_revision") or 0),
+                is_test,
             ),
         )
+        if is_test_provided and is_test:
+            conn.execute(
+                "DELETE FROM sync_outbox WHERE server_account_id=?",
+                (server_account_id,),
+            )
+            conn.execute(
+                "DELETE FROM captcha_upload_outbox WHERE server_account_id=?",
+                (server_account_id,),
+            )
         return int(cursor.lastrowid)
 
     def upsert_remote_account(self, payload: Dict) -> Account:

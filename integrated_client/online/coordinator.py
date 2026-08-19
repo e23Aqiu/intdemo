@@ -72,8 +72,17 @@ class SyncCoordinator(QObject):
         # never try to refresh the same session at the same time.
         self.request_sync()
 
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def is_stopped(self) -> bool:
+        return self._stopped
+
     def stop(self):
         self._stopped = True
+        self._rerun_requested = False
         self._push_timer.stop()
         self._poll_timer.stop()
         self._ws_retry_timer.stop()
@@ -102,6 +111,23 @@ class SyncCoordinator(QObject):
         )
         self.engine.database.make_sync_retries_due(account_id)
         self.request_sync()
+
+    def pause_for_reauthentication(self) -> bool:
+        if self._running:
+            return False
+        self.stop()
+        return True
+
+    def resume_after_reauthentication(self):
+        state = self.engine.session.state
+        if state is None or not state.is_online:
+            return
+        account_id = state.account.server_account_id
+        self.engine.database.make_sync_retries_due(account_id)
+        if self._stopped:
+            self.start()
+        else:
+            self.request_sync()
 
     def _on_worker_finished(self, status):
         self._running = False
@@ -152,6 +178,10 @@ class SyncCoordinator(QObject):
                 or exc.retryable
                 or exc.status_code >= 500
             )
+            if offline:
+                note_offline = getattr(self.engine.session, "note_offline", None)
+                if callable(note_offline):
+                    note_offline()
             self.status_changed.emit(
                 self.engine.status(
                     "offline" if offline else "error",

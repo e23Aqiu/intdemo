@@ -940,12 +940,13 @@ class DashboardPage(QWidget):
         stations = [
             account
             for account in self.database.list_accounts()
-            if not account.is_admin
+            if not account.is_admin and not account.is_test
         ]
         restricted_online_scope = (
             self.account.server_account_id is not None
             and not self.account.can_view_all_stats
         )
+        hidden_test_scope = self.account.is_test and not self.account.can_view_all_stats
         if restricted_online_scope:
             stations = [
                 account for account in stations if account.id == self.account.id
@@ -959,11 +960,16 @@ class DashboardPage(QWidget):
 
         self.station_combo.blockSignals(True)
         self.station_combo.clear()
-        self.station_combo.addItem("全部站点", None)
+        self.station_combo.addItem(
+            "不参与统计" if hidden_test_scope else "全部站点",
+            self.account.id if hidden_test_scope else None,
+        )
         for station in stations:
             self.station_combo.addItem(station.name_label, station.id)
         available_ids = {station.id for station in stations}
-        if had_options and current_id in available_ids:
+        if hidden_test_scope:
+            target_id = self.account.id
+        elif had_options and current_id in available_ids:
             target_id = current_id
         elif had_options and current_id is None:
             target_id = None

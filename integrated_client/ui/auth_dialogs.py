@@ -398,6 +398,77 @@ class LoginDialog(FramelessDialog):
         self.accept()
 
 
+class ReconnectDialog(FramelessDialog):
+    def __init__(self, session_manager, account, parent=None):
+        super().__init__(
+            parent,
+            resizable=False,
+            show_minimize=False,
+            show_maximize=False,
+        )
+        self.session_manager = session_manager
+        self.account = None
+        self.password = ""
+        self.setWindowTitle("重新上线")
+        self.setFixedSize(430, 270)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(34, 28, 34, 28)
+        layout.setSpacing(14)
+        title = QLabel("重新上线")
+        title.setObjectName("PageTitle")
+        layout.addWidget(title)
+        hint = QLabel(
+            "当前账号和业务任务会继续保留。验证成功后将自动上传离线数据。"
+        )
+        hint.setObjectName("Muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        form = QFormLayout()
+        username = QLabel(account.username)
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.setPlaceholderText("请输入当前账号密码")
+        self.password_edit.returnPressed.connect(self._reconnect)
+        form.addRow("账号", username)
+        form.addRow("密码", self.password_edit)
+        layout.addLayout(form)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("取消")
+        cancel.clicked.connect(self.reject)
+        self.reconnect_button = QPushButton("重新上线")
+        self.reconnect_button.setObjectName("PrimaryButton")
+        self.reconnect_button.clicked.connect(self._reconnect)
+        buttons.addWidget(cancel)
+        buttons.addWidget(self.reconnect_button)
+        layout.addLayout(buttons)
+        self.password_edit.setFocus()
+
+    def _reconnect(self):
+        password = self.password_edit.text()
+        if not password:
+            QMessageBox.warning(self, "密码为空", "请输入当前账号密码。")
+            self.password_edit.setFocus()
+            return
+        try:
+            account = run_with_loading(
+                self,
+                "正在重新上线…",
+                lambda: self.session_manager.reauthenticate(password),
+            )
+        except AuthenticationError as exc:
+            QMessageBox.warning(self, "重新上线失败", str(exc))
+            self.password_edit.selectAll()
+            self.password_edit.setFocus()
+            return
+        self.account = account
+        self.password = password
+        self.accept()
+
+
 class RenameAccountDialog(FramelessDialog):
     def __init__(self, account, parent=None):
         super().__init__(parent)
@@ -458,7 +529,7 @@ class AccountPermissionDialog(FramelessDialog):
         title.setObjectName("PageTitle")
         layout.addWidget(title)
         hint = QLabel(
-            "管理员可以管理账号和所有站点数据；普通用户不显示账号管理入口。"
+            "测试账号与普通用户权限相同，但不记录或汇总业务统计。"
         )
         hint.setWordWrap(True)
         hint.setObjectName("Muted")
@@ -468,8 +539,10 @@ class AccountPermissionDialog(FramelessDialog):
         account_label = QLabel(f"{account.name_label}（{account.username}）")
         self.role_combo = QComboBox()
         self.role_combo.addItem("普通用户", "user")
+        self.role_combo.addItem("测试账号", "test")
         self.role_combo.addItem("管理员", "admin")
-        self.role_combo.setCurrentIndex(self.role_combo.findData(account.role))
+        account_type = "test" if account.is_test else account.role
+        self.role_combo.setCurrentIndex(self.role_combo.findData(account_type))
         form.addRow("账号", account_label)
         form.addRow("账号权限", self.role_combo)
         layout.addLayout(form)
@@ -506,6 +579,7 @@ class CreateAccountDialog(FramelessDialog):
         self.confirm_edit.setEchoMode(QLineEdit.Password)
         self.role_combo = QComboBox()
         self.role_combo.addItem("普通用户", "user")
+        self.role_combo.addItem("测试账号", "test")
         self.role_combo.addItem("管理员", "admin")
         form.addRow("用户名称", self.display_name_edit)
         form.addRow("账号", self.username_edit)

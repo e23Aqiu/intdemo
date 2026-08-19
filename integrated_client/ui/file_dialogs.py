@@ -91,6 +91,17 @@ def _initial_path(value: str) -> str:
     return str(path)
 
 
+def _find_zenity():
+    """Find the distro chooser even when a desktop launcher has a short PATH."""
+    program = shutil.which("zenity")
+    if program:
+        return program
+    for candidate in ("/usr/bin/zenity", "/bin/zenity", "/usr/local/bin/zenity"):
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
 def _run_process_blocking(
     arguments: list[str],
     environment: dict[str, str],
@@ -231,17 +242,13 @@ def _uos_file_selection(
     """Return selected paths, ``[]`` for cancel, or ``None`` for Qt fallback."""
     if not is_uos():
         return None
-    program = shutil.which("zenity")
+    program = _find_zenity()
     if not program:
         return None
 
-    # Zenity can only establish a transient/modal relationship with a Qt
-    # parent through its X11 window id. On a pure Wayland session, or when the
-    # id cannot be resolved, use the in-process modal fallback instead.
+    # Attach to the Qt window when X11 exposes a native id. Pure Wayland and
+    # restricted desktop launchers still use the portal chooser without an id.
     window_id = _parent_window_id(parent)
-    if parent is not None and window_id <= 0:
-        return None
-
     # Keep the native chooser modal so the Qt parent cannot cover it while
     # the synchronous selection call is waiting for a result.
     arguments = [

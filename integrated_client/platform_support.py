@@ -76,7 +76,16 @@ def is_uos():
         except OSError:
             continue
         normalized = content.casefold()
-        if "systemname=uos" in normalized or "uniontech" in normalized:
+        if any(
+            marker in normalized
+            for marker in (
+                "systemname=uos",
+                "id=uos",
+                "id_like=uos",
+                "uniontech",
+                "uos desktop",
+            )
+        ):
             return True
     return False
 

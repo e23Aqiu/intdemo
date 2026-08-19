@@ -108,6 +108,7 @@ from integrated_client.ui.online_account_page import (
 )
 from integrated_client.ui.statistics_page import (
     AnimatedDonutChart,
+    DISTRIBUTION_CHART_HEIGHT,
     StationDistributionChart,
     StatisticsPage,
     ViolationReasonChart,
@@ -1964,6 +1965,7 @@ class ToolAndUiTests(unittest.TestCase):
             "is_active": True,
             "is_archived": False,
             "entitlement_revision": 1,
+            "last_login_at": "2026-08-19T08:32:47+08:00",
         }
         stale_payload = {
             "id": "deleted-test-account",
@@ -2010,6 +2012,7 @@ class ToolAndUiTests(unittest.TestCase):
             page.refresh()
 
         self.assertEqual(page.table.rowCount(), 1)
+        self.assertEqual(page.table.item(0, 8).text(), "2026-08-19 08:32:47")
         self.assertEqual(deleted_ids, [stale.id])
         self.assertNotIn(
             "test",
@@ -2028,6 +2031,12 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(dialog.device_limit.value(), 10000)
         dialog.device_limit.setValue(3)
         self.assertEqual(dialog.values()["device_limit"], 3)
+        dialog.scope.setCurrentIndex(dialog.scope.findData("all"))
+        dialog.role.setCurrentIndex(dialog.role.findData("test"))
+        self.assertTrue(dialog.scope.isEnabled())
+        self.assertEqual(dialog.values()["role"], "user")
+        self.assertTrue(dialog.values()["is_test"])
+        self.assertEqual(dialog.values()["stats_scope"], "all")
         dialog.deleteLater()
 
     def test_sync_coordinator_uses_pyqt5_socket_state_without_crashing(self):
@@ -2046,6 +2055,28 @@ class ToolAndUiTests(unittest.TestCase):
             coordinator._on_worker_finished(status)
         connect.assert_called_once_with()
         self.assertFalse(coordinator._running)
+        coordinator.stop()
+        coordinator.deleteLater()
+
+    def test_sync_coordinator_resumes_and_makes_offline_items_due(self):
+        account = self.db.create_account(
+            "resume01",
+            "Resume@123",
+            "user",
+            self.admin.id,
+        )
+        state = Mock(is_online=True, account=account)
+        engine = Mock()
+        engine.session.state = state
+        coordinator = SyncCoordinator(engine)
+
+        with patch.object(coordinator, "start") as start:
+            coordinator.resume_after_reauthentication()
+
+        engine.database.make_sync_retries_due.assert_called_once_with(
+            account.server_account_id
+        )
+        start.assert_called_once_with()
         coordinator.stop()
         coordinator.deleteLater()
 
@@ -2154,7 +2185,7 @@ class ToolAndUiTests(unittest.TestCase):
             last_sync_at="2026-07-28T10:00:00+08:00",
         )
         window._update_sync_status(status)
-        self.assertIn("待同步：35", window.sync_retry_button.text())
+        self.assertIn("未上传：35", window.sync_retry_button.text())
         self.assertTrue(
             window.sync_status_card.isAncestorOf(window.sync_retry_button)
         )
@@ -2204,6 +2235,151 @@ class ToolAndUiTests(unittest.TestCase):
             "重启并安装",
         )
 
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
+    def test_expired_online_session_keeps_window_and_current_page_open(self):
+        user = self.db.create_account(
+            "offline01",
+            "Offline@123",
+            "user",
+            self.admin.id,
+            display_name="离线站点",
+        )
+
+        class State:
+            account = user
+            mode = "reauth_required"
+            is_online = False
+            offline_expires_at = "2026-08-26T10:00:00+08:00"
+
+        class Session:
+            state = State()
+            api = object()
+
+        class Engine:
+            @staticmethod
+            def status(state=None, error=None):
+                return SyncStatus(
+                    state=state or "reauth_required",
+                    pending_count=4,
+                    quarantined_count=0,
+                    last_sync_at=None,
+                    error=error,
+                )
+
+        class Coordinator(QObject):
+            status_changed = pyqtSignal(object)
+            data_changed = pyqtSignal()
+            engine = Engine()
+
+            @staticmethod
+            def retry_now():
+                return None
+
+        window = MainWindow(
+            self.db,
+            user,
+            session_manager=Session(),
+            sync_coordinator=Coordinator(),
+        )
+        window.show_page("workflow")
+        close_attempt = Mock(return_value=True)
+        window._prepare_close = close_attempt
+        logout_requests = []
+        window.logout_requested.connect(lambda: logout_requests.append(True))
+
+        window._update_sync_status(Engine.status())
+        self.app.processEvents()
+
+        self.assertIs(window.stack.currentWidget(), window.workflow_page)
+        self.assertFalse(logout_requests)
+        close_attempt.assert_not_called()
+        self.assertIn("未上传：4", window.sync_retry_button.text())
+        self.assertTrue(window.sidebar_profile.property("reconnectAvailable"))
+        self.assertIn("点击重新上线", window.sidebar_role.text())
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
+    def test_test_account_has_user_features_without_statistics_or_timing(self):
+        self.assertEqual(self.db.ensure_default_station_users(), 5)
+        account = self.db.create_account(
+            "testonly",
+            "TestOnly@123",
+            "test",
+            self.admin.id,
+            display_name="测试专用",
+        )
+        window = MainWindow(self.db, account)
+
+        self.assertEqual(account.role, "user")
+        self.assertTrue(account.is_test)
+        self.assertEqual(account.role_label, "测试账号")
+        self.assertIn("workflow", window._pages)
+        self.assertIn("statistics", window._pages)
+        self.assertNotIn("accounts", window._pages)
+        self.assertIsNone(window.workflow_timing)
+        self.assertFalse(window.business_metrics_enabled)
+        self.assertTrue(
+            window._record_workflow_summary(
+                {WORKFLOW_TOTAL_METRIC: 8},
+                "unified_workflow",
+                task_id="test-account-task",
+            )
+        )
+        self.assertTrue(
+            all(row["total"] == 0 for row in self.db.get_user_totals(account.id))
+        )
+        self.assertEqual(self.db.get_sync_pending_count(), 0)
+        self.assertEqual(window.sidebar_role.text(), "测试账号  ·  testonly")
+        statistics_page = window.statistics_page
+        statistics_scope_index = statistics_page.station_combo.findData(account.id)
+        self.assertGreaterEqual(statistics_scope_index, 0)
+        self.assertEqual(
+            statistics_page.station_combo.itemText(statistics_scope_index),
+            "不参与统计",
+        )
+        self.assertNotIn(
+            account.username,
+            {
+                row["username"]
+                for row in statistics_page.station_distribution_chart._rows
+            },
+        )
+        self.assertNotIn(
+            account.name_label,
+            [
+                statistics_page.station_combo.itemText(index)
+                for index in range(statistics_page.station_combo.count())
+            ],
+        )
+        self.assertNotIn(
+            account.name_label,
+            [
+                statistics_page.summary_table.item(row, 0).text()
+                for row in range(statistics_page.summary_table.rowCount())
+            ],
+        )
+        dashboard_page = window.dashboard_page
+        dashboard_scope_index = dashboard_page.station_combo.findData(account.id)
+        self.assertGreaterEqual(dashboard_scope_index, 0)
+        self.assertEqual(
+            dashboard_page.station_combo.itemText(dashboard_scope_index),
+            "不参与统计",
+        )
+        self.assertNotIn(
+            account.username,
+            {row["username"] for row in dashboard_page.station_share_chart._rows},
+        )
+        self.assertNotIn(
+            account.name_label,
+            [
+                dashboard_page.station_table.item(row, 0).text()
+                for row in range(dashboard_page.station_table.rowCount())
+            ],
+        )
         window.workflow_page.shutdown()
         window._prepared_to_close = True
         window.close()
@@ -2680,6 +2856,16 @@ class ToolAndUiTests(unittest.TestCase):
         window.workflow_page.shutdown()
         window._prepared_to_close = True
         window.close()
+
+    def test_system_settings_does_not_inherit_hidden_page_scrollbars(self):
+        window = MainWindow(self.db, self.admin)
+        window.show()
+        window.show_page("personal")
+        self.app.processEvents()
+
+        self.assertEqual(window.stack.sizeHint(), window.personal_center_page.sizeHint())
+        self.assertFalse(window.page_scroll_area.horizontalScrollBar().isVisible())
+        self.assertFalse(window.page_scroll_area.verticalScrollBar().isVisible())
 
     def test_normal_user_permissions_and_stat_recording(self):
         self.assertEqual(self.db.ensure_default_station_users(), 5)
@@ -5303,6 +5489,13 @@ class ToolAndUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(len(chart._slice_hitboxes), 1)
         self.assertTrue(all(rect.height() == chart.BAR_HEIGHT for rect in chart._bar_rects))
+        self.assertEqual(
+            [chart._values[key] for key, _label, _color in chart._bar_payloads],
+            sorted(
+                [chart._values[key] for key, _label, _color in chart._bar_payloads],
+                reverse=True,
+            ),
+        )
         slice_item = chart._slice_hitboxes[0]
         outer = slice_item["outer"]
         inner = slice_item["inner"]
@@ -5371,6 +5564,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(chart.mode_button.isChecked())
         self.assertEqual(chart.mode_button.text(), "切换为电话拆分")
         self.assertEqual(chart._format_bar_label(2, 10), "2 条  ·  20.0%")
+        self.assertEqual([row["total"] for row in chart._rows], [8, 2])
         self.assertEqual(len(chart._bar_hitboxes), 2)
         self.assertEqual(
             int(
@@ -5383,7 +5577,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertLess(chart.mode_button.geometry().bottom(), int(bar_rect.top()))
         bar_y = int(bar_rect.center().y())
         value_x = int(bar_rect.left() + bar_rect.width() * 0.1)
-        empty_x = int(bar_rect.left() + bar_rect.width() * 0.5)
+        empty_x = int(bar_rect.left() + bar_rect.width() * 0.9)
         self.assertEqual(
             image.pixelColor(value_x, bar_y).name(), chart.COLORS[0].name()
         )
@@ -5392,6 +5586,100 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(chart._format_bar_label(2, 10), "2 条")
         self.assertFalse(chart.mode_button.isChecked())
         chart.close()
+
+    def test_distribution_charts_use_fixed_height_and_scroll_long_sorted_lists(self):
+        page = StatisticsPage(self.db, self.admin)
+        for chart in (
+            page.distribution_chart,
+            page.violation_chart,
+            page.station_distribution_chart,
+        ):
+            self.assertEqual(chart.minimumHeight(), DISTRIBUTION_CHART_HEIGHT)
+            self.assertEqual(chart.maximumHeight(), DISTRIBUTION_CHART_HEIGHT)
+        page.close()
+
+        violation_chart = ViolationReasonChart()
+        violation_chart.resize(900, DISTRIBUTION_CHART_HEIGHT)
+        violation_chart.set_rows(
+            [
+                {
+                    "reason": f"原因{value:02d}",
+                    "total": value,
+                    "has_phone": value // 2,
+                    "other": value - value // 2,
+                }
+                for value in range(1, 15)
+            ],
+            "全部站点",
+        )
+        violation_chart.show()
+        violation_chart.grab()
+        self.app.processEvents()
+        self.assertEqual(
+            [row["total"] for row in violation_chart._rows],
+            list(range(14, 0, -1)),
+        )
+        self.assertTrue(violation_chart._meter_scrollbar.isVisible())
+        self.assertGreater(violation_chart._meter_scrollbar.maximum(), 0)
+        self.assertEqual(violation_chart._bar_hitboxes[0][1]["total"], 14)
+        violation_chart._meter_scrollbar.setValue(
+            violation_chart._meter_scrollbar.maximum()
+        )
+        violation_chart.grab()
+        self.app.processEvents()
+        self.assertEqual(violation_chart._bar_hitboxes[-1][1]["total"], 1)
+        self.assertTrue(
+            all(
+                rect.intersects(violation_chart._meter_viewport)
+                for rect, _row in violation_chart._bar_hitboxes
+            )
+        )
+        violation_chart.close()
+
+        station_chart = StationDistributionChart()
+        station_chart.resize(1000, DISTRIBUTION_CHART_HEIGHT)
+        station_chart.set_rows(
+            [
+                {
+                    "station": f"站点{value:02d}",
+                    "username": f"station{value:02d}",
+                    "total": value,
+                    "has_phone": value // 2,
+                    "total_share": float(value),
+                    "phone_share": float(value),
+                    "total_time_ms": (13 - value) * 1000,
+                    "active_ms": (13 - value) * 500,
+                    "total_time_share": float(13 - value),
+                    "active_time_share": float(13 - value),
+                }
+                for value in range(1, 13)
+            ]
+        )
+        station_chart.show()
+        station_chart.grab()
+        self.app.processEvents()
+        self.assertEqual(
+            [row["total"] for row in station_chart._rows],
+            list(range(12, 0, -1)),
+        )
+        self.assertTrue(station_chart._meter_scrollbar.isVisible())
+        station_chart._meter_scrollbar.setValue(
+            station_chart._meter_scrollbar.maximum()
+        )
+        station_chart.grab()
+        self.app.processEvents()
+        self.assertEqual(station_chart._legend_hitboxes[-1][1]["total"], 1)
+
+        station_chart.set_series_mode("timing")
+        station_chart.set_timing_basis("active")
+        self.assertEqual(
+            [row["active_ms"] for row in station_chart._rows],
+            sorted(
+                [row["active_ms"] for row in station_chart._rows],
+                reverse=True,
+            ),
+        )
+        station_chart.close()
 
     def test_hover_card_is_not_clipped_by_a_narrow_chart(self):
         chart = ViolationReasonChart()

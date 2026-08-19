@@ -238,6 +238,8 @@ class OnlineSessionManager:
             raise NetworkUnavailable("当前没有可用的在线会话")
         if self.state.mode == "offline_untracked":
             raise NetworkUnavailable("当前为手动离线业务模式")
+        if self.state.mode == "reauth_required":
+            raise NetworkUnavailable("登录会话已失效，请从左下角账号区域重新上线")
         if not self.state.is_online:
             return self._refresh_access_token()
         expires = self._parse_time(self._bundle["access_expires_at"])
@@ -246,21 +248,10 @@ class OnlineSessionManager:
         return self._refresh_access_token()
 
     def _refresh_access_token(self) -> str:
-        try:
-            bundle = self.api.refresh(
-                self._bundle["refresh_token"],
-                self.device_uid,
-            )
-        except ApiResponseError as exc:
-            if exc.code in {
-                "refresh_token_reuse",
-                "session_revoked",
-                "device_revoked",
-                "account_unavailable",
-                "refresh_token_expired",
-            }:
-                self.database.clear_secure_online_profile()
-            raise
+        bundle = self.api.refresh(
+            self._bundle["refresh_token"],
+            self.device_uid,
+        )
         profile = self._decrypt_profile()
         if not profile:
             raise AuthenticationError("本机加密登录资料不存在")
@@ -282,7 +273,7 @@ class OnlineSessionManager:
         if (
             self.state
             and self._bundle
-            and self.state.mode != "offline_untracked"
+            and self.state.mode not in {"offline_untracked", "reauth_required"}
         ):
             self._state_from_bundle(self._bundle, "offline")
 
@@ -292,8 +283,6 @@ class OnlineSessionManager:
         self.state = None
 
     def invalidate_credentials(self) -> None:
-        self.database.clear_secure_online_profile()
-        self._bundle = None
         if self.state:
             self.state = SessionState(
                 account=self.state.account,
@@ -301,6 +290,33 @@ class OnlineSessionManager:
                 device_uid=self.state.device_uid,
                 offline_expires_at=self.state.offline_expires_at,
             )
+
+    def reauthenticate(self, password: str) -> Account:
+        """Restore this account online without replacing the active app session."""
+        if not self.state or not self._bundle:
+            raise AuthenticationError("当前没有可重新上线的账号")
+        username = self.state.account.username
+        expected_account_id = str(self.state.account.server_account_id or "")
+        try:
+            bundle = self.api.login(
+                username,
+                password,
+                self.device_uid,
+                platform.node() or f"{platform.system() or 'Desktop'} device",
+                APP_VERSION,
+            )
+        except NetworkUnavailable as exc:
+            raise AuthenticationError(f"暂时无法重新上线：{exc}") from exc
+        except ApiResponseError as exc:
+            raise AuthenticationError(exc.message) from exc
+
+        received_account_id = str(bundle.get("account", {}).get("id") or "")
+        if expected_account_id and received_account_id != expected_account_id:
+            raise AuthenticationError("服务器返回的账号与当前登录账号不一致")
+        account = self._state_from_bundle(bundle, "online")
+        if not bundle["account"].get("must_change_password"):
+            account = self._save_bundle(bundle, password)
+        return account
 
     def logout(self) -> None:
         if self._bundle and self.state and self.state.access_token:

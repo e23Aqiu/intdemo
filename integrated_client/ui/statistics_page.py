@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollBar,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -50,6 +51,7 @@ from .frameless import FramelessMessageBox as QMessageBox
 
 
 MILLISECONDS_PER_HOUR = 60 * 60 * 1000
+DISTRIBUTION_CHART_HEIGHT = 300
 
 
 def format_hours(milliseconds):
@@ -264,6 +266,7 @@ class AnimatedDonutChart(QWidget):
 
     BAR_HEIGHT = 10.0
     DONUT_HOVER_OFFSET = 9.0
+    METER_SCROLLBAR_WIDTH = 12
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -274,7 +277,61 @@ class AnimatedDonutChart(QWidget):
         self._animation_timer.setInterval(40)
         self._animation_timer.timeout.connect(self._advance_animation)
         self._hover_card = ChartHoverCard(self)
+        self._meter_viewport = QRectF()
+        self._meter_row_height = 32
+        self._meter_scrollbar = QScrollBar(Qt.Vertical, self)
+        self._meter_scrollbar.setObjectName("ChartMeterScrollBar")
+        self._meter_scrollbar.setFocusPolicy(Qt.NoFocus)
+        self._meter_scrollbar.valueChanged.connect(self._on_meter_scroll)
+        self._meter_scrollbar.hide()
         self.setMouseTracking(True)
+
+    def _on_meter_scroll(self, _value):
+        self._hover_card.hide()
+        self.update()
+
+    def _reset_meter_scroll(self):
+        self._meter_scrollbar.setValue(0)
+
+    def _configure_meter_scroll(self, viewport, content_height, row_height):
+        """Configure the child scrollbar and return the current pixel offset."""
+        self._meter_viewport = QRectF(viewport)
+        self._meter_row_height = max(1, int(row_height))
+        viewport_height = max(0, int(self._meter_viewport.height()))
+        maximum = max(0, int(math.ceil(content_height - viewport_height)))
+        self._meter_scrollbar.setGeometry(
+            max(0, self.width() - self.METER_SCROLLBAR_WIDTH - 5),
+            max(0, int(self._meter_viewport.top())),
+            self.METER_SCROLLBAR_WIDTH,
+            viewport_height,
+        )
+        self._meter_scrollbar.setSingleStep(self._meter_row_height)
+        self._meter_scrollbar.setPageStep(max(self._meter_row_height, viewport_height))
+        self._meter_scrollbar.setRange(0, maximum)
+        self._meter_scrollbar.setVisible(maximum > 0)
+        if maximum > 0:
+            self._meter_scrollbar.raise_()
+        return self._meter_scrollbar.value()
+
+    def wheelEvent(self, event):
+        if (
+            self._meter_scrollbar.maximum() > 0
+            and self._meter_viewport.contains(event.pos())
+        ):
+            pixel_delta = event.pixelDelta().y()
+            angle_delta = event.angleDelta().y()
+            if pixel_delta:
+                amount = -pixel_delta
+            else:
+                steps = angle_delta / 120 if angle_delta else 0
+                amount = int(-steps * self._meter_row_height * 3)
+            if amount:
+                self._meter_scrollbar.setValue(
+                    self._meter_scrollbar.value() + amount
+                )
+                event.accept()
+                return
+        super().wheelEvent(event)
 
     def _advance_animation(self):
         self._animation_phase = (self._animation_phase + 0.025) % 1.0
@@ -375,6 +432,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
     def set_values(self, values, scope=""):
         self._values = {key: int(value or 0) for key, value in values.items()}
         self._scope = scope
+        self._reset_meter_scroll()
         self.update()
 
     def paintEvent(self, event):
@@ -462,8 +520,21 @@ class WorkflowDistributionChart(AnimatedDonutChart):
             zip(self.SEGMENTS, segment_values),
             key=lambda item: (-int(item[1]), str(item[0][1])),
         )
+        meter_viewport = QRectF(
+            legend_left,
+            50,
+            max(0, self.width() - legend_left - 22),
+            max(0, self.height() - 64),
+        )
+        scroll_offset = self._configure_meter_scroll(
+            meter_viewport,
+            len(legend_rows) * row_height,
+            row_height,
+        )
+        painter.save()
+        painter.setClipRect(meter_viewport)
         for index, ((metric_key, label, color), value) in enumerate(legend_rows):
-            top = 50 + index * row_height
+            top = 50 + index * row_height - scroll_offset
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(QRectF(legend_left, top + 2, 10, 10), 3, 3)
@@ -481,8 +552,9 @@ class WorkflowDistributionChart(AnimatedDonutChart):
             bar_rect = QRectF(
                 legend_left, top + 20, legend_width, self.BAR_HEIGHT
             )
-            self._bar_rects.append(QRectF(bar_rect))
-            self._bar_payloads.append((metric_key, label, color))
+            if bar_rect.intersects(meter_viewport):
+                self._bar_rects.append(QRectF(bar_rect))
+                self._bar_payloads.append((metric_key, label, color))
             painter.setPen(Qt.NoPen)
             painter.setBrush(QColor("#e8f1ef"))
             painter.drawRoundedRect(bar_rect, 5, 5)
@@ -494,6 +566,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
                 value_path.addRoundedRect(value_rect, 5, 5)
                 painter.drawPath(value_path)
                 self._draw_flow_highlight(painter, value_path, value_rect)
+        painter.restore()
 
     def _show_category_details(self, label, value, total, color, anchor):
         percent = value / max(total, 1) * 100
@@ -576,13 +649,15 @@ class ViolationReasonChart(AnimatedDonutChart):
         self.setMinimumHeight(280)
 
     def set_rows(self, rows, scope=""):
-        self._rows = list(rows)
-        self._scope = scope
-        # Keep enough vertical room for every reason bar. The page-level
-        # scroll area then handles long lists instead of clipping rows.
-        self.setMinimumHeight(
-            max(280, 82 + len(self._rows) * self.BAR_ROW_HEIGHT + 18)
+        self._rows = sorted(
+            (dict(row) for row in rows),
+            key=lambda row: (
+                -int(row.get("total") or 0),
+                str(row.get("reason") or ""),
+            ),
         )
+        self._scope = scope
+        self._reset_meter_scroll()
         self.update()
 
     def set_bar_mode(self, mode):
@@ -658,6 +733,11 @@ class ViolationReasonChart(AnimatedDonutChart):
             )
 
         if not self._rows:
+            self._configure_meter_scroll(
+                QRectF(320, 46, max(0, self.width() - 342), max(0, self.height() - 60)),
+                0,
+                self.BAR_ROW_HEIGHT,
+            )
             painter.setPen(QColor("#8a98aa"))
             painter.drawText(self.rect(), Qt.AlignCenter, "当前筛选范围暂无“原因”数据")
             return
@@ -713,10 +793,23 @@ class ViolationReasonChart(AnimatedDonutChart):
         label_width = max(90, int(legend_width * 0.56))
         row_height = self.BAR_ROW_HEIGHT
         top = 46
+        meter_viewport = QRectF(
+            legend_left,
+            top,
+            max(0, self.width() - legend_left - 22),
+            max(0, self.height() - top - 14),
+        )
+        scroll_offset = self._configure_meter_scroll(
+            meter_viewport,
+            len(rows) * row_height,
+            row_height,
+        )
         painter.setFont(QFont("Microsoft YaHei UI", 9))
 
+        painter.save()
+        painter.setClipRect(meter_viewport)
         for index, row in enumerate(rows):
-            row_top = top + index * row_height
+            row_top = top + index * row_height - scroll_offset
             color = self.COLORS[index % len(self.COLORS)]
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
@@ -740,7 +833,8 @@ class ViolationReasonChart(AnimatedDonutChart):
             bar_rect = QRectF(
                 legend_left, row_top + 18, legend_width, self.BAR_HEIGHT
             )
-            self._bar_hitboxes.append((bar_rect, dict(row)))
+            if bar_rect.intersects(meter_viewport):
+                self._bar_hitboxes.append((bar_rect, dict(row)))
             painter.setPen(Qt.NoPen)
             bar_path = QPainterPath()
             bar_path.addRoundedRect(bar_rect, 5, 5)
@@ -771,6 +865,7 @@ class ViolationReasonChart(AnimatedDonutChart):
                     painter.setBrush(color)
                     painter.drawPath(value_path)
                     self._draw_flow_highlight(painter, value_path, value_rect)
+        painter.restore()
 
     def mouseMoveEvent(self, event):
         slice_index, slice_row = self._slice_at(event.pos())
@@ -828,6 +923,8 @@ class StationDistributionChart(AnimatedDonutChart):
         QColor("#df8b55"),
         QColor("#4a9c91"),
     )
+    COUNT_ROW_HEIGHT = 30
+    TIMING_ROW_HEIGHT = 34
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -839,25 +936,48 @@ class StationDistributionChart(AnimatedDonutChart):
         self.setMinimumHeight(280)
 
     def set_rows(self, rows):
-        self._rows = list(rows)
+        self._rows = [dict(row) for row in rows]
+        self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
+        self._reset_meter_scroll()
         self.update()
+
+    def _sort_rows(self):
+        if self._series_mode == "timing":
+            value_key = (
+                "active_ms" if self._timing_basis == "active" else "total_time_ms"
+            )
+            tie_key = "total"
+        else:
+            value_key = "total"
+            tie_key = "has_phone"
+        self._rows.sort(
+            key=lambda row: (
+                -int(row.get(value_key) or 0),
+                -int(row.get(tie_key) or 0),
+                str(row.get("station") or "").casefold(),
+            )
+        )
 
     def set_series_mode(self, mode):
         if mode not in {"counts", "timing"}:
             raise ValueError(f"Unsupported station distribution mode: {mode}")
         self._series_mode = mode
+        self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
+        self._reset_meter_scroll()
         self.update()
 
     def set_timing_basis(self, basis):
         if basis not in {"total", "active"}:
             raise ValueError(f"Unsupported timing basis: {basis}")
         self._timing_basis = basis
+        self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
+        self._reset_meter_scroll()
         self.update()
 
     @staticmethod
@@ -978,6 +1098,11 @@ class StationDistributionChart(AnimatedDonutChart):
         painter.drawText(155, 29, panel_subtitle)
 
         if not self._rows:
+            self._configure_meter_scroll(
+                QRectF(320, 59, max(0, self.width() - 342), max(0, self.height() - 73)),
+                0,
+                self.COUNT_ROW_HEIGHT,
+            )
             painter.setPen(QColor("#8a98aa"))
             painter.drawText(self.rect(), Qt.AlignCenter, "暂无站点数据")
             return
@@ -1073,28 +1198,35 @@ class StationDistributionChart(AnimatedDonutChart):
                 "有电话数 / 占比",
             )
 
-        visible_rows = self._rows[:7]
         if is_timing_mode:
-            row_height = max(
-                30,
-                min(34, int((self.height() - 54) / max(len(visible_rows), 1))),
-            )
+            row_height = self.TIMING_ROW_HEIGHT
             top = 50
         else:
-            row_height = max(
-                29,
-                min(38, int((self.height() - 58) / max(len(visible_rows), 1))),
-            )
+            row_height = self.COUNT_ROW_HEIGHT
             top = 59
+        meter_viewport = QRectF(
+            legend_left,
+            top,
+            max(0, self.width() - legend_left - 22),
+            max(0, self.height() - top - 14),
+        )
+        scroll_offset = self._configure_meter_scroll(
+            meter_viewport,
+            len(self._rows) * row_height,
+            row_height,
+        )
         label_width = max(90, first_column - legend_left - 24)
         painter.setFont(QFont("Microsoft YaHei UI", 9))
 
-        for index, row in enumerate(visible_rows):
-            row_top = top + index * row_height
+        painter.save()
+        painter.setClipRect(meter_viewport)
+        for index, row in enumerate(self._rows):
+            row_top = top + index * row_height - scroll_offset
             hitbox = QRectF(
                 legend_left, row_top, legend_width, max(27, row_height - 2)
             )
-            self._legend_hitboxes.append((hitbox, dict(row)))
+            if hitbox.intersects(meter_viewport):
+                self._legend_hitboxes.append((hitbox, dict(row)))
             if not is_timing_mode and index % 2:
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor("#f5f8f7"))
@@ -1139,7 +1271,8 @@ class StationDistributionChart(AnimatedDonutChart):
                     legend_width,
                     self.BAR_HEIGHT,
                 )
-                self._bar_rects.append(QRectF(bar_rect))
+                if bar_rect.intersects(meter_viewport):
+                    self._bar_rects.append(QRectF(bar_rect))
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QColor("#e8f1ef"))
                 painter.drawRoundedRect(bar_rect, 5, 5)
@@ -1160,15 +1293,7 @@ class StationDistributionChart(AnimatedDonutChart):
                     f'{row["has_phone"]} 条 · '
                     f'{self._format_share(row["phone_share"])}',
                 )
-
-        if len(self._rows) > len(visible_rows):
-            painter.setPen(QColor("#8a98aa"))
-            painter.setFont(QFont("Microsoft YaHei UI", 8))
-            painter.drawText(
-                20,
-                self.height() - 7,
-                f"图表显示前 7 个站点，完整 {len(self._rows)} 个站点见下方表格",
-            )
+        painter.restore()
 
     def mouseMoveEvent(self, event):
         slice_index, payload = self._slice_at(event.pos())
@@ -1425,6 +1550,12 @@ class StatisticsPage(QWidget):
         self.distribution_chart = WorkflowDistributionChart()
         self.violation_chart = ViolationReasonChart()
         self.station_distribution_chart = StationDistributionChart()
+        for chart in (
+            self.distribution_chart,
+            self.violation_chart,
+            self.station_distribution_chart,
+        ):
+            chart.setFixedHeight(DISTRIBUTION_CHART_HEIGHT)
         self.violation_mode_button = self.violation_chart.mode_button
         chart_layout.addWidget(self.distribution_chart)
         chart_layout.addWidget(self.violation_chart)
@@ -1600,15 +1731,23 @@ class StatisticsPage(QWidget):
     def _populate_station_options(self):
         had_options = self.station_combo.count() > 0
         current_id = self.station_combo.currentData()
-        self.station_combo.blockSignals(True)
-        self.station_combo.clear()
-        self.station_combo.addItem("全部站点", None)
-        order = {username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)}
-        accounts = [account for account in self.database.list_accounts() if not account.is_admin]
         restricted_online_scope = (
             self.account.server_account_id is not None
             and not self.account.can_view_all_stats
         )
+        hidden_test_scope = self.account.is_test and not self.account.can_view_all_stats
+        self.station_combo.blockSignals(True)
+        self.station_combo.clear()
+        self.station_combo.addItem(
+            "不参与统计" if hidden_test_scope else "全部站点",
+            self.account.id if hidden_test_scope else None,
+        )
+        order = {username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)}
+        accounts = [
+            account
+            for account in self.database.list_accounts()
+            if not account.is_admin and not account.is_test
+        ]
         if restricted_online_scope:
             accounts = [
                 account for account in accounts if account.id == self.account.id
@@ -1649,7 +1788,7 @@ class StatisticsPage(QWidget):
         accounts = [
             account
             for account in self.database.list_accounts()
-            if not account.is_admin
+            if not account.is_admin and not account.is_test
         ]
         accounts.sort(
             key=lambda account: (
@@ -2389,13 +2528,18 @@ class StatisticsPage(QWidget):
         return ordered
 
     def _get_station_distribution_rows(self):
-        default_order = {
-            username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
-        }
         stations = {}
         start_date, end_date = self._date_range()
+        restricted_user_id = (
+            self.account.id
+            if self.account.server_account_id is not None
+            and not self.account.can_view_all_stats
+            else None
+        )
         for row in self.database.get_all_account_totals(start_date, end_date):
             if row["role"] != "user":
+                continue
+            if restricted_user_id is not None and row["user_id"] != restricted_user_id:
                 continue
             station = stations.setdefault(
                 row["user_id"],
@@ -2412,13 +2556,7 @@ class StatisticsPage(QWidget):
             elif row["metric_key"] == WORKFLOW_HAS_PHONE_METRIC:
                 station["has_phone"] = int(row["total"])
 
-        rows = sorted(
-            stations.values(),
-            key=lambda row: (
-                default_order.get(row["username"], 999),
-                row["station"],
-            ),
-        )
+        rows = list(stations.values())
         for row in rows:
             timing = self.database.get_workflow_timing_totals(
                 row["user_id"],
@@ -2446,6 +2584,13 @@ class StatisticsPage(QWidget):
                 if all_active_ms
                 else 0
             )
+        rows.sort(
+            key=lambda row: (
+                -int(row["total"]),
+                -int(row["has_phone"]),
+                str(row["station"]).casefold(),
+            )
+        )
         return rows
 
     def _get_anomaly_rows(self, user_id=None):

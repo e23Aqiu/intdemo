@@ -244,12 +244,20 @@ class AnnouncementHoverCard(QFrame):
         painter.setBrush(QColor("#55c2b1"))
         painter.drawRoundedRect(QRectF(18, 0, 92, 4), 2, 2)
 
-    def show_announcement(self, announcement, index, total, anchor):
+    def show_announcement(
+        self,
+        announcement,
+        index,
+        total,
+        anchor,
+        *,
+        show_unread=True,
+    ):
         self.announcement = announcement
-        unread = not bool(announcement.get("read_at"))
+        unread = bool(show_unread and not announcement.get("read_at"))
         self.badge_label.setText(f"公告 {int(index) + 1} / {max(1, int(total))}")
         self.state_label.setText("未读" if unread else "已读")
-        self.state_label.setVisible(unread)
+        self.state_label.setVisible(bool(show_unread))
         self.title_label.setText(str(announcement.get("title") or "公告"))
         self.summary_label.setText(
             str(
@@ -293,13 +301,15 @@ class AnnouncementTickerButton(QPushButton):
         self._announcement = None
         self._announcement_index = 0
         self._announcement_total = 0
+        self._show_unread = True
         self._hover_card = AnnouncementHoverCard(self)
         self.setMouseTracking(True)
 
-    def set_announcement(self, announcement, index=0, total=0):
+    def set_announcement(self, announcement, index=0, total=0, *, show_unread=True):
         self._announcement = announcement
         self._announcement_index = int(index)
         self._announcement_total = int(total)
+        self._show_unread = bool(show_unread)
         if announcement is None or not self.isEnabled():
             self._hover_card.hide()
         elif self._hover_card.isVisible():
@@ -316,6 +326,7 @@ class AnnouncementTickerButton(QPushButton):
             self._announcement_index,
             self._announcement_total,
             anchor,
+            show_unread=self._show_unread,
         )
 
     def enterEvent(self, event):
@@ -345,8 +356,10 @@ class AnnouncementListDialog(FramelessDialog):
     """Archive-style list of every announcement visible to the account."""
 
     announcement_open_requested = pyqtSignal(object)
+    announcement_read_requested = pyqtSignal(object)
+    conversation_history_requested = pyqtSignal()
 
-    def __init__(self, announcements, parent=None):
+    def __init__(self, announcements, parent=None, *, show_unread=True):
         super().__init__(
             parent,
             resizable=True,
@@ -354,6 +367,7 @@ class AnnouncementListDialog(FramelessDialog):
             show_maximize=True,
         )
         self.announcements = []
+        self.show_unread = bool(show_unread)
         self.setWindowTitle("全部公告")
         self.setModal(True)
         self.resize(980, 680)
@@ -432,7 +446,13 @@ class AnnouncementListDialog(FramelessDialog):
         self.open_button = QPushButton("查看公告详情")
         self.open_button.setObjectName("PrimaryButton")
         self.open_button.clicked.connect(self._open_selected)
+        self.mark_read_button = QPushButton("标记已读")
+        self.mark_read_button.clicked.connect(self._mark_selected_read)
+        self.history_button = QPushButton("历史会话")
+        self.history_button.clicked.connect(self._open_history)
         buttons.addWidget(close_btn)
+        buttons.addWidget(self.history_button)
+        buttons.addWidget(self.mark_read_button)
         buttons.addWidget(self.open_button)
         root.addLayout(buttons)
 
@@ -443,28 +463,35 @@ class AnnouncementListDialog(FramelessDialog):
         selected_id = str(selected.get("id") or "") if selected else ""
         self.announcements = list(announcements or [])
         self.announcement_list.clear()
-        unread_count = sum(
-            not bool(announcement.get("read_at"))
-            for announcement in self.announcements
+        unread_count = (
+            sum(
+                not bool(announcement.get("read_at"))
+                for announcement in self.announcements
+            )
+            if self.show_unread
+            else 0
         )
         self.count_label.setText(
-            f"共 {len(self.announcements)} 条 · 未读 {unread_count} 条"
+            f"共 {len(self.announcements)} 条"
+            + (f" · 未读 {unread_count} 条" if self.show_unread else "")
         )
         selected_row = 0
         for index, announcement in enumerate(self.announcements):
-            unread = not bool(announcement.get("read_at"))
-            state = "● 未读" if unread else "已读"
+            unread = bool(self.show_unread and not announcement.get("read_at"))
             title = str(announcement.get("title") or "公告")
             summary = str(
                 announcement.get("ticker_text") or "暂无轮播摘要"
             )
             created_at = _display_time(announcement.get("created_at"))
-            item = QListWidgetItem(
-                f"{state}  ·  {created_at}\n{title}\n{summary}"
+            state = (
+                "● 未读  ·  "
+                if unread
+                else ("已读  ·  " if self.show_unread else "")
             )
+            item = QListWidgetItem(f"{state}{created_at}\n{title}\n{summary}")
             item.setData(Qt.UserRole, index)
             item.setSizeHint(QSize(300, 82))
-            if unread:
+            if unread and self.show_unread:
                 item.setForeground(QColor("#176f68"))
                 font = item.font()
                 font.setBold(True)
@@ -474,6 +501,9 @@ class AnnouncementListDialog(FramelessDialog):
                 selected_row = index
         has_announcements = bool(self.announcements)
         self.open_button.setEnabled(has_announcements)
+        self.history_button.setVisible(self.show_unread)
+        self.mark_read_button.setVisible(self.show_unread)
+        self.mark_read_button.setEnabled(False)
         if has_announcements:
             self.announcement_list.setCurrentRow(selected_row)
         else:
@@ -503,8 +533,11 @@ class AnnouncementListDialog(FramelessDialog):
             self._clear_preview()
             self.open_button.setEnabled(False)
             return
-        unread = not bool(announcement.get("read_at"))
-        self.preview_state.setText("● 未读公告" if unread else "已读公告")
+        unread = bool(self.show_unread and not announcement.get("read_at"))
+        if self.show_unread:
+            self.preview_state.setText("● 未读公告" if unread else "已读公告")
+        else:
+            self.preview_state.setText("公告")
         self.preview_state.setProperty("unread", unread)
         self.preview_state.style().unpolish(self.preview_state)
         self.preview_state.style().polish(self.preview_state)
@@ -522,6 +555,8 @@ class AnnouncementListDialog(FramelessDialog):
             f"附件：{attachment_count} 个" if attachment_count else "无附件"
         )
         self.open_button.setEnabled(True)
+        self.mark_read_button.setVisible(self.show_unread)
+        self.mark_read_button.setEnabled(self.show_unread and unread)
 
     def _open_selected(self):
         announcement = self.selected_announcement()
@@ -529,6 +564,18 @@ class AnnouncementListDialog(FramelessDialog):
             return
         self.accept()
         self.announcement_open_requested.emit(announcement)
+
+    def _mark_selected_read(self):
+        announcement = self.selected_announcement()
+        if not self.show_unread or announcement is None or announcement.get("read_at"):
+            return
+        announcement["read_at"] = True
+        self.set_announcements(self.announcements)
+        self.announcement_read_requested.emit(announcement)
+
+    def _open_history(self):
+        self.accept()
+        self.conversation_history_requested.emit()
 
 
 class ContactAdminDialog(FramelessDialog):
@@ -737,17 +784,21 @@ class ContactConversationDialog(FramelessDialog):
 
     MAX_LENGTH = 2_000
 
-    def __init__(self, announcement, session, parent=None):
+    def __init__(self, announcement, session, parent=None, *, history_mode=False):
         super().__init__(
             parent,
             resizable=True,
             show_minimize=True,
             show_maximize=True,
         )
-        self.announcement = announcement
+        self.announcement = announcement or {}
         self.session = session
+        self.history_mode = bool(history_mode or not announcement)
         self.conversation = None
-        self.setWindowTitle("联系管理员")
+        self.conversations = []
+        self.legacy_mode = False
+        self._conversation_picker_updating = False
+        self.setWindowTitle("历史会话" if self.history_mode else "联系管理员")
         self.setModal(True)
         self.resize(760, 620)
         self.setMinimumSize(620, 500)
@@ -755,13 +806,25 @@ class ContactConversationDialog(FramelessDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 44, 26, 22)
         layout.setSpacing(10)
-        title = QLabel("联系管理员")
+        title = QLabel("历史会话" if self.history_mode else "联系管理员")
         title.setObjectName("PageTitle")
         layout.addWidget(title)
-        related = QLabel(f"关联公告：{announcement.get('title') or '公告'}")
-        related.setObjectName("Muted")
-        related.setWordWrap(True)
-        layout.addWidget(related)
+        self.related_label = QLabel(
+            "查看与管理员的历史会话"
+            if self.history_mode
+            else f"关联公告：{self.announcement.get('title') or '公告'}"
+        )
+        self.related_label.setObjectName("Muted")
+        self.related_label.setWordWrap(True)
+        layout.addWidget(self.related_label)
+        self.conversation_picker = None
+        if self.history_mode:
+            self.conversation_picker = QComboBox()
+            self.conversation_picker.setPlaceholderText("暂无历史会话")
+            self.conversation_picker.currentIndexChanged.connect(
+                self._conversation_changed
+            )
+            layout.addWidget(self.conversation_picker)
         self.status_label = QLabel("正在读取会话…")
         self.status_label.setObjectName("Muted")
         layout.addWidget(self.status_label)
@@ -822,22 +885,123 @@ class ContactConversationDialog(FramelessDialog):
             return None
 
     def _load(self):
-        result = self._call(
-            "正在读取会话…",
-            lambda: self.session.api.contact_conversations(
-                self.session.access_token(),
-                announcement_id=str(self.announcement.get("id") or ""),
-            ),
-        )
-        if result is None:
+        request_kwargs = {}
+        if not self.history_mode and self.announcement.get("id"):
+            request_kwargs["announcement_id"] = str(self.announcement["id"])
+        try:
+            result = run_with_loading(
+                self,
+                "正在读取会话…",
+                lambda: self.session.api.contact_conversations(
+                    self.session.access_token(),
+                    **request_kwargs,
+                ),
+            )
+        except ApiResponseError as exc:
+            if exc.status_code == 404:
+                self._enable_legacy_mode()
+                return
+            QMessageBox.warning(self, "消息操作失败", str(exc))
             self._render()
             return
-        conversations = list((result or {}).get("items") or [])
-        self.conversation = next(
-            (item for item in conversations if item.get("status") == "open"),
-            conversations[0] if conversations else None,
-        )
+        except NetworkUnavailable as exc:
+            QMessageBox.warning(self, "消息操作失败", str(exc))
+            self._render()
+            return
+        self.conversations = list((result or {}).get("items") or [])
+        if self.history_mode:
+            self._populate_conversation_picker()
+        else:
+            self.conversation = next(
+                (item for item in self.conversations if item.get("status") == "open"),
+                self.conversations[0] if self.conversations else None,
+            )
         self._render()
+
+    @staticmethod
+    def _conversation_label(conversation):
+        title = str(conversation.get("announcement_title") or "公告已删除")
+        latest = conversation.get("last_message") or {}
+        preview = str(latest.get("message") or conversation.get("message") or "")
+        preview = " ".join(preview.split())
+        if len(preview) > 28:
+            preview = preview[:25] + "…"
+        status = "已解决" if conversation.get("status") == "resolved" else "处理中"
+        timestamp = _display_time(
+            conversation.get("updated_at") or conversation.get("created_at")
+        )
+        suffix = f" · {preview}" if preview else ""
+        return f"{title} · {timestamp} · {status}{suffix}"
+
+    def _populate_conversation_picker(self, selected_id=None):
+        if self.conversation_picker is None:
+            return
+        if selected_id is None and self.conversation is not None:
+            selected_id = str(self.conversation.get("id") or "")
+        self._conversation_picker_updating = True
+        self.conversation_picker.clear()
+        for conversation in self.conversations:
+            self.conversation_picker.addItem(
+                self._conversation_label(conversation),
+                conversation,
+            )
+        selected_index = -1
+        if selected_id:
+            for index, conversation in enumerate(self.conversations):
+                if str(conversation.get("id") or "") == str(selected_id):
+                    selected_index = index
+                    break
+        if selected_index < 0 and self.conversations:
+            selected_index = next(
+                (
+                    index
+                    for index, conversation in enumerate(self.conversations)
+                    if conversation.get("status") == "open"
+                ),
+                0,
+            )
+        self.conversation_picker.setCurrentIndex(selected_index)
+        self._conversation_picker_updating = False
+        self.conversation = (
+            self.conversations[selected_index]
+            if selected_index >= 0
+            else None
+        )
+        self._update_related_label()
+
+    def _conversation_changed(self, index):
+        if self._conversation_picker_updating or self.conversation_picker is None:
+            return
+        item = self.conversation_picker.itemData(index)
+        self.conversation = item if isinstance(item, dict) else None
+        self._update_related_label()
+        self._render()
+
+    def _update_related_label(self):
+        if not self.history_mode:
+            return
+        title = (self.conversation or {}).get("announcement_title") or "公告已删除"
+        self.related_label.setText(f"关联公告：{title}")
+
+    def _enable_legacy_mode(self):
+        self.legacy_mode = True
+        self.conversation = None
+        self.status_label.setText(
+            "当前服务仅支持发送纯文字消息。"
+            if not self.history_mode
+            else "当前服务暂不支持读取历史会话。"
+        )
+        self.history.clear()
+        self.history.setPlaceholderText("尚未联系管理员。")
+        self.attachment_picker.hide()
+        self.received_attachments.hide()
+        self.unresolved_btn.hide()
+        self.resolved_btn.hide()
+        self.send_btn.setText("发送消息")
+        if self.history_mode:
+            self.send_btn.setEnabled(False)
+            self.message_edit.setEnabled(False)
+            self.attachment_picker.setEnabled(False)
 
     def _render(self):
         conversation = self.conversation
@@ -859,9 +1023,17 @@ class ContactConversationDialog(FramelessDialog):
                 self.received_attachments.addItem(item)
         self.history.setPlainText("\n\n".join(lines))
         self.received_attachments.setVisible(self.received_attachments.count() > 0)
+        if self.history_mode:
+            self._update_related_label()
         status = str((conversation or {}).get("status") or "")
+        can_compose = bool(not self.history_mode or conversation)
+        self.message_edit.setEnabled(can_compose)
+        self.attachment_picker.setEnabled(can_compose and not self.legacy_mode)
+        self.send_btn.setEnabled(can_compose and not self.legacy_mode)
         if not conversation:
-            self.status_label.setText("尚未发起会话")
+            self.status_label.setText(
+                "暂无历史会话" if self.history_mode else "尚未发起会话"
+            )
             self.unresolved_btn.setEnabled(False)
             self.resolved_btn.setEnabled(False)
             self.send_btn.setText("发送消息")
@@ -875,6 +1047,8 @@ class ContactConversationDialog(FramelessDialog):
             self.unresolved_btn.setEnabled(True)
             self.resolved_btn.setEnabled(True)
             self.send_btn.setText("发送回复")
+        if self.history_mode and not conversation:
+            self.send_btn.setEnabled(False)
         self.history.moveCursor(self.history.textCursor().End)
 
     def _limit_message(self):
@@ -886,33 +1060,76 @@ class ContactConversationDialog(FramelessDialog):
 
     def _send(self):
         message = self.message_edit.toPlainText().strip()
-        if not message and not self.attachment_picker.has_attachments():
+        if not message and (
+            self.legacy_mode or not self.attachment_picker.has_attachments()
+        ):
             QMessageBox.warning(self, "消息为空", "请输入文字或添加附件。")
             return
-        try:
-            attachments = self.attachment_picker.payloads()
-        except OSError as exc:
-            QMessageBox.warning(self, "附件读取失败", str(exc))
-            return
+        attachments = []
+        if not self.legacy_mode:
+            try:
+                attachments = self.attachment_picker.payloads()
+            except OSError as exc:
+                QMessageBox.warning(self, "附件读取失败", str(exc))
+                return
         conversation = self.conversation
-        if conversation and conversation.get("status") == "open":
-            action = lambda: self.session.api.reply_admin_message(
-                self.session.access_token(),
-                str(conversation.get("id")),
-                message,
-                attachments,
-            )
+        announcement_id = str(
+            self.announcement.get("id")
+            or (conversation or {}).get("announcement_id")
+            or ""
+        )
+        if self.legacy_mode:
+            if not announcement_id:
+                QMessageBox.warning(self, "消息操作失败", "当前会话没有关联公告。")
+                return
+
+            def action():
+                return self.session.api.send_admin_message(
+                    self.session.access_token(),
+                    announcement_id,
+                    message,
+                )
+
+        elif conversation and conversation.get("status") == "open":
+
+            def action():
+                return self.session.api.reply_admin_message(
+                    self.session.access_token(),
+                    str(conversation.get("id")),
+                    message,
+                    attachments,
+                )
+
         else:
-            action = lambda: self.session.api.send_admin_message(
-                self.session.access_token(),
-                str(self.announcement.get("id")),
-                message,
-                attachments,
-            )
+            if not announcement_id:
+                QMessageBox.warning(self, "消息操作失败", "当前会话没有关联公告。")
+                return
+
+            def action():
+                return self.session.api.send_admin_message(
+                    self.session.access_token(),
+                    announcement_id,
+                    message,
+                    attachments,
+                )
+
         result = self._call("正在发送消息…", action)
         if result is None:
             return
+        if self.legacy_mode:
+            QMessageBox.information(self, "发送成功", "消息已发送给管理员。")
+            self.accept()
+            return
         self.conversation = result
+        if self.history_mode:
+            result_id = str(result.get("id") or "")
+            self.conversations = [
+                item
+                for item in self.conversations
+                if str(item.get("id") or "") != result_id
+            ]
+            self.conversations.insert(0, result)
+            self._populate_conversation_picker(selected_id=result_id)
         self.message_edit.clear()
         self.attachment_picker.clear()
         self._render()
@@ -932,9 +1149,25 @@ class ContactConversationDialog(FramelessDialog):
         if result is None:
             return
         self.conversation = result
+        if self.history_mode:
+            result_id = str(result.get("id") or "")
+            self.conversations = [
+                item
+                for item in self.conversations
+                if str(item.get("id") or "") != result_id
+            ]
+            self.conversations.insert(0, result)
+            self._populate_conversation_picker(selected_id=result_id)
         self._render()
         if status == "open":
             self.message_edit.setFocus()
+
+
+class ContactHistoryDialog(ContactConversationDialog):
+    """Show every conversation belonging to the current normal user."""
+
+    def __init__(self, session, parent=None):
+        super().__init__(None, session, parent, history_mode=True)
 
 
 class ImagePreviewDialog(FramelessDialog):
@@ -1813,10 +2046,7 @@ class AnnouncementAdminPage(QWidget):
             values = [
                 str(announcement.get("title") or ""),
                 scope,
-                (
-                    f"{int(announcement.get('read_count') or 0)} / "
-                    f"{int(announcement.get('unread_count') or 0)}"
-                ),
+                self._receipt_count_text(announcement),
                 "是" if announcement.get("show_on_startup") else "否",
                 "已启用" if announcement.get("is_active") else "已停用",
                 str(len(announcement.get("attachments") or [])),
@@ -1841,6 +2071,15 @@ class AnnouncementAdminPage(QWidget):
         self.announcement_preview.clear()
         self.announcement_receipt_detail.clear()
         self._selection_state()
+
+    @staticmethod
+    def _receipt_count_text(announcement):
+        if "read_count" not in announcement or "unread_count" not in announcement:
+            return "- / -"
+        return (
+            f"{int(announcement.get('read_count') or 0)} / "
+            f"{int(announcement.get('unread_count') or 0)}"
+        )
 
     def _fill_messages(self, unread_count):
         self.message_table.setRowCount(len(self.messages))
@@ -1939,6 +2178,9 @@ class AnnouncementAdminPage(QWidget):
         )
         if not announcement:
             self.announcement_receipt_detail.clear()
+            return
+        if "read_users" not in announcement or "unread_users" not in announcement:
+            self.announcement_receipt_detail.setPlainText("当前服务未返回阅读统计。")
             return
         read_users = list(announcement.get("read_users") or [])
         unread_users = list(announcement.get("unread_users") or [])

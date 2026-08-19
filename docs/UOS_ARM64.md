@@ -51,9 +51,10 @@ sudo apt install -y \
 MB 的浏览器文件；网络较慢时可设置代理或增大
 `PLAYWRIGHT_DOWNLOAD_CONNECTION_TIMEOUT`。
 
-业务客户端和打包发布器在 UOS 上优先通过 `zenity` 与桌面门户打开系统文件选择
-窗口；Windows 继续使用系统原生窗口。缺少 `zenity` 时会安全回退到 Qt 文件窗口，
-不会加载 UOS 系统 Qt 插件。
+业务客户端和打包发布器在 UOS 上通过 `zenity` 与桌面门户打开系统文件选择窗口；
+Windows 继续使用系统原生窗口。正式 DEB 已将 `zenity` 声明为必需依赖，安装软件时
+会一并补齐，确保开发机与用户机器显示一致。仅源码或便携包缺少该组件时才安全
+回退到 Qt 文件窗口，且不会加载 UOS 系统 Qt 插件。
 
 ## 二、获取兼容分支
 

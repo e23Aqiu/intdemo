@@ -42,9 +42,10 @@ from .announcement_page import (
     AnnouncementDetailDialog,
     AnnouncementListDialog,
     AnnouncementTickerButton,
+    ContactHistoryDialog,
     start_api_task,
 )
-from .auth_dialogs import PasswordDialog
+from .auth_dialogs import PasswordDialog, ReconnectDialog
 from .dashboard_page import DashboardPage
 from .frameless import (
     FramelessMainWindow,
@@ -60,6 +61,42 @@ from .statistics_page import StatisticsPage
 from .theme import _control_asset_path, install_disabled_cursor_filter
 from .update_dialog import UpdatePromptDialog
 from .workflow_page import WorkflowPage
+
+
+class _CurrentPageStack(QStackedWidget):
+    """Size a scrollable stack from the page the user can currently see."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.currentChanged.connect(lambda _index: self.updateGeometry())
+
+    def sizeHint(self):
+        current = self.currentWidget()
+        return current.sizeHint() if current is not None else super().sizeHint()
+
+    def minimumSizeHint(self):
+        current = self.currentWidget()
+        return (
+            current.minimumSizeHint()
+            if current is not None
+            else super().minimumSizeHint()
+        )
+
+
+class _ClickableFrame(QFrame):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event):
+        if event.key() in {Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space}:
+            self.clicked.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class MainWindow(FramelessMainWindow):
@@ -103,8 +140,11 @@ class MainWindow(FramelessMainWindow):
             None if self.offline_business_mode else update_coordinator
         )
         self.credential_store = credential_store
+        self._business_metrics_requested = bool(business_metrics_enabled)
         self.business_metrics_enabled = (
-            bool(business_metrics_enabled) and not self.offline_business_mode
+            self._business_metrics_requested
+            and not self.offline_business_mode
+            and account.statistics_enabled
         )
         self.client_preferences = client_preferences or ClientPreferences(
             self.database.path.parent
@@ -136,6 +176,7 @@ class MainWindow(FramelessMainWindow):
         self.announcement_index = 0
         self.announcement_dialog = None
         self.announcement_list_dialog = None
+        self.contact_history_dialog = None
         self._announcement_poll_task = None
         self._announcement_action_tasks = []
         self._announcement_poll_timer = None
@@ -166,7 +207,7 @@ class MainWindow(FramelessMainWindow):
         content_layout.setSpacing(0)
         content_layout.addWidget(self._build_top_bar())
 
-        self.stack = QStackedWidget()
+        self.stack = _CurrentPageStack()
         self.stack.setMinimumWidth(self.PAGE_CANVAS_SIZE.width())
         self.stack.setMinimumHeight(self.PAGE_CANVAS_SIZE.height())
         self.page_scroll_area = QScrollArea()
@@ -202,7 +243,12 @@ class MainWindow(FramelessMainWindow):
             timing_service=self.workflow_timing,
             client_preferences=self.client_preferences,
             account_key=account.username,
-            untracked_mode=self.offline_business_mode,
+            untracked_mode=not self.business_metrics_enabled,
+            untracked_label=(
+                "游客模式"
+                if self.offline_business_mode
+                else "测试账号" if account.is_test else "当前模式"
+            ),
             captcha_reporter=(
                 self.captcha_learning_service.record_attempt
                 if self.captcha_learning_service is not None
@@ -560,7 +606,7 @@ class MainWindow(FramelessMainWindow):
         self.sync_error_label.setWordWrap(True)
         self.sync_error_label.hide()
         sync_layout.addWidget(self.sync_error_label)
-        self.sync_retry_button = QPushButton("待同步：0")
+        self.sync_retry_button = QPushButton("未上传：0")
         self.sync_retry_button.setObjectName("SyncActionButton")
         self.sync_retry_button.setProperty("hasPending", False)
         self.sync_retry_button.setProperty("split", False)
@@ -594,8 +640,12 @@ class MainWindow(FramelessMainWindow):
         self.sync_status_label = self.sync_detail_label
         layout.addWidget(sync_card)
 
-        profile = QFrame()
+        profile = _ClickableFrame()
         profile.setObjectName("SidebarProfile")
+        profile.setFocusPolicy(Qt.StrongFocus)
+        profile.setProperty("reconnectAvailable", False)
+        profile.clicked.connect(self._reconnect_online)
+        self.sidebar_profile = profile
         profile_layout = QHBoxLayout(profile)
         profile_layout.setContentsMargins(11, 10, 11, 10)
         profile_layout.setSpacing(10)
@@ -603,6 +653,7 @@ class MainWindow(FramelessMainWindow):
         self.sidebar_avatar.setObjectName("SidebarAvatar")
         self.sidebar_avatar.setAlignment(Qt.AlignCenter)
         self.sidebar_avatar.setFixedSize(36, 36)
+        self.sidebar_avatar.setAttribute(Qt.WA_TransparentForMouseEvents)
         profile_layout.addWidget(self.sidebar_avatar)
 
         identity_layout = QVBoxLayout()
@@ -611,12 +662,14 @@ class MainWindow(FramelessMainWindow):
         self.sidebar_user = QLabel(self.account.name_label)
         self.sidebar_user.setObjectName("SidebarUser")
         self.sidebar_user.setToolTip(self.account.name_label)
+        self.sidebar_user.setAttribute(Qt.WA_TransparentForMouseEvents)
         self.sidebar_role = QLabel(
             "游客  ·  不记录数据"
             if self.offline_business_mode
             else f"{self.account.role_label}  ·  {self.account.username}"
         )
         self.sidebar_role.setObjectName("SidebarRole")
+        self.sidebar_role.setAttribute(Qt.WA_TransparentForMouseEvents)
         identity_layout.addWidget(self.sidebar_user)
         identity_layout.addWidget(self.sidebar_role)
         profile_layout.addLayout(identity_layout, 1)
@@ -795,16 +848,18 @@ class MainWindow(FramelessMainWindow):
 
     def _update_announcement_ticker(self):
         has_announcements = bool(self.announcements)
-        controls_enabled = (
-            has_announcements
-            and not self._update_busy
-            and not self._update_prompt_blocked
+        controls_available = not self._update_busy and not self._update_prompt_blocked
+        self.announcement_horn_button.setEnabled(
+            controls_available and (has_announcements or not self.account.is_admin)
         )
-        self.announcement_horn_button.setEnabled(controls_enabled)
-        self.announcement_ticker_button.setEnabled(controls_enabled)
+        self.announcement_ticker_button.setEnabled(
+            controls_available and has_announcements
+        )
         if not has_announcements:
             self.announcement_horn_button.setProperty("hasUnread", False)
-            self.announcement_horn_button.setToolTip("暂无公告")
+            self.announcement_horn_button.setToolTip(
+                "查看历史会话" if not self.account.is_admin else "暂无公告"
+            )
             self.announcement_ticker_button.setText("暂无公告")
             self.announcement_ticker_button.setToolTip("")
             self.announcement_ticker_button.set_announcement(None)
@@ -816,8 +871,12 @@ class MainWindow(FramelessMainWindow):
                 or announcement.get("title")
                 or "查看公告"
             )
-            unread = any(
-                not announcement.get("read_at") for announcement in self.announcements
+            unread = bool(
+                not self.account.is_admin
+                and any(
+                    not announcement.get("read_at")
+                    for announcement in self.announcements
+                )
             )
             self.announcement_horn_button.setProperty("hasUnread", unread)
             self.announcement_horn_button.setToolTip(
@@ -831,6 +890,7 @@ class MainWindow(FramelessMainWindow):
                 announcement,
                 self.announcement_index,
                 len(self.announcements),
+                show_unread=not self.account.is_admin,
             )
         self.announcement_horn_button.style().unpolish(self.announcement_horn_button)
         self.announcement_horn_button.style().polish(self.announcement_horn_button)
@@ -845,14 +905,18 @@ class MainWindow(FramelessMainWindow):
         )
 
     def _show_announcement_list(self, *_args):
-        if not self.announcements:
+        if not self.announcements and self.account.is_admin:
             return
         current = self.announcement_list_dialog
         if current is not None and current.isVisible():
             current.raise_()
             current.activateWindow()
             return
-        dialog = AnnouncementListDialog(self.announcements, self)
+        dialog = AnnouncementListDialog(
+            self.announcements,
+            self,
+            show_unread=not self.account.is_admin,
+        )
 
         def clear_dialog(*_args):
             if self.announcement_list_dialog is dialog:
@@ -864,8 +928,28 @@ class MainWindow(FramelessMainWindow):
                 startup_shown=False,
             )
         )
+        dialog.announcement_read_requested.connect(self._confirm_announcement_read)
+        dialog.conversation_history_requested.connect(self._show_contact_history)
         dialog.finished.connect(clear_dialog)
         self.announcement_list_dialog = dialog
+        dialog.open()
+
+    def _show_contact_history(self):
+        if self.account.is_admin or self.session_manager is None:
+            return
+        current = self.contact_history_dialog
+        if current is not None and current.isVisible():
+            current.raise_()
+            current.activateWindow()
+            return
+        dialog = ContactHistoryDialog(self.session_manager, self)
+
+        def clear_dialog(*_args):
+            if self.contact_history_dialog is dialog:
+                self.contact_history_dialog = None
+
+        dialog.finished.connect(clear_dialog)
+        self.contact_history_dialog = dialog
         dialog.open()
 
     def _open_announcement(self, announcement, *, startup_shown):
@@ -1197,8 +1281,13 @@ class MainWindow(FramelessMainWindow):
             self._update_sync_status(self.sync_coordinator.engine.status())
 
     def _retry_sync(self):
-        if self.sync_coordinator is not None and not self._update_busy:
-            self.sync_coordinator.retry_now()
+        if self.sync_coordinator is None or self._update_busy:
+            return
+        state = getattr(self.session_manager, "state", None)
+        if state is not None and state.mode == "reauth_required":
+            self._reconnect_online()
+            return
+        self.sync_coordinator.retry_now()
 
     def _retry_captcha_sync(self):
         if self.captcha_learning_service is None:
@@ -1258,7 +1347,7 @@ class MainWindow(FramelessMainWindow):
             "syncing": "同步中",
             "offline": "离线",
             "error": "同步错误",
-            "reauth_required": "登录已失效",
+            "reauth_required": "离线，需重新上线",
         }
         state_label = labels.get(status.state, status.state)
         self.sync_state_title.setText(state_label)
@@ -1267,7 +1356,7 @@ class MainWindow(FramelessMainWindow):
             widget.style().unpolish(widget)
             widget.style().polish(widget)
 
-        pending_text = f"待同步：{status.pending_count}"
+        pending_text = f"未上传：{status.pending_count}"
         if status.quarantined_count:
             pending_text += f"（隔离：{status.quarantined_count}）"
         if status.state == "syncing":
@@ -1282,12 +1371,14 @@ class MainWindow(FramelessMainWindow):
 
         details = []
         if (
-            status.state == "offline"
+            status.state in {"offline", "reauth_required"}
             and self.session_manager is not None
             and self.session_manager.state is not None
         ):
             expires = self.session_manager.state.offline_expires_at
             details.append(f"离线授权至 {str(expires).replace('T', ' ')[:19]}")
+        if status.state == "reauth_required":
+            details.append("当前任务继续，数据保存在本机")
         if status.last_sync_at:
             details.append(
                 f"上次同步 {str(status.last_sync_at).replace('T', ' ')[:19]}"
@@ -1320,29 +1411,170 @@ class MainWindow(FramelessMainWindow):
                     f"{row['kind']}: {row['last_error_message']}" for row in quarantined
                 )
             )
-        if status.state == "reauth_required" and not self._reauth_scheduled:
-            self._reauth_scheduled = True
-            QTimer.singleShot(0, self._require_reauthentication)
+        session_state = getattr(self.session_manager, "state", None)
+        reconnect_available = bool(
+            session_state is not None
+            and not session_state.is_online
+            and session_state.mode != "offline_untracked"
+            and status.state != "syncing"
+        )
+        self.sidebar_profile.setProperty(
+            "reconnectAvailable",
+            reconnect_available,
+        )
+        self.sidebar_profile.setCursor(
+            Qt.PointingHandCursor if reconnect_available else Qt.ArrowCursor
+        )
+        self.sidebar_profile.setToolTip(
+            "点击输入密码并重新上线" if reconnect_available else "当前账号已在线"
+        )
+        self.sidebar_profile.style().unpolish(self.sidebar_profile)
+        self.sidebar_profile.style().polish(self.sidebar_profile)
+        self.sidebar_role.setText(
+            f"{self.account.role_label}  ·  点击重新上线"
+            if reconnect_available
+            else f"{self.account.role_label}  ·  {self.account.username}"
+        )
 
     def _require_reauthentication(self):
-        QMessageBox.warning(
-            self,
-            "登录已失效",
-            "账号、密码或设备授权已在服务器端变更。"
-            "为保护数据，客户端将退出到登录页面。",
+        self._reconnect_online()
+
+    def _reconnect_online(self):
+        if self.session_manager is None:
+            return
+        state = self.session_manager.state
+        if state is None or state.is_online or state.mode == "offline_untracked":
+            return
+        coordinator_was_active = bool(
+            self.sync_coordinator is not None
+            and not bool(
+                getattr(
+                    self.sync_coordinator,
+                    "is_stopped",
+                    getattr(self.sync_coordinator, "_stopped", False),
+                )
+            )
         )
-        if self._prepare_close():
-            self.logout_requested.emit()
+        if self.sync_coordinator is not None:
+            pause = getattr(
+                self.sync_coordinator,
+                "pause_for_reauthentication",
+                None,
+            )
+            if callable(pause):
+                paused = pause()
+            else:
+                if getattr(self.sync_coordinator, "_running", False):
+                    return
+                self.sync_coordinator.stop()
+                paused = True
+            if not paused:
+                return
+        dialog = ReconnectDialog(self.session_manager, self.account, self)
+        if dialog.exec_() != dialog.Accepted or dialog.account is None:
+            if coordinator_was_active and state.mode != "reauth_required":
+                self.sync_coordinator.start()
+            return
+
+        account = dialog.account
+        password = dialog.password
+        if account.must_change_password:
+            password_dialog = PasswordDialog(
+                self.database,
+                account.id,
+                forced=True,
+                parent=self,
+                session_manager=self.session_manager,
+                initial_current_password=password,
+            )
+            if password_dialog.exec_() != password_dialog.Accepted:
+                self.session_manager.invalidate_credentials()
+                if self.sync_coordinator is not None:
+                    self.sync_coordinator.stop()
+                    self._update_sync_status(
+                        self.sync_coordinator.engine.status(
+                            "reauth_required",
+                            "必须先修改初始密码才能重新上线",
+                        )
+                    )
+                return
+            account = password_dialog.account or replace(
+                account,
+                must_change_password=False,
+            )
+            password = password_dialog.new_password or password
+
+        self._apply_current_account(account)
+        if self.credential_store is not None:
+            try:
+                remembered = self.credential_store.load()
+                if (
+                    remembered is not None
+                    and remembered.username.casefold() == account.username.casefold()
+                ):
+                    self.credential_store.save(
+                        account.username,
+                        password,
+                        auto_login=remembered.auto_login,
+                    )
+            except (OSError, RuntimeError, ValueError):
+                pass
+        if self.sync_coordinator is not None:
+            self.sync_coordinator.resume_after_reauthentication()
+        if self.captcha_learning_service is not None:
+            self.captcha_learning_service.refresh_policy()
+            self.captcha_learning_service.retry_pending()
+        if self.announcement_service_available:
+            self.refresh_announcements()
+        QMessageBox.information(
+            self,
+            "已重新上线",
+            "账号已恢复在线，未上传数据正在后台同步。",
+        )
+
+    def _apply_current_account(self, account):
+        self.account = account
+        self.business_metrics_enabled = (
+            self._business_metrics_requested and account.statistics_enabled
+        )
+        if account.is_test:
+            if self.workflow_timing is not None and self.workflow_timing.is_active:
+                self.workflow_page._timing_finish_run(
+                    "stopped",
+                    "账号已切换为测试账号",
+                )
+            self.workflow_timing = None
+            self.workflow_page._timing_service = None
+            self.workflow_page._untracked_mode = True
+            self.workflow_page._untracked_label = "测试账号"
+        elif self._business_metrics_requested and self.workflow_timing is None:
+            self.workflow_timing = WorkflowTimingService(
+                self.database,
+                account.id,
+            )
+            self.workflow_page._timing_service = self.workflow_timing
+            self.workflow_page._untracked_mode = False
+            self.workflow_page._untracked_label = "当前模式"
+        for page in (self.dashboard_page, self.statistics_page):
+            if page is not None:
+                page.account = account
+        if self.personal_center_page is not None:
+            self.personal_center_page.account = account
+            self.personal_center_page.identity_value.setText(account.role_label)
+            self.personal_center_page.name_value.setText(account.name_label)
+            self.personal_center_page.username_value.setText(account.username)
+        if self.account_page is not None:
+            self.account_page.current_account = account
+        self.sidebar_user.setText(account.name_label)
+        self.sidebar_user.setToolTip(account.name_label)
+        self.sidebar_role.setText(f"{account.role_label}  ·  {account.username}")
+        self.sidebar_avatar.setText(self._sidebar_avatar_text(account.name_label))
+        self.setWindowTitle(f"{APP_NAME} - {account.name_label}")
 
     def _online_data_changed(self):
         refreshed_account = self.database.get_account(self.account.id)
         if refreshed_account is not None:
-            self.account = refreshed_account
-            self.dashboard_page.account = refreshed_account
-            self.statistics_page.account = refreshed_account
-            self.personal_center_page.account = refreshed_account
-            if self.account_page is not None:
-                self.account_page.current_account = refreshed_account
+            self._apply_current_account(refreshed_account)
         self.dashboard_page.refresh()
         self.statistics_page.refresh()
 

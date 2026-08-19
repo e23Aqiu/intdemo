@@ -12,14 +12,17 @@ from PyQt5.QtWidgets import QApplication, QPlainTextEdit, QPushButton
 
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import Database
+from integrated_client.online.api import ApiResponseError
 from integrated_client.ui.announcement_page import (
     AnnouncementAdminPage,
     AnnouncementDetailDialog,
     AnnouncementEditorDialog,
     AnnouncementListDialog,
     AnnouncementTickerButton,
-    ContactAttachmentPicker,
     ContactAdminDialog,
+    ContactAttachmentPicker,
+    ContactConversationDialog,
+    ContactHistoryDialog,
 )
 from integrated_client.ui.main_window import MainWindow
 
@@ -33,6 +36,7 @@ class FakeAnnouncementApi:
         self.managed_announcements = []
         self.inbox = {"items": [], "unread_count": 0}
         self.accounts = []
+        self.conversations = []
 
     def announcements(self, _token, limit=50):
         return list(self.visible_announcements[:limit])
@@ -51,9 +55,77 @@ class FakeAnnouncementApi:
     def download_announcement_attachment(_token, _attachment_id):
         return b"attachment"
 
-    def send_admin_message(self, _token, announcement_id, message):
+    def send_admin_message(
+        self,
+        _token,
+        announcement_id,
+        message,
+        attachments=None,
+    ):
         self.sent_messages.append((announcement_id, message))
-        return {"id": "message-1"}
+        conversation = {
+            "id": "message-1",
+            "announcement_id": announcement_id,
+            "announcement_title": "公告",
+            "status": "open",
+            "messages": [
+                {
+                    "sender_role": "user",
+                    "message": message,
+                    "attachments": list(attachments or []),
+                    "created_at": "2026-08-19T10:00:00",
+                }
+            ],
+        }
+        return conversation
+
+    def contact_conversations(
+        self,
+        _token,
+        *,
+        announcement_id=None,
+        limit=50,
+    ):
+        items = list(self.conversations)
+        if announcement_id:
+            items = [
+                item
+                for item in items
+                if str(item.get("announcement_id")) == str(announcement_id)
+            ]
+        return {"items": items[:limit]}
+
+    @staticmethod
+    def reply_admin_message(
+        _token,
+        message_id,
+        message,
+        attachments=None,
+    ):
+        return {
+            "id": message_id,
+            "announcement_id": "announcement-1",
+            "announcement_title": "系统维护公告",
+            "status": "open",
+            "messages": [
+                {
+                    "sender_role": "user",
+                    "message": message,
+                    "attachments": list(attachments or []),
+                    "created_at": "2026-08-19T10:05:00",
+                }
+            ],
+        }
+
+    @staticmethod
+    def update_contact_status(_token, message_id, status):
+        return {
+            "id": message_id,
+            "announcement_id": "announcement-1",
+            "announcement_title": "系统维护公告",
+            "status": status,
+            "messages": [],
+        }
 
     def admin_announcements(self, _token, limit=100):
         return list(self.managed_announcements[:limit])
@@ -182,6 +254,14 @@ class AnnouncementUiTests(unittest.TestCase):
             "attachments": [],
             "target_account_ids": [],
             "targets": [],
+            "read_count": 2,
+            "unread_count": 3,
+            "read_users": [
+                {"username": "reader", "display_name": "已读用户"},
+            ],
+            "unread_users": [
+                {"username": "pending", "display_name": "未读用户"},
+            ],
             "read_at": None,
             "created_at": "2026-07-28T10:00:00",
             "updated_at": "2026-07-28T10:00:00",
@@ -189,7 +269,7 @@ class AnnouncementUiTests(unittest.TestCase):
         result.update(overrides)
         return result
 
-    def test_main_window_ticker_admin_navigation_and_unread_indicator(self):
+    def test_admin_ticker_hides_announcement_unread_but_keeps_message_indicator(self):
         api = FakeAnnouncementApi()
         api.visible_announcements = [self._announcement()]
         api.inbox = {"items": [], "unread_count": 3}
@@ -214,7 +294,24 @@ class AnnouncementUiTests(unittest.TestCase):
             window._nav_buttons["announcements_admin"].toolTip(),
             "收到 3 条未读用户消息",
         )
-        self.assertTrue(window.announcement_horn_button.property("hasUnread"))
+        self.assertFalse(window.announcement_horn_button.property("hasUnread"))
+        self.assertEqual(
+            window.announcement_horn_button.toolTip(),
+            "点击查看全部公告",
+        )
+        window.announcement_ticker_button.enterEvent(QEvent(QEvent.Enter))
+        self.app.processEvents()
+        self.assertFalse(
+            window.announcement_ticker_button._hover_card.state_label.isVisible()
+        )
+        window.announcement_horn_button.click()
+        self.app.processEvents()
+        announcement_list = window.announcement_list_dialog
+        self.assertEqual(announcement_list.count_label.text(), "共 1 条")
+        self.assertTrue(announcement_list.mark_read_button.isHidden())
+        self.assertTrue(announcement_list.history_button.isHidden())
+        self.assertNotIn("未读", announcement_list.announcement_list.item(0).text())
+        self.assertEqual(announcement_list.preview_state.text(), "公告")
 
         window._show_current_announcement()
         self.assertIsNotNone(window.announcement_dialog)
@@ -240,9 +337,16 @@ class AnnouncementUiTests(unittest.TestCase):
                 created_at="2026-07-28T11:00:00",
             ),
         ]
+        user = self.database.create_account(
+            "horn_user",
+            "HornUser@123",
+            "user",
+            self.admin.id,
+            display_name="公告用户",
+        )
         window = MainWindow(
             self.database,
-            self.admin,
+            user,
             session_manager=FakeSession(api),
         )
         window.show()
@@ -256,6 +360,18 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(dialog.announcement_list.count(), 2)
         self.assertEqual(dialog.count_label.text(), "共 2 条 · 未读 1 条")
         self.assertEqual(dialog.preview_title.text(), "系统维护公告")
+        self.assertTrue(dialog.mark_read_button.isEnabled())
+
+        dialog.mark_read_button.click()
+        self.app.processEvents()
+        self.assertTrue(api.visible_announcements[0]["read_at"])
+        self.assertEqual(dialog.count_label.text(), "共 2 条 · 未读 0 条")
+        self.assertFalse(window.announcement_horn_button.property("hasUnread"))
+        self.assertTrue(
+            self._wait_until(
+                lambda: ("announcement-1", False) in api.read_calls
+            )
+        )
 
         dialog.announcement_list.setCurrentRow(1)
         self.app.processEvents()
@@ -274,6 +390,79 @@ class AnnouncementUiTests(unittest.TestCase):
             window.announcement_dialog.announcement["id"],
             "announcement-2",
         )
+
+    def test_normal_user_horn_opens_all_conversation_history(self):
+        api = FakeAnnouncementApi()
+        api.visible_announcements = [self._announcement(read_at="2026-08-19T09:00:00")]
+        api.conversations = [
+            {
+                "id": "conversation-1",
+                "announcement_id": "announcement-1",
+                "announcement_title": "系统维护公告",
+                "status": "open",
+                "updated_at": "2026-08-19T10:05:00",
+                "last_message": {"message": "请继续协助处理"},
+                "messages": [
+                    {
+                        "sender_role": "user",
+                        "message": "请继续协助处理",
+                        "attachments": [],
+                        "created_at": "2026-08-19T10:05:00",
+                    }
+                ],
+            },
+            {
+                "id": "conversation-2",
+                "announcement_id": "announcement-2",
+                "announcement_title": "业务提醒",
+                "status": "resolved",
+                "updated_at": "2026-08-18T15:30:00",
+                "last_message": {"message": "已经解决"},
+                "messages": [
+                    {
+                        "sender_role": "admin",
+                        "message": "已经解决",
+                        "attachments": [],
+                        "created_at": "2026-08-18T15:30:00",
+                    }
+                ],
+            },
+        ]
+        user = self.database.create_account(
+            "history_user",
+            "History@123",
+            "user",
+            self.admin.id,
+            display_name="历史会话用户",
+        )
+        window = MainWindow(
+            self.database,
+            user,
+            session_manager=FakeSession(api),
+        )
+        window.show()
+        self.assertTrue(self._wait_until(lambda: bool(window.announcements)))
+
+        window.announcement_horn_button.click()
+        self.app.processEvents()
+        announcement_list = window.announcement_list_dialog
+        self.assertTrue(announcement_list.history_button.isVisible())
+        with patch(
+            "integrated_client.ui.announcement_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            announcement_list.history_button.click()
+        self.app.processEvents()
+
+        history = window.contact_history_dialog
+        self.assertIsInstance(history, ContactHistoryDialog)
+        self.assertEqual(history.conversation_picker.count(), 2)
+        self.assertEqual(history.conversation["id"], "conversation-1")
+        self.assertIn("请继续协助处理", history.history.toPlainText())
+        history.conversation_picker.setCurrentIndex(1)
+        self.app.processEvents()
+        self.assertEqual(history.conversation["id"], "conversation-2")
+        self.assertIn("已经解决", history.history.toPlainText())
 
     def test_ticker_uses_styled_hover_preview(self):
         api = FakeAnnouncementApi()
@@ -362,6 +551,35 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(payload["file_name"], "现场.txt")
         self.assertEqual(payload["content_base64"], "Y29udGFjdCBhdHRhY2htZW50")
 
+    def test_contact_dialog_falls_back_to_legacy_text_message_api(self):
+        class LegacyApi(FakeAnnouncementApi):
+            @staticmethod
+            def contact_conversations(_token, *, announcement_id=None, limit=50):
+                raise ApiResponseError(
+                    "not_found",
+                    "Not Found",
+                    status_code=404,
+                )
+
+        api = LegacyApi()
+        with patch(
+            "integrated_client.ui.announcement_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            dialog = ContactConversationDialog(
+                self._announcement(),
+                FakeSession(api),
+            )
+            self.assertTrue(dialog.legacy_mode)
+            self.assertTrue(dialog.attachment_picker.isHidden())
+            dialog.message_edit.setPlainText("旧服务反馈")
+            with patch(
+                "integrated_client.ui.announcement_page.QMessageBox.information"
+            ):
+                dialog._send()
+
+        self.assertEqual(api.sent_messages, [("announcement-1", "旧服务反馈")])
+
     def test_editor_preserves_rich_text_targets_and_startup_option(self):
         accounts = [
             {
@@ -449,6 +667,7 @@ class AnnouncementUiTests(unittest.TestCase):
             page.refresh()
 
         self.assertEqual(page.announcement_table.rowCount(), 1)
+        self.assertEqual(page.announcement_table.item(0, 2).text(), "2 / 3")
         self.assertEqual(page.message_table.rowCount(), 1)
         self.assertEqual(unread, [1])
         page.message_table.selectRow(0)

@@ -295,6 +295,7 @@ class WorkflowPage(QWidget):
         client_preferences=None,
         account_key="",
         untracked_mode=False,
+        untracked_label="游客模式",
         captcha_reporter=None,
         captcha_model_manager=None,
         captcha_collection_enabled=None,
@@ -304,6 +305,7 @@ class WorkflowPage(QWidget):
         self._stats_recorder = stats_recorder
         self._timing_service = timing_service
         self._untracked_mode = bool(untracked_mode)
+        self._untracked_label = str(untracked_label or "当前模式")
         self.client_preferences = client_preferences
         self.account_key = str(account_key or "").strip().lower()
         self.captcha_reporter = captcha_reporter
@@ -1923,7 +1925,8 @@ class WorkflowPage(QWidget):
         if self._untracked_mode:
             self._stats_recorded = True
             self._log(
-                "游客模式：业务结果已保存，本次不记录统计、计时或待同步数据。"
+                f"{self._untracked_label}：业务结果已保存，"
+                "本次不记录统计、计时或待同步数据。"
             )
             return
         counts = self.calculate_workflow_counts(self.df)

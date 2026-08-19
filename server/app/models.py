@@ -32,6 +32,7 @@ class Account(Base):
     display_name: Mapped[str] = mapped_column(String(120))
     password_hash: Mapped[str] = mapped_column(String(512))
     role: Mapped[str] = mapped_column(String(16), default="user")
+    is_test: Mapped[bool] = mapped_column(Boolean, default=False)
     stats_scope: Mapped[str] = mapped_column(String(8), default="own")
     device_limit: Mapped[int] = mapped_column(Integer, default=10000)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
