@@ -337,6 +337,10 @@ class UosCompatibilityTests(unittest.TestCase):
             return_value="/usr/bin/zenity",
         ), patch.object(
             file_dialogs,
+            "_run_process_blocking",
+            return_value=None,
+        ) as run_process, patch.object(
+            file_dialogs,
             "_qt_uos_file_selection",
             return_value=(["/tmp/result.xlsx"], "Excel (*.xlsx)"),
         ) as qt_dialog:
@@ -348,6 +352,7 @@ class UosCompatibilityTests(unittest.TestCase):
             )
 
         self.assertEqual(selected, ("/tmp/result.xlsx", "Excel (*.xlsx)"))
+        run_process.assert_called_once()
         qt_dialog.assert_called_once()
 
     def test_uos_file_selection_without_parent_handle_still_tries_system_chooser(self):

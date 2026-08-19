@@ -501,7 +501,9 @@ class EnhancedPackageToolTests(unittest.TestCase):
                 runner=runner,
             )
 
-        self.assertEqual(bundle, build_root / "dist" / "intdemo-trainer")
+        self.assertTrue(
+            bundle.samefile(build_root / "dist" / "intdemo-trainer")
+        )
         synchronize_runtime.assert_called_once_with(bundle)
         command = commands[0]
         self.assertNotIn("--collect-all", command)
