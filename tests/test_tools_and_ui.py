@@ -2227,6 +2227,87 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(captured, [(target.server_account_id, {"role": "admin"})])
         page.deleteLater()
 
+    def test_online_account_role_update_retries_legacy_server_without_test_marker(self):
+        captured = []
+
+        class Api:
+            def admin_update_account(self, _token, account_id, payload):
+                captured.append((account_id, dict(payload)))
+                if len(captured) == 1:
+                    raise ApiResponseError(
+                        "validation_error",
+                        "请求参数无效",
+                        status_code=422,
+                        details=[
+                            {
+                                "type": "extra_forbidden",
+                                "loc": ["body", "is_test"],
+                                "msg": "Extra inputs are not permitted",
+                            }
+                        ],
+                    )
+                return dict(payload)
+
+        class Session:
+            api = Api()
+
+            @staticmethod
+            def access_token():
+                return "test-token"
+
+        target = self.db.create_account(
+            "legacy-test-target",
+            "LegacyTest@123",
+            "test",
+            self.admin.id,
+            display_name="旧服务测试账号",
+        )
+        object.__setattr__(target, "server_account_id", "legacy-test-id")
+        object.__setattr__(target, "_device_limit", 10000)
+        page = OnlineAccountPage(self.db, self.admin, Session())
+        page._selected_account = lambda: target
+
+        class Dialog:
+            Accepted = 1
+
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def exec_(self):
+                return self.Accepted
+
+            def values(self):
+                return {
+                    "username": target.username,
+                    "display_name": target.name_label,
+                    "role": "admin",
+                    "is_test": False,
+                    "stats_scope": target.stats_scope,
+                    "device_limit": 10000,
+                    "is_active": target.is_active,
+                }
+
+        with patch(
+            "integrated_client.ui.online_account_page._AccountSettingsDialog",
+            Dialog,
+        ), patch(
+            "integrated_client.ui.online_account_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ), patch.object(page, "refresh"), patch(
+            "integrated_client.ui.online_account_page.QMessageBox.warning"
+        ) as warning:
+            page._change_permission()
+
+        self.assertEqual(
+            captured,
+            [
+                ("legacy-test-id", {"role": "admin", "is_test": False}),
+                ("legacy-test-id", {"role": "admin"}),
+            ],
+        )
+        warning.assert_not_called()
+        page.deleteLater()
+
     def test_sync_coordinator_uses_pyqt5_socket_state_without_crashing(self):
         class Engine:
             pass
@@ -6238,6 +6319,9 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(page.station_table.item(station_row, 1).text(), "15")
         self.assertEqual(page.station_table.item(station_row, 2).text(), "11")
         self.assertEqual(page.station_table.item(station_row, 3).text(), "4")
+        station_header = page.station_table.horizontalHeader()
+        self.assertEqual(station_header.sectionResizeMode(4), QHeaderView.Stretch)
+        self.assertEqual(station_header.sectionResizeMode(3), QHeaderView.Interactive)
         self.assertFalse(page.grab().isNull())
         page.close()
         page.deleteLater()

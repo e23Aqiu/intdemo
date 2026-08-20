@@ -624,6 +624,75 @@ class OnlineAccountPage(AccountPage):
             messages.append(f"{label}：{message}")
         return "\n".join(messages) if messages else str(error)
 
+    @staticmethod
+    def _legacy_server_rejects_test_marker(error):
+        if (
+            not isinstance(error, ApiResponseError)
+            or error.status_code != 422
+            or not isinstance(error.details, list)
+        ):
+            return False
+        return any(
+            isinstance(detail, dict)
+            and list(detail.get("loc") or [])[-1:] == ["is_test"]
+            and (
+                str(detail.get("type") or "") == "extra_forbidden"
+                or "extra inputs" in str(detail.get("msg") or "").lower()
+            )
+            for detail in error.details
+        )
+
+    def _update_account_with_compatibility(self, account_id, payload):
+        def update(request_payload):
+            return self.session.api.admin_update_account(
+                self.session.access_token(),
+                account_id,
+                request_payload,
+            )
+
+        try:
+            return run_with_loading(
+                self,
+                "处理中…",
+                lambda: update(payload),
+            )
+        except ApiResponseError as exc:
+            if not (
+                "is_test" in payload
+                and self._legacy_server_rejects_test_marker(exc)
+            ):
+                QMessageBox.warning(
+                    self,
+                    "在线操作失败",
+                    self._api_error_text(exc),
+                )
+                return _CALL_FAILED
+            fallback_payload = dict(payload)
+            requested_test_account = bool(fallback_payload.pop("is_test"))
+            if requested_test_account or not fallback_payload:
+                QMessageBox.warning(
+                    self,
+                    "在线服务版本过旧",
+                    "当前在线服务不支持修改账号类型，请先将服务端升级到 v1.1.1。",
+                )
+                return _CALL_FAILED
+            try:
+                return run_with_loading(
+                    self,
+                    "正在兼容旧版服务…",
+                    lambda: update(fallback_payload),
+                )
+            except (ApiResponseError, NetworkUnavailable) as retry_error:
+                QMessageBox.warning(
+                    self,
+                    "在线操作失败",
+                    self._api_error_text(retry_error),
+                )
+                return _CALL_FAILED
+        except NetworkUnavailable as exc:
+            QMessageBox.warning(self, "在线操作失败", self._api_error_text(exc))
+            return _CALL_FAILED
+
     def refresh(self):
         rows = self._call(self.session.api.admin_accounts)
         if rows is _CALL_FAILED:
@@ -868,8 +937,7 @@ class OnlineAccountPage(AccountPage):
         }
         if not payload:
             return
-        result = self._call(
-            self.session.api.admin_update_account,
+        result = self._update_account_with_compatibility(
             account.server_account_id,
             payload,
         )

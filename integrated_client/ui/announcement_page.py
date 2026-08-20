@@ -6,8 +6,11 @@ import os
 from pathlib import Path
 
 from PyQt5.QtCore import (
+    QEvent,
     QObject,
     QPoint,
+    QPointF,
+    QRect,
     QRectF,
     QRunnable,
     QSize,
@@ -48,7 +51,6 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSplitter,
-    QTabBar,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -325,13 +327,183 @@ class AnnouncementHoverCard(QFrame):
         self.raise_()
 
 
+class UnreadMessageBubble(QWidget):
+    """A floating unread notice anchored to a control without affecting layout."""
+
+    TAIL_HEIGHT = 7
+
+    def __init__(
+        self,
+        anchor,
+        parent=None,
+        *,
+        anchor_rect_provider=None,
+    ):
+        overlay_parent = parent or anchor.window()
+        super().__init__(overlay_parent)
+        self._anchor = anchor
+        self._anchor_rect_provider = anchor_rect_provider
+        self._unread_count = 0
+        self._text = ""
+        self._tail_at_top = False
+        self._tail_x = 24.0
+        bubble_font = QFont(anchor.font())
+        bubble_font.setPointSize(max(9, bubble_font.pointSize()))
+        bubble_font.setBold(True)
+        self.setFont(bubble_font)
+        self.setObjectName("UnreadMessageBubble")
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.setFocusPolicy(Qt.NoFocus)
+        self.hide()
+        self._anchor.installEventFilter(self)
+        if overlay_parent is not self._anchor:
+            overlay_parent.installEventFilter(self)
+
+    @property
+    def unread_count(self):
+        return self._unread_count
+
+    def text(self):
+        return self._text
+
+    def set_unread_count(self, count):
+        self._unread_count = max(0, int(count or 0))
+        self._text = (
+            f"有 {self._unread_count} 条新消息" if self._unread_count else ""
+        )
+        self.setToolTip(
+            f"{self._unread_count} 条未读消息" if self._unread_count else ""
+        )
+        self.resize(self.sizeHint())
+        self.reposition()
+        self.update()
+
+    def sizeHint(self):
+        text_width = self.fontMetrics().horizontalAdvance(self._text or "有 0 条新消息")
+        return QSize(max(132, text_width + 52), 38)
+
+    def _anchor_rect(self):
+        parent = self.parentWidget()
+        if parent is None:
+            return QRect()
+        local_rect = (
+            self._anchor_rect_provider()
+            if callable(self._anchor_rect_provider)
+            else self._anchor.rect()
+        )
+        if not isinstance(local_rect, QRect):
+            local_rect = QRect(local_rect)
+        top_left = self._anchor.mapTo(parent, local_rect.topLeft())
+        return QRect(top_left, local_rect.size())
+
+    def reposition(self):
+        parent = self.parentWidget()
+        if (
+            not self._unread_count
+            or parent is None
+            or not parent.isVisible()
+            or not self._anchor.isVisibleTo(parent)
+        ):
+            self.hide()
+            return
+        anchor_rect = self._anchor_rect()
+        if not anchor_rect.isValid():
+            self.hide()
+            return
+        size = self.sizeHint()
+        available = parent.rect().adjusted(6, 6, -6, -6)
+        x = anchor_rect.center().x() - size.width() // 2
+        x = max(available.left(), min(x, available.right() - size.width() + 1))
+        above_y = anchor_rect.top() - size.height() + 3
+        if above_y >= available.top():
+            y = above_y
+            self._tail_at_top = False
+        else:
+            y = anchor_rect.bottom() - 2
+            y = min(y, available.bottom() - size.height() + 1)
+            self._tail_at_top = True
+        y = max(available.top(), y)
+        self._tail_x = float(
+            max(18, min(anchor_rect.center().x() - x, size.width() - 18))
+        )
+        self.setGeometry(x, y, size.width(), size.height())
+        self.show()
+        self.raise_()
+
+    def eventFilter(self, watched, event):
+        if event.type() in {
+            QEvent.Hide,
+            QEvent.LayoutRequest,
+            QEvent.Move,
+            QEvent.ParentChange,
+            QEvent.Resize,
+            QEvent.Show,
+            QEvent.ZOrderChange,
+        }:
+            QTimer.singleShot(0, self.reposition)
+        return super().eventFilter(watched, event)
+
+    def paintEvent(self, event):
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        tail = float(self.TAIL_HEIGHT)
+        body_top = tail if self._tail_at_top else 0.0
+        body_bottom = float(self.height()) if self._tail_at_top else self.height() - tail
+        body_rect = QRectF(
+            0.5,
+            body_top + 0.5,
+            self.width() - 1.0,
+            body_bottom - body_top - 1.0,
+        )
+        fill = QColor("#e8f6f3")
+        border = QColor("#73b9ae")
+        body_path = QPainterPath()
+        body_path.addRoundedRect(body_rect, 10, 10)
+        painter.fillPath(body_path, fill)
+        painter.setPen(QPen(border, 1))
+        painter.drawPath(body_path)
+
+        tail_path = QPainterPath()
+        if self._tail_at_top:
+            tail_path.moveTo(QPointF(self._tail_x, 0.5))
+            tail_path.lineTo(QPointF(self._tail_x - 7, body_top + 1))
+            tail_path.lineTo(QPointF(self._tail_x + 7, body_top + 1))
+        else:
+            tail_path.moveTo(QPointF(self._tail_x, self.height() - 0.5))
+            tail_path.lineTo(QPointF(self._tail_x - 7, body_bottom - 1))
+            tail_path.lineTo(QPointF(self._tail_x + 7, body_bottom - 1))
+        tail_path.closeSubpath()
+        painter.fillPath(tail_path, fill)
+        painter.setPen(QPen(border, 1))
+        painter.drawPath(tail_path)
+
+        icon_rect = QRect(
+            12,
+            int(body_top + (body_bottom - body_top - 16) / 2),
+            16,
+            16,
+        )
+        QIcon(str(ASSET_DIRECTORY / "announcement.svg")).paint(painter, icon_rect)
+        painter.setPen(QColor("#145f58"))
+        painter.setFont(self.font())
+        painter.drawText(
+            QRectF(36, body_top, self.width() - 46, body_bottom - body_top),
+            Qt.AlignLeft | Qt.AlignVCenter,
+            self._text,
+        )
+
+
 class UnreadBadgeButton(QPushButton):
-    """A button that presents unread messages as an explicit text notice."""
+    """A button with a floating unread notice that does not change its label."""
 
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
         self._base_text = str(text or "")
         self._unread_count = 0
+        self._unread_bubble = None
+        self._unread_overlay_parent = None
         self.setProperty("hasUnread", False)
 
     @property
@@ -342,37 +514,50 @@ class UnreadBadgeButton(QPushButton):
     def message_unread_count(self):
         return self._unread_count
 
+    @property
+    def unread_bubble(self):
+        self._sync_unread_bubble()
+        return self._unread_bubble
+
+    def set_unread_overlay_parent(self, parent):
+        if parent is self._unread_overlay_parent:
+            return
+        self._unread_overlay_parent = parent
+        if self._unread_bubble is not None:
+            self._unread_bubble.deleteLater()
+            self._unread_bubble = None
+        QTimer.singleShot(0, self._sync_unread_bubble)
+
+    def _sync_unread_bubble(self):
+        overlay_parent = self._unread_overlay_parent or self.window()
+        if overlay_parent is None or overlay_parent is self:
+            return
+        if self._unread_bubble is None:
+            self._unread_bubble = UnreadMessageBubble(
+                self,
+                overlay_parent,
+            )
+        self._unread_bubble.set_unread_count(self._unread_count)
+
     def set_unread_count(self, count):
         count = max(0, int(count or 0))
-        if count == self._unread_count:
-            return
         self._unread_count = count
         self.setProperty("hasUnread", bool(count))
-        notice = f"有 {count} 条新消息" if count else ""
-        self.setText(
-            f"{self._base_text}  ·  {notice}"
-            if self._base_text and notice
-            else self._base_text or notice
-        )
+        self.setText(self._base_text)
         self.style().unpolish(self)
         self.style().polish(self)
-        self.updateGeometry()
+        QTimer.singleShot(0, self._sync_unread_bubble)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QTimer.singleShot(0, self._sync_unread_bubble)
 
     # Keep the announcement-specific API used by existing callers.
     def set_message_unread_count(self, count):
         self.set_unread_count(count)
 
 class AnnouncementHornButton(UnreadBadgeButton):
-    """Announcement shortcut that expands when new replies are available."""
-
-    def set_unread_count(self, count):
-        super().set_unread_count(count)
-        if self._unread_count:
-            text_width = self.fontMetrics().horizontalAdvance(self.text())
-            width = max(132, text_width + self.iconSize().width() + 34)
-        else:
-            width = 38
-        self.setFixedWidth(width)
+    """Fixed-size announcement shortcut with an independent unread bubble."""
 
     @property
     def message_unread_count(self):
@@ -1061,6 +1246,7 @@ class ContactConversationDialog(FramelessDialog):
         self._conversation_picker_updating = False
         self._refresh_task = None
         self._read_tasks = []
+        self._opened_conversation_ids = set()
         self._known_admin_message_ids = set()
         self._message_ids_initialized = False
         self._failed_messages = []
@@ -1125,6 +1311,9 @@ class ContactConversationDialog(FramelessDialog):
             self.conversation_picker.setView(picker_view)
             self.conversation_picker.currentIndexChanged.connect(
                 self._conversation_changed
+            )
+            self.conversation_picker.activated.connect(
+                self._conversation_activated
             )
             layout.addWidget(self.conversation_picker)
         self.status_label = QLabel("正在读取会话…")
@@ -1245,7 +1434,8 @@ class ContactConversationDialog(FramelessDialog):
         self._render()
         self._remember_admin_messages(notify=False)
         self.unread_count_changed.emit(self.total_unread_count)
-        self._mark_current_conversation_read()
+        if not self.history_mode:
+            self._mark_current_conversation_read()
 
     @staticmethod
     def _conversation_label(conversation):
@@ -1352,6 +1542,18 @@ class ContactConversationDialog(FramelessDialog):
             return
         item = self.conversation_picker.itemData(index)
         self.conversation = item if isinstance(item, dict) else None
+        self._update_conversation_picker_display()
+        self._update_related_label()
+        self._render()
+
+    def _conversation_activated(self, index):
+        if self.conversation_picker is None:
+            return
+        item = self.conversation_picker.itemData(index)
+        self.conversation = item if isinstance(item, dict) else None
+        conversation_id = str((self.conversation or {}).get("id") or "")
+        if conversation_id:
+            self._opened_conversation_ids.add(conversation_id)
         self._update_conversation_picker_display()
         self._update_related_label()
         self._render()
@@ -1471,7 +1673,9 @@ class ContactConversationDialog(FramelessDialog):
             self.unread_count_changed.emit(
                 self.total_unread_count
             )
-            self._mark_current_conversation_read()
+            current_id = str((self.conversation or {}).get("id") or "")
+            if not self.history_mode or current_id in self._opened_conversation_ids:
+                self._mark_current_conversation_read()
 
         self._refresh_task = start_api_task(
             lambda: self._fetch_conversations(**self._request_kwargs()),
@@ -2965,6 +3169,10 @@ class AnnouncementAdminPage(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("AnnouncementTabs")
+        self.message_badge_spacer = QWidget()
+        self.message_badge_spacer.setFixedHeight(14)
+        self.message_badge_spacer.hide()
+        root.addWidget(self.message_badge_spacer)
         root.addWidget(self.tabs, 1)
 
         management = QWidget()
@@ -3007,6 +3215,10 @@ class AnnouncementAdminPage(QWidget):
         make_table_columns_resizable(
             self.announcement_table,
             [220, 180, 125, 85, 85, 85, 85, 170],
+        )
+        self.announcement_table.horizontalHeader().setSectionResizeMode(
+            7,
+            QHeaderView.Stretch,
         )
         splitter.addWidget(self.announcement_table)
         self.announcement_preview = QTextBrowser()
@@ -3072,15 +3284,11 @@ class AnnouncementAdminPage(QWidget):
         )
         inbox_layout.addWidget(self.message_table, 1)
         self.message_tab_index = self.tabs.addTab(inbox, "用户消息")
-        self.message_tab_badge = QLabel("0")
-        self.message_tab_badge.setObjectName("AnnouncementTabBadge")
-        self.message_tab_badge.setAlignment(Qt.AlignCenter)
-        self.message_tab_badge.setMinimumHeight(22)
-        self.message_tab_badge.setVisible(False)
-        self.tabs.tabBar().setTabButton(
-            self.message_tab_index,
-            QTabBar.RightSide,
-            self.message_tab_badge,
+        tab_bar = self.tabs.tabBar()
+        self.message_tab_badge = UnreadMessageBubble(
+            tab_bar,
+            self,
+            anchor_rect_provider=lambda: tab_bar.tabRect(self.message_tab_index),
         )
         self._selection_state()
 
@@ -3090,17 +3298,8 @@ class AnnouncementAdminPage(QWidget):
         badge = getattr(self, "message_tab_badge", None)
         if badge is None:
             return
-        text = f"有 {count} 条新消息"
-        badge.setText(text)
-        badge.setFixedWidth(
-            badge.fontMetrics().horizontalAdvance(text) + 18
-            if count
-            else 0
-        )
-        badge.setVisible(bool(count))
-        badge.setToolTip(f"{count} 条未读用户消息" if count else "")
-        self.tabs.tabBar().updateGeometry()
-        badge.update()
+        self.message_badge_spacer.setVisible(bool(count))
+        badge.set_unread_count(count)
 
     @staticmethod
     def _style_management_table(table, object_name):

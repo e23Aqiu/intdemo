@@ -328,10 +328,17 @@ class AnnouncementUiTests(unittest.TestCase):
             "今晚 22:00 维护，请提前保存数据",
         )
         self.assertIn("announcements_admin", window._pages)
-        self.assertIn(
-            "新消息 3",
+        self.assertEqual(
             window._nav_buttons["announcements_admin"].text(),
+            "公告发布",
         )
+        self.assertEqual(window._announcement_nav_badge.unread_count, 3)
+        self.assertTrue(window._announcement_nav_badge_spacer.isVisible())
+        self.assertEqual(
+            window._announcement_nav_badge.text(),
+            "有 3 条新消息",
+        )
+        self.assertTrue(window._announcement_nav_badge.isVisible())
         self.assertNotIn(
             "●",
             window._nav_buttons["announcements_admin"].text(),
@@ -561,19 +568,22 @@ class AnnouncementUiTests(unittest.TestCase):
                 lambda: window.announcement_horn_button.message_unread_count == 2
             )
         )
+        self.assertEqual(window.announcement_horn_button.text(), "")
+        self.assertEqual(window.announcement_horn_button.width(), 38)
         self.assertEqual(
-            window.announcement_horn_button.text(),
+            window.announcement_horn_button.unread_bubble.text(),
             "有 2 条新消息",
         )
-        self.assertGreater(window.announcement_horn_button.width(), 38)
+        self.assertTrue(window.announcement_horn_button.unread_bubble.isVisible())
 
         window.announcement_horn_button.click()
         self.app.processEvents()
         announcement_list = window.announcement_list_dialog
         self.assertEqual(announcement_list.history_button.message_unread_count, 2)
+        self.assertEqual(announcement_list.history_button.text(), "历史会话")
         self.assertEqual(
-            announcement_list.history_button.text(),
-            "历史会话  ·  有 2 条新消息",
+            announcement_list.history_button.unread_bubble.text(),
+            "有 2 条新消息",
         )
         with patch(
             "integrated_client.ui.announcement_page.run_with_loading",
@@ -590,6 +600,9 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertIn("有 2 条新消息", history.conversation_picker.itemText(1))
         self.assertNotIn("●", history.conversation_picker.itemText(1))
         history.conversation_picker.setCurrentIndex(1)
+        self.assertEqual(api.user_read_calls, [])
+        self.assertIn("有 2 条新消息", history.conversation_picker.itemText(1))
+        history.conversation_picker.activated.emit(1)
         self.assertTrue(
             self._wait_until(lambda: api.user_read_calls == ["conversation-unread"])
         )
@@ -597,6 +610,7 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
         self.assertEqual(window.announcement_horn_button.text(), "")
         self.assertEqual(window.announcement_horn_button.width(), 38)
+        self.assertTrue(window.announcement_horn_button.unread_bubble.isHidden())
 
     def test_image_preview_supports_fit_zoom_and_actual_size(self):
         pixmap = QPixmap(1600, 1000)
@@ -831,6 +845,8 @@ class AnnouncementUiTests(unittest.TestCase):
             ],
         }
         page = AnnouncementAdminPage(FakeSession(api))
+        page.show()
+        self.app.processEvents()
         unread = []
         page.unread_messages_changed.connect(unread.append)
         with patch(
@@ -845,6 +861,7 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(unread, [1])
         self.assertEqual(page.message_tab_badge.text(), "有 1 条新消息")
         self.assertFalse(page.message_tab_badge.isHidden())
+        self.assertTrue(page.message_badge_spacer.isVisible())
         self.assertGreater(
             page.message_tab_badge.width(),
             page.message_tab_badge.fontMetrics().horizontalAdvance(
@@ -969,12 +986,15 @@ class AnnouncementUiTests(unittest.TestCase):
 
     def test_admin_message_table_stretches_latest_message_column(self):
         page = AnnouncementAdminPage(FakeSession(FakeAnnouncementApi()))
-        header = page.message_table.horizontalHeader()
-        self.assertEqual(header.sectionResizeMode(4), QHeaderView.Stretch)
-        self.assertEqual(header.sectionResizeMode(5), QHeaderView.Interactive)
+        message_header = page.message_table.horizontalHeader()
+        self.assertEqual(message_header.sectionResizeMode(4), QHeaderView.Stretch)
+        self.assertEqual(message_header.sectionResizeMode(5), QHeaderView.Interactive)
+        announcement_header = page.announcement_table.horizontalHeader()
+        self.assertEqual(announcement_header.sectionResizeMode(7), QHeaderView.Stretch)
+        self.assertEqual(announcement_header.sectionResizeMode(6), QHeaderView.Interactive)
         page.deleteLater()
 
-    def test_user_message_unread_badge_is_cleared_when_chat_opens(self):
+    def test_history_keeps_unread_badge_until_conversation_is_explicitly_opened(self):
         api = FakeAnnouncementApi()
         api.visible_announcements = [self._announcement(read_at=True)]
         api.conversations = [
@@ -1014,6 +1034,13 @@ class AnnouncementUiTests(unittest.TestCase):
             )
         )
         window._show_contact_history()
+        history = window.contact_history_dialog
+        self.app.processEvents()
+        self.assertEqual(api.user_read_calls, [])
+        self.assertEqual(window.announcement_horn_button.message_unread_count, 1)
+        self.assertIn("1 个未读会话", history.conversation_picker.currentText())
+        self.assertIn("1 条新消息", history.conversation_picker.itemText(0))
+        history.conversation_picker.activated.emit(0)
         self.assertTrue(self._wait_until(lambda: api.user_read_calls == ["conversation-1"]))
         self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
 

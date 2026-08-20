@@ -46,6 +46,7 @@ from .announcement_page import (
     AnnouncementTickerButton,
     ContactConversationDialog,
     ContactHistoryDialog,
+    UnreadMessageBubble,
     start_api_task,
 )
 from .auth_dialogs import PasswordDialog, ReconnectDialog
@@ -186,6 +187,8 @@ class MainWindow(FramelessMainWindow):
         self.contact_history_dialog = None
         self.contact_conversation_dialogs = {}
         self._announcement_message_unread_count = None
+        self._announcement_nav_badge = None
+        self._announcement_nav_badge_spacer = None
         self._announcement_poll_task = None
         self._announcement_action_tasks = []
         self._announcement_poll_timer = None
@@ -567,6 +570,11 @@ class MainWindow(FramelessMainWindow):
         if not self.offline_business_mode:
             trailing_nav_items.append(("personal", "系统设置", "nav-user.svg"))
         for key, text, icon_name in trailing_nav_items:
+            if key == "announcements_admin":
+                self._announcement_nav_badge_spacer = QWidget(sidebar)
+                self._announcement_nav_badge_spacer.setFixedHeight(20)
+                self._announcement_nav_badge_spacer.hide()
+                layout.addWidget(self._announcement_nav_badge_spacer)
             button = self._create_nav_button(key, text)
             button.setIcon(QIcon(_control_asset_path(icon_name)))
             button.setIconSize(QSize(19, 19))
@@ -746,6 +754,9 @@ class MainWindow(FramelessMainWindow):
         )
         self.announcement_horn_button.setIconSize(QSize(20, 20))
         self.announcement_horn_button.setFixedSize(38, 38)
+        self.announcement_horn_button.set_unread_overlay_parent(
+            self.centralWidget()
+        )
         self.announcement_horn_button.setToolTip("暂无公告")
         self.announcement_horn_button.setEnabled(False)
         self.announcement_horn_button.setVisible(
@@ -1147,12 +1158,16 @@ class MainWindow(FramelessMainWindow):
         if button is None:
             return
         button.setProperty("hasMessage", bool(unread_count))
-        button.setText(
-            f"公告发布  ·  新消息 {unread_count}"
-            if unread_count
-            else "公告发布"
-        )
+        button.setText("公告发布")
         button.setToolTip(f"收到 {unread_count} 条未读用户消息" if unread_count else "")
+        if self._announcement_nav_badge_spacer is not None:
+            self._announcement_nav_badge_spacer.setVisible(bool(unread_count))
+        if self._announcement_nav_badge is None:
+            self._announcement_nav_badge = UnreadMessageBubble(
+                button,
+                self.centralWidget(),
+            )
+        self._announcement_nav_badge.set_unread_count(unread_count)
         button.style().unpolish(button)
         button.style().polish(button)
 
