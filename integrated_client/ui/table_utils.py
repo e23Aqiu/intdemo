@@ -21,6 +21,28 @@ class _TableColumnWidthController(QObject):
         self._model = None
         table.installEventFilter(self)
         table.viewport().installEventFilter(self)
+        table.destroyed.connect(self._table_destroyed)
+
+    def _table_is_alive(self):
+        return self.table is not None and not sip.isdeleted(self.table)
+
+    def _disconnect_model(self):
+        model = self._model
+        self._model = None
+        if model is None or sip.isdeleted(model):
+            return
+        for signal_name in ("modelReset", "columnsInserted", "columnsRemoved"):
+            try:
+                getattr(model, signal_name).disconnect(
+                    self._model_structure_changed
+                )
+            except (TypeError, RuntimeError):
+                pass
+
+    def _table_destroyed(self, *_args):
+        self._disconnect_model()
+        self.table = None
+        self._fit_scheduled = False
 
     def configure(self, initial_widths, minimum_width):
         self.initial_widths = dict(initial_widths)
@@ -31,33 +53,57 @@ class _TableColumnWidthController(QObject):
         self.schedule_fit()
 
     def _column_count(self):
-        column_count = getattr(self.table, "columnCount", None)
-        if callable(column_count):
-            return int(column_count())
-        model = self.table.model()
-        return int(model.columnCount()) if model is not None else 0
+        if not self._table_is_alive():
+            return 0
+        try:
+            column_count = getattr(self.table, "columnCount", None)
+            if callable(column_count):
+                return int(column_count())
+            model = self.table.model()
+            return int(model.columnCount()) if model is not None else 0
+        except RuntimeError:
+            return 0
 
     def _connect_model(self):
-        model = self.table.model()
-        if model is None or model is self._model:
+        if not self._table_is_alive():
+            self._disconnect_model()
             return
+        try:
+            model = self.table.model()
+        except RuntimeError:
+            self._disconnect_model()
+            return
+        if model is None:
+            self._disconnect_model()
+            return
+        if model is self._model and not sip.isdeleted(model):
+            return
+        self._disconnect_model()
         self._model = model
-        model.modelReset.connect(self._model_structure_changed)
-        model.columnsInserted.connect(self._model_structure_changed)
-        model.columnsRemoved.connect(self._model_structure_changed)
+        try:
+            model.modelReset.connect(self._model_structure_changed)
+            model.columnsInserted.connect(self._model_structure_changed)
+            model.columnsRemoved.connect(self._model_structure_changed)
+        except RuntimeError:
+            self._model = None
 
     def _model_structure_changed(self, *_args):
+        if not self._table_is_alive():
+            self._disconnect_model()
+            return
         if self._column_count() != self._fitted_column_count:
             self._fitted = False
             self.schedule_fit()
 
     def refit(self):
+        if not self._table_is_alive():
+            return
         self._fitted = False
         self._fitted_column_count = 0
         self.schedule_fit()
 
     def schedule_fit(self):
-        if self._fit_scheduled:
+        if self._fit_scheduled or not self._table_is_alive():
             return
         self._fit_scheduled = True
         QTimer.singleShot(0, self.fit_once)
@@ -82,7 +128,7 @@ class _TableColumnWidthController(QObject):
 
     def fit_once(self):
         self._fit_scheduled = False
-        if sip.isdeleted(self.table):
+        if not self._table_is_alive():
             return
         self._connect_model()
         column_count = self._column_count()
@@ -121,6 +167,8 @@ class _TableColumnWidthController(QObject):
         self._fitted_column_count = column_count
 
     def eventFilter(self, watched, event):
+        if not self._table_is_alive():
+            return False
         if event.type() in {QEvent.Show, QEvent.Resize, QEvent.LayoutRequest}:
             if not self._fitted:
                 self._connect_model()
