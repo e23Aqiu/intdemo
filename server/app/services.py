@@ -70,6 +70,7 @@ def account_view(db: Session, account: Account) -> dict[str, Any]:
         "active_device_count": active_device_count(db, account.id),
         "online_device_count": online_count,
         "last_login_at": account.last_login_at,
+        "last_login_system": account.last_login_system,
         "created_at": account.created_at,
         "updated_at": account.updated_at,
     }

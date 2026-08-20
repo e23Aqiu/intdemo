@@ -3,8 +3,11 @@ from __future__ import annotations
 import base64
 import mimetypes
 import os
+import uuid
+from datetime import datetime
 from pathlib import Path
 
+from PyQt5 import sip
 from PyQt5.QtCore import (
     QEvent,
     QObject,
@@ -41,7 +44,6 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QLineEdit,
     QListView,
@@ -1182,7 +1184,9 @@ class ConversationTimeline(QScrollArea):
                     else message.get("user_read_at")
                 )
             time_text = created_at
-            if own and send_state != "failed":
+            if own and send_state == "sending":
+                time_text += "  ·  发送中…"
+            elif own and send_state != "failed":
                 time_text += "  ·  " + ("已读" if peer_read else "未读")
             time_label = QLabel(time_text)
             time_label.setObjectName("ChatBubbleTime")
@@ -1246,10 +1250,10 @@ class ContactConversationDialog(FramelessDialog):
         self._conversation_picker_updating = False
         self._refresh_task = None
         self._read_tasks = []
-        self._opened_conversation_ids = set()
         self._known_admin_message_ids = set()
         self._message_ids_initialized = False
         self._failed_messages = []
+        self._send_task = None
         self.setWindowTitle("历史会话" if self.history_mode else "联系管理员")
         self.setModal(False)
         self.resize(840, 700)
@@ -1311,9 +1315,6 @@ class ContactConversationDialog(FramelessDialog):
             self.conversation_picker.setView(picker_view)
             self.conversation_picker.currentIndexChanged.connect(
                 self._conversation_changed
-            )
-            self.conversation_picker.activated.connect(
-                self._conversation_activated
             )
             layout.addWidget(self.conversation_picker)
         self.status_label = QLabel("正在读取会话…")
@@ -1434,8 +1435,7 @@ class ContactConversationDialog(FramelessDialog):
         self._render()
         self._remember_admin_messages(notify=False)
         self.unread_count_changed.emit(self.total_unread_count)
-        if not self.history_mode:
-            self._mark_current_conversation_read()
+        self._mark_current_conversation_read()
 
     @staticmethod
     def _conversation_label(conversation):
@@ -1446,9 +1446,13 @@ class ContactConversationDialog(FramelessDialog):
         if len(preview) > 28:
             preview = preview[:25] + "…"
         status = "已解决" if conversation.get("status") == "resolved" else "处理中"
-        timestamp = _display_time(
+        started_at = _display_time(conversation.get("created_at"))
+        updated_at = _display_time(
             conversation.get("updated_at") or conversation.get("created_at")
         )
+        timestamp = f"发起：{started_at}"
+        if updated_at != started_at:
+            timestamp += f"  ·  最近：{updated_at}"
         suffix = f" · {preview}" if preview else ""
         unread_count = int(conversation.get("user_unread_count") or 0)
         unread_prefix = f"有 {unread_count} 条新消息  ·  " if unread_count else ""
@@ -1545,18 +1549,6 @@ class ContactConversationDialog(FramelessDialog):
         self._update_conversation_picker_display()
         self._update_related_label()
         self._render()
-
-    def _conversation_activated(self, index):
-        if self.conversation_picker is None:
-            return
-        item = self.conversation_picker.itemData(index)
-        self.conversation = item if isinstance(item, dict) else None
-        conversation_id = str((self.conversation or {}).get("id") or "")
-        if conversation_id:
-            self._opened_conversation_ids.add(conversation_id)
-        self._update_conversation_picker_display()
-        self._update_related_label()
-        self._render()
         self._mark_current_conversation_read()
 
     def _update_related_label(self):
@@ -1615,7 +1607,9 @@ class ContactConversationDialog(FramelessDialog):
         can_compose = bool(not self.history_mode or conversation)
         self.message_edit.setEnabled(can_compose)
         self.attachment_picker.setEnabled(can_compose and not self.legacy_mode)
-        self.send_btn.setEnabled(can_compose and not self.legacy_mode)
+        self.send_btn.setEnabled(
+            can_compose and not self.legacy_mode and self._send_task is None
+        )
         if not conversation:
             self.status_label.setText(
                 "暂无历史会话" if self.history_mode else "尚未发起会话"
@@ -1673,9 +1667,7 @@ class ContactConversationDialog(FramelessDialog):
             self.unread_count_changed.emit(
                 self.total_unread_count
             )
-            current_id = str((self.conversation or {}).get("id") or "")
-            if not self.history_mode or current_id in self._opened_conversation_ids:
-                self._mark_current_conversation_read()
+            self._mark_current_conversation_read()
 
         self._refresh_task = start_api_task(
             lambda: self._fetch_conversations(**self._request_kwargs()),
@@ -1717,6 +1709,11 @@ class ContactConversationDialog(FramelessDialog):
         if not conversation_id:
             return
         conversation_unread = int(conversation.get("user_unread_count") or 0)
+        previous_read_values = [
+            (message, message.get("user_read_at"))
+            for message in conversation.get("messages") or []
+            if message.get("sender_role") == "admin"
+        ]
         conversation["user_unread_count"] = 0
         for message in conversation.get("messages") or []:
             if message.get("sender_role") == "admin":
@@ -1740,12 +1737,27 @@ class ContactConversationDialog(FramelessDialog):
                 selected_id=conversation_id,
             )
         self.unread_count_changed.emit(self.total_unread_count)
-        self.messages_changed.emit()
         task = None
 
-        def completed(_result, _error):
+        def completed(_result, error):
+            if sip.isdeleted(self):
+                return
             if task in self._read_tasks:
                 self._read_tasks.remove(task)
+            if error is None:
+                self.messages_changed.emit()
+                return
+            conversation["user_unread_count"] = conversation_unread
+            for message, previous_value in previous_read_values:
+                message["user_read_at"] = previous_value
+            self.total_unread_count += conversation_unread
+            if self.history_mode:
+                for item in self.conversations:
+                    if str(item.get("id") or "") == conversation_id:
+                        item["user_unread_count"] = conversation_unread
+                        break
+                self._populate_conversation_picker(selected_id=conversation_id)
+            self.unread_count_changed.emit(self.total_unread_count)
 
         task = start_api_task(
             lambda: method(
@@ -1764,6 +1776,8 @@ class ContactConversationDialog(FramelessDialog):
         self.count_label.setText(f"{len(text)} / {self.MAX_LENGTH}")
 
     def _send(self):
+        if self._send_task is not None:
+            return
         message = self.message_edit.toPlainText().strip()
         if not message and (
             self.legacy_mode or not self.attachment_picker.has_attachments()
@@ -1845,8 +1859,6 @@ class ContactConversationDialog(FramelessDialog):
             self._failed_messages.append(failed_message)
         failed_message["_send_state"] = "failed"
         failed_message["_send_error"] = str(error)
-        self.message_edit.clear()
-        self.attachment_picker.clear()
         self._render()
         self.status_label.setText("消息发送失败，请检查网络后点击“重新发送”。")
         self.messages_changed.emit()
@@ -1869,46 +1881,69 @@ class ContactConversationDialog(FramelessDialog):
         *,
         failed_message=None,
     ):
-        if failed_message is not None:
-            failed_message["_send_state"] = "sending"
-            self._render()
-        try:
-            result = run_with_loading(
-                self,
-                "正在重新发送…" if failed_message is not None else "正在发送消息…",
-                lambda: self._send_action(message, attachments, context),
-            )
-            if result is None:
-                raise ValueError("服务器未返回发送结果")
-        except (OnlineApiError, OSError, ValueError) as exc:
-            self._record_failed_message(
-                message,
-                attachments,
-                context,
-                exc,
-                failed_message,
-            )
+        if self._send_task is not None:
             return
-        if failed_message in self._failed_messages:
-            self._failed_messages.remove(failed_message)
-        if context.get("kind") == "legacy":
-            QMessageBox.information(self, "发送成功", "消息已发送给管理员。")
-            self.accept()
-            return
-        self.conversation = result
-        if self.history_mode:
-            result_id = str(result.get("id") or "")
-            self.conversations = [
-                item
-                for item in self.conversations
-                if str(item.get("id") or "") != result_id
-            ]
-            self.conversations.insert(0, result)
-            self._populate_conversation_picker(selected_id=result_id)
-        self.message_edit.clear()
-        self.attachment_picker.clear()
+        pending_message = failed_message
+        if pending_message is None:
+            pending_message = {
+                "id": f"local-sending-{uuid.uuid4().hex}",
+                "sender_role": "user",
+                "message": message,
+                "attachments": _local_attachment_views(attachments),
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "_retry_attachments": list(attachments),
+                "_retry_context": dict(context),
+                "_conversation_id": str(context.get("conversation_id") or ""),
+            }
+            self._failed_messages.append(pending_message)
+            self.message_edit.clear()
+            self.attachment_picker.clear()
+        pending_message["_send_state"] = "sending"
+        pending_message.pop("_send_error", None)
         self._render()
-        self.messages_changed.emit()
+        self.message_edit.setFocus()
+
+        def completed(result, error):
+            if sip.isdeleted(self):
+                return
+            self._send_task = None
+            if error is None and result is None:
+                error = ValueError("服务器未返回发送结果")
+            if error is not None:
+                self._record_failed_message(
+                    message,
+                    attachments,
+                    context,
+                    error,
+                    pending_message,
+                )
+                QTimer.singleShot(0, self.message_edit.setFocus)
+                return
+            if pending_message in self._failed_messages:
+                self._failed_messages.remove(pending_message)
+            if context.get("kind") == "legacy":
+                QMessageBox.information(self, "发送成功", "消息已发送给管理员。")
+                self.accept()
+                return
+            self.conversation = result
+            if self.history_mode:
+                result_id = str(result.get("id") or "")
+                self.conversations = [
+                    item
+                    for item in self.conversations
+                    if str(item.get("id") or "") != result_id
+                ]
+                self.conversations.insert(0, result)
+                self._populate_conversation_picker(selected_id=result_id)
+            self._render()
+            self.messages_changed.emit()
+            QTimer.singleShot(0, self.message_edit.setFocus)
+
+        self._send_task = start_api_task(
+            lambda: self._send_action(message, attachments, context),
+            completed,
+        )
+        self._render()
 
     def _set_status(self, status):
         conversation = self.conversation
@@ -1971,6 +2006,7 @@ class AdminConversationDialog(FramelessDialog):
         self._known_user_message_ids = set()
         self._message_ids_initialized = False
         self._failed_messages = []
+        self._send_task = None
         self.setWindowTitle(
             f"回复用户 - {self.conversation.get('sender_display_name') or '用户'}"
         )
@@ -2106,6 +2142,7 @@ class AdminConversationDialog(FramelessDialog):
             own_role="admin",
             peer_label=display_name,
         )
+        self.send_btn.setEnabled(self._send_task is None)
 
     def _limit_message(self):
         text = self.message_edit.toPlainText()
@@ -2120,6 +2157,8 @@ class AdminConversationDialog(FramelessDialog):
         self.count_label.setText(f"{len(text)} / {self.MAX_LENGTH}")
 
     def _send(self):
+        if self._send_task is not None:
+            return
         message = self.message_edit.toPlainText().strip()
         if not message and not self.attachment_picker.has_attachments():
             QMessageBox.warning(self, "回复为空", "请输入文字或添加附件。")
@@ -2154,8 +2193,6 @@ class AdminConversationDialog(FramelessDialog):
             self._failed_messages.append(failed_message)
         failed_message["_send_state"] = "failed"
         failed_message["_send_error"] = str(error)
-        self.message_edit.clear()
-        self.attachment_picker.clear()
         self._render()
         self.status_label.setText("回复发送失败，请检查网络后点击“重新发送”。")
 
@@ -2169,49 +2206,70 @@ class AdminConversationDialog(FramelessDialog):
         )
 
     def _submit_message(self, message, attachments, *, failed_message=None):
-        if failed_message is not None:
-            failed_message["_send_state"] = "sending"
-            self._render()
-        conversation_id = str(self.conversation.get("id") or "")
-        try:
-            result = run_with_loading(
-                self,
-                "正在重新发送…" if failed_message is not None else "正在发送回复…",
-                lambda: self.session.api.admin_reply_message(
-                    self.session.access_token(),
-                    conversation_id,
-                    message,
-                    attachments,
-                ),
-            )
-            if result is None:
-                raise ValueError("服务器未返回发送结果")
-        except (OnlineApiError, OSError, ValueError) as exc:
-            self._record_failed_message(
-                message,
-                attachments,
-                exc,
-                failed_message,
-            )
+        if self._send_task is not None:
             return
-        if failed_message in self._failed_messages:
-            self._failed_messages.remove(failed_message)
-        if isinstance(result, dict) and result.get("messages") is not None:
-            self.conversation = result
-        else:
-            local_message = {
-                "id": f"local-{len(self.conversation.get('messages') or [])}",
+        conversation_id = str(self.conversation.get("id") or "")
+        pending_message = failed_message
+        if pending_message is None:
+            pending_message = {
+                "id": f"local-sending-{uuid.uuid4().hex}",
                 "sender_role": "admin",
                 "message": message,
                 "attachments": _local_attachment_views(attachments),
-                "created_at": "刚刚",
+                "created_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "_retry_attachments": list(attachments),
             }
-            self.conversation.setdefault("messages", []).append(local_message)
-            self.conversation["last_message"] = local_message
-        self.message_edit.clear()
-        self.attachment_picker.clear()
+            self._failed_messages.append(pending_message)
+            self.message_edit.clear()
+            self.attachment_picker.clear()
+        pending_message["_send_state"] = "sending"
+        pending_message.pop("_send_error", None)
         self._render()
-        self.conversation_updated.emit(self.conversation)
+        self.message_edit.setFocus()
+
+        def completed(result, error):
+            if sip.isdeleted(self):
+                return
+            self._send_task = None
+            if error is None and result is None:
+                error = ValueError("服务器未返回发送结果")
+            if error is not None:
+                self._record_failed_message(
+                    message,
+                    attachments,
+                    error,
+                    pending_message,
+                )
+                QTimer.singleShot(0, self.message_edit.setFocus)
+                return
+            if pending_message in self._failed_messages:
+                self._failed_messages.remove(pending_message)
+            if isinstance(result, dict) and result.get("messages") is not None:
+                self.conversation = result
+            else:
+                local_message = {
+                    "id": f"local-{len(self.conversation.get('messages') or [])}",
+                    "sender_role": "admin",
+                    "message": message,
+                    "attachments": _local_attachment_views(attachments),
+                    "created_at": "刚刚",
+                }
+                self.conversation.setdefault("messages", []).append(local_message)
+                self.conversation["last_message"] = local_message
+            self._render()
+            self.conversation_updated.emit(self.conversation)
+            QTimer.singleShot(0, self.message_edit.setFocus)
+
+        self._send_task = start_api_task(
+            lambda: self.session.api.admin_reply_message(
+                self.session.access_token(),
+                conversation_id,
+                message,
+                attachments,
+            ),
+            completed,
+        )
+        self._render()
 
     def _mark_read(self):
         if not int(self.conversation.get("unread_count") or 0):
@@ -3216,10 +3274,6 @@ class AnnouncementAdminPage(QWidget):
             self.announcement_table,
             [220, 180, 125, 85, 85, 85, 85, 170],
         )
-        self.announcement_table.horizontalHeader().setSectionResizeMode(
-            7,
-            QHeaderView.Stretch,
-        )
         splitter.addWidget(self.announcement_table)
         self.announcement_preview = QTextBrowser()
         self.announcement_preview.setObjectName("AnnouncementBody")
@@ -3277,10 +3331,6 @@ class AnnouncementAdminPage(QWidget):
         make_table_columns_resizable(
             self.message_table,
             [80, 105, 145, 200, 280, 170],
-        )
-        self.message_table.horizontalHeader().setSectionResizeMode(
-            4,
-            QHeaderView.Stretch,
         )
         inbox_layout.addWidget(self.message_table, 1)
         self.message_tab_index = self.tabs.addTab(inbox, "用户消息")

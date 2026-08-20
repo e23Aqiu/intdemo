@@ -600,13 +600,11 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertIn("有 2 条新消息", history.conversation_picker.itemText(1))
         self.assertNotIn("●", history.conversation_picker.itemText(1))
         history.conversation_picker.setCurrentIndex(1)
-        self.assertEqual(api.user_read_calls, [])
-        self.assertIn("有 2 条新消息", history.conversation_picker.itemText(1))
-        history.conversation_picker.activated.emit(1)
         self.assertTrue(
             self._wait_until(lambda: api.user_read_calls == ["conversation-unread"])
         )
         self.assertNotIn("新消息", history.conversation_picker.itemText(1))
+        self.assertIn("发起：", history.conversation_picker.itemText(1))
         self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
         self.assertEqual(window.announcement_horn_button.text(), "")
         self.assertEqual(window.announcement_horn_button.width(), 38)
@@ -905,6 +903,7 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertIn("<b>这里按纯文字显示</b>", chat.history.toPlainText())
         chat.message_edit.setPlainText("管理员回复")
         chat._send()
+        self.assertTrue(self._wait_until(lambda: bool(api.admin_replies)))
         self.assertEqual(api.admin_replies[0][:2], ("message-id", "管理员回复"))
 
     def test_chat_composers_put_count_and_separator_before_attachments(self):
@@ -984,17 +983,25 @@ class AnnouncementUiTests(unittest.TestCase):
             )
         )
 
-    def test_admin_message_table_stretches_latest_message_column(self):
+    def test_admin_tables_keep_all_columns_interactive_and_fill_viewport(self):
         page = AnnouncementAdminPage(FakeSession(FakeAnnouncementApi()))
         message_header = page.message_table.horizontalHeader()
-        self.assertEqual(message_header.sectionResizeMode(4), QHeaderView.Stretch)
-        self.assertEqual(message_header.sectionResizeMode(5), QHeaderView.Interactive)
+        for column in range(page.message_table.columnCount()):
+            self.assertEqual(
+                message_header.sectionResizeMode(column),
+                QHeaderView.Interactive,
+            )
+        self.assertTrue(message_header.stretchLastSection())
         announcement_header = page.announcement_table.horizontalHeader()
-        self.assertEqual(announcement_header.sectionResizeMode(7), QHeaderView.Stretch)
-        self.assertEqual(announcement_header.sectionResizeMode(6), QHeaderView.Interactive)
+        for column in range(page.announcement_table.columnCount()):
+            self.assertEqual(
+                announcement_header.sectionResizeMode(column),
+                QHeaderView.Interactive,
+            )
+        self.assertTrue(announcement_header.stretchLastSection())
         page.deleteLater()
 
-    def test_history_keeps_unread_badge_until_conversation_is_explicitly_opened(self):
+    def test_history_marks_the_visible_conversation_read_when_opened(self):
         api = FakeAnnouncementApi()
         api.visible_announcements = [self._announcement(read_at=True)]
         api.conversations = [
@@ -1035,14 +1042,9 @@ class AnnouncementUiTests(unittest.TestCase):
         )
         window._show_contact_history()
         history = window.contact_history_dialog
-        self.app.processEvents()
-        self.assertEqual(api.user_read_calls, [])
-        self.assertEqual(window.announcement_horn_button.message_unread_count, 1)
-        self.assertIn("1 个未读会话", history.conversation_picker.currentText())
-        self.assertIn("1 条新消息", history.conversation_picker.itemText(0))
-        history.conversation_picker.activated.emit(0)
         self.assertTrue(self._wait_until(lambda: api.user_read_calls == ["conversation-1"]))
         self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
+        self.assertNotIn("新消息", history.conversation_picker.itemText(0))
 
     def test_chat_failed_messages_can_be_retried_for_user_and_admin(self):
         api = FakeAnnouncementApi()
@@ -1064,14 +1066,28 @@ class AnnouncementUiTests(unittest.TestCase):
             user_chat = ContactConversationDialog(self._announcement(), session)
             user_chat.message_edit.setPlainText("稍后重发的用户消息")
             user_chat._send()
+            user_chat.message_edit.setPlainText("下一条草稿可立即输入")
+            self.assertTrue(user_chat.message_edit.isEnabled())
+            self.assertEqual(user_chat.message_edit.toPlainText(), "下一条草稿可立即输入")
+            self.assertTrue(
+                self._wait_until(
+                    lambda: bool(user_chat._failed_messages)
+                    and user_chat._failed_messages[0].get("_send_state") == "failed"
+                )
+            )
             self.assertEqual(len(user_chat._failed_messages), 1)
             self.assertIn("发送失败", user_chat.status_label.text())
             retry = user_chat.findChild(QPushButton, "ChatRetryButton")
             self.assertIsNotNone(retry)
             retry.click()
-            self.assertEqual(len(user_attempts), 2)
-            self.assertEqual(user_chat._failed_messages, [])
+            self.assertTrue(
+                self._wait_until(
+                    lambda: len(user_attempts) == 2
+                    and not user_chat._failed_messages
+                )
+            )
             self.assertEqual(api.sent_messages[-1][1], "稍后重发的用户消息")
+            self.assertEqual(user_chat.message_edit.toPlainText(), "下一条草稿可立即输入")
 
         conversation = {
             "id": "admin-retry-conversation",
@@ -1098,13 +1114,26 @@ class AnnouncementUiTests(unittest.TestCase):
             admin_chat = AdminConversationDialog(conversation, session)
             admin_chat.message_edit.setPlainText("稍后重发的管理员回复")
             admin_chat._send()
+            admin_chat.message_edit.setPlainText("管理员下一条草稿")
+            self.assertTrue(admin_chat.message_edit.isEnabled())
+            self.assertTrue(
+                self._wait_until(
+                    lambda: bool(admin_chat._failed_messages)
+                    and admin_chat._failed_messages[0].get("_send_state") == "failed"
+                )
+            )
             self.assertEqual(len(admin_chat._failed_messages), 1)
             retry = admin_chat.findChild(QPushButton, "ChatRetryButton")
             self.assertIsNotNone(retry)
             retry.click()
-            self.assertEqual(len(admin_attempts), 2)
-            self.assertEqual(admin_chat._failed_messages, [])
+            self.assertTrue(
+                self._wait_until(
+                    lambda: len(admin_attempts) == 2
+                    and not admin_chat._failed_messages
+                )
+            )
             self.assertEqual(api.admin_replies[-1][1], "稍后重发的管理员回复")
+            self.assertEqual(admin_chat.message_edit.toPlainText(), "管理员下一条草稿")
 
         user_chat.close()
         admin_chat.close()

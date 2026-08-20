@@ -118,17 +118,21 @@ class ApiClient:
         device_uid: str,
         device_name: str,
         client_version: str,
+        login_system: str | None = None,
     ) -> dict:
+        payload = {
+            "username": username,
+            "password": password,
+            "device_uid": device_uid,
+            "device_name": device_name,
+            "client_version": client_version,
+        }
+        if login_system:
+            payload["login_system"] = str(login_system)
         return self._request(
             "POST",
             "/auth/login",
-            json_body={
-                "username": username,
-                "password": password,
-                "device_uid": device_uid,
-                "device_name": device_name,
-                "client_version": client_version,
-            },
+            json_body=payload,
         )
 
     def refresh(self, refresh_token: str, device_uid: str) -> dict:

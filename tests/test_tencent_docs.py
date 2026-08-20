@@ -49,6 +49,7 @@ class TencentDocsImportTests(unittest.TestCase):
 
         self.assertEqual(selection.headers, headers)
         self.assertEqual(selection.company_header, "公司名称")
+        self.assertEqual(selection.source_header_row, 1)
         self.assertEqual(selection.source_start_row, 10)
         self.assertEqual(
             selection.rows,
@@ -71,6 +72,50 @@ class TencentDocsImportTests(unittest.TestCase):
 
         self.assertEqual(selection.source_start_row, 2)
         self.assertEqual(len(selection.rows), 2)
+
+    def test_second_row_header_is_detected_after_a_title_row(self):
+        selection = select_pending_tencent_rows(
+            self._clipboard(
+                ("2026 年逃费车辆业务清单", "", ""),
+                (
+                    ("车辆标识", "公司名称", "备注"),
+                    ("车1", "已处理公司", ""),
+                    ("车2", "", "待处理"),
+                ),
+            )
+        )
+
+        self.assertEqual(selection.source_header_row, 2)
+        self.assertEqual(selection.headers, ("车辆标识", "公司名称", "备注"))
+        self.assertEqual(selection.company_header, "公司名称")
+        self.assertEqual(selection.source_start_row, 4)
+        self.assertEqual(selection.source_row_count, 2)
+        self.assertEqual(selection.rows, (("车2", "", "待处理"),))
+
+        destination = Path(self.temp_dir.name) / "second-row-pending.xlsx"
+        write_tencent_import_workbook(selection, destination)
+        workbook = openpyxl.load_workbook(destination)
+        try:
+            worksheet = workbook.active
+            self.assertEqual(
+                [cell.value for cell in worksheet[1]],
+                ["车辆标识", "公司名称", "备注"],
+            )
+            self.assertEqual(
+                [cell.value for cell in worksheet[2]],
+                ["车2", None, "待处理"],
+            )
+        finally:
+            workbook.close()
+
+    def test_second_row_header_is_detected_after_a_blank_row(self):
+        selection = select_pending_tencent_rows(
+            "\t\t\n车辆标识\t车辆所有人/企业\t备注\n车1\t\t待处理"
+        )
+
+        self.assertEqual(selection.source_header_row, 2)
+        self.assertEqual(selection.source_start_row, 3)
+        self.assertEqual(selection.rows, (("车1", "", "待处理"),))
 
     def test_missing_company_header_is_reported(self):
         with self.assertRaisesRegex(
@@ -224,6 +269,7 @@ class TencentDocsImportTests(unittest.TestCase):
         self.assertEqual(progress, [0, 84, 92, 100])
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].copied_rows, 1)
+        self.assertEqual(results[0].source_header_row, 1)
         self.assertEqual(
             results[0].path.parent,
             tencent_docs_import_directory("admin", self.temp_dir.name),

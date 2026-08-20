@@ -496,13 +496,14 @@ QTableWidget#DashboardTable {
     selection-background-color: transparent;
 }
 QTableWidget#DashboardTable::item {
-    border-bottom: 1px solid #ebf2f0;
+    border: none;
     padding: 4px 7px;
 }
 QTableWidget#DashboardTable QHeaderView::section {
     color: #536e6c;
     background: #eef5f3;
     border: none;
+    border-right: 1px solid #cadbd7;
     border-bottom: 1px solid #d8e7e3;
     padding: 6px 8px;
     font-weight: 700;
@@ -1357,14 +1358,24 @@ QHeaderView::section {
     background: #f1f5fa;
     color: #526177;
     border: none;
+    border-right: 1px solid #d4dee9;
     border-bottom: 1px solid #dce4ef;
     padding: 8px;
     font-weight: 600;
 }
 QTableWidget, QTableView {
-    gridline-color: #edf1f6;
+    gridline-color: transparent;
     alternate-background-color: #f8fafd;
     selection-color: white;
+    outline: 0;
+}
+QTableWidget::item,
+QTableView::item {
+    border: none;
+}
+QTableWidget::item:selected,
+QTableView::item:selected {
+    border: none;
 }
 QTableWidget#AnnouncementManagementTable,
 QTableWidget#AnnouncementMessageTable {
@@ -1377,13 +1388,14 @@ QTableWidget#AnnouncementMessageTable {
 }
 QTableWidget#AnnouncementManagementTable::item,
 QTableWidget#AnnouncementMessageTable::item {
-    border-bottom: 1px solid #e8f1ef;
+    border: none;
     padding: 7px 9px;
 }
 QTableWidget#AnnouncementManagementTable::item:selected,
 QTableWidget#AnnouncementMessageTable::item:selected {
-    border-top: 1px solid #b8d8d1;
-    border-bottom: 1px solid #b8d8d1;
+    color: #173a3d;
+    background: #cfeae4;
+    border: none;
 }
 QListWidget#AnnouncementChoiceList,
 QListWidget#AnnouncementAttachmentList {

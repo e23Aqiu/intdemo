@@ -30,6 +30,30 @@ class UosCompatibilityTests(unittest.TestCase):
             pass
         return path
 
+    def test_login_system_label_distinguishes_supported_desktops(self):
+        self.assertEqual(
+            platform_support.login_system_label(
+                system="Windows",
+                release="10",
+                version="10.0.19045",
+            ),
+            "Win10",
+        )
+        self.assertEqual(
+            platform_support.login_system_label(
+                system="Windows",
+                release="10",
+                version="10.0.22631",
+            ),
+            "Win11",
+        )
+        with patch.object(platform_support, "is_uos", return_value=True), patch.object(
+            platform_support.platform,
+            "system",
+            return_value="Linux",
+        ):
+            self.assertEqual(platform_support.login_system_label(), "统信 UOS")
+
     def test_windows_compatible_browser_prefers_edge_over_360(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -2,11 +2,11 @@
 
 import os
 import platform
+import re
 import shutil
 import sys
 from contextlib import contextmanager
 from pathlib import Path, PurePosixPath
-
 
 WINDOWS_UPDATE_PLATFORM = "windows-x86_64"
 UOS_UPDATE_PLATFORM = "linux-aarch64"
@@ -88,6 +88,47 @@ def is_uos():
         ):
             return True
     return False
+
+
+def login_system_label(*, system=None, release=None, version=None):
+    """Return the concise operating-system label reported at online login.
+
+    Windows 10 and 11 both commonly report a major version of ``10``.  The
+    kernel build therefore has to be considered: Windows 11 starts at build
+    22000.  Optional arguments keep the detection deterministic in tests.
+    """
+
+    system_name = str(system or platform.system() or sys.platform).strip()
+    normalized_system = system_name.casefold()
+    release_text = str(release or platform.release() or "").strip()
+    version_text = str(version or platform.version() or "").strip()
+
+    if normalized_system.startswith("win"):
+        build = 0
+        if system is None:
+            try:
+                build = int(sys.getwindowsversion().build)
+            except (AttributeError, TypeError, ValueError):
+                build = 0
+        if not build:
+            numeric_parts = [int(part) for part in re.findall(r"\d+", version_text)]
+            if len(numeric_parts) >= 3:
+                build = numeric_parts[2]
+            elif numeric_parts:
+                build = numeric_parts[-1]
+        if release_text == "11" or build >= 22000:
+            return "Win11"
+        if release_text == "10" or build >= 10240:
+            return "Win10"
+        return f"Windows {release_text}".strip()
+
+    if normalized_system.startswith("linux"):
+        if system is None and is_uos():
+            return "统信 UOS"
+        return "Linux"
+    if normalized_system in {"darwin", "mac", "macos"}:
+        return "macOS"
+    return system_name or "未知"
 
 
 def configure_desktop_environment():

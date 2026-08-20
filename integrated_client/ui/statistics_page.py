@@ -1806,13 +1806,14 @@ class StatisticsPage(QWidget):
                 selection-color: #145f58;
             }
             QTableWidget::item {
-                border-bottom: 1px solid #e8f1ef;
+                border: none;
                 padding: 7px 10px;
             }
             QHeaderView::section {
                 background: #eef5f3;
                 color: #536e6c;
                 border: none;
+                border-right: 1px solid #cadbd7;
                 border-bottom: 1px solid #d8e7e3;
                 padding: 8px 10px;
                 font-weight: 700;

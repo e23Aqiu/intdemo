@@ -45,6 +45,7 @@ class Account(Base):
         DateTime(timezone=True), default=utcnow, onupdate=utcnow
     )
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_login_system: Mapped[str | None] = mapped_column(String(80))
     data_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     devices: Mapped[list[Device]] = relationship(back_populates="account")

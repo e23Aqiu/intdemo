@@ -26,6 +26,7 @@ class AccountView(StrictModel):
     active_device_count: int = 0
     online_device_count: int = 0
     last_login_at: datetime | None = None
+    last_login_system: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -47,6 +48,7 @@ class LoginRequest(StrictModel):
     device_uid: uuid.UUID
     device_name: str = Field(default="Windows device", min_length=1, max_length=160)
     client_version: str = Field(default="1.1.1", min_length=1, max_length=40)
+    login_system: str | None = Field(default=None, min_length=1, max_length=80)
     control_client: bool = False
 
     @field_validator("username")

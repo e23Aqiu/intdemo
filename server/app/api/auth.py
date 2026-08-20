@@ -204,6 +204,7 @@ def login(payload: LoginRequest, request: Request, db: Db) -> TokenBundle:
         connection_test_gate.unregister_control_device(device.id)
 
     account.last_login_at = utcnow()
+    account.last_login_system = payload.login_system or "未知"
     raw_refresh, session = _new_refresh_session(db, account, device)
     db.execute(
         delete(LoginThrottle).where(LoginThrottle.key == throttle_key(payload.username, ip_address))

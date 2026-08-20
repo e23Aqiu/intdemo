@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import platform
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -12,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from ..config import APP_VERSION
 from ..database import AuthenticationError, Database
 from ..models import Account
+from ..platform_support import login_system_label
 from .api import ApiClient, ApiResponseError, NetworkUnavailable
 from .secure import (
     PasswordVerifier,
@@ -86,6 +88,7 @@ class OnlineSessionManager:
         self.device_uid = self.database.get_or_create_online_device_uid()
         self.state: SessionState | None = None
         self._bundle: dict | None = None
+        self._refresh_lock = threading.Lock()
 
     def _encrypt_profile(self, payload: dict) -> bytes:
         encoded = json.dumps(
@@ -163,6 +166,7 @@ class OnlineSessionManager:
                 self.device_uid,
                 platform.node() or f"{platform.system() or 'Desktop'} device",
                 APP_VERSION,
+                login_system_label(),
             )
         except NetworkUnavailable:
             return self._offline_login(username, password)
@@ -248,18 +252,30 @@ class OnlineSessionManager:
         return self._refresh_access_token()
 
     def _refresh_access_token(self) -> str:
-        bundle = self.api.refresh(
-            self._bundle["refresh_token"],
-            self.device_uid,
-        )
-        profile = self._decrypt_profile()
-        if not profile:
-            raise AuthenticationError("本机加密登录资料不存在")
-        profile["bundle"] = bundle
-        profile["saved_at"] = datetime.now(timezone.utc).isoformat()
-        self.database.save_secure_online_profile(self._encrypt_profile(profile))
-        self._state_from_bundle(bundle, "online")
-        return bundle["access_token"]
+        # Access-token refresh rotates a single-use refresh token.  Serialize
+        # callers so background sync, announcements and WebSocket startup can
+        # never submit the same token concurrently and trigger reuse revocation.
+        with self._refresh_lock:
+            if not self._bundle or not self.state:
+                raise NetworkUnavailable("当前没有可用的在线会话")
+            if self.state.mode == "reauth_required":
+                raise NetworkUnavailable("登录会话已失效，请重新上线")
+            expires = self._parse_time(self._bundle["access_expires_at"])
+            if self.state.is_online and expires.timestamp() - time.time() > 60:
+                return self._bundle["access_token"]
+
+            bundle = self.api.refresh(
+                self._bundle["refresh_token"],
+                self.device_uid,
+            )
+            profile = self._decrypt_profile()
+            if not profile:
+                raise AuthenticationError("本机加密登录资料不存在")
+            profile["bundle"] = bundle
+            profile["saved_at"] = datetime.now(timezone.utc).isoformat()
+            self.database.save_secure_online_profile(self._encrypt_profile(profile))
+            self._state_from_bundle(bundle, "online")
+            return bundle["access_token"]
 
     def note_online(self) -> None:
         if (
@@ -304,6 +320,7 @@ class OnlineSessionManager:
                 self.device_uid,
                 platform.node() or f"{platform.system() or 'Desktop'} device",
                 APP_VERSION,
+                login_system_label(),
             )
         except NetworkUnavailable as exc:
             raise AuthenticationError(f"暂时无法重新上线：{exc}") from exc

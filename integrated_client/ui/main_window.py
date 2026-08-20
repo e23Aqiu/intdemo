@@ -187,6 +187,7 @@ class MainWindow(FramelessMainWindow):
         self.contact_history_dialog = None
         self.contact_conversation_dialogs = {}
         self._announcement_message_unread_count = None
+        self._last_sync_state = None
         self._announcement_nav_badge = None
         self._announcement_nav_badge_spacer = None
         self._announcement_poll_task = None
@@ -1475,6 +1476,15 @@ class MainWindow(FramelessMainWindow):
     def _update_sync_status(self, status):
         if not hasattr(self, "sync_status_card"):
             return
+        self._last_sync_state = status.state
+        if status.state == "reauth_required":
+            invalidate = getattr(
+                self.session_manager,
+                "invalidate_credentials",
+                None,
+            )
+            if callable(invalidate):
+                invalidate()
         labels = {
             "online": "在线",
             "syncing": "同步中",
@@ -1594,9 +1604,12 @@ class MainWindow(FramelessMainWindow):
                 "当前为手动离线业务模式，不能在此恢复在线。"
                 "请先退出游客模式，再使用账号登录。"
             )
+        effective_sync_state = sync_state or self._last_sync_state
+        if effective_sync_state == "reauth_required":
+            return ""
         if state.is_online:
             return "当前账号的登录会话仍然有效，无需重新上线。"
-        if sync_state == "syncing":
+        if effective_sync_state == "syncing":
             return self.RECONNECT_SYNC_BUSY_MESSAGE
         return ""
 
@@ -1608,7 +1621,9 @@ class MainWindow(FramelessMainWindow):
         )
 
     def _reconnect_online(self):
-        unavailable_reason = self._reconnect_unavailable_reason()
+        unavailable_reason = self._reconnect_unavailable_reason(
+            self._last_sync_state
+        )
         if unavailable_reason:
             self._show_reconnect_unavailable(unavailable_reason)
             return

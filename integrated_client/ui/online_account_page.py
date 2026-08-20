@@ -549,7 +549,7 @@ class OnlineAccountPage(AccountPage):
         self.password_btn = self.reset_btn
         self.archive_btn = self.delete_btn
 
-        self.table.setColumnCount(11)
+        self.table.setColumnCount(12)
         self.table.setHorizontalHeaderLabels(
             [
                 "用户名称",
@@ -561,13 +561,14 @@ class OnlineAccountPage(AccountPage):
                 "在线",
                 "创建时间",
                 "最后登录",
+                "最近系统",
                 "首次改密",
                 "归档",
             ]
         )
         make_table_columns_resizable(
             self.table,
-            [160, 130, 105, 110, 90, 110, 85, 170, 170, 105, 90],
+            [160, 130, 105, 110, 90, 110, 85, 170, 170, 105, 105, 90],
         )
         # Do not perform a blocking HTTPS request while MainWindow is still
         # being constructed. MainWindow calls refresh() when the user opens
@@ -769,6 +770,7 @@ class OnlineAccountPage(AccountPage):
                 str(server.get("created_at") or account.created_at)
                 .replace("T", " ")[:19],
                 (account.last_login or "-").replace("T", " ")[:19],
+                str(server.get("last_login_system") or "-"),
                 "需要修改" if account.must_change_password else "已设置",
                 "已归档" if account.is_archived else "-",
             ]
@@ -790,9 +792,9 @@ class OnlineAccountPage(AccountPage):
                     )
                 if column == 6 and int(server.get("online_device_count") or 0):
                     item.setForeground(QColor("#188b57"))
-                if column == 9 and account.must_change_password:
+                if column == 10 and account.must_change_password:
                     item.setForeground(QColor("#b26a00"))
-                if column == 10 and account.is_archived:
+                if column == 11 and account.is_archived:
                     item.setForeground(QColor("#d33f49"))
                 item.setTextAlignment(
                     Qt.AlignLeft | Qt.AlignVCenter

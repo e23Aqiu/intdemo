@@ -48,16 +48,20 @@ def login(
     password: str,
     *,
     device: int = 1,
+    login_system: str | None = None,
 ) -> dict:
+    payload = {
+        "username": username,
+        "password": password,
+        "device_uid": device_uid(device),
+        "device_name": f"test-device-{device}",
+        "client_version": "0.2.0-test",
+    }
+    if login_system:
+        payload["login_system"] = login_system
     response = client.post(
         "/api/v1/auth/login",
-        json={
-            "username": username,
-            "password": password,
-            "device_uid": device_uid(device),
-            "device_name": f"test-device-{device}",
-            "client_version": "0.2.0-test",
-        },
+        json=payload,
     )
     assert response.status_code == 200, response.text
     return response.json()

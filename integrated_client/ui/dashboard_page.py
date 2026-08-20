@@ -14,7 +14,6 @@ from PyQt5.QtWidgets import (
     QComboBox,
     QFrame,
     QGridLayout,
-    QHeaderView,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -884,10 +883,6 @@ class DashboardPage(QWidget):
         self.station_view_stack = QStackedWidget()
         self.station_table = self._table(
             ["站点", "查询量", "有电话", "无电话", "总用时"]
-        )
-        self.station_table.horizontalHeader().setSectionResizeMode(
-            4,
-            QHeaderView.Stretch,
         )
         self.station_share_chart = StationShareChart()
         self.station_view_stack.addWidget(self.station_table)

@@ -437,14 +437,22 @@ def test_account_lifecycle_device_limit_and_audit(client):
     assert created.status_code == 201, created.text
     account_id = created.json()["id"]
     assert created.json()["last_login_at"] is None
+    assert created.json()["last_login_system"] is None
 
-    station = login(client, "station_test", "123456", device=20)
+    station = login(
+        client,
+        "station_test",
+        "123456",
+        device=20,
+        login_system="Win11",
+    )
     listed_accounts = client.get(
         "/api/v1/admin/accounts",
         headers=headers,
     ).json()
     station_row = next(row for row in listed_accounts if row["id"] == account_id)
     assert station_row["last_login_at"] is not None
+    assert station_row["last_login_system"] == "Win11"
     changed = client.post(
         "/api/v1/auth/change-password",
         headers=auth_header(station),

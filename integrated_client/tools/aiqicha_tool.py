@@ -22,7 +22,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTableWidget, QTableWidgetItem, QHeaderView,
+    QPushButton, QLabel, QTableWidget, QTableWidgetItem,
     QProgressBar, QMessageBox, QGroupBox, QTextEdit,
     QSplitter, QFrame, QCheckBox,
 )
@@ -44,6 +44,7 @@ from ..platform_support import (
     system_application_launch_context,
 )
 from ..ui.file_dialogs import SystemFileDialog as QFileDialog
+from ..ui.table_utils import make_table_columns_resizable, refit_table_columns
 
 
 # ==================== 配置 ====================
@@ -1217,7 +1218,7 @@ class MainWindow(QMainWindow):
         table_layout.setContentsMargins(4, 4, 4, 4)
         self.table = QTableWidget()
         self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
+        make_table_columns_resizable(self.table)
         self.table.verticalHeader().setVisible(False)
         # 用户编辑单元格后同步到 DataFrame
         self.table.cellChanged.connect(self._on_cell_changed)
@@ -1404,7 +1405,7 @@ class MainWindow(QMainWindow):
 
                 self.table.setItem(r, c, item)
 
-        self.table.resizeColumnsToContents()
+        refit_table_columns(self.table)
 
         # 高亮目标列表头
         target_cols = [COMPANY_COL_NAME, LEGAL_COL_NAME, ADDR_COL_NAME, PHONE_COL_NAME]

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt5.QtNetwork import (
     QAbstractSocket,
     QNetworkRequest,
+    QSsl,
     QSslCertificate,
     QSslConfiguration,
 )
@@ -13,6 +15,20 @@ from PyQt5.QtWebSockets import QWebSocket, QWebSocketProtocol
 
 from ..diagnostics import get_logger
 from .api import ApiResponseError, NetworkUnavailable
+
+
+def load_websocket_ca_certificates(path):
+    """Load a CA bundle from bytes, including Unicode Windows paths."""
+
+    certificate_path = Path(path)
+    data = certificate_path.read_bytes()
+    certificates = list(QSslCertificate.fromData(data, QSsl.Pem))
+    if not certificates:
+        certificates = list(QSslCertificate.fromData(data, QSsl.Der))
+    certificates = [certificate for certificate in certificates if not certificate.isNull()]
+    if not certificates:
+        raise ValueError(f"CA 根证书格式无效：{certificate_path}")
+    return certificates
 
 
 class _SyncTask(QRunnable):
@@ -160,13 +176,15 @@ class SyncCoordinator(QObject):
             )
             ca_bundle = self.engine.session.api.config.ca_bundle
             if ca_bundle:
-                certificates = QSslCertificate.fromPath(ca_bundle)
-                if not certificates:
-                    self.status_changed.emit(
-                        self.engine.status(
-                            "error",
-                            "无法加载 WebSocket CA 根证书",
-                        )
+                try:
+                    certificates = load_websocket_ca_certificates(ca_bundle)
+                except (OSError, ValueError) as exc:
+                    # REST synchronization remains fully certificate-verified.
+                    # WebSocket is an optional accelerator; the 30-second poll
+                    # continues when Qt cannot parse the configured CA file.
+                    get_logger().warning(
+                        "WebSocket CA could not be loaded; using polling fallback: %s",
+                        exc,
                     )
                     return
                 ssl_configuration = QSslConfiguration.defaultConfiguration()

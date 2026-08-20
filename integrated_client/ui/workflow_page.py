@@ -24,7 +24,6 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
-    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -59,6 +58,7 @@ from ..excel_files import (
     copy_excel_as_writable,
     is_excel_file_open,
     is_excel_file_read_only,
+    make_excel_file_writable,
 )
 from ..tencent_docs import (
     TencentDocsImportResult,
@@ -67,21 +67,22 @@ from ..tencent_docs import (
     validate_tencent_docs_url,
 )
 from ..tools.aiqicha_tool import (
-    ADDR_COL_NAME,
     COMPANY_COL_NAME,
-    LEGAL_COL_NAME,
     PHONE_COL_NAME,
     TARGET_COLUMNS,
     QueryWorker,
     has_meaningful_value,
 )
 from ..tools.transport_tool import (
-    ASSISTED_PAYMENT_COLUMNS,
     BusinessBackfillWorker,
+    PLATE_COLUMN_ALIASES,
     Worker,
-    resolve_assisted_payment_column,
+    read_business_dataframe,
+    resolve_plate_column,
+    resolve_plate_header_row,
 )
 from .frameless import FramelessMessageBox as QMessageBox
+from .table_utils import make_table_columns_resizable, refit_table_columns
 from .tencent_docs_dialog import (
     TencentDocsLinkDialog,
     TencentDocsProgressDialog,
@@ -259,7 +260,7 @@ class WorkflowPage(QWidget):
     """统一编排运输证、营运回填、爱企查查询的三步流水线。"""
 
     browser_check_completed = pyqtSignal(bool, str, str)
-    REQUIRED_COLUMNS = ("车辆标识",)
+    REQUIRED_COLUMNS = ("车牌 / 车辆标识",)
     # 约 60 帧/秒刷新计时文本；16 不是 10 的整数倍，可避免毫秒
     # 末位长期只在少数固定数字间变化。
     TIMING_DISPLAY_INTERVAL_MS = 16
@@ -278,13 +279,9 @@ class WorkflowPage(QWidget):
             for column in columns
             if column is not None and str(column).strip()
         }
-        missing = [
-            name for name in cls.REQUIRED_COLUMNS if name not in available
-        ]
-        if resolve_assisted_payment_column(available) is None:
-            aliases = " / ".join(ASSISTED_PAYMENT_COLUMNS)
-            missing.append(aliases)
-        return missing
+        if resolve_plate_column(available) is None:
+            return [" / ".join(PLATE_COLUMN_ALIASES)]
+        return []
 
     def __init__(
         self,
@@ -315,6 +312,8 @@ class WorkflowPage(QWidget):
             captcha_sample_collection_enabled
         )
         self.file_path = ""
+        self._read_only_conversion_error = ""
+        self._business_header_row = 1
         self.df = pd.DataFrame()
         self.model = DataFrameTableModel(self.df, self)
         self.current_worker = None
@@ -410,8 +409,10 @@ class WorkflowPage(QWidget):
         )
         reload_btn = QPushButton("刷新预览")
         reload_btn.clicked.connect(lambda: self._reload_preview(force=True))
-        save_writable_btn = QPushButton("另存为可写表格")
-        save_writable_btn.setToolTip("将只读业务表格复制为可读写的 .xlsx 文件")
+        save_writable_btn = QPushButton("另存为可写表格（兜底）")
+        save_writable_btn.setToolTip(
+            "导入时会先自动解除原表格的只读属性；无法解除时可另存副本"
+        )
         save_writable_btn.clicked.connect(self._save_workbook_as_writable)
         self.choose_btn = choose_btn
         self.tencent_docs_btn = tencent_docs_btn
@@ -621,8 +622,7 @@ class WorkflowPage(QWidget):
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Interactive)
-        self.table.horizontalHeader().setStretchLastSection(True)
+        make_table_columns_resizable(self.table)
         self.preview_panel = CollapsiblePanel(
             "数据预览（随处理结果实时刷新）",
             self.table,
@@ -968,6 +968,15 @@ class WorkflowPage(QWidget):
         self.open_workbook_btn.setEnabled(enabled)
         self.open_workbook_folder_btn.setEnabled(enabled)
         self.save_writable_btn.setEnabled(enabled)
+        if path_exists and is_excel_file_read_only(self.file_path):
+            details = self._read_only_conversion_error or "原表格当前仍不可写"
+            self.save_writable_btn.setToolTip(
+                f"{details}；可将表格另存到有写入权限的位置"
+            )
+        else:
+            self.save_writable_btn.setToolTip(
+                "导入时会先自动解除原表格的只读属性；此功能仅作为另存兜底"
+            )
 
     def _refresh_tencent_task_controls(self):
         task_busy = self.tencent_import_worker is not None
@@ -1043,12 +1052,38 @@ class WorkflowPage(QWidget):
             return False
         if not self._load_workbook_path(saved_path):
             return False
-        self._log(f"只读表格已另存并切换到：{saved_path}")
+        self._log(f"表格已另存并切换到：{saved_path}")
         QMessageBox.information(
             self,
             "另存完成",
             f"已切换到可读写表格：\n{saved_path}",
         )
+        return True
+
+    def _try_make_current_workbook_writable(self):
+        if not self.file_path or not Path(self.file_path).is_file():
+            return False
+        if not is_excel_file_read_only(self.file_path):
+            self._read_only_conversion_error = ""
+            self._update_workbook_action_buttons()
+            return True
+        try:
+            writable_path = make_excel_file_writable(self.file_path)
+        except (OSError, ValueError) as exc:
+            message = str(exc) or "未知权限错误"
+            if message != self._read_only_conversion_error:
+                self._log(
+                    "⚠️ 无法直接解除表格只读状态："
+                    f"{message}。可使用“另存为可写表格（兜底）”。"
+                )
+            self._read_only_conversion_error = message
+            self._update_workbook_action_buttons()
+            return False
+        self.file_path = str(writable_path)
+        self.file_edit.setText(self.file_path)
+        self._read_only_conversion_error = ""
+        self._log(f"✅ 已自动解除表格只读状态：{writable_path}")
+        self._update_workbook_action_buttons()
         return True
 
     def _load_workbook_path(self, path):
@@ -1086,6 +1121,7 @@ class WorkflowPage(QWidget):
             self._last_file_mtime = None
             self._update_workbook_action_buttons()
             return False
+        self._try_make_current_workbook_writable()
         self._update_workbook_action_buttons()
         return True
 
@@ -1229,7 +1265,8 @@ class WorkflowPage(QWidget):
         loaded = self._reload_preview(force=True)
         self._update_workbook_action_buttons()
         self._log(
-            "腾讯文档导入完成：从原表第 "
+            f"腾讯文档导入完成：已识别第 {result.source_header_row} 行为表头，"
+            "从原表第 "
             f"{result.source_start_row} 行开始复制 {result.copied_rows} 行，"
             f"新表位于 {result.path}"
         )
@@ -1237,7 +1274,8 @@ class WorkflowPage(QWidget):
             QMessageBox.information(
                 self,
                 "腾讯文档导入完成",
-                f"已按“{result.company_header}”列筛选：\n"
+                f"已识别原表第 {result.source_header_row} 行为表头，"
+                f"并按“{result.company_header}”列筛选：\n"
                 f"从原表第 {result.source_start_row} 行开始，"
                 f"复制 {result.copied_rows} 行。\n\n"
                 "新 Excel 已自动导入程序，且本次导入不计入业务时间。\n"
@@ -1276,11 +1314,12 @@ class WorkflowPage(QWidget):
         self._refresh_tencent_task_controls()
 
     def _read_dataframe(self):
-        return pd.read_excel(
+        dataframe, header_row = read_business_dataframe(
             self.file_path,
-            engine="openpyxl",
             dtype=str,
-        ).fillna("")
+        )
+        self._business_header_row = header_row
+        return dataframe.fillna("")
 
     def _reload_preview(self, force=False):
         if not self.file_path or not os.path.exists(self.file_path):
@@ -1302,8 +1341,10 @@ class WorkflowPage(QWidget):
         self._last_file_mtime = mtime
         self._update_workbook_action_buttons()
         if force:
-            self.table.resizeColumnsToContents()
+            refit_table_columns(self.table)
             self._log(f"已加载表格：{len(self.df)} 行 × {len(self.df.columns)} 列")
+            if self._business_header_row == 2:
+                self._log("已识别第 2 行为业务表头。")
         return True
 
     def _poll_file_preview(self):
@@ -1435,11 +1476,16 @@ class WorkflowPage(QWidget):
         if not self.file_path or not os.path.exists(self.file_path):
             QMessageBox.warning(self, "缺少表格", "请先选择业务表格。")
             return
-        if is_excel_file_read_only(self.file_path):
+        if (
+            is_excel_file_read_only(self.file_path)
+            and not self._try_make_current_workbook_writable()
+        ):
+            details = self._read_only_conversion_error or "系统不允许修改原表格"
             reply = QMessageBox.question(
                 self,
-                "表格为只读",
-                "当前业务表格为只读，无法写入处理结果。\n\n"
+                "原表格无法改为可写",
+                "程序已尝试直接解除原表格的只读状态，但未成功。\n"
+                f"原因：{details}\n\n"
                 "是否现在另存为可读写表格？",
                 QMessageBox.Yes | QMessageBox.No,
             )
@@ -1806,15 +1852,24 @@ class WorkflowPage(QWidget):
         try:
             workbook = openpyxl.load_workbook(self.file_path)
             sheet = workbook.active
-            header = {cell.value: cell.column for cell in sheet[1] if cell.value is not None}
+            header_row = (
+                resolve_plate_header_row(sheet)
+                or self._business_header_row
+                or 1
+            )
+            header = {
+                str(cell.value).strip(): cell.column
+                for cell in sheet[header_row]
+                if cell.value is not None and str(cell.value).strip()
+            }
             next_column = max(header.values(), default=0) + 1
             for name in TARGET_COLUMNS:
                 if name not in header:
-                    sheet.cell(1, next_column, name)
+                    sheet.cell(header_row, next_column, name)
                     header[name] = next_column
                     next_column += 1
             for row_index in range(len(self.df.index)):
-                excel_row = row_index + 2
+                excel_row = row_index + header_row + 1
                 for name in TARGET_COLUMNS:
                     value = self.df.at[row_index, name] if name in self.df.columns else ""
                     if pd.isna(value) or str(value).strip() in {"nan", "None"}:

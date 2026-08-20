@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
@@ -16,6 +17,7 @@ from integrated_client.config import APP_VERSION
 from integrated_client.database import AuthenticationError, Database
 from integrated_client.online.api import ApiResponseError, NetworkUnavailable
 from integrated_client.online.config import OnlineConfig, OnlineConfigurationError
+from integrated_client.online.coordinator import load_websocket_ca_certificates
 from integrated_client.online.secure import DpapiProtector, Protector
 from integrated_client.online.session import OnlineSessionManager
 from integrated_client.online.sync import SyncEngine
@@ -26,7 +28,10 @@ from integrated_client.online.update import (
     UpdateInfo,
     version_key,
 )
-from integrated_client.platform_support import WINDOWS_UPDATE_PLATFORM
+from integrated_client.platform_support import (
+    WINDOWS_UPDATE_PLATFORM,
+    login_system_label,
+)
 from integrated_client.preferences import ClientPreferences, LoginCredentialStore
 
 
@@ -56,6 +61,8 @@ class FakeApi:
         self.password = "Online!234"
         self.account_id = str(uuid.uuid4())
         self.last_login_at = "2026-08-19T00:32:47+00:00"
+        self.last_login_system = None
+        self.refresh_calls = 0
         self.push_calls = []
         self.server_revision = 0
 
@@ -121,6 +128,7 @@ class FakeApi:
                 "must_change_password": must_change,
                 "entitlement_revision": 1,
                 "last_login_at": self.last_login_at,
+                "last_login_system": self.last_login_system,
                 "created_at": now.isoformat(),
                 "updated_at": now.isoformat(),
             },
@@ -137,11 +145,20 @@ class FakeApi:
             "server_revision": self.server_revision,
         }
 
-    def login(self, username, password, device_uid, device_name, client_version):
+    def login(
+        self,
+        username,
+        password,
+        device_uid,
+        device_name,
+        client_version,
+        login_system=None,
+    ):
         if not self.online:
             raise NetworkUnavailable("offline")
         if password != self.password:
             raise AssertionError("unexpected test password")
+        self.last_login_system = login_system
         return self._bundle(username, device_uid)
 
     def change_password(self, access_token, current_password, new_password):
@@ -151,6 +168,7 @@ class FakeApi:
     def refresh(self, refresh_token, device_uid):
         if not self.online:
             raise NetworkUnavailable("offline")
+        self.refresh_calls += 1
         return self._bundle("station", device_uid)
 
     def logout(self, access_token, refresh_token):
@@ -216,6 +234,7 @@ class OnlineClientTests(unittest.TestCase):
         account = self.session.login("station", "Online!234")
         self.assertEqual(account.server_account_id, self.api.account_id)
         self.assertEqual(account.last_login, self.api.last_login_at)
+        self.assertEqual(self.api.last_login_system, login_system_label())
         self.assertTrue(self.session.state.is_online)
         encrypted = self.database.load_secure_online_profile()
         self.assertNotIn(b"Online!234", encrypted)
@@ -234,6 +253,26 @@ class OnlineClientTests(unittest.TestCase):
         self.api.online = True
         self.assertEqual(offline_session.access_token(), "access-token")
         self.assertTrue(offline_session.state.is_online)
+
+    def test_concurrent_access_token_refresh_uses_rotating_token_once(self):
+        self.session.login("station", "Online!234")
+        self.session._bundle["access_expires_at"] = (
+            datetime.now(timezone.utc) + timedelta(seconds=1)
+        ).isoformat()
+        original_refresh = self.api.refresh
+
+        def slow_refresh(*args, **kwargs):
+            import time
+
+            time.sleep(0.05)
+            return original_refresh(*args, **kwargs)
+
+        self.api.refresh = slow_refresh
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            tokens = list(pool.map(lambda _index: self.session.access_token(), range(2)))
+
+        self.assertEqual(tokens, ["access-token", "access-token"])
+        self.assertEqual(self.api.refresh_calls, 1)
 
     def test_remote_account_without_last_login_field_preserves_cached_value(self):
         account = self.session.login("station", "Online!234")
@@ -286,6 +325,23 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         ).validate()
         self.assertEqual(config.ca_bundle, str(self.database.path))
+
+    def test_websocket_ca_loads_from_unicode_windows_path(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "packaging"
+            / "uos-arm64"
+            / "certs"
+            / "intdemo-caddy-root.crt"
+        )
+        target = Path(self.temp_dir.name) / "中文证书目录" / "根证书.crt"
+        target.parent.mkdir()
+        target.write_bytes(source.read_bytes())
+
+        certificates = load_websocket_ca_certificates(target)
+
+        self.assertTrue(certificates)
+        self.assertTrue(all(not certificate.isNull() for certificate in certificates))
 
     def test_update_manifest_accepts_only_newer_same_server_package(self):
         installer = b"signed-by-manifest-hash"

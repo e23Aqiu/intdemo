@@ -14,7 +14,6 @@ import io
 import cv2
 import numpy as np
 import sys
-import subprocess
 import difflib
 import uuid
 from datetime import datetime
@@ -47,51 +46,67 @@ os.environ["DDDOCR_NO_LOG"] = "1"
 os.environ["PLAYWRIGHT_LOG"] = "none"
 os.environ["PLAYWRIGHT_LOCAL_LOG_DIR"] = os.devnull
 
-ASSISTED_PAYMENT_COLUMNS = ("备注", "已协助补缴")
+PLATE_COLUMN_ALIASES = ("车牌", "车辆标识")
+BUSINESS_HEADER_ROW_CANDIDATES = (1, 2)
 
 
-def resolve_assisted_payment_column(columns):
-    """返回当前业务表中的补缴标记列，优先使用新版“备注”。"""
+def resolve_plate_column(columns):
+    """Return the supported plate column, preferring the new ``车牌`` name."""
     available = {
-        str(column).strip()
+        str(column).strip(): column
         for column in columns
         if column is not None and str(column).strip()
     }
     return next(
-        (name for name in ASSISTED_PAYMENT_COLUMNS if name in available),
+        (available[name] for name in PLATE_COLUMN_ALIASES if name in available),
         None,
     )
 
 
-def has_assisted_payment(row):
-    """新旧列任意一个包含内容时，沿用原规则视为已协助补缴。"""
-    getter = getattr(row, "get", None)
-    if not callable(getter):
-        return False
-    for column_name in ASSISTED_PAYMENT_COLUMNS:
-        value = getter(column_name, None)
-        try:
-            if pd.isna(value):
-                continue
-        except (TypeError, ValueError):
-            pass
-        if str(value).strip():
-            return True
-    return False
+def resolve_plate_header_row(worksheet):
+    """Return the first supported business header row (Excel row 1 or 2)."""
+    for row_number in BUSINESS_HEADER_ROW_CANDIDATES:
+        if resolve_plate_column(cell.value for cell in worksheet[row_number]):
+            return row_number
+    return None
+
+
+def detect_plate_header_row(file_path):
+    """Inspect the active worksheet without changing the workbook."""
+    workbook = openpyxl.load_workbook(file_path, read_only=True, data_only=False)
+    try:
+        return resolve_plate_header_row(workbook.active)
+    finally:
+        workbook.close()
+
+
+def read_business_dataframe(file_path, *, dtype=str):
+    """Read a business workbook whose header may be on Excel row 1 or 2."""
+    header_row = detect_plate_header_row(file_path) or 1
+    dataframe = pd.read_excel(
+        file_path,
+        engine="openpyxl",
+        header=header_row - 1,
+        dtype=dtype,
+    )
+    return dataframe, header_row
 
 
 class TargetedWorkbookWriter:
     """只更新指定结果单元格，并通过同目录原子替换保存工作簿。"""
 
-    RESULT_COLUMN_ANCHORS = ASSISTED_PAYMENT_COLUMNS
+    RESULT_COLUMN_ANCHORS = PLATE_COLUMN_ALIASES
 
-    def __init__(self, file_path, target_columns):
+    def __init__(self, file_path, target_columns, *, header_row=None):
         self.file_path = Path(file_path)
         self.workbook = openpyxl.load_workbook(self.file_path)
         self.sheet = self.workbook.active
+        self.header_row = int(
+            header_row or resolve_plate_header_row(self.sheet) or 1
+        )
         self.column_indexes = {
             str(cell.value).strip(): cell.column
-            for cell in self.sheet[1]
+            for cell in self.sheet[self.header_row]
             if cell.value is not None and str(cell.value).strip()
         }
         self.dirty = False
@@ -100,7 +115,7 @@ class TargetedWorkbookWriter:
                 self._move_existing_result_column_left(column_name)
                 continue
             column_index = self._next_result_column()
-            self.sheet.cell(1, column_index, column_name)
+            self.sheet.cell(self.header_row, column_index, column_name)
             self.column_indexes[column_name] = column_index
             self.dirty = True
 
@@ -111,7 +126,7 @@ class TargetedWorkbookWriter:
     def _column_is_empty(self, column_index):
         return all(
             self._is_empty_value(self.sheet.cell(row, column_index).value)
-            for row in range(1, self.sheet.max_row + 1)
+            for row in range(self.header_row, self.sheet.max_row + 1)
         )
 
     def _first_empty_column(self, start_column, stop_column):
@@ -146,7 +161,7 @@ class TargetedWorkbookWriter:
         )
         if destination_column is None:
             return
-        for row in range(1, self.sheet.max_row + 1):
+        for row in range(self.header_row, self.sheet.max_row + 1):
             source_cell = self.sheet.cell(row, source_column)
             destination_cell = self.sheet.cell(row, destination_column)
             destination_cell.value = source_cell.value
@@ -174,7 +189,7 @@ class TargetedWorkbookWriter:
         return value
 
     def write_row(self, dataframe_row_index, values):
-        excel_row = int(dataframe_row_index) + 2
+        excel_row = int(dataframe_row_index) + self.header_row + 1
         for column_name, value in values.items():
             column_index = self.column_indexes[column_name]
             self.sheet.cell(
@@ -728,20 +743,19 @@ class Worker(QThread):
         current_row_index = None
         try:
             try:
-                df = pd.read_excel(self.src, engine='openpyxl', dtype=str)
+                df, header_row = read_business_dataframe(self.src, dtype=str)
             except PermissionError:
                 self.log.emit("❌ 无法读取原始表，请先关闭 Excel/WPS 表格后再运行程序！")
                 self.finished.emit("失败")
                 return
 
-            required_cols = ["车辆标识"]
-            missing_cols = [col for col in required_cols if col not in df.columns]
-            if resolve_assisted_payment_column(df.columns) is None:
-                missing_cols.append("备注（兼容“已协助补缴”）")
-            if missing_cols:
-                self.log.emit(f"❌ 源表格缺少必要列：{','.join(missing_cols)}")
+            plate_column = resolve_plate_column(df.columns)
+            if plate_column is None:
+                self.log.emit("❌ 源表格缺少必要列：车牌（兼容“车辆标识”）")
                 self.finished.emit("失败")
                 return
+            if header_row == 2:
+                self.log.emit("📌 已识别第 2 行为业务表头")
 
             # 新增"运输证号_纯数字"列（如果不存在）
             if "运输证号_纯数字" not in df.columns:
@@ -752,6 +766,7 @@ class Worker(QThread):
             workbook_writer = TargetedWorkbookWriter(
                 self.src,
                 ("运输证号_纯数字", "查询状态"),
+                header_row=header_row,
             )
 
             total = len(df)
@@ -790,7 +805,7 @@ class Worker(QThread):
                 progress = round((idx + 1) / total * 100)
                 self.progress.emit(progress)
 
-                plate_identifier = str(row["车辆标识"]).strip()
+                plate_identifier = str(row[plate_column]).strip()
                 self.log.emit(f"\n[{idx + 1}/{total}] 处理：{plate_identifier}")
 
                 # 检查是否已有运输证号（断点续查）
@@ -818,23 +833,6 @@ class Worker(QThread):
                     continue
                 if previous_browser_failure:
                     self.log.emit("↻ 检测到上次浏览器异常，本行重新查询运输证号")
-
-                # 检查是否已补缴
-                if has_assisted_payment(row):
-                    df.at[idx, "查询状态"] = "已补缴（无需查询）"
-                    self.log.emit("✅ 已补缴，无需查询")
-                    save_results(idx)
-                    try:
-                        self.page.goto(
-                            CONFIG["TARGET_URL"],
-                            timeout=CONFIG["BROWSER_WAIT_TIMEOUT_MS"],
-                        )
-                        self.page.wait_for_timeout(1000)
-                    except:
-                        pass
-                    idx += 1
-                    browser_restarts = 0
-                    continue
 
                 # 解析车牌
                 province, plate_num, plate_color = parse_plate(plate_identifier)
@@ -3162,9 +3160,8 @@ class BusinessBackfillWorker(QThread):
         final_result = "结束"
         try:
             try:
-                df_original = pd.read_excel(
+                df_original, header_row = read_business_dataframe(
                     self.original_file,
-                    engine='openpyxl',
                     dtype={"车辆所有人/企业": str, "回填状态": str, "运输证号_纯数字": str}
                 )
             except PermissionError:
@@ -3178,6 +3175,14 @@ class BusinessBackfillWorker(QThread):
                 final_result = "失败"
                 return
 
+            plate_column = resolve_plate_column(df_original.columns)
+            if plate_column is None:
+                self.log.emit("❌ 原始表缺少[车牌]列（兼容[车辆标识]）")
+                final_result = "失败"
+                return
+            if header_row == 2:
+                self.log.emit("📌 已识别第 2 行为业务表头")
+
             if "车辆所有人/企业" not in df_original.columns:
                 df_original["车辆所有人/企业"] = ""
             if "回填状态" not in df_original.columns:
@@ -3186,6 +3191,7 @@ class BusinessBackfillWorker(QThread):
             workbook_writer = TargetedWorkbookWriter(
                 self.original_file,
                 ("车辆所有人/企业", "回填状态"),
+                header_row=header_row,
             )
 
             def save_results(row_index):
@@ -3201,9 +3207,9 @@ class BusinessBackfillWorker(QThread):
                 )
                 workbook_writer.save()
 
-            # 直接从原始表提取"车辆标识→运输证号"映射
+            # 直接从原始表提取"车牌→运输证号"映射
             plate_to_cert = dict(zip(
-                df_original["车辆标识"].astype(str).str.strip(),
+                df_original[plate_column].astype(str).str.strip(),
                 df_original["运输证号_纯数字"].astype(str).str.replace(r"\.0$", "", regex=True).str.strip()
             ))
 
@@ -3232,18 +3238,8 @@ class BusinessBackfillWorker(QThread):
                     self.log.emit("🛑 回填已停止")
                     break
 
-                car_full = str(row["车辆标识"]).strip()
+                car_full = str(row[plate_column]).strip()
                 cert_no = plate_to_cert.get(car_full, "")
-
-                if has_assisted_payment(row):
-                    self.log.emit(f"✅ 已补缴，跳过：{car_full}")
-                    df_original.at[idx, "车辆所有人/企业"] = "已补缴"
-                    df_original.at[idx, "回填状态"] = "已补缴"
-                    save_results(idx)
-                    idx += 1
-                    progress = int((idx / total) * 100)
-                    self.progress.emit(progress)
-                    continue
 
                 # 然后再判断 车辆所有人/企业
                 if "车辆所有人/企业" in df_original.columns:

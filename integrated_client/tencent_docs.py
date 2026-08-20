@@ -28,6 +28,8 @@ COMPANY_HEADER_ALIASES = (
     "车辆所有人/企业",
     "公司/所有人名称",
 )
+PLATE_HEADER_ALIASES = ("车牌", "车辆标识")
+TENCENT_HEADER_ROW_CANDIDATES = (0, 1)
 TENCENT_DOCS_HOST = "docs.qq.com"
 TENCENT_DOCS_PUBLIC_WAIT_SECONDS = 60
 TENCENT_DOCS_LOGIN_WAIT_SECONDS = 10 * 60
@@ -60,6 +62,7 @@ class TencentSheetSelection:
     company_header: str
     source_start_row: int
     source_row_count: int
+    source_header_row: int = 1
 
 
 @dataclass(frozen=True)
@@ -69,6 +72,7 @@ class TencentDocsImportResult:
     source_start_row: int
     source_row_count: int
     company_header: str
+    source_header_row: int = 1
 
 
 def validate_tencent_docs_url(value: str) -> str:
@@ -197,24 +201,82 @@ def _clipboard_rows(clipboard_text: str) -> list[list[str]]:
         raise TencentDocsImportError(f"无法解析腾讯文档表格内容：{exc}") from exc
     while rows and not any(value.strip() for value in rows[-1]):
         rows.pop()
-    if not rows or not any(value.strip() for value in rows[0]):
-        raise TencentDocsImportError("腾讯文档首行没有可识别的表头")
+    if not rows or not any(
+        value.strip()
+        for row in rows[:2]
+        for value in row
+    ):
+        raise TencentDocsImportError("腾讯文档前两行没有可识别的表头")
     return rows
 
 
-def _company_column_index(headers: list[str]) -> int:
+def _company_column_match(headers: list[str]):
     normalized = [_normalized_header(header) for header in headers]
     aliases = [_normalized_header(alias) for alias in COMPANY_HEADER_ALIASES]
     for alias in aliases:
         if alias in normalized:
-            return normalized.index(alias)
+            return normalized.index(alias), 2
     for index, header in enumerate(normalized):
         if "公司名称" in header or "企业名称" in header:
-            return index
+            return index, 1
+    return None
+
+
+def _company_column_index(headers: list[str]) -> int:
+    match = _company_column_match(headers)
+    if match is not None:
+        return match[0]
     available = "、".join(header for header in headers if header.strip()) or "（空）"
     raise TencentDocsImportError(
         "未找到“公司名称”列。支持的列名包括："
         f"{'、'.join(COMPANY_HEADER_ALIASES)}；当前表头：{available}"
+    )
+
+
+def _tencent_header_row(rows: list[list[str]]):
+    candidates = []
+    normalized_plate_aliases = {
+        _normalized_header(alias) for alias in PLATE_HEADER_ALIASES
+    }
+    for row_index in TENCENT_HEADER_ROW_CANDIDATES:
+        if row_index >= len(rows):
+            continue
+        headers = rows[row_index]
+        company_match = _company_column_match(headers)
+        if company_match is None:
+            continue
+        company_column, match_quality = company_match
+        normalized_headers = {
+            _normalized_header(header)
+            for header in headers
+            if str(header or "").strip()
+        }
+        has_plate_header = bool(
+            normalized_headers.intersection(normalized_plate_aliases)
+        )
+        nonempty_count = sum(bool(str(header or "").strip()) for header in headers)
+        score = (
+            match_quality * 10
+            + int(has_plate_header) * 10
+            + min(nonempty_count, 9)
+        )
+        candidates.append((score, -row_index, row_index, company_column))
+    if candidates:
+        _score, _earlier_row, row_index, company_column = max(candidates)
+        return row_index, company_column
+
+    previews = []
+    for row_index in TENCENT_HEADER_ROW_CANDIDATES:
+        if row_index >= len(rows):
+            continue
+        available = "、".join(
+            value for value in rows[row_index] if value.strip()
+        ) or "（空）"
+        previews.append(f"第 {row_index + 1} 行：{available}")
+    raise TencentDocsImportError(
+        "前两行均未找到“公司名称”列。支持的列名包括："
+        f"{'、'.join(COMPANY_HEADER_ALIASES)}；"
+        + "；".join(previews)
     )
 
 
@@ -227,11 +289,14 @@ def select_pending_tencent_rows(clipboard_text: str) -> TencentSheetSelection:
         row[:width] + [""] * (width - len(row))
         for row in rows
     ]
-    headers = normalized_rows[0]
-    company_column = _company_column_index(headers)
+    header_row_index, company_column = _tencent_header_row(normalized_rows)
+    headers = normalized_rows[header_row_index]
 
-    last_company_row_index = 0
-    for row_index, row in enumerate(normalized_rows[1:], start=1):
+    last_company_row_index = header_row_index
+    for row_index, row in enumerate(
+        normalized_rows[header_row_index + 1 :],
+        start=header_row_index + 1,
+    ):
         if row[company_column].strip():
             last_company_row_index = row_index
 
@@ -246,7 +311,8 @@ def select_pending_tencent_rows(clipboard_text: str) -> TencentSheetSelection:
         rows=tuple(tuple(row) for row in pending_rows),
         company_header=headers[company_column],
         source_start_row=last_company_row_index + 2,
-        source_row_count=max(0, len(normalized_rows) - 1),
+        source_row_count=max(0, len(normalized_rows) - header_row_index - 1),
+        source_header_row=header_row_index + 1,
     )
 
 
@@ -822,6 +888,7 @@ class TencentDocsImportWorker(QThread):
                     source_start_row=selection.source_start_row,
                     source_row_count=selection.source_row_count,
                     company_header=selection.company_header,
+                    source_header_row=selection.source_header_row,
                 )
             )
         except TencentDocsImportCancelled:

@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import stat
 import tempfile
 import threading
 import unittest
@@ -59,6 +60,7 @@ from integrated_client.database import (
     WORKFLOW_TOTAL_METRIC,
     Database,
 )
+from integrated_client.excel_files import is_excel_file_read_only
 from integrated_client.online.api import ApiResponseError
 from integrated_client.online.coordinator import SyncCoordinator
 from integrated_client.online.sync import SyncStatus
@@ -78,13 +80,14 @@ from integrated_client.tools.aiqicha_tool import (
 )
 from integrated_client.tools.aiqicha_tool import MainWindow as AiqichaToolWidget
 from integrated_client.tools.transport_tool import (
-    ASSISTED_PAYMENT_COLUMNS,
     CONFIG,
     BusinessBackfillWorker,
+    PLATE_COLUMN_ALIASES,
     TargetedWorkbookWriter,
     Worker,
-    has_assisted_payment,
-    resolve_assisted_payment_column,
+    detect_plate_header_row,
+    read_business_dataframe,
+    resolve_plate_column,
 )
 from integrated_client.ui.auth_dialogs import LoginDialog, PasswordDialog
 from integrated_client.ui.dashboard_page import (
@@ -181,47 +184,80 @@ class ToolAndUiTests(unittest.TestCase):
             self.assertIn(name, header)
             self.assertEqual(sheet.cell(1, header[name]).value, name)
 
-    def test_assisted_payment_column_aliases_keep_the_same_rule(self):
+    def test_plate_aliases_are_required_but_payment_columns_are_optional(self):
         self.assertEqual(
-            ASSISTED_PAYMENT_COLUMNS,
-            ("备注", "已协助补缴"),
-        )
-        self.assertEqual(
-            resolve_assisted_payment_column(["车辆标识", "备注"]),
-            "备注",
+            PLATE_COLUMN_ALIASES,
+            ("车牌", "车辆标识"),
         )
         self.assertEqual(
-            resolve_assisted_payment_column(["车辆标识", "已协助补缴"]),
-            "已协助补缴",
-        )
-        self.assertTrue(has_assisted_payment(pd.Series({"备注": "是"})))
-        self.assertTrue(
-            has_assisted_payment(pd.Series({"已协助补缴": "已处理"}))
-        )
-        self.assertTrue(
-            has_assisted_payment(
-                pd.Series({"备注": "", "已协助补缴": "是"})
-            )
-        )
-        self.assertFalse(
-            has_assisted_payment(
-                pd.Series({"备注": "", "已协助补缴": ""})
-            )
+            resolve_plate_column(["车辆标识", "备注"]),
+            "车辆标识",
         )
         self.assertEqual(
-            WorkflowPage.missing_required_columns(["车辆标识", "备注"]),
-            [],
+            resolve_plate_column(["车辆标识", "车牌"]),
+            "车牌",
         )
         self.assertEqual(
-            WorkflowPage.missing_required_columns(
-                ["车辆标识", "已协助补缴"]
-            ),
-            [],
-        )
-        self.assertIn(
-            "备注 / 已协助补缴",
             WorkflowPage.missing_required_columns(["车辆标识"]),
+            [],
         )
+        self.assertEqual(
+            WorkflowPage.missing_required_columns(["车牌"]),
+            [],
+        )
+        self.assertEqual(
+            WorkflowPage.missing_required_columns(["备注", "已协助补缴"]),
+            ["车牌 / 车辆标识"],
+        )
+
+    def test_second_row_business_header_is_detected_and_written_in_place(self):
+        file_path = Path(self.temp_dir.name) / "second-row-header.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "逃费车辆业务清单"
+        sheet.append(["车牌", "备注"])
+        sheet.append(["粤A12345_黄色", "保留"])
+        workbook.save(file_path)
+        workbook.close()
+
+        self.assertEqual(detect_plate_header_row(file_path), 2)
+        dataframe, header_row = read_business_dataframe(file_path, dtype=str)
+        self.assertEqual(header_row, 2)
+        self.assertEqual(list(dataframe.columns), ["车牌", "备注"])
+        self.assertEqual(dataframe.at[0, "车牌"], "粤A12345_黄色")
+
+        writer = TargetedWorkbookWriter(
+            file_path,
+            ("运输证号_纯数字", "查询状态"),
+            header_row=header_row,
+        )
+        writer.write_row(
+            0,
+            {
+                "运输证号_纯数字": "440100001",
+                "查询状态": "查询成功",
+            },
+        )
+        writer.save()
+        writer.close()
+
+        saved = load_workbook(file_path)
+        try:
+            sheet = saved.active
+            headers = {
+                cell.value: cell.column
+                for cell in sheet[2]
+                if cell.value is not None
+            }
+            self.assertEqual(sheet["A1"].value, "逃费车辆业务清单")
+            self.assertEqual(sheet.cell(3, headers["车牌"]).value, "粤A12345_黄色")
+            self.assertEqual(
+                sheet.cell(3, headers["运输证号_纯数字"]).value,
+                "440100001",
+            )
+            self.assertEqual(sheet.cell(3, headers["查询状态"]).value, "查询成功")
+        finally:
+            saved.close()
 
     def test_targeted_writer_preserves_rows_below_a_blank_row_and_workbook_layout(self):
         file_path = Path(self.temp_dir.name) / "targeted-write.xlsx"
@@ -291,7 +327,7 @@ class ToolAndUiTests(unittest.TestCase):
         sheet["H1"] = "车辆所有人/企业"
         sheet["H2"] = "示例公司"
         sheet["O1"] = "站场"
-        sheet["P1"] = "备注"
+        sheet["P1"] = "车牌"
         for row in range(1, 4):
             for column in range(17, 20):
                 sheet.cell(row, column).fill = PatternFill("solid", fgColor="FFF2CC")
@@ -325,7 +361,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(sheet["R2"].value, "查询成功")
         self.assertEqual(sheet["S1"].value, "回填状态")
         self.assertEqual(sheet["S2"].value, "回填成功")
-        self.assertEqual(sheet["P1"].value, "备注")
+        self.assertEqual(sheet["P1"].value, "车牌")
         self.assertEqual(sheet["H1"].value, "车辆所有人/企业")
         self.assertEqual(sheet["H2"].value, "示例公司")
         for column in ("T", "U", "V"):
@@ -341,8 +377,8 @@ class ToolAndUiTests(unittest.TestCase):
         file_path = Path(self.temp_dir.name) / "existing-company.xlsx"
         workbook = Workbook()
         sheet = workbook.active
-        sheet.append(["车辆标识", "已协助补缴", "车辆所有人/企业"])
-        sheet.append(["冀T2892_黄色", "", "无运输证号"])
+        sheet.append(["车牌", "车辆所有人/企业"])
+        sheet.append(["冀T2892_黄色", "无运输证号"])
         workbook.save(file_path)
         workbook.close()
 
@@ -427,12 +463,12 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(sheet.cell(2, headers["查询状态"]).value, "已有企业信息（跳过）")
         saved.close()
 
-    def test_transport_worker_accepts_note_as_assisted_payment_column(self):
+    def test_transport_worker_does_not_treat_note_as_payment_skip_marker(self):
         file_path = Path(self.temp_dir.name) / "note-column.xlsx"
         workbook = Workbook()
         sheet = workbook.active
-        sheet.append(["车辆标识", "备注"])
-        sheet.append(["粤A12345_黄色", "已协助补缴"])
+        sheet.append(["车牌", "备注"])
+        sheet.append(["无效车牌", "已协助补缴"])
         workbook.save(file_path)
         workbook.close()
 
@@ -468,7 +504,7 @@ class ToolAndUiTests(unittest.TestCase):
             worker.run()
 
         self.assertEqual(results, ["完成"])
-        self.assertEqual(page.goto_calls, 1)
+        self.assertEqual(page.goto_calls, 0)
         saved = load_workbook(file_path)
         try:
             headers = {
@@ -478,7 +514,55 @@ class ToolAndUiTests(unittest.TestCase):
             }
             self.assertEqual(
                 saved.active.cell(2, headers["查询状态"]).value,
-                "已补缴（无需查询）",
+                "车牌格式错误（解析失败）",
+            )
+        finally:
+            saved.close()
+
+    def test_transport_worker_uses_second_row_business_header(self):
+        file_path = Path(self.temp_dir.name) / "worker-second-row-header.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "业务清单标题"
+        sheet.append(["车牌", "备注"])
+        sheet.append(["无效车牌", "保留"])
+        workbook.save(file_path)
+        workbook.close()
+
+        worker = Worker(
+            str(file_path),
+            True,
+            False,
+            2,
+            True,
+            2,
+            False,
+        )
+        logs = []
+        results = []
+        worker.log.connect(logs.append)
+        worker.finished.connect(results.append)
+        with patch.object(
+            worker,
+            "_create_browser_until_ready",
+            return_value=True,
+        ):
+            worker.run()
+
+        self.assertEqual(results, ["完成"])
+        self.assertTrue(any("第 2 行" in line for line in logs))
+        saved = load_workbook(file_path)
+        try:
+            sheet = saved.active
+            headers = {
+                cell.value: cell.column
+                for cell in sheet[2]
+                if cell.value is not None
+            }
+            self.assertEqual(sheet["A1"].value, "业务清单标题")
+            self.assertEqual(
+                sheet.cell(3, headers["查询状态"]).value,
+                "车牌格式错误（解析失败）",
             )
         finally:
             saved.close()
@@ -2020,6 +2104,7 @@ class ToolAndUiTests(unittest.TestCase):
             "is_archived": False,
             "entitlement_revision": 1,
             "last_login_at": "2026-08-19T08:32:47+08:00",
+            "last_login_system": "Win11",
         }
         stale_payload = {
             "id": "deleted-test-account",
@@ -2067,6 +2152,8 @@ class ToolAndUiTests(unittest.TestCase):
 
         self.assertEqual(page.table.rowCount(), 1)
         self.assertEqual(page.table.item(0, 8).text(), "2026-08-19 08:32:47")
+        self.assertEqual(page.table.horizontalHeaderItem(9).text(), "最近系统")
+        self.assertEqual(page.table.item(0, 9).text(), "Win11")
         self.assertEqual(deleted_ids, [stale.id])
         self.assertNotIn(
             "test",
@@ -2604,6 +2691,72 @@ class ToolAndUiTests(unittest.TestCase):
         window._update_sync_status(Engine.status("syncing"))
         self.assertFalse(window.sidebar_profile.property("reconnectAvailable"))
         self.assertIn("同步任务正在结束", window.sidebar_profile.toolTip())
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
+    def test_reauth_status_overrides_a_stale_online_session_state(self):
+        user = self.db.create_account(
+            "stale_online",
+            "StaleOnline@123",
+            "user",
+            self.admin.id,
+        )
+
+        class State:
+            account = user
+            mode = "online"
+            is_online = True
+            offline_expires_at = "2026-08-26T10:00:00+08:00"
+
+        class Session:
+            api = object()
+
+            def __init__(self):
+                self.state = State()
+                self.invalidate_calls = 0
+
+            def invalidate_credentials(self):
+                self.invalidate_calls += 1
+                self.state.mode = "reauth_required"
+                self.state.is_online = False
+
+        class Engine:
+            @staticmethod
+            def status(state=None, error=None):
+                return SyncStatus(
+                    state=state or "online",
+                    pending_count=0,
+                    quarantined_count=0,
+                    last_sync_at=None,
+                    error=error,
+                )
+
+        class Coordinator(QObject):
+            status_changed = pyqtSignal(object)
+            data_changed = pyqtSignal()
+            engine = Engine()
+
+            @staticmethod
+            def retry_now():
+                return None
+
+        session = Session()
+        window = MainWindow(
+            self.db,
+            user,
+            session_manager=session,
+            sync_coordinator=Coordinator(),
+        )
+
+        window._update_sync_status(
+            Engine.status("reauth_required", "检测到刷新令牌重复使用")
+        )
+
+        self.assertEqual(session.invalidate_calls, 1)
+        self.assertEqual(session.state.mode, "reauth_required")
+        self.assertTrue(window.sidebar_profile.property("reconnectAvailable"))
+        self.assertEqual(window._reconnect_unavailable_reason(), "")
         window.workflow_page.shutdown()
         window._prepared_to_close = True
         window.close()
@@ -4437,6 +4590,7 @@ class ToolAndUiTests(unittest.TestCase):
             source_start_row=10,
             source_row_count=9,
             company_header="公司名称",
+            source_header_row=2,
         )
         with patch(
             "integrated_client.ui.workflow_page.QMessageBox.information"
@@ -4452,6 +4606,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(len(page.df), 1)
         self.assertEqual(page.df.iloc[0]["车辆标识"], "粤A12345")
         self.assertFalse(timing.is_active)
+        self.assertIn("第 2 行为表头", information.call_args.args[2])
         self.assertIn("第 10 行", information.call_args.args[2])
         page.tencent_import_worker = None
         self.assertTrue(page.shutdown())
@@ -5389,6 +5544,7 @@ class ToolAndUiTests(unittest.TestCase):
                 table_header.sectionResizeMode(column),
                 QHeaderView.Interactive,
             )
+        self.assertTrue(table_header.stretchLastSection())
 
         luogang_row = next(
             index
@@ -6115,6 +6271,111 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(saved.at[0, PHONE_COL_NAME], "13800000000")
         page.shutdown()
 
+    def test_workflow_reads_and_saves_a_second_row_header(self):
+        file_path = Path(self.temp_dir.name) / "workflow-second-row-header.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet["A1"] = "2026 年逃费车辆业务清单"
+        sheet.append(["车辆标识", "车辆所有人/企业"])
+        sheet.append(["粤A12345_黄色", "示例企业"])
+        workbook.save(file_path)
+        workbook.close()
+
+        page = WorkflowPage()
+        self.assertTrue(page._load_workbook_path(file_path))
+        self.assertEqual(page._business_header_row, 2)
+        self.assertEqual(page.df.at[0, "车辆标识"], "粤A12345_黄色")
+        for column in TARGET_COLUMNS:
+            page.df[column] = ""
+        page.df.at[0, LEGAL_COL_NAME] = "张三"
+        page.df.at[0, ADDR_COL_NAME] = "测试路1号"
+        page.df.at[0, PHONE_COL_NAME] = "13800000000"
+
+        self.assertTrue(page._save_aiqicha_results())
+        saved = load_workbook(file_path, data_only=True)
+        try:
+            sheet = saved.active
+            headers = {
+                cell.value: cell.column
+                for cell in sheet[2]
+                if cell.value is not None
+            }
+            self.assertEqual(sheet["A1"].value, "2026 年逃费车辆业务清单")
+            self.assertEqual(sheet.cell(3, headers[LEGAL_COL_NAME]).value, "张三")
+            self.assertEqual(sheet.cell(3, headers[ADDR_COL_NAME]).value, "测试路1号")
+            self.assertEqual(
+                sheet.cell(3, headers[PHONE_COL_NAME]).value,
+                "13800000000",
+            )
+        finally:
+            saved.close()
+        page.shutdown()
+
+    def test_workflow_load_makes_read_only_workbook_writable_in_place(self):
+        file_path = Path(self.temp_dir.name) / "read-only-workflow.xlsx"
+        workbook = Workbook()
+        workbook.active.append(["车辆标识", "车辆所有人/企业"])
+        workbook.active.append(["粤A12345_黄色", "示例企业"])
+        workbook.save(file_path)
+        workbook.close()
+        original_size = file_path.stat().st_size
+        file_path.chmod(stat.S_IREAD)
+
+        page = WorkflowPage()
+        try:
+            self.assertTrue(page._load_workbook_path(file_path))
+            self.assertEqual(Path(page.file_path), file_path.resolve())
+            self.assertFalse(is_excel_file_read_only(file_path))
+            self.assertEqual(file_path.stat().st_size, original_size)
+            self.assertIn(
+                "已自动解除表格只读状态",
+                page.log_text.toPlainText(),
+            )
+            self.assertIn("另存兜底", page.save_writable_btn.toolTip())
+        finally:
+            file_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+            page.shutdown()
+
+    def test_workflow_uses_save_as_fallback_when_read_only_cannot_be_removed(self):
+        file_path = Path(self.temp_dir.name) / "read-only-fallback.xlsx"
+        workbook = Workbook()
+        workbook.active.append(["车辆标识", "车辆所有人/企业"])
+        workbook.active.append(["粤A12345_黄色", "示例企业"])
+        workbook.save(file_path)
+        workbook.close()
+        file_path.chmod(stat.S_IREAD)
+
+        page = WorkflowPage()
+        try:
+            with patch(
+                "integrated_client.ui.workflow_page.make_excel_file_writable",
+                side_effect=PermissionError("文件位于只读共享目录"),
+            ) as make_writable:
+                self.assertTrue(page._load_workbook_path(file_path))
+                self.assertTrue(is_excel_file_read_only(file_path))
+                self.assertIn(
+                    "另存为可写表格（兜底）",
+                    page.log_text.toPlainText(),
+                )
+                self.assertIn(
+                    "文件位于只读共享目录",
+                    page.save_writable_btn.toolTip(),
+                )
+
+                with patch(
+                    "integrated_client.ui.workflow_page.QMessageBox.question",
+                    return_value=QMessageBox.No,
+                ) as question:
+                    page.start_pipeline()
+
+            self.assertEqual(make_writable.call_count, 2)
+            question.assert_called_once()
+            self.assertIn("是否现在另存", question.call_args.args[2])
+            self.assertFalse(page.pipeline_running)
+        finally:
+            file_path.chmod(stat.S_IREAD | stat.S_IWRITE)
+            page.shutdown()
+
     def test_workflow_counts_only_once_with_mutually_exclusive_categories(self):
         dataframe = pd.DataFrame(
             [
@@ -6320,8 +6581,12 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(page.station_table.item(station_row, 2).text(), "11")
         self.assertEqual(page.station_table.item(station_row, 3).text(), "4")
         station_header = page.station_table.horizontalHeader()
-        self.assertEqual(station_header.sectionResizeMode(4), QHeaderView.Stretch)
-        self.assertEqual(station_header.sectionResizeMode(3), QHeaderView.Interactive)
+        for column in range(page.station_table.columnCount()):
+            self.assertEqual(
+                station_header.sectionResizeMode(column),
+                QHeaderView.Interactive,
+            )
+        self.assertTrue(station_header.stretchLastSection())
         self.assertFalse(page.grab().isNull())
         page.close()
         page.deleteLater()
