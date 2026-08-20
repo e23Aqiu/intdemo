@@ -7,9 +7,24 @@ from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt5.QtCore import QBuffer, QByteArray, QCoreApplication, QEvent, QIODevice, Qt
+from PyQt5.QtCore import (
+    QBuffer,
+    QByteArray,
+    QCoreApplication,
+    QEvent,
+    QIODevice,
+    QPoint,
+    Qt,
+)
 from PyQt5.QtGui import QPixmap
-from PyQt5.QtWidgets import QApplication, QLabel, QPlainTextEdit, QPushButton
+from PyQt5.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHeaderView,
+    QLabel,
+    QPlainTextEdit,
+    QPushButton,
+)
 
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
 from integrated_client.database import Database
@@ -313,7 +328,14 @@ class AnnouncementUiTests(unittest.TestCase):
             "今晚 22:00 维护，请提前保存数据",
         )
         self.assertIn("announcements_admin", window._pages)
-        self.assertIn("● 3", window._nav_buttons["announcements_admin"].text())
+        self.assertIn(
+            "新消息 3",
+            window._nav_buttons["announcements_admin"].text(),
+        )
+        self.assertNotIn(
+            "●",
+            window._nav_buttons["announcements_admin"].text(),
+        )
         self.assertEqual(
             window._nav_buttons["announcements_admin"].toolTip(),
             "收到 3 条未读用户消息",
@@ -539,11 +561,20 @@ class AnnouncementUiTests(unittest.TestCase):
                 lambda: window.announcement_horn_button.message_unread_count == 2
             )
         )
+        self.assertEqual(
+            window.announcement_horn_button.text(),
+            "有 2 条新消息",
+        )
+        self.assertGreater(window.announcement_horn_button.width(), 38)
 
         window.announcement_horn_button.click()
         self.app.processEvents()
         announcement_list = window.announcement_list_dialog
         self.assertEqual(announcement_list.history_button.message_unread_count, 2)
+        self.assertEqual(
+            announcement_list.history_button.text(),
+            "历史会话  ·  有 2 条新消息",
+        )
         with patch(
             "integrated_client.ui.announcement_page.run_with_loading",
             side_effect=lambda _parent, _message, function: function(),
@@ -552,13 +583,20 @@ class AnnouncementUiTests(unittest.TestCase):
         self.app.processEvents()
 
         history = window.contact_history_dialog
-        self.assertIn("● 未读 2 条", history.conversation_picker.itemText(1))
+        self.assertIn(
+            "有 1 个未读会话 · 2 条新消息",
+            history.conversation_picker.currentText(),
+        )
+        self.assertIn("有 2 条新消息", history.conversation_picker.itemText(1))
+        self.assertNotIn("●", history.conversation_picker.itemText(1))
         history.conversation_picker.setCurrentIndex(1)
         self.assertTrue(
             self._wait_until(lambda: api.user_read_calls == ["conversation-unread"])
         )
-        self.assertNotIn("未读", history.conversation_picker.itemText(1))
+        self.assertNotIn("新消息", history.conversation_picker.itemText(1))
         self.assertEqual(window.announcement_horn_button.message_unread_count, 0)
+        self.assertEqual(window.announcement_horn_button.text(), "")
+        self.assertEqual(window.announcement_horn_button.width(), 38)
 
     def test_image_preview_supports_fit_zoom_and_actual_size(self):
         pixmap = QPixmap(1600, 1000)
@@ -576,6 +614,17 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertLess(fitted_zoom, 1.0)
         dialog._step_zoom(1)
         self.assertGreater(dialog._zoom, fitted_zoom)
+        dialog._set_zoom(1.0)
+        horizontal = dialog.image_scroll.horizontalScrollBar()
+        vertical = dialog.image_scroll.verticalScrollBar()
+        horizontal.setValue(horizontal.maximum() // 2)
+        vertical.setValue(vertical.maximum() // 2)
+        previous_position = (horizontal.value(), vertical.value())
+        dialog._pan_image(QPoint(20, 15))
+        self.assertEqual(
+            (horizontal.value(), vertical.value()),
+            (previous_position[0] - 20, previous_position[1] - 15),
+        )
         dialog.zoom_actual_btn.click()
         self.assertEqual(dialog._zoom, 1.0)
         self.assertEqual(dialog.zoom_label.text(), "100%")
@@ -738,7 +787,7 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(dialog.toolbar_buttons["underline"].text(), "U")
         self.assertTrue(dialog.toolbar_buttons["align_left"].icon().isNull() is False)
 
-    def test_admin_page_opens_independent_chat_and_marks_selection_read(self):
+    def test_admin_page_marks_message_read_only_after_chat_opens(self):
         api = FakeAnnouncementApi()
         api.managed_announcements = [self._announcement()]
         api.accounts = [
@@ -794,18 +843,25 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(page.announcement_table.item(0, 2).text(), "2 / 3")
         self.assertEqual(page.message_table.rowCount(), 1)
         self.assertEqual(unread, [1])
-        self.assertEqual(page.message_tab_badge.text(), "1")
+        self.assertEqual(page.message_tab_badge.text(), "有 1 条新消息")
         self.assertFalse(page.message_tab_badge.isHidden())
+        self.assertGreater(
+            page.message_tab_badge.width(),
+            page.message_tab_badge.fontMetrics().horizontalAdvance(
+                page.message_tab_badge.text()
+            ),
+        )
+        self.assertEqual(page.announcement_preview.objectName(), "AnnouncementBody")
+        self.assertEqual(
+            page.announcement_receipt_detail.objectName(),
+            "AnnouncementReceiptDetail",
+        )
         page.message_table.selectRow(0)
         self.app.processEvents()
-        self.assertTrue(
-            self._wait_until(
-                lambda: api.inbox["items"][0].get("read_at") is not None
-                or page.messages[0].get("read_at") is not None
-            )
-        )
-        self.assertEqual(page.inbox_summary.text(), "未读消息：0")
-        self.assertTrue(page.message_tab_badge.isHidden())
+        self.assertIsNone(api.inbox["items"][0].get("read_at"))
+        self.assertIsNone(page.messages[0].get("read_at"))
+        self.assertEqual(page.inbox_summary.text(), "未读消息：1")
+        self.assertFalse(page.message_tab_badge.isHidden())
         self.assertFalse(
             any(
                 button.text() == "标记所选为已读"
@@ -815,15 +871,61 @@ class AnnouncementUiTests(unittest.TestCase):
         page._reply_message()
         self.app.processEvents()
         chat = page._chat_windows["message-id"]
+        self.assertTrue(
+            self._wait_until(
+                lambda: api.inbox["items"][0].get("read_at") is not None
+                or page.messages[0].get("read_at") is not None
+            )
+        )
+        self.assertEqual(page.inbox_summary.text(), "未读消息：0")
+        self.assertTrue(page.message_tab_badge.isHidden())
         self.assertIsInstance(chat, AdminConversationDialog)
         self.assertFalse(chat.isModal())
         self.assertIsNone(chat.parent())
+        self.assertEqual(chat.windowType(), Qt.Window)
         self.assertTrue(chat.message_edit.isEnabled())
         self.assertTrue(chat.message_edit.hasFocus())
         self.assertIn("<b>这里按纯文字显示</b>", chat.history.toPlainText())
         chat.message_edit.setPlainText("管理员回复")
         chat._send()
         self.assertEqual(api.admin_replies[0][:2], ("message-id", "管理员回复"))
+
+    def test_chat_composers_put_count_and_separator_before_attachments(self):
+        api = FakeAnnouncementApi()
+        session = FakeSession(api)
+        with patch(
+            "integrated_client.ui.announcement_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            user_chat = ContactConversationDialog(self._announcement(), session)
+        admin_chat = AdminConversationDialog(
+            {
+                "id": "conversation-layout",
+                "sender_display_name": "布局用户",
+                "sender_username": "layout-user",
+                "announcement_title": "布局公告",
+                "status": "open",
+                "messages": [],
+            },
+            session,
+        )
+
+        for chat in (user_chat, admin_chat):
+            composer_layout = chat.message_edit.parentWidget().layout()
+            self.assertLess(
+                composer_layout.indexOf(chat.message_edit),
+                composer_layout.indexOf(chat.count_label),
+            )
+            self.assertLess(
+                composer_layout.indexOf(chat.count_label),
+                composer_layout.indexOf(chat.composer_separator),
+            )
+            self.assertLess(
+                composer_layout.indexOf(chat.composer_separator),
+                composer_layout.indexOf(chat.attachment_picker),
+            )
+            self.assertEqual(chat.composer_separator.frameShape(), QFrame.HLine)
+            chat.close()
 
     def test_detail_contact_closes_announcement_and_opens_independent_chat(self):
         api = FakeAnnouncementApi()
@@ -852,12 +954,25 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertTrue(chat.isVisible())
         self.assertFalse(chat.isModal())
         self.assertIsNone(chat.parent())
+        self.assertEqual(chat.windowType(), Qt.Window)
+        window.showMinimized()
+        self.app.processEvents()
+        self.assertTrue(window.isMinimized())
+        self.assertFalse(chat.isMinimized())
+        window.showNormal()
         self.assertFalse(
             any(
                 button.text() == "未解决，继续沟通"
                 for button in chat.findChildren(QPushButton)
             )
         )
+
+    def test_admin_message_table_stretches_latest_message_column(self):
+        page = AnnouncementAdminPage(FakeSession(FakeAnnouncementApi()))
+        header = page.message_table.horizontalHeader()
+        self.assertEqual(header.sectionResizeMode(4), QHeaderView.Stretch)
+        self.assertEqual(header.sectionResizeMode(5), QHeaderView.Interactive)
+        page.deleteLater()
 
     def test_user_message_unread_badge_is_cleared_when_chat_opens(self):
         api = FakeAnnouncementApi()

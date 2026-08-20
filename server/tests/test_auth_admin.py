@@ -553,6 +553,63 @@ def test_account_update_rejects_explicit_null(client):
     assert response.json()["code"] == "validation_error"
 
 
+def test_account_creation_accepts_unicode_login_name_and_role_updates(client):
+    admin = changed_admin(client)
+    headers = auth_header(admin)
+    created = client.post(
+        "/api/v1/admin/accounts",
+        headers=headers,
+        json={
+            "username": "萝岗站01",
+            "display_name": "萝岗一号站",
+            "role": "user",
+            "stats_scope": "own",
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["username"] == "萝岗站01"
+
+    account_id = created.json()["id"]
+    marked_as_test = client.patch(
+        f"/api/v1/admin/accounts/{account_id}",
+        headers=headers,
+        json={"is_test": True},
+    )
+    assert marked_as_test.status_code == 200, marked_as_test.text
+    assert marked_as_test.json()["role"] == "user"
+    assert marked_as_test.json()["is_test"] is True
+
+    promoted = client.patch(
+        f"/api/v1/admin/accounts/{account_id}",
+        headers=headers,
+        json={"role": "admin", "is_test": False},
+    )
+    assert promoted.status_code == 200, promoted.text
+    assert promoted.json()["role"] == "admin"
+    assert promoted.json()["is_test"] is False
+
+    demoted = client.patch(
+        f"/api/v1/admin/accounts/{account_id}",
+        headers=headers,
+        json={"role": "user", "stats_scope": "all"},
+    )
+    assert demoted.status_code == 200, demoted.text
+    assert demoted.json()["role"] == "user"
+    assert demoted.json()["stats_scope"] == "all"
+
+    invalid = client.post(
+        "/api/v1/admin/accounts",
+        headers=headers,
+        json={
+            "username": "萝岗 02",
+            "display_name": "无效站点",
+        },
+    )
+    assert invalid.status_code == 422
+    assert invalid.json()["code"] == "validation_error"
+    assert invalid.json()["details"][0]["loc"][-1] == "username"
+
+
 def test_archived_account_can_be_permanently_deleted(client):
     admin = changed_admin(client)
     headers = auth_header(admin)

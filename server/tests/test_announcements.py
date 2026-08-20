@@ -366,21 +366,29 @@ def test_user_text_messages_are_visible_and_readable_by_admin(client):
         headers=auth_header(admin),
     ).json() == {"items": [], "unread_count": 0}
 
-    replied = client.post(
-        f"/api/v1/admin/messages/{body['items'][0]['id']}/reply",
-        headers=auth_header(admin),
-        json={
-            "message": "可以继续录入，维护期间同步会自动重试。",
-            "attachments": [
-                {
-                    "file_name": "说明.txt",
-                    "content_type": "text/plain",
-                    "kind": "file",
-                    "content_base64": base64.b64encode(b"retry help").decode(),
-                }
-            ],
-        },
-    )
+    with client.websocket_connect(
+        "/api/v1/ws/updates",
+        headers=auth_header(first),
+    ) as user_socket:
+        assert user_socket.receive_json()["type"] == "connected"
+        replied = client.post(
+            f"/api/v1/admin/messages/{body['items'][0]['id']}/reply",
+            headers=auth_header(admin),
+            json={
+                "message": "可以继续录入，维护期间同步会自动重试。",
+                "attachments": [
+                    {
+                        "file_name": "说明.txt",
+                        "content_type": "text/plain",
+                        "kind": "file",
+                        "content_base64": base64.b64encode(b"retry help").decode(),
+                    }
+                ],
+            },
+        )
+        assert user_socket.receive_json() == {
+            "type": "contact_messages_changed"
+        }
     assert replied.status_code == 201, replied.text
     assert replied.json()["messages"][-1]["sender_role"] == "admin"
     admin_attachment = replied.json()["messages"][-1]["attachments"][0]

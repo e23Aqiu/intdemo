@@ -519,14 +519,17 @@ QPushButton#AnnouncementHornButton {
     border: 1px solid #d3e7e3;
     border-radius: 10px;
     padding: 0;
+    font-weight: 600;
 }
 QPushButton#AnnouncementHornButton:hover {
     background: #dff0ec;
     border-color: #9dcfc6;
 }
 QPushButton#AnnouncementHornButton[hasUnread="true"] {
-    background: #fff4ec;
-    border-color: #f0b888;
+    color: #145f58;
+    background: #e4f5f1;
+    border-color: #8fc8bf;
+    padding: 0 12px;
 }
 QPushButton#AnnouncementTickerButton {
     color: #365654;
@@ -548,7 +551,8 @@ QPushButton#AnnouncementTickerButton:disabled {
     background: transparent;
     border-color: transparent;
 }
-QTextBrowser#AnnouncementBody {
+QTextBrowser#AnnouncementBody,
+QPlainTextEdit#AnnouncementReceiptDetail {
     color: #334155;
     background: white;
     border: 1px solid #dfe6f1;
@@ -664,8 +668,20 @@ QPlainTextEdit#ChatComposer {
     border: none;
     padding: 4px;
 }
+QFrame#ChatComposerSeparator {
+    min-height: 1px;
+    max-height: 1px;
+    background: #e1e9ec;
+    border: none;
+}
 QPushButton#HistoryConversationButton {
-    padding-right: 26px;
+    padding-right: 12px;
+}
+QPushButton#HistoryConversationButton[hasUnread="true"] {
+    color: #145f58;
+    background: #e4f5f1;
+    border-color: #8fc8bf;
+    font-weight: 700;
 }
 QComboBox#ConversationPicker {
     color: #243a40;
@@ -708,12 +724,12 @@ QListView#ConversationPickerView::item:selected {
     background: #dff2ed;
 }
 QLabel#AnnouncementTabBadge {
-    color: #ffffff;
-    background: #d14f45;
-    border: 1px solid #ffffff;
-    border-radius: 10px;
-    padding: 1px 5px;
-    font-size: 10px;
+    color: #145f58;
+    background: #e4f5f1;
+    border: 1px solid #9ccfc7;
+    border-radius: 9px;
+    padding: 2px 8px;
+    font-size: 11px;
     font-weight: 700;
 }
 QToolButton#ImageZoomButton {

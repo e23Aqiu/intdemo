@@ -21,6 +21,7 @@ from ..models import (
     AnnouncementTarget,
     ContactMessageAttachment,
 )
+from ..realtime import update_hub
 from ..schemas import (
     AdminContactMessageCreate,
     AnnouncementAttachmentInput,
@@ -1001,7 +1002,7 @@ def admin_mark_contact_message_read(
 
 
 @router.post("/admin/messages/{message_id}/reply", status_code=201)
-def admin_reply_contact_message(
+async def admin_reply_contact_message(
     message_id: uuid.UUID,
     payload: AdminContactMessageCreate,
     context: AdminContext,
@@ -1021,6 +1022,7 @@ def admin_reply_contact_message(
     db.flush()
     _add_contact_attachments(db, row.id, payload.attachments)
     db.commit()
+    await update_hub.broadcast_event("contact_messages_changed")
     return _contact_conversation_view(db, root)
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, QUrl, pyqtSignal
 from PyQt5.QtNetwork import (
     QAbstractSocket,
@@ -33,6 +35,7 @@ class _SyncTask(QRunnable):
 class SyncCoordinator(QObject):
     status_changed = pyqtSignal(object)
     data_changed = pyqtSignal()
+    messages_changed = pyqtSignal()
     _worker_finished = pyqtSignal(object)
 
     def __init__(self, engine, parent=None):
@@ -197,12 +200,18 @@ class SyncCoordinator(QObject):
             return
 
     def _on_websocket_message(self, message):
-        if (
-            "revision_changed" in message
-            or '"type":"connected"' in message
-            or "test_connection_blocked" in message
-        ):
+        try:
+            event_type = str(json.loads(message).get("type") or "")
+        except (AttributeError, TypeError, ValueError):
+            return
+        if event_type in {
+            "revision_changed",
+            "connected",
+            "test_connection_blocked",
+        }:
             self.request_sync()
+        if event_type == "contact_messages_changed":
+            self.messages_changed.emit()
 
     def _on_websocket_disconnected(self):
         if not self._stopped:

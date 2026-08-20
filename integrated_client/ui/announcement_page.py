@@ -8,7 +8,6 @@ from pathlib import Path
 from PyQt5.QtCore import (
     QObject,
     QPoint,
-    QRect,
     QRectF,
     QRunnable,
     QSize,
@@ -39,6 +38,7 @@ from PyQt5.QtWidgets import (
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QListView,
@@ -326,11 +326,13 @@ class AnnouncementHoverCard(QFrame):
 
 
 class UnreadBadgeButton(QPushButton):
-    """A push button with a small, high-contrast unread counter bubble."""
+    """A button that presents unread messages as an explicit text notice."""
 
     def __init__(self, text="", parent=None):
         super().__init__(text, parent)
+        self._base_text = str(text or "")
         self._unread_count = 0
+        self.setProperty("hasUnread", False)
 
     @property
     def unread_count(self):
@@ -345,35 +347,32 @@ class UnreadBadgeButton(QPushButton):
         if count == self._unread_count:
             return
         self._unread_count = count
-        self.update()
+        self.setProperty("hasUnread", bool(count))
+        notice = f"有 {count} 条新消息" if count else ""
+        self.setText(
+            f"{self._base_text}  ·  {notice}"
+            if self._base_text and notice
+            else self._base_text or notice
+        )
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.updateGeometry()
 
     # Keep the announcement-specific API used by existing callers.
     def set_message_unread_count(self, count):
         self.set_unread_count(count)
 
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        if not self._unread_count:
-            return
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing, True)
-        diameter = 18
-        badge = QRect(self.width() - diameter - 1, 1, diameter, diameter)
-        painter.setPen(QPen(QColor("#ffffff"), 1))
-        painter.setBrush(QColor("#d14f45"))
-        painter.drawEllipse(badge)
-        font = painter.font()
-        font.setPointSize(7)
-        font.setBold(True)
-        painter.setFont(font)
-        painter.setPen(QColor("#ffffff"))
-        label = "99+" if self._unread_count > 99 else str(self._unread_count)
-        painter.drawText(badge, Qt.AlignCenter, label)
-        painter.end()
-
-
 class AnnouncementHornButton(UnreadBadgeButton):
-    """Announcement shortcut with a compact unread-message counter."""
+    """Announcement shortcut that expands when new replies are available."""
+
+    def set_unread_count(self, count):
+        super().set_unread_count(count)
+        if self._unread_count:
+            text_width = self.fontMetrics().horizontalAdvance(self.text())
+            width = max(132, text_width + self.iconSize().width() + 34)
+        else:
+            width = 38
+        self.setFixedWidth(width)
 
     @property
     def message_unread_count(self):
@@ -1049,6 +1048,9 @@ class ContactConversationDialog(FramelessDialog):
             show_minimize=True,
             show_maximize=True,
         )
+        self.setWindowFlags(
+            (self.windowFlags() & ~Qt.WindowType_Mask) | Qt.Window
+        )
         self.announcement = announcement or {}
         self.session = session
         self.history_mode = bool(history_mode or not announcement)
@@ -1156,12 +1158,17 @@ class ContactConversationDialog(FramelessDialog):
         self.message_edit.setPlaceholderText("输入需要发送给管理员的内容…")
         self.message_edit.textChanged.connect(self._limit_message)
         composer_layout.addWidget(self.message_edit)
-        self.attachment_picker = ContactAttachmentPicker(self)
-        composer_layout.addWidget(self.attachment_picker)
         self.count_label = QLabel(f"0 / {self.MAX_LENGTH}")
         self.count_label.setObjectName("Muted")
         self.count_label.setAlignment(Qt.AlignRight)
         composer_layout.addWidget(self.count_label)
+        self.composer_separator = QFrame()
+        self.composer_separator.setObjectName("ChatComposerSeparator")
+        self.composer_separator.setFrameShape(QFrame.HLine)
+        self.composer_separator.setFrameShadow(QFrame.Plain)
+        composer_layout.addWidget(self.composer_separator)
+        self.attachment_picker = ContactAttachmentPicker(self)
+        composer_layout.addWidget(self.attachment_picker)
         layout.addWidget(composer)
 
         buttons = QHBoxLayout()
@@ -1254,27 +1261,42 @@ class ContactConversationDialog(FramelessDialog):
         )
         suffix = f" · {preview}" if preview else ""
         unread_count = int(conversation.get("user_unread_count") or 0)
-        unread_prefix = f"● 未读 {unread_count} 条  ·  " if unread_count else ""
+        unread_prefix = f"有 {unread_count} 条新消息  ·  " if unread_count else ""
         # Two compact lines make the popup scannable while retaining a useful
         # single-line summary in older Qt styles that do not expand combo rows.
         return f"{unread_prefix}{title} · {status}\n{timestamp}{suffix}"
 
-    @staticmethod
-    def _conversation_current_label(conversation):
+    def _conversation_current_label(self, conversation):
         if not conversation:
             return ""
         title = str(conversation.get("announcement_title") or "公告已删除")
         status = "已解决" if conversation.get("status") == "resolved" else "处理中"
-        unread_count = int(conversation.get("user_unread_count") or 0)
-        unread_prefix = f"● 未读 {unread_count} 条  ·  " if unread_count else ""
-        return f"{unread_prefix}{title} · {status}"
+        unread_conversations = sum(
+            bool(int(item.get("user_unread_count") or 0))
+            for item in self.conversations
+        )
+        loaded_unread_messages = sum(
+            int(item.get("user_unread_count") or 0)
+            for item in self.conversations
+        )
+        unread_messages = max(
+            int(self.total_unread_count or 0),
+            loaded_unread_messages,
+        )
+        summary = (
+            f"有 {unread_conversations} 个未读会话 · "
+            f"{unread_messages} 条新消息  |  "
+            if unread_messages
+            else ""
+        )
+        return f"{summary}{title} · {status}"
 
     def _update_conversation_picker_display(self):
         if self.conversation_picker is None:
             return
-        self.conversation_picker.setEditText(
-            self._conversation_current_label(self.conversation)
-        )
+        label = self._conversation_current_label(self.conversation)
+        self.conversation_picker.setEditText(label)
+        self.conversation_picker.setToolTip(label)
 
     def _populate_conversation_picker(self, selected_id=None):
         if self.conversation_picker is None:
@@ -1296,7 +1318,7 @@ class ContactConversationDialog(FramelessDialog):
                 item.setData(unread_count, Qt.UserRole + 1)
                 item.setSizeHint(QSize(0, 54))
                 if unread_count:
-                    item.setForeground(QColor("#a43d43"))
+                    item.setForeground(QColor("#176f68"))
                     font = item.font()
                     font.setBold(True)
                     item.setFont(font)
@@ -1495,6 +1517,10 @@ class ContactConversationDialog(FramelessDialog):
         for message in conversation.get("messages") or []:
             if message.get("sender_role") == "admin":
                 message["user_read_at"] = message.get("user_read_at") or True
+        self.total_unread_count = max(
+            0,
+            self.total_unread_count - conversation_unread,
+        )
         if self.history_mode:
             for item in self.conversations:
                 if str(item.get("id") or "") != conversation_id:
@@ -1509,10 +1535,6 @@ class ContactConversationDialog(FramelessDialog):
             self._populate_conversation_picker(
                 selected_id=conversation_id,
             )
-        self.total_unread_count = max(
-            0,
-            self.total_unread_count - conversation_unread,
-        )
         self.unread_count_changed.emit(self.total_unread_count)
         self.messages_changed.emit()
         task = None
@@ -1735,6 +1757,9 @@ class AdminConversationDialog(FramelessDialog):
             show_minimize=True,
             show_maximize=True,
         )
+        self.setWindowFlags(
+            (self.windowFlags() & ~Qt.WindowType_Mask) | Qt.Window
+        )
         self.conversation = dict(conversation or {})
         self.session = session
         self._refresh_task = None
@@ -1811,12 +1836,17 @@ class AdminConversationDialog(FramelessDialog):
         self.message_edit.setPlaceholderText("输入回复内容…")
         self.message_edit.textChanged.connect(self._limit_message)
         composer_layout.addWidget(self.message_edit)
-        self.attachment_picker = ContactAttachmentPicker(self)
-        composer_layout.addWidget(self.attachment_picker)
         self.count_label = QLabel(f"0 / {self.MAX_LENGTH}")
         self.count_label.setObjectName("Muted")
         self.count_label.setAlignment(Qt.AlignRight)
         composer_layout.addWidget(self.count_label)
+        self.composer_separator = QFrame()
+        self.composer_separator.setObjectName("ChatComposerSeparator")
+        self.composer_separator.setFrameShape(QFrame.HLine)
+        self.composer_separator.setFrameShadow(QFrame.Plain)
+        composer_layout.addWidget(self.composer_separator)
+        self.attachment_picker = ContactAttachmentPicker(self)
+        composer_layout.addWidget(self.attachment_picker)
         root.addWidget(composer)
 
         actions = QHBoxLayout()
@@ -1832,12 +1862,15 @@ class AdminConversationDialog(FramelessDialog):
 
         self._render()
         self._remember_user_messages(notify=False)
-        self._mark_read()
         self._refresh_timer = QTimer(self)
         self._refresh_timer.setInterval(12_000)
         self._refresh_timer.timeout.connect(self._refresh_silently)
         self._refresh_timer.start()
         QTimer.singleShot(0, self.message_edit.setFocus)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._mark_read()
 
     def _call(self, message, function):
         try:
@@ -2061,13 +2094,44 @@ class AdminConversationDialog(FramelessDialog):
 class _ZoomImageLabel(QLabel):
     zoom_requested = pyqtSignal(int)
     fit_requested = pyqtSignal()
+    pan_requested = pyqtSignal(QPoint)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._drag_position = None
+        self.setCursor(Qt.OpenHandCursor)
 
     def wheelEvent(self, event):
-        if event.modifiers() & Qt.ControlModifier and event.angleDelta().y():
+        if event.angleDelta().y():
             self.zoom_requested.emit(1 if event.angleDelta().y() > 0 else -1)
             event.accept()
             return
         super().wheelEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_position = event.pos()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._drag_position is not None and event.buttons() & Qt.LeftButton:
+            position = event.pos()
+            self.pan_requested.emit(position - self._drag_position)
+            self._drag_position = position
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self._drag_position is not None:
+            self._drag_position = None
+            self.setCursor(Qt.OpenHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.LeftButton:
@@ -2151,6 +2215,7 @@ class ImagePreviewDialog(FramelessDialog):
         self.image = self.image_label
         self.image_label.zoom_requested.connect(self._step_zoom)
         self.image_label.fit_requested.connect(self.fit_to_window)
+        self.image_label.pan_requested.connect(self._pan_image)
         if self._source_pixmap.loadFromData(self.data):
             self.image_scroll.setWidget(self.image_label)
             self._apply_zoom()
@@ -2229,6 +2294,12 @@ class ImagePreviewDialog(FramelessDialog):
         self.image_scroll.verticalScrollBar().setValue(
             round(center_y * self.image_label.height() - viewport.height() / 2)
         )
+
+    def _pan_image(self, delta):
+        horizontal = self.image_scroll.horizontalScrollBar()
+        vertical = self.image_scroll.verticalScrollBar()
+        horizontal.setValue(horizontal.value() - delta.x())
+        vertical.setValue(vertical.value() - delta.y())
 
     def fit_to_window(self):
         if self._source_pixmap.isNull():
@@ -2939,10 +3010,14 @@ class AnnouncementAdminPage(QWidget):
         )
         splitter.addWidget(self.announcement_table)
         self.announcement_preview = QTextBrowser()
+        self.announcement_preview.setObjectName("AnnouncementBody")
         self.announcement_preview.setOpenExternalLinks(False)
         self.announcement_preview.setPlaceholderText("选择公告后在这里预览正文。")
         splitter.addWidget(self.announcement_preview)
         self.announcement_receipt_detail = QPlainTextEdit()
+        self.announcement_receipt_detail.setObjectName(
+            "AnnouncementReceiptDetail"
+        )
         self.announcement_receipt_detail.setReadOnly(True)
         self.announcement_receipt_detail.setMaximumHeight(130)
         self.announcement_receipt_detail.setPlaceholderText(
@@ -2991,12 +3066,16 @@ class AnnouncementAdminPage(QWidget):
             self.message_table,
             [80, 105, 145, 200, 280, 170],
         )
+        self.message_table.horizontalHeader().setSectionResizeMode(
+            4,
+            QHeaderView.Stretch,
+        )
         inbox_layout.addWidget(self.message_table, 1)
         self.message_tab_index = self.tabs.addTab(inbox, "用户消息")
         self.message_tab_badge = QLabel("0")
         self.message_tab_badge.setObjectName("AnnouncementTabBadge")
         self.message_tab_badge.setAlignment(Qt.AlignCenter)
-        self.message_tab_badge.setMinimumSize(20, 20)
+        self.message_tab_badge.setMinimumHeight(22)
         self.message_tab_badge.setVisible(False)
         self.tabs.tabBar().setTabButton(
             self.message_tab_index,
@@ -3006,14 +3085,21 @@ class AnnouncementAdminPage(QWidget):
         self._selection_state()
 
     def set_unread_message_count(self, count):
-        """Show the unread bubble on the user-message tab."""
+        """Show an explicit new-message notice on the user-message tab."""
         count = max(0, int(count or 0))
         badge = getattr(self, "message_tab_badge", None)
         if badge is None:
             return
-        badge.setText("99+" if count > 99 else str(count))
+        text = f"有 {count} 条新消息"
+        badge.setText(text)
+        badge.setFixedWidth(
+            badge.fontMetrics().horizontalAdvance(text) + 18
+            if count
+            else 0
+        )
         badge.setVisible(bool(count))
         badge.setToolTip(f"{count} 条未读用户消息" if count else "")
+        self.tabs.tabBar().updateGeometry()
         badge.update()
 
     @staticmethod
@@ -3215,10 +3301,7 @@ class AnnouncementAdminPage(QWidget):
         )
 
     def _message_selection_changed(self):
-        message = self._selected_message()
         self._selection_state()
-        if message and int(message.get("unread_count") or 0):
-            self._mark_message_read(message)
 
     def _create(self):
         dialog = AnnouncementEditorDialog(self.accounts, parent=self)
@@ -3402,7 +3485,6 @@ class AnnouncementAdminPage(QWidget):
             current.activateWindow()
             current.message_edit.setFocus()
             return
-        self._mark_message_read(message)
         dialog = AdminConversationDialog(message, self.session, parent=None)
 
         def update_message(updated):

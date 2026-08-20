@@ -65,10 +65,10 @@ class UpdateHub:
         return closed
 
     async def broadcast_revision(self, revision: int) -> None:
-        payload: dict[str, Any] = {
-            "type": "revision_changed",
-            "revision": revision,
-        }
+        await self.broadcast_event("revision_changed", revision=revision)
+
+    async def broadcast_event(self, event_type: str, **fields: Any) -> None:
+        payload: dict[str, Any] = {"type": str(event_type), **fields}
         async with self._lock:
             clients = tuple(self._clients)
         failed = []

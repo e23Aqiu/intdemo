@@ -18,7 +18,6 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
-    QButtonGroup,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -53,7 +52,7 @@ from .table_utils import make_table_columns_resizable
 
 
 MILLISECONDS_PER_HOUR = 60 * 60 * 1000
-DISTRIBUTION_CHART_HEIGHT = 300
+DISTRIBUTION_CHART_HEIGHT = 270
 DISTRIBUTION_PANEL_RADIUS = 8
 DISTRIBUTION_TITLE_LEFT = 20
 DISTRIBUTION_TITLE_BASELINE = 29
@@ -435,7 +434,7 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         self._scope = ""
         self._bar_rects = []
         self._bar_payloads = []
-        self.setMinimumHeight(280)
+        self.setMinimumHeight(DISTRIBUTION_CHART_HEIGHT)
 
     def set_values(self, values, scope=""):
         self._values = {key: int(value or 0) for key, value in values.items()}
@@ -667,7 +666,7 @@ class ViolationReasonChart(AnimatedDonutChart):
         self.mode_button.setChecked(True)
         self.mode_button.setFixedSize(150, 32)
         self.mode_button.toggled.connect(self._on_mode_button_toggled)
-        self.setMinimumHeight(280)
+        self.setMinimumHeight(DISTRIBUTION_CHART_HEIGHT)
 
     def set_rows(self, rows, scope=""):
         self._rows = sorted(
@@ -944,7 +943,7 @@ class ViolationReasonChart(AnimatedDonutChart):
 
 
 class StationDistributionChart(AnimatedDonutChart):
-    """Compare station counts with bars and station timing with one donut."""
+    """Compare station counts with two donuts and a switchable meter list."""
 
     TOTAL_COLOR = QColor("#1d8178")
     PHONE_COLOR = QColor("#f0a45d")
@@ -957,8 +956,8 @@ class StationDistributionChart(AnimatedDonutChart):
         QColor("#df8b55"),
         QColor("#4a9c91"),
     )
-    COUNT_ROW_HEIGHT = 42
-    TIMING_ROW_HEIGHT = 34
+    COUNT_ROW_HEIGHT = 33
+    TIMING_ROW_HEIGHT = 33
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -968,32 +967,41 @@ class StationDistributionChart(AnimatedDonutChart):
         self._series_mode = "counts"
         self._timing_basis = "total"
         self._count_metric = "total"
-        self.count_metric_group = QButtonGroup(self)
-        self.count_metric_group.setExclusive(True)
-        self.total_count_button = QPushButton("总计数", self)
-        self.phone_count_button = QPushButton("有电话计数", self)
-        for button, metric in (
-            (self.total_count_button, "total"),
-            (self.phone_count_button, "has_phone"),
-        ):
-            button.setObjectName("StationMetricSegment")
-            button.setCheckable(True)
-            button.setProperty("metric", metric)
-            button.setFixedHeight(30)
-            self.count_metric_group.addButton(button)
-            button.clicked.connect(
-                lambda _checked=False, value=metric: self.set_count_metric(value)
+        self._station_colors = {}
+        self.count_metric_button = QPushButton("计量条：总计数", self)
+        self.count_metric_button.setObjectName("StationMetricSegment")
+        self.count_metric_button.setCheckable(True)
+        self.count_metric_button.setFixedHeight(30)
+        self.count_metric_button.setToolTip("切换右侧站点计量条")
+        self.count_metric_button.clicked.connect(
+            lambda checked=False: self.set_count_metric(
+                "has_phone" if checked else "total"
             )
-        self.total_count_button.setChecked(True)
-        self.setMinimumHeight(280)
+        )
+        self.setMinimumHeight(DISTRIBUTION_CHART_HEIGHT)
 
     def set_rows(self, rows):
         self._rows = [dict(row) for row in rows]
+        station_keys = sorted(
+            {self._station_key(row) for row in self._rows},
+            key=str.casefold,
+        )
+        self._station_colors = {
+            key: self.COLORS[index % len(self.COLORS)]
+            for index, key in enumerate(station_keys)
+        }
         self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
         self._reset_meter_scroll()
         self.update()
+
+    @staticmethod
+    def _station_key(row):
+        return str(row.get("username") or row.get("station") or "-")
+
+    def _station_color(self, row):
+        return self._station_colors.get(self._station_key(row), self.COLORS[0])
 
     def _sort_rows(self):
         if self._series_mode == "timing":
@@ -1017,8 +1025,7 @@ class StationDistributionChart(AnimatedDonutChart):
             raise ValueError(f"Unsupported station distribution mode: {mode}")
         self._series_mode = mode
         show_count_switch = mode == "counts"
-        self.total_count_button.setVisible(show_count_switch)
-        self.phone_count_button.setVisible(show_count_switch)
+        self.count_metric_button.setVisible(show_count_switch)
         self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
@@ -1029,12 +1036,12 @@ class StationDistributionChart(AnimatedDonutChart):
         if metric not in {"total", "has_phone"}:
             raise ValueError(f"Unsupported station count metric: {metric}")
         self._count_metric = metric
-        target = (
-            self.total_count_button
+        self.count_metric_button.setChecked(metric == "has_phone")
+        self.count_metric_button.setText(
+            "计量条：总计数"
             if metric == "total"
-            else self.phone_count_button
+            else "计量条：有电话计数"
         )
-        target.setChecked(True)
         self._sort_rows()
         self._hover_card.hide()
         self._reset_meter_scroll()
@@ -1042,22 +1049,14 @@ class StationDistributionChart(AnimatedDonutChart):
 
     def resizeEvent(self, event):
         right = self.width() - 18
-        phone_width = 108
-        total_width = 82
-        self.phone_count_button.setGeometry(
-            right - phone_width,
+        button_width = 150
+        self.count_metric_button.setGeometry(
+            right - button_width,
             8,
-            phone_width,
+            button_width,
             30,
         )
-        self.total_count_button.setGeometry(
-            right - phone_width - total_width + 1,
-            8,
-            total_width,
-            30,
-        )
-        self.total_count_button.raise_()
-        self.phone_count_button.raise_()
+        self.count_metric_button.raise_()
         super().resizeEvent(event)
 
     def set_timing_basis(self, basis):
@@ -1091,7 +1090,18 @@ class StationDistributionChart(AnimatedDonutChart):
             -outer.width() * 0.28,
             -outer.height() * 0.28,
         )
-        total = sum(max(0, int(row[value_key])) for row in self._rows)
+        rows = (
+            sorted(
+                self._rows,
+                key=lambda row: (
+                    self._station_key(row).casefold(),
+                    str(row.get("station") or "").casefold(),
+                ),
+            )
+            if self._series_mode == "counts"
+            else self._rows
+        )
+        total = sum(max(0, int(row[value_key])) for row in rows)
         if show_title:
             painter.setPen(QColor("#526e6d"))
             painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Bold))
@@ -1103,11 +1113,11 @@ class StationDistributionChart(AnimatedDonutChart):
 
         if total:
             start_degrees = 90.0
-            for index, row in enumerate(self._rows):
+            for row in rows:
                 value = int(row[value_key])
                 span_degrees = -(value / total * 360)
                 if value:
-                    color = self.COLORS[index % len(self.COLORS)]
+                    color = self._station_color(row)
                     self._slice_hitboxes.append(
                         {
                             "outer": QRectF(outer),
@@ -1161,7 +1171,7 @@ class StationDistributionChart(AnimatedDonutChart):
             center_label,
         )
 
-    def _paint_count_bars(self, painter):
+    def _paint_count_bars(self, painter, left):
         value_key = self._count_metric
         share_key = "total_share" if value_key == "total" else "phone_share"
         metric_label = "总计数" if value_key == "total" else "有电话计数"
@@ -1169,7 +1179,6 @@ class StationDistributionChart(AnimatedDonutChart):
             (max(0, int(row.get(value_key) or 0)) for row in self._rows),
             default=0,
         )
-        left = DISTRIBUTION_CHART_LEFT
         right = self.width() - 22
         width = max(120, right - left)
         top = DISTRIBUTION_CHART_TOP
@@ -1201,7 +1210,7 @@ class StationDistributionChart(AnimatedDonutChart):
                 painter.setBrush(QColor("#f5f8f7"))
                 painter.drawRoundedRect(row_rect, 5, 5)
 
-            color = self.COLORS[index % len(self.COLORS)]
+            color = self._station_color(row)
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)
             painter.drawRoundedRect(QRectF(left + 2, row_top + 4, 10, 10), 3, 3)
@@ -1245,7 +1254,41 @@ class StationDistributionChart(AnimatedDonutChart):
 
         painter.setPen(QColor("#647c7b"))
         painter.setFont(QFont("Microsoft YaHei UI", 9))
-        painter.drawText(155, DISTRIBUTION_TITLE_BASELINE, f"{metric_label}降序")
+        painter.drawText(
+            155,
+            DISTRIBUTION_TITLE_BASELINE,
+            f"{metric_label}计量条",
+        )
+
+    def _paint_count_distribution(self, painter):
+        chart_area_width = min(430, max(330, int(self.width() * 0.43)))
+        chart_gap = 18
+        chart_size = min(
+            168,
+            max(112, self.height() - 112),
+            max(112, int((chart_area_width - 44) / 2)),
+        )
+        chart_top = 82
+        first_left = 20
+        series = (
+            ("total", "total_share", "各站总计数占比", "总计数"),
+            ("has_phone", "phone_share", "各站有电话数占比", "有电话数"),
+        )
+        for index, (value_key, share_key, title, center_label) in enumerate(series):
+            left = first_left + index * (chart_size + chart_gap)
+            self._draw_series_donut(
+                painter,
+                QRectF(left, chart_top, chart_size, chart_size),
+                value_key,
+                share_key,
+                title,
+                center_label,
+            )
+        meter_left = max(
+            chart_area_width + 24,
+            first_left + chart_size * 2 + chart_gap + 28,
+        )
+        self._paint_count_bars(painter, meter_left)
 
     def paintEvent(self, event):
         self._slice_hitboxes = []
@@ -1289,7 +1332,7 @@ class StationDistributionChart(AnimatedDonutChart):
             return
 
         if not is_timing_mode:
-            self._paint_count_bars(painter)
+            self._paint_count_distribution(painter)
             return
 
         if self._timing_basis == "active":
@@ -1366,7 +1409,7 @@ class StationDistributionChart(AnimatedDonutChart):
             )
             if hitbox.intersects(meter_viewport):
                 self._legend_hitboxes.append((hitbox, dict(row)))
-            color = self.COLORS[index % len(self.COLORS)]
+            color = self._station_color(row)
             label_height = 20
             painter.setPen(Qt.NoPen)
             painter.setBrush(color)

@@ -84,7 +84,7 @@ class TokenBundle(StrictModel):
 
 
 class AccountCreate(StrictModel):
-    username: str = Field(min_length=1, max_length=80, pattern=r"^[A-Za-z0-9_.-]+$")
+    username: str = Field(min_length=1, max_length=80)
     display_name: str = Field(min_length=1, max_length=120)
     role: Literal["admin", "user"] = "user"
     is_test: bool = False
@@ -95,7 +95,15 @@ class AccountCreate(StrictModel):
     @field_validator("username")
     @classmethod
     def normalize_username(cls, value: str) -> str:
-        return value.strip().lower()
+        value = value.strip().lower()
+        if not value:
+            raise ValueError("登录名不能为空")
+        if any(
+            character.isspace() or not character.isprintable()
+            for character in value
+        ):
+            raise ValueError("登录名不能包含空白或控制字符")
+        return value
 
     @field_validator("display_name")
     @classmethod

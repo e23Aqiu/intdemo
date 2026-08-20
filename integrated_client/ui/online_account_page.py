@@ -48,7 +48,9 @@ class _AccountSettingsDialog(FramelessDialog):
         form = QFormLayout()
         self.username = QLineEdit(account.username if account else "")
         self.username.setEnabled(account is None)
+        self.username.setMaxLength(80)
         self.display_name = QLineEdit(account.name_label if account else "")
+        self.display_name.setMaxLength(120)
         self.role = QComboBox()
         self.role.addItem("普通用户", "user")
         self.role.addItem("测试账号", "test")
@@ -102,8 +104,21 @@ class _AccountSettingsDialog(FramelessDialog):
         layout.addLayout(buttons)
 
     def _accept_if_valid(self):
-        if not self.username.text().strip() or not self.display_name.text().strip():
+        username = self.username.text().strip()
+        if not username or not self.display_name.text().strip():
             QMessageBox.warning(self, "资料不完整", "登录名和站点显示名不能为空。")
+            return
+        invalid_username = any(
+            character.isspace() or not character.isprintable()
+            for character in username
+        )
+        if invalid_username:
+            QMessageBox.warning(
+                self,
+                "登录名无效",
+                "登录名不能包含空格、换行或其他控制字符。",
+            )
+            self.username.setFocus()
             return
         self.accept()
 
@@ -578,8 +593,36 @@ class OnlineAccountPage(AccountPage):
                 lambda: function(self.session.access_token(), *args),
             )
         except (ApiResponseError, NetworkUnavailable) as exc:
-            QMessageBox.warning(self, "在线操作失败", str(exc))
+            QMessageBox.warning(self, "在线操作失败", self._api_error_text(exc))
             return _CALL_FAILED
+
+    @staticmethod
+    def _api_error_text(error):
+        if not isinstance(error, ApiResponseError) or not isinstance(
+            error.details, list
+        ):
+            return str(error)
+        field_labels = {
+            "username": "登录名",
+            "display_name": "站点显示名",
+            "role": "角色",
+            "is_test": "账号类型",
+            "stats_scope": "数据范围",
+            "device_limit": "登录设备上限",
+            "is_active": "账号状态",
+        }
+        messages = []
+        for detail in error.details[:4]:
+            if not isinstance(detail, dict):
+                continue
+            location = list(detail.get("loc") or [])
+            field = str(location[-1]) if location else "请求参数"
+            label = field_labels.get(field, field)
+            message = str(detail.get("msg") or "参数无效").removeprefix(
+                "Value error, "
+            )
+            messages.append(f"{label}：{message}")
+        return "\n".join(messages) if messages else str(error)
 
     def refresh(self):
         rows = self._call(self.session.api.admin_accounts)
@@ -806,24 +849,41 @@ class OnlineAccountPage(AccountPage):
         dialog = _AccountSettingsDialog(account, self)
         if dialog.exec_() != dialog.Accepted:
             return
-        payload = dialog.values()
-        payload.pop("username", None)
-        if bool(payload.get("is_test")) == bool(account.is_test):
-            payload.pop("is_test", None)
+        requested = dialog.values()
+        requested.pop("username", None)
+        current = {
+            "display_name": account.name_label,
+            "role": account.role,
+            "is_test": bool(account.is_test),
+            "stats_scope": account.stats_scope,
+            "device_limit": int(
+                getattr(account, "_device_limit", 10000) or 10000
+            ),
+            "is_active": bool(account.is_active),
+        }
+        payload = {
+            field: value
+            for field, value in requested.items()
+            if value != current.get(field)
+        }
+        if not payload:
+            return
         result = self._call(
             self.session.api.admin_update_account,
             account.server_account_id,
             payload,
         )
         if result is not _CALL_FAILED:
-            self.account_name_changed.emit(
-                account.id,
-                payload["display_name"],
-            )
-            self.account_permission_changed.emit(
-                account.id,
-                payload["role"],
-            )
+            if "display_name" in payload:
+                self.account_name_changed.emit(
+                    account.id,
+                    payload["display_name"],
+                )
+            if {"role", "is_test", "stats_scope", "is_active"} & payload.keys():
+                self.account_permission_changed.emit(
+                    account.id,
+                    str(payload.get("role", account.role)),
+                )
             self.refresh()
 
     def _reset_password(self):

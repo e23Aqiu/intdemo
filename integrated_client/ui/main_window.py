@@ -107,6 +107,9 @@ class MainWindow(FramelessMainWindow):
     logout_requested = pyqtSignal()
     window_closed = pyqtSignal()
     PAGE_CANVAS_SIZE = QSize(1220, 700)
+    RECONNECT_SYNC_BUSY_MESSAGE = (
+        "同步任务正在结束当前操作，暂时无法重新上线，请稍后再试。"
+    )
     DATA_CENTER_VIEWS = {
         "data_station": "station_distribution",
         "data_timing": "timing",
@@ -357,6 +360,13 @@ class MainWindow(FramelessMainWindow):
         if self.sync_coordinator is not None:
             self.sync_coordinator.status_changed.connect(self._update_sync_status)
             self.sync_coordinator.data_changed.connect(self._online_data_changed)
+            messages_changed = getattr(
+                self.sync_coordinator,
+                "messages_changed",
+                None,
+            )
+            if messages_changed is not None:
+                messages_changed.connect(self.refresh_announcements)
             self._update_sync_status(self.sync_coordinator.engine.status())
         if self.captcha_learning_service is not None:
             self.captcha_learning_service.policy_changed.connect(
@@ -1137,7 +1147,11 @@ class MainWindow(FramelessMainWindow):
         if button is None:
             return
         button.setProperty("hasMessage", bool(unread_count))
-        button.setText(f"公告发布    ● {unread_count}" if unread_count else "公告发布")
+        button.setText(
+            f"公告发布  ·  新消息 {unread_count}"
+            if unread_count
+            else "公告发布"
+        )
         button.setToolTip(f"收到 {unread_count} 条未读用户消息" if unread_count else "")
         button.style().unpolish(button)
         button.style().polish(button)
@@ -1516,11 +1530,12 @@ class MainWindow(FramelessMainWindow):
                 )
             )
         session_state = getattr(self.session_manager, "state", None)
+        reconnect_unavailable_reason = self._reconnect_unavailable_reason(
+            status.state
+        )
         reconnect_available = bool(
             session_state is not None
-            and not session_state.is_online
-            and session_state.mode != "offline_untracked"
-            and status.state != "syncing"
+            and not reconnect_unavailable_reason
         )
         self.sidebar_profile.setProperty(
             "reconnectAvailable",
@@ -1530,7 +1545,9 @@ class MainWindow(FramelessMainWindow):
             Qt.PointingHandCursor if reconnect_available else Qt.ArrowCursor
         )
         self.sidebar_profile.setToolTip(
-            "点击输入密码并重新上线" if reconnect_available else "当前账号已在线"
+            "点击输入密码并重新上线"
+            if reconnect_available
+            else reconnect_unavailable_reason
         )
         self.sidebar_profile.style().unpolish(self.sidebar_profile)
         self.sidebar_profile.style().polish(self.sidebar_profile)
@@ -1543,12 +1560,44 @@ class MainWindow(FramelessMainWindow):
     def _require_reauthentication(self):
         self._reconnect_online()
 
-    def _reconnect_online(self):
+    def _reconnect_unavailable_reason(self, sync_state=None):
         if self.session_manager is None:
+            if self.offline_business_mode:
+                return (
+                    "当前为离线游客模式，没有可恢复的在线登录会话。"
+                    "请先退出游客模式，再使用账号登录。"
+                )
+            return (
+                "当前未连接在线登录服务，无法从账号区域重新上线。"
+                "请返回登录页后重新登录。"
+            )
+        state = self.session_manager.state
+        if state is None:
+            return "当前没有可恢复的登录会话，请返回登录页后重新登录。"
+        if state.mode == "offline_untracked":
+            return (
+                "当前为手动离线业务模式，不能在此恢复在线。"
+                "请先退出游客模式，再使用账号登录。"
+            )
+        if state.is_online:
+            return "当前账号的登录会话仍然有效，无需重新上线。"
+        if sync_state == "syncing":
+            return self.RECONNECT_SYNC_BUSY_MESSAGE
+        return ""
+
+    def _show_reconnect_unavailable(self, reason):
+        QMessageBox.information(
+            self,
+            "暂时无法重新上线",
+            reason,
+        )
+
+    def _reconnect_online(self):
+        unavailable_reason = self._reconnect_unavailable_reason()
+        if unavailable_reason:
+            self._show_reconnect_unavailable(unavailable_reason)
             return
         state = self.session_manager.state
-        if state is None or state.is_online or state.mode == "offline_untracked":
-            return
         coordinator_was_active = bool(
             self.sync_coordinator is not None
             and not bool(
@@ -1565,14 +1614,33 @@ class MainWindow(FramelessMainWindow):
                 "pause_for_reauthentication",
                 None,
             )
-            if callable(pause):
-                paused = pause()
-            else:
-                if getattr(self.sync_coordinator, "_running", False):
-                    return
-                self.sync_coordinator.stop()
-                paused = True
+            try:
+                if callable(pause):
+                    paused = pause()
+                else:
+                    if getattr(self.sync_coordinator, "_running", False):
+                        self._show_reconnect_unavailable(
+                            self.RECONNECT_SYNC_BUSY_MESSAGE
+                        )
+                        return
+                    stop = getattr(self.sync_coordinator, "stop", None)
+                    if not callable(stop):
+                        self._show_reconnect_unavailable(
+                            "同步组件当前无法暂停，请稍后再试；若持续出现，"
+                            "请返回登录页后重新登录。"
+                        )
+                        return
+                    stop()
+                    paused = True
+            except Exception as exc:  # noqa: BLE001 - Qt slots must show failures
+                self._show_reconnect_unavailable(
+                    f"同步组件暂时无法暂停：{exc}"
+                )
+                return
             if not paused:
+                self._show_reconnect_unavailable(
+                    self.RECONNECT_SYNC_BUSY_MESSAGE
+                )
                 return
         dialog = ReconnectDialog(self.session_manager, self.account, self)
         if dialog.exec_() != dialog.Accepted or dialog.account is None:
