@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from integrated_client.config import APP_NAME
+from release_publisher import release_tasks
 from release_publisher.connection_control import ConnectionControlClient
 from release_publisher.core import (
     CommandStep,
@@ -26,6 +27,7 @@ from release_publisher.core import (
     build_git_push_plan,
     build_package_steps,
     build_pause_distribution_steps,
+    build_publish_steps,
     build_release_plan,
     find_inno_compiler,
     git_status,
@@ -300,6 +302,23 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         self.assertIn("publish", publish_step.arguments)
         self.assertIn("--mandatory", publish_step.arguments)
         self.assertIn("--remote-host", publish_step.arguments)
+
+    def test_publish_notes_starting_with_dashes_remain_one_argument(self):
+        notes = "-- 修复登录参数\n- 优化发布流程"
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.1.1",
+            base_url="https://api.example.com",
+            notes=notes,
+            remote_host="intdemo-test",
+        )
+
+        step = build_publish_steps(options)[0]
+        parsed = release_tasks.build_parser().parse_args(list(step.arguments)[1:])
+
+        self.assertIn(f"--notes={notes}", step.arguments)
+        self.assertNotIn("--notes", step.arguments)
+        self.assertEqual(parsed.notes, notes)
 
     def test_native_uos_plan_supports_selected_platforms_and_unified_publish(self):
         both = ReleaseOptions(
