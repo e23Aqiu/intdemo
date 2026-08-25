@@ -4563,6 +4563,51 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertFalse(other.station_view_toggle.isChecked())
         other.close()
 
+    def test_yellow_statistics_filter_persists_and_syncs_between_pages(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        window = MainWindow(
+            self.db,
+            self.admin,
+            client_preferences=preferences,
+        )
+        self.assertTrue(window.dashboard_page.yellow_only_check.isChecked())
+        self.assertTrue(window.statistics_page.yellow_only_check.isChecked())
+
+        window.dashboard_page.yellow_only_check.setChecked(False)
+        self.app.processEvents()
+        self.assertFalse(window.statistics_page.yellow_only_check.isChecked())
+        self.assertFalse(
+            ClientPreferences(self.temp_dir.name).statistics_yellow_only("ADMIN")
+        )
+        window.close()
+
+        restored_preferences = ClientPreferences(self.temp_dir.name)
+        restored_dashboard = DashboardPage(
+            self.db,
+            self.admin,
+            client_preferences=restored_preferences,
+            account_key="admin",
+        )
+        restored_statistics = StatisticsPage(
+            self.db,
+            self.admin,
+            client_preferences=restored_preferences,
+            account_key="Admin",
+        )
+        self.assertFalse(restored_dashboard.yellow_only_check.isChecked())
+        self.assertFalse(restored_statistics.yellow_only_check.isChecked())
+        restored_dashboard.close()
+        restored_statistics.close()
+
+        other_account = DashboardPage(
+            self.db,
+            self.admin,
+            client_preferences=restored_preferences,
+            account_key="station01",
+        )
+        self.assertTrue(other_account.yellow_only_check.isChecked())
+        other_account.close()
+
     def test_tencent_docs_result_is_automatically_loaded_without_timing(self):
         workbook_path = Path(self.temp_dir.name) / "tencent-pending.xlsx"
         workbook = Workbook()

@@ -826,11 +826,16 @@ class DashboardPage(QWidget):
         self.station_combo.currentIndexChanged.connect(self.refresh)
         scope_layout.addWidget(self.station_combo)
         self.yellow_only_check = QCheckBox("只看黄牌车辆")
-        self.yellow_only_check.setChecked(True)
-        self.yellow_only_check.setToolTip(
-            "默认仅显示黄牌车辆；历史统计数据按黄牌车辆处理"
+        saved_yellow_only = (
+            self.client_preferences.statistics_yellow_only(self.account_key)
+            if self.client_preferences is not None
+            else True
         )
-        self.yellow_only_check.toggled.connect(self.refresh)
+        self.yellow_only_check.setChecked(saved_yellow_only)
+        self.yellow_only_check.setToolTip(
+            "自动记住上次选择；历史统计数据按黄牌车辆处理"
+        )
+        self.yellow_only_check.toggled.connect(self._toggle_yellow_only)
         scope_layout.addWidget(self.yellow_only_check)
         header.addWidget(scope_group)
 
@@ -950,6 +955,14 @@ class DashboardPage(QWidget):
                 self.account_key,
                 "chart" if show_charts else "table",
             )
+
+    def _toggle_yellow_only(self, checked):
+        if self.client_preferences is not None and self.account_key:
+            self.client_preferences.set_statistics_yellow_only(
+                self.account_key,
+                bool(checked),
+            )
+        self.refresh()
 
     @staticmethod
     def _table(headers):

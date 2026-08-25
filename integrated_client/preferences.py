@@ -224,6 +224,28 @@ class ClientPreferences:
         payload["dashboard_station_views"] = views
         self._save(payload)
 
+    def statistics_yellow_only(self, username: str) -> bool:
+        account_key = self._account_key(username)
+        if not account_key:
+            return True
+        settings = self._load().get("statistics_yellow_only")
+        if not isinstance(settings, dict):
+            return True
+        value = settings.get(account_key)
+        return value if isinstance(value, bool) else True
+
+    def set_statistics_yellow_only(self, username: str, checked: bool) -> None:
+        account_key = self._account_key(username)
+        if not account_key:
+            raise ValueError("无法识别当前登录账号")
+        payload = self._load()
+        settings = payload.get("statistics_yellow_only")
+        if not isinstance(settings, dict):
+            settings = {}
+        settings[account_key] = bool(checked)
+        payload["statistics_yellow_only"] = settings
+        self._save(payload)
+
     def workflow_run_settings(self, username: str) -> dict:
         account_key = self._account_key(username)
         if not account_key:

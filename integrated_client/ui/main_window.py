@@ -243,13 +243,25 @@ class MainWindow(FramelessMainWindow):
         self.statistics_page = None
         self.dashboard_page = None
         if not self.offline_business_mode:
-            self.statistics_page = StatisticsPage(database, account, warning)
+            self.statistics_page = StatisticsPage(
+                database,
+                account,
+                warning,
+                client_preferences=self.client_preferences,
+                account_key=account.username,
+            )
             self.statistics_page.set_sidebar_navigation(True)
             self.dashboard_page = DashboardPage(
                 database,
                 account,
                 client_preferences=self.client_preferences,
                 account_key=account.username,
+            )
+            self.dashboard_page.yellow_only_check.toggled.connect(
+                self.statistics_page.yellow_only_check.setChecked
+            )
+            self.statistics_page.yellow_only_check.toggled.connect(
+                self.dashboard_page.yellow_only_check.setChecked
             )
         self.workflow_timing = (
             WorkflowTimingService(database, account.id)

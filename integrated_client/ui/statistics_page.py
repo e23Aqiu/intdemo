@@ -1565,10 +1565,21 @@ class StatisticsPage(QWidget):
         ),
     }
 
-    def __init__(self, database: Database, account: Account, dependency_warning="", parent=None):
+    def __init__(
+        self,
+        database: Database,
+        account: Account,
+        dependency_warning="",
+        parent=None,
+        *,
+        client_preferences=None,
+        account_key=None,
+    ):
         super().__init__(parent)
         self.database = database
         self.account = account
+        self.client_preferences = client_preferences
+        self.account_key = str(account_key or account.username or "")
         self._sidebar_navigation = False
         self._timing_basis = "total"
 
@@ -1633,9 +1644,14 @@ class StatisticsPage(QWidget):
         self.category_combo.addItem("按违规类型", "violation")
         self.date_range_selector = DateRangeSelector()
         self.yellow_only_check = QCheckBox("只看黄牌车辆")
-        self.yellow_only_check.setChecked(True)
+        saved_yellow_only = (
+            self.client_preferences.statistics_yellow_only(self.account_key)
+            if self.client_preferences is not None
+            else True
+        )
+        self.yellow_only_check.setChecked(saved_yellow_only)
         self.yellow_only_check.setToolTip(
-            "默认仅显示黄牌车辆；历史统计数据按黄牌车辆处理"
+            "自动记住上次选择；历史统计数据按黄牌车辆处理"
         )
         (
             self.station_filter_group,
@@ -1705,7 +1721,7 @@ class StatisticsPage(QWidget):
         self.station_combo.currentIndexChanged.connect(self.refresh)
         self.category_combo.currentIndexChanged.connect(self._on_category_changed)
         self.date_range_selector.range_changed.connect(self.refresh)
-        self.yellow_only_check.toggled.connect(self.refresh)
+        self.yellow_only_check.toggled.connect(self._toggle_yellow_only)
 
         self.kpi_layout = QGridLayout()
         self.kpi_layout.setSpacing(10)
@@ -1851,6 +1867,14 @@ class StatisticsPage(QWidget):
 
     def _refresh_with_loading(self, _checked=False):
         return run_ui_with_loading(self, "正在加载统计数据…", self.refresh)
+
+    def _toggle_yellow_only(self, checked):
+        if self.client_preferences is not None and self.account_key:
+            self.client_preferences.set_statistics_yellow_only(
+                self.account_key,
+                bool(checked),
+            )
+        self.refresh()
 
     def set_sidebar_navigation(self, enabled=True):
         """由主窗口的数据中心侧边栏接管详细统计分类。"""
