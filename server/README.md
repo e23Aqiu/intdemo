@@ -40,4 +40,8 @@ account owns it. Unassigned stations are managed directly by a global
 administrator. Permanently deleting the last manager releases every station on
 that road and removes the road; archiving keeps the relationship so it can be
 restored. Legacy v1.1.x account creation without a road remains valid and creates
-an unassigned station.
+an unassigned station. Road-administrator accounts do not contribute business
+statistics: legacy client uploads are acknowledged for outbox compatibility but
+do not create metric or workflow rows, and existing rows are omitted from pull
+and snapshot results. Their permitted road/all scopes still expose centre-station
+statistics in the assigned data range.

@@ -23,9 +23,11 @@ from ..models import (
     WorkflowRun,
 )
 from ..permissions import (
+    ROAD_ADMIN,
     account_type,
     effective_data_scope,
     legacy_stats_scope,
+    participates_in_statistics,
     scoped_account_ids,
 )
 from ..realtime import update_hub
@@ -320,10 +322,10 @@ def _process_item(
             status="duplicate",
             server_revision=receipt.server_revision,
         )
-    # Test accounts retain ordinary-user permissions but never contribute
-    # business statistics.  Acknowledge queued items so old clients can
-    # drain their outbox without creating server-side metric rows.
-    if account.is_test:
+    # Road managers and test accounts do not contribute business statistics.
+    # Their items are still acknowledged so older clients can drain their
+    # outbox without creating server-side metric rows.
+    if not participates_in_statistics(account):
         server_revision = latest_revision(db)
         db.add(
             SyncReceipt(
@@ -551,11 +553,16 @@ def pull(
         context.device.client_version,
     )
     query = select(ChangeLog).where(ChangeLog.revision > after_revision)
-    test_account_ids = select(Account.id).where(Account.is_test.is_(True))
+    non_statistic_account_ids = select(Account.id).where(
+        or_(
+            Account.is_test.is_(True),
+            Account.account_type == ROAD_ADMIN,
+        )
+    )
     query = query.where(
         or_(
             ChangeLog.account_id.is_(None),
-            ChangeLog.account_id.not_in(test_account_ids),
+            ChangeLog.account_id.not_in(non_statistic_account_ids),
             ChangeLog.kind == "account",
         )
     )
@@ -633,7 +640,9 @@ def snapshot(context: BusinessContext, db: Db) -> SnapshotResponse:
         context.device.client_version,
     )
     accounts = db.scalars(select(Account).where(Account.id.in_(account_ids))).all()
-    statistic_account_ids = [row.id for row in accounts if not row.is_test]
+    statistic_account_ids = [
+        row.id for row in accounts if participates_in_statistics(row)
+    ]
     metrics = db.scalars(
         select(MetricDefinition)
         .where(MetricDefinition.is_active.is_(True))

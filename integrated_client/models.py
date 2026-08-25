@@ -50,6 +50,10 @@ class Account:
         return self.resolved_account_type == "road_admin"
 
     @property
+    def is_station(self) -> bool:
+        return self.resolved_account_type == "station"
+
+    @property
     def is_account_manager(self) -> bool:
         return self.resolved_account_type in {"admin", "road_admin"}
 
@@ -75,4 +79,4 @@ class Account:
 
     @property
     def statistics_enabled(self) -> bool:
-        return not self.is_test
+        return not self.is_test and not self.is_road_admin

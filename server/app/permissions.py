@@ -54,6 +54,11 @@ def is_account_manager(account: Account) -> bool:
     return account_type(account) in {GLOBAL_ADMIN, ROAD_ADMIN}
 
 
+def participates_in_statistics(account: Account) -> bool:
+    """Keep legacy admins unchanged while excluding tests and road managers."""
+    return account_type(account) != ROAD_ADMIN and not account.is_test
+
+
 def can_manage_account(actor: Account, target: Account) -> bool:
     if is_global_admin(actor):
         return True

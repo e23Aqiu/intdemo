@@ -989,13 +989,16 @@ class DashboardPage(QWidget):
         stations = [
             account
             for account in self.database.list_accounts()
-            if not account.is_admin and not account.is_test
+            if account.is_station and not account.is_test
         ]
         restricted_online_scope = (
             self.account.server_account_id is not None
             and not self.account.can_view_shared_stats
         )
-        hidden_test_scope = self.account.is_test and not self.account.can_view_shared_stats
+        hidden_non_statistic_scope = (
+            not self.account.statistics_enabled
+            and not self.account.can_view_shared_stats
+        )
         if restricted_online_scope:
             stations = [
                 account for account in stations if account.id == self.account.id
@@ -1015,13 +1018,13 @@ class DashboardPage(QWidget):
             else "全部站点"
         )
         self.station_combo.addItem(
-            "不参与统计" if hidden_test_scope else aggregate_label,
-            self.account.id if hidden_test_scope else None,
+            "不参与统计" if hidden_non_statistic_scope else aggregate_label,
+            self.account.id if hidden_non_statistic_scope else None,
         )
         for station in stations:
             self.station_combo.addItem(station.name_label, station.id)
         available_ids = {station.id for station in stations}
-        if hidden_test_scope:
+        if hidden_non_statistic_scope:
             target_id = self.account.id
         elif had_options and current_id in available_ids:
             target_id = current_id
@@ -1050,7 +1053,7 @@ class DashboardPage(QWidget):
                 end_date,
                 yellow_only=yellow_only,
             ):
-                if row["role"] != "user":
+                if row["role"] != "user" or row["account_type"] != "station":
                     continue
                 totals[row["metric_key"]] = (
                     totals.get(row["metric_key"], 0) + int(row["total"])
@@ -1086,7 +1089,7 @@ class DashboardPage(QWidget):
         for row in self.database.get_all_account_totals(
             yellow_only=yellow_only
         ):
-            if row["role"] != "user":
+            if row["role"] != "user" or row["account_type"] != "station":
                 continue
             station = stations.setdefault(
                 row["user_id"],

@@ -689,6 +689,71 @@ def test_road_manager_display_name_owns_and_renames_the_category(client):
     assert duplicate.json()["code"] == "road_manager_exists"
 
 
+def test_promoted_road_manager_historical_statistics_are_excluded(client):
+    admin = changed_admin(client)
+    admin_headers = auth_header(admin)
+    station = _create_account(
+        client,
+        admin_headers,
+        username="historical_station",
+        display_name="历史中心站",
+        account_type="station",
+        data_scope="own",
+    )
+    station_bundle = _activate(
+        client,
+        "historical_station",
+        device=290,
+        password="Historical!234",
+    )
+    historical_item = _activity_item("historical-manager-event", 13)
+    pushed = client.post(
+        "/api/v1/sync/push",
+        headers=auth_header(station_bundle),
+        json={"items": [historical_item]},
+    )
+    assert pushed.status_code == 200, pushed.text
+    assert historical_item["event_uid"] in {
+        row["event_uid"]
+        for row in client.get(
+            "/api/v1/sync/snapshot",
+            headers=admin_headers,
+        ).json()["activity_events"]
+    }
+
+    promoted = client.patch(
+        f"/api/v1/admin/accounts/{station['id']}",
+        headers=admin_headers,
+        json={
+            "display_name": "历史统计路段",
+            "account_type": "road_admin",
+            "data_scope": "road",
+        },
+    )
+    assert promoted.status_code == 200, promoted.text
+    assert promoted.json()["road_name"] == "历史统计路段"
+    assert historical_item["event_uid"] not in {
+        row["event_uid"]
+        for row in client.get(
+            "/api/v1/sync/snapshot",
+            headers=admin_headers,
+        ).json()["activity_events"]
+    }
+    pulled = client.get(
+        "/api/v1/sync/pull?after_revision=0",
+        headers=admin_headers,
+    ).json()["changes"]
+    assert not any(
+        row["kind"] == "activity_event"
+        and row["entity_id"] == "historical-manager-event"
+        for row in pulled
+    )
+    assert any(
+        row["kind"] == "account" and row["entity_id"] == station["id"]
+        for row in pulled
+    )
+
+
 def test_legacy_account_create_without_road_stays_unassigned(client):
     admin = changed_admin(client)
     response = client.post(
@@ -770,6 +835,42 @@ def test_road_data_scope_and_legacy_client_downgrade(client):
     )
     same_item = _activity_item("same-road-event", 3)
     other_item = _activity_item("other-road-event", 5)
+    manager_item = _activity_item("manager-event", 11)
+    manager_batch = {
+        "schema_version": 1,
+        "event_uid": str(uuid.uuid4()),
+        "kind": "workflow_batch_snapshot",
+        "entity_id": "manager-batch",
+        "revision": 1,
+        "occurred_at": datetime.now(UTC).isoformat(),
+        "payload": {
+            "status": "succeeded",
+            "input_fingerprint": "0" * 64,
+            "business_date": "2026-08-25",
+            "elapsed_ms": 1200,
+            "active_ms": 1000,
+            "paused_ms": 200,
+            "retry_count": 0,
+            "counters": {"completed": 11},
+        },
+    }
+    manager_run = {
+        "schema_version": 1,
+        "event_uid": str(uuid.uuid4()),
+        "kind": "workflow_run_snapshot",
+        "entity_id": "manager-run",
+        "revision": 1,
+        "occurred_at": datetime.now(UTC).isoformat(),
+        "payload": {
+            "batch_id": "manager-batch",
+            "status": "succeeded",
+            "step_index": 1,
+            "elapsed_ms": 1200,
+            "active_ms": 1000,
+            "paused_ms": 200,
+            "retry_count": 0,
+        },
+    }
     assert client.post(
         "/api/v1/sync/push",
         headers=auth_header(same_bundle),
@@ -780,6 +881,28 @@ def test_road_data_scope_and_legacy_client_downgrade(client):
         headers=auth_header(other_bundle),
         json={"items": [other_item]},
     ).json()["items"][0]["status"] == "accepted"
+    manager_items = [manager_item, manager_batch, manager_run]
+    manager_push = client.post(
+        "/api/v1/sync/push",
+        headers=auth_header(manager),
+        json={"items": manager_items},
+    )
+    assert manager_push.status_code == 200, manager_push.text
+    assert [row["status"] for row in manager_push.json()["items"]] == [
+        "accepted",
+        "accepted",
+        "accepted",
+    ]
+    manager_duplicate = client.post(
+        "/api/v1/sync/push",
+        headers=auth_header(manager),
+        json={"items": manager_items},
+    )
+    assert [row["status"] for row in manager_duplicate.json()["items"]] == [
+        "duplicate",
+        "duplicate",
+        "duplicate",
+    ]
 
     road_snapshot = client.get(
         "/api/v1/sync/snapshot",
@@ -790,6 +913,27 @@ def test_road_data_scope_and_legacy_client_downgrade(client):
     assert road_snapshot["stats_scope"] == "own"
     assert same_item["event_uid"] in road_event_ids
     assert other_item["event_uid"] not in road_event_ids
+    assert manager_item["event_uid"] not in road_event_ids
+    assert "manager-batch" not in {
+        row["entity_id"] for row in road_snapshot["workflow_batches"]
+    }
+    assert "manager-run" not in {
+        row["entity_id"] for row in road_snapshot["workflow_runs"]
+    }
+
+    admin_snapshot = client.get(
+        "/api/v1/sync/snapshot",
+        headers=admin_headers,
+    ).json()
+    assert manager_item["event_uid"] not in {
+        row["event_uid"] for row in admin_snapshot["activity_events"]
+    }
+    assert "manager-batch" not in {
+        row["entity_id"] for row in admin_snapshot["workflow_batches"]
+    }
+    assert "manager-run" not in {
+        row["entity_id"] for row in admin_snapshot["workflow_runs"]
+    }
 
     moved_out = client.patch(
         f"/api/v1/admin/accounts/{same_station['id']}",

@@ -277,7 +277,7 @@ class MainWindow(FramelessMainWindow):
             untracked_label=(
                 "游客模式"
                 if self.offline_business_mode
-                else "测试账号" if account.is_test else "当前模式"
+                else account.role_label if not account.statistics_enabled else "当前模式"
             ),
             captcha_reporter=(
                 self.captcha_learning_service.record_attempt
@@ -1753,16 +1753,16 @@ class MainWindow(FramelessMainWindow):
         self.business_metrics_enabled = (
             self._business_metrics_requested and account.statistics_enabled
         )
-        if account.is_test:
+        if not account.statistics_enabled:
             if self.workflow_timing is not None and self.workflow_timing.is_active:
                 self.workflow_page._timing_finish_run(
                     "stopped",
-                    "账号已切换为测试账号",
+                    f"账号已切换为{account.role_label}",
                 )
             self.workflow_timing = None
             self.workflow_page._timing_service = None
             self.workflow_page._untracked_mode = True
-            self.workflow_page._untracked_label = "测试账号"
+            self.workflow_page._untracked_label = account.role_label
         elif self._business_metrics_requested and self.workflow_timing is None:
             self.workflow_timing = WorkflowTimingService(
                 self.database,

@@ -1990,7 +1990,10 @@ class StatisticsPage(QWidget):
             self.account.server_account_id is not None
             and not self.account.can_view_shared_stats
         )
-        hidden_test_scope = self.account.is_test and not self.account.can_view_shared_stats
+        hidden_non_statistic_scope = (
+            not self.account.statistics_enabled
+            and not self.account.can_view_shared_stats
+        )
         aggregate_label = (
             "本路段"
             if self.account.effective_data_scope == "road"
@@ -2000,7 +2003,7 @@ class StatisticsPage(QWidget):
         accounts = [
             account
             for account in self.database.list_accounts()
-            if not account.is_admin and not account.is_test
+            if account.is_station and not account.is_test
         ]
         if restricted_online_scope:
             accounts = [
@@ -2009,8 +2012,8 @@ class StatisticsPage(QWidget):
         accounts.sort(key=lambda item: (order.get(item.username, 999), item.name_label))
         options = [
             (
-                "不参与统计" if hidden_test_scope else aggregate_label,
-                self.account.id if hidden_test_scope else None,
+                "不参与统计" if hidden_non_statistic_scope else aggregate_label,
+                self.account.id if hidden_non_statistic_scope else None,
                 "",
             )
         ]
@@ -2024,7 +2027,7 @@ class StatisticsPage(QWidget):
             )
         signature = (
             restricted_online_scope,
-            hidden_test_scope,
+            hidden_non_statistic_scope,
             tuple((label, value, tooltip) for label, value, tooltip in options),
         )
         if getattr(self, "_station_options_signature", None) == signature:
@@ -2070,7 +2073,7 @@ class StatisticsPage(QWidget):
         accounts = [
             account
             for account in self.database.list_accounts()
-            if not account.is_admin and not account.is_test
+            if account.is_station and not account.is_test
         ]
         accounts.sort(
             key=lambda account: (
@@ -2986,7 +2989,7 @@ class StatisticsPage(QWidget):
             else None
         )
         for row in self._all_account_totals():
-            if row["role"] != "user":
+            if row["role"] != "user" or row["account_type"] != "station":
                 continue
             if restricted_user_id is not None and row["user_id"] != restricted_user_id:
                 continue
@@ -3045,7 +3048,7 @@ class StatisticsPage(QWidget):
         }
         stations = {}
         for row in self._all_account_totals():
-            if row["role"] != "user":
+            if row["role"] != "user" or row["account_type"] != "station":
                 continue
             if user_id is not None and row["user_id"] != user_id:
                 continue
@@ -3177,7 +3180,7 @@ class StatisticsPage(QWidget):
         if user_id is None:
             totals_by_metric = {metric["metric_key"]: 0 for metric in metrics}
             for row in self._all_account_totals():
-                if row["role"] == "user":
+                if row["role"] == "user" and row["account_type"] == "station":
                     totals_by_metric[row["metric_key"]] = (
                         totals_by_metric.get(row["metric_key"], 0)
                         + int(row["total"])

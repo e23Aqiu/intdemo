@@ -752,12 +752,15 @@ class Database:
     def account_statistics_enabled(self, account_id: int) -> bool:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT is_test FROM accounts WHERE id=?",
+                "SELECT role, account_type, is_test FROM accounts WHERE id=?",
                 (int(account_id),),
             ).fetchone()
         if not row:
             raise DatabaseError("账号不存在")
-        return not bool(row["is_test"])
+        account_type = str(row["account_type"] or "").strip()
+        if account_type not in {"admin", "road_admin", "station"}:
+            account_type = "admin" if row["role"] == "admin" else "station"
+        return account_type != "road_admin" and not bool(row["is_test"])
 
     def update_account_display_name(
         self, account_id: int, display_name: str
@@ -1596,7 +1599,8 @@ class Database:
         with self._connect() as conn:
             return conn.execute(
                 f"""
-                SELECT a.id AS user_id, a.username, a.display_name, a.role, a.is_active,
+                SELECT a.id AS user_id, a.username, a.display_name, a.role,
+                       a.account_type, a.is_active,
                        m.metric_key, m.label, m.unit,
                        COALESCE(SUM({amount_sql}), 0) AS total
                 FROM accounts a
@@ -1604,7 +1608,9 @@ class Database:
                 LEFT JOIN activity_events e
                   ON e.user_id=a.id AND e.metric_key=m.metric_key{date_sql}
                 WHERE m.is_active=1 AND a.is_test=0
-                GROUP BY a.id, a.username, a.display_name, a.role, a.is_active,
+                  AND a.role='user' AND a.account_type='station'
+                GROUP BY a.id, a.username, a.display_name, a.role,
+                         a.account_type, a.is_active,
                          m.metric_key, m.label, m.unit, m.sort_order
                 ORDER BY a.username COLLATE NOCASE, m.sort_order, m.metric_key
                 """,
@@ -1628,13 +1634,14 @@ class Database:
             FROM activity_events e
             JOIN accounts a ON a.id=e.user_id
             WHERE e.metric_key=? AND a.is_test=0
+              AND a.account_type!='road_admin'
         """
         params = [str(metric_key)]
         if user_id is not None:
             sql += " AND e.user_id=?"
             params.append(int(user_id))
         elif users_only:
-            sql += " AND a.role='user'"
+            sql += " AND a.role='user' AND a.account_type='station'"
         date_sql, date_params, _, _ = self._date_range_clause(
             "e.created_at",
             start_date,
@@ -1668,14 +1675,14 @@ class Database:
             FROM activity_events e
             JOIN accounts a ON a.id=e.user_id
             WHERE e.metric_key=? AND e.source='unified_workflow'
-              AND a.is_test=0
+              AND a.is_test=0 AND a.account_type!='road_admin'
         """
         params = [WORKFLOW_TOTAL_METRIC]
         if user_id is not None:
             sql += " AND e.user_id=?"
             params.append(int(user_id))
         elif users_only:
-            sql += " AND a.role='user'"
+            sql += " AND a.role='user' AND a.account_type='station'"
         date_sql, date_params, _, _ = self._date_range_clause(
             "e.created_at",
             start_date,
@@ -1742,13 +1749,14 @@ class Database:
             JOIN accounts a ON a.id=e.user_id
             JOIN metric_definitions m ON m.metric_key=e.metric_key
             WHERE m.is_active=1 AND a.is_test=0
+              AND a.account_type!='road_admin'
         """
         params: Iterable = ()
         if user_id is not None:
             sql += " AND e.user_id=?"
             params = (user_id,)
         elif users_only:
-            sql += " AND a.role='user'"
+            sql += " AND a.role='user' AND a.account_type='station'"
         date_sql, date_params, _, _ = self._date_range_clause(
             "e.created_at",
             start_date,
@@ -2045,13 +2053,18 @@ class Database:
         heartbeat_ts = time.time()
         with self._connect() as conn:
             account = conn.execute(
-                "SELECT id, is_active, is_test FROM accounts WHERE id=?",
+                """
+                SELECT id, is_active, is_test, account_type
+                FROM accounts WHERE id=?
+                """,
                 (int(user_id),),
             ).fetchone()
             if not account or not account["is_active"]:
                 raise DatabaseError("当前账号不可用于创建计时任务")
             if account["is_test"]:
                 raise DatabaseError("测试账号不记录业务计时")
+            if account["account_type"] == "road_admin":
+                raise DatabaseError("路段管理员账号不记录业务计时")
 
             signature_placeholders = ",".join("?" for _ in signature_aliases)
             batches = conn.execute(
@@ -2680,7 +2693,7 @@ class Database:
             JOIN accounts a ON a.id=e.user_id
             WHERE e.metric_key=? AND e.source='unified_workflow'
               AND final_run.status='succeeded' AND b.status='succeeded'
-              AND a.is_test=0
+              AND a.is_test=0 AND a.account_type!='road_admin'
         """
         params = [WORKFLOW_TOTAL_METRIC]
 
@@ -2688,7 +2701,9 @@ class Database:
             completed_batches_sql += " AND e.user_id=?"
             params.append(int(user_id))
         elif users_only:
-            completed_batches_sql += " AND a.role='user'"
+            completed_batches_sql += (
+                " AND a.role='user' AND a.account_type='station'"
+            )
 
         date_sql, date_params, _, _ = self._date_range_clause(
             "e.created_at",
@@ -2734,7 +2749,7 @@ class Database:
                  AND rb.server_account_id=final_run.server_account_id
                 WHERE e.metric_key=? AND e.source='unified_workflow'
                   AND final_run.status='succeeded' AND rb.status='succeeded'
-                  AND a.is_test=0
+                  AND a.is_test=0 AND a.account_type!='road_admin'
                   AND NOT EXISTS (
                       SELECT 1 FROM workflow_runs local_run
                       WHERE local_run.run_id=final_run.entity_id
@@ -2745,7 +2760,9 @@ class Database:
                 remote_completed_sql += " AND e.user_id=?"
                 remote_params.append(int(user_id))
             elif users_only:
-                remote_completed_sql += " AND a.role='user'"
+                remote_completed_sql += (
+                    " AND a.role='user' AND a.account_type='station'"
+                )
             remote_completed_sql += date_sql
             remote_params.extend(date_params)
             remote_completed_sql += (

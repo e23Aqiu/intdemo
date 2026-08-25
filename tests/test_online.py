@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from integrated_client.config import APP_VERSION
-from integrated_client.database import AuthenticationError, Database
+from integrated_client.database import AuthenticationError, Database, DatabaseError
 from integrated_client.online.api import ApiResponseError, NetworkUnavailable
 from integrated_client.online.config import OnlineConfig, OnlineConfigurationError
 from integrated_client.online.coordinator import load_websocket_ca_certificates
@@ -309,6 +309,8 @@ class OnlineClientTests(unittest.TestCase):
         self.assertTrue(account.is_road_admin)
         self.assertTrue(account.is_account_manager)
         self.assertFalse(account.is_admin)
+        self.assertFalse(account.statistics_enabled)
+        self.assertFalse(self.database.account_statistics_enabled(account.id))
         self.assertEqual(account.role_label, "路段管理员")
         self.assertEqual(account.effective_data_scope, "road")
         self.assertTrue(account.can_view_shared_stats)
@@ -326,6 +328,127 @@ class OnlineClientTests(unittest.TestCase):
         self.assertEqual(state["data_scope"], "road")
         self.assertTrue(state["needs_snapshot"])
 
+    def test_road_manager_cannot_record_and_cached_history_is_not_counted(self):
+        account_id = str(uuid.uuid4())
+        road_id = str(uuid.uuid4())
+        payload = {
+            "id": account_id,
+            "username": "promoted_manager",
+            "display_name": "晋升前中心站",
+            "role": "user",
+            "stats_scope": "own",
+            "account_type": "station",
+            "data_scope": "own",
+            "road_id": road_id,
+            "road_name": "晋升测试路段",
+            "is_active": True,
+            "is_archived": False,
+            "entitlement_revision": 1,
+        }
+        station = self.database.upsert_remote_account(payload)
+        self.database.start_workflow_run(
+            station.id,
+            "历史数据.xlsx",
+            "history-signature",
+            "history-run",
+            "history-process-session",
+            os.getpid(),
+        )
+        self.database.finish_workflow_run(
+            "history-run",
+            "succeeded",
+            active_ms=1000,
+            paused_ms=200,
+        )
+        self.database.record_activity(
+            station.id,
+            "workflow_detail_total",
+            7,
+            source="unified_workflow",
+            details={
+                "violation_counts": {
+                    "历史违规": {"total": 7, "has_phone": 3, "other": 4}
+                }
+            },
+            task_id="history-run",
+        )
+        self.assertEqual(
+            next(
+                row["total"]
+                for row in self.database.get_user_totals(station.id)
+                if row["metric_key"] == "workflow_detail_total"
+            ),
+            7,
+        )
+        self.assertEqual(
+            self.database.get_workflow_timing_totals(station.id)["completed_items"],
+            7,
+        )
+
+        payload.update(
+            {
+                "display_name": "晋升测试路段",
+                "account_type": "road_admin",
+                "data_scope": "road",
+                "entitlement_revision": 2,
+            }
+        )
+        manager = self.database.upsert_remote_account(payload)
+        self.database.record_activity(
+            manager.id,
+            "workflow_detail_total",
+            9,
+            source="unified_workflow",
+        )
+
+        self.assertFalse(manager.statistics_enabled)
+        self.assertFalse(self.database.account_statistics_enabled(manager.id))
+        self.assertTrue(
+            all(row["total"] == 0 for row in self.database.get_user_totals(manager.id))
+        )
+        self.assertNotIn(
+            manager.username,
+            {row["username"] for row in self.database.get_all_account_totals()},
+        )
+        self.assertEqual(
+            self.database.get_daily_metric_totals(
+                "workflow_detail_total",
+                user_id=manager.id,
+            ),
+            [],
+        )
+        self.assertEqual(
+            self.database.get_violation_totals(user_id=manager.id),
+            [],
+        )
+        self.assertEqual(self.database.get_recent_activity(manager.id), [])
+        self.assertEqual(
+            self.database.get_workflow_timing_totals(manager.id),
+            {
+                "active_ms": 0,
+                "paused_ms": 0,
+                "total_ms": 0,
+                "run_count": 0,
+                "completed_items": 0,
+            },
+        )
+        with self.assertRaisesRegex(DatabaseError, "路段管理员账号不记录业务计时"):
+            self.database.start_workflow_run(
+                manager.id,
+                "管理账号.xlsx",
+                "manager-signature",
+                "manager-run",
+                "manager-process-session",
+                os.getpid(),
+            )
+        with self.database._connect() as conn:
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM activity_events WHERE user_id=?",
+                    (manager.id,),
+                ).fetchone()[0],
+                1,
+            )
     def test_road_membership_change_requests_a_fresh_scope_snapshot(self):
         road_id = str(uuid.uuid4())
         manager_id = str(uuid.uuid4())

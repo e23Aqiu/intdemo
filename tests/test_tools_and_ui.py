@@ -2281,6 +2281,9 @@ class ToolAndUiTests(unittest.TestCase):
 
         window = MainWindow(self.db, manager, session_manager=Session())
         self.assertTrue(manager.is_account_manager)
+        self.assertFalse(manager.statistics_enabled)
+        self.assertFalse(window.business_metrics_enabled)
+        self.assertIsNone(window.workflow_timing)
         self.assertIn("accounts", window._pages)
         self.assertIn("accounts", window._nav_buttons)
         self.assertNotIn("machine_learning", window._pages)
@@ -2289,9 +2292,41 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIs(window.stack.currentWidget(), window.dashboard_page)
         self.assertTrue(hasattr(window.statistics_page, "anomaly_button"))
         self.assertEqual(window.sidebar_role.text(), "路段管理员  ·  road_manager")
+        self.assertEqual(window.statistics_page.station_combo.findData(manager.id), -1)
+        self.assertEqual(window.dashboard_page.station_combo.findData(manager.id), -1)
+        self.assertEqual(window.statistics_page.station_combo.itemText(0), "本路段")
+        self.assertEqual(window.dashboard_page.station_combo.itemText(0), "本路段")
         window.workflow_page.shutdown()
         window._prepared_to_close = True
         window.close()
+
+        manager = self.db.upsert_remote_account(
+            {
+                "id": "server-road-manager",
+                "username": "road_manager",
+                "display_name": "广深高速",
+                "role": "user",
+                "stats_scope": "own",
+                "account_type": "road_admin",
+                "data_scope": "own",
+                "road_id": road_id,
+                "road_name": "广深高速",
+                "is_active": True,
+                "is_archived": False,
+                "entitlement_revision": 2,
+            }
+        )
+        own_window = MainWindow(self.db, manager, session_manager=Session())
+        for page in (own_window.dashboard_page, own_window.statistics_page):
+            manager_index = page.station_combo.findData(manager.id)
+            self.assertGreaterEqual(manager_index, 0)
+            self.assertEqual(
+                page.station_combo.itemText(manager_index),
+                "不参与统计",
+            )
+        own_window.workflow_page.shutdown()
+        own_window._prepared_to_close = True
+        own_window.close()
 
     def test_global_admin_dialog_supports_road_admin_and_three_data_scopes(self):
         roads = [
