@@ -23,3 +23,13 @@ Important environment variables:
 
 The Docker deployment uses secret files and runs `alembic upgrade head` before
 starting exactly one Uvicorn worker.
+
+## Account hierarchy compatibility
+
+Version 1.2.0 adds `roads` and the authoritative `account_type`, `data_scope`,
+and `road_id` account fields. The legacy `role` (`admin/user`) and
+`stats_scope` (`own/all`) columns remain in place for v1.1.0/v1.1.1 clients.
+Road administrators are projected as legacy users, and a road scope is
+downgraded to own for devices older than 1.2.0. Migration 0014 assigns existing
+non-admin accounts to `广深高速` without changing passwords, token versions,
+active state, or refresh sessions.

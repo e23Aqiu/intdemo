@@ -116,6 +116,7 @@ class OnlineSessionManager:
         self.database.set_current_online_account(
             bundle["account"]["id"],
             bundle["account"].get("stats_scope"),
+            bundle["account"].get("data_scope"),
         )
         profile = {
             "version": self.PROFILE_VERSION,
@@ -143,6 +144,7 @@ class OnlineSessionManager:
         self.database.set_current_online_account(
             bundle["account"]["id"],
             bundle["account"].get("stats_scope"),
+            bundle["account"].get("data_scope"),
         )
         self._bundle = bundle
         self.state = SessionState(

@@ -16,8 +16,12 @@ class AccountView(StrictModel):
     username: str
     display_name: str
     role: Literal["admin", "user"]
+    account_type: Literal["admin", "road_admin", "station"]
     is_test: bool = False
     stats_scope: Literal["own", "all"]
+    data_scope: Literal["own", "road", "all"]
+    road_id: uuid.UUID | None = None
+    road_name: str | None = None
     device_limit: int
     is_active: bool
     is_archived: bool
@@ -29,6 +33,11 @@ class AccountView(StrictModel):
     last_login_system: str | None = None
     created_at: datetime
     updated_at: datetime
+
+
+class RoadView(StrictModel):
+    id: uuid.UUID
+    name: str
 
 
 class DeviceView(StrictModel):
@@ -47,6 +56,9 @@ class LoginRequest(StrictModel):
     password: str = Field(min_length=1, max_length=256)
     device_uid: uuid.UUID
     device_name: str = Field(default="Windows device", min_length=1, max_length=160)
+    # Missing version must remain legacy-safe. Official clients always send
+    # their exact APP_VERSION, while an omitted value may come from an older
+    # integration that cannot represent the v1.2 road scope.
     client_version: str = Field(default="1.1.2", min_length=1, max_length=40)
     login_system: str | None = Field(default=None, min_length=1, max_length=80)
     control_client: bool = False
@@ -89,8 +101,12 @@ class AccountCreate(StrictModel):
     username: str = Field(min_length=1, max_length=80)
     display_name: str = Field(min_length=1, max_length=120)
     role: Literal["admin", "user"] = "user"
+    account_type: Literal["admin", "road_admin", "station"] | None = None
     is_test: bool = False
     stats_scope: Literal["own", "all"] = "own"
+    data_scope: Literal["own", "road", "all"] | None = None
+    road_id: uuid.UUID | None = None
+    road_name: str | None = Field(default=None, min_length=1, max_length=120)
     device_limit: int = Field(default=10000, ge=1, le=10000)
     is_active: bool = True
 
@@ -115,18 +131,36 @@ class AccountCreate(StrictModel):
             raise ValueError("站点显示名不能为空")
         return value
 
+    @field_validator("road_name")
+    @classmethod
+    def normalize_road_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("路段名称不能为空")
+        return value
+
     @model_validator(mode="after")
     def validate_test_account(self) -> AccountCreate:
         if self.is_test and self.role != "user":
             raise ValueError("测试账号必须使用普通用户权限")
+        if self.is_test and self.account_type not in {None, "station"}:
+            raise ValueError("测试账号必须属于中心站账号")
+        if self.road_id is not None and self.road_name is not None:
+            raise ValueError("所属路段不能同时使用编号和名称")
         return self
 
 
 class AccountUpdate(StrictModel):
     display_name: str | None = Field(default=None, min_length=1, max_length=120)
     role: Literal["admin", "user"] | None = None
+    account_type: Literal["admin", "road_admin", "station"] | None = None
     is_test: bool | None = None
     stats_scope: Literal["own", "all"] | None = None
+    data_scope: Literal["own", "road", "all"] | None = None
+    road_id: uuid.UUID | None = None
+    road_name: str | None = Field(default=None, min_length=1, max_length=120)
     device_limit: int | None = Field(default=None, ge=1, le=10000)
     is_active: bool | None = None
 
@@ -140,10 +174,22 @@ class AccountUpdate(StrictModel):
             raise ValueError("站点显示名不能为空")
         return value
 
+    @field_validator("road_name")
+    @classmethod
+    def normalize_update_road_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not value:
+            raise ValueError("路段名称不能为空")
+        return value
+
     @model_validator(mode="after")
     def reject_explicit_nulls(self) -> AccountUpdate:
         if any(getattr(self, field_name) is None for field_name in self.model_fields_set):
             raise ValueError("更新字段不能为 null")
+        if self.road_id is not None and self.road_name is not None:
+            raise ValueError("所属路段不能同时使用编号和名称")
         return self
 
 
@@ -226,6 +272,7 @@ class SyncPullResponse(StrictModel):
     has_more: bool
     entitlement_revision: int
     stats_scope: Literal["own", "all"]
+    data_scope: Literal["own", "road", "all"]
 
 
 class SnapshotResponse(StrictModel):
@@ -238,6 +285,7 @@ class SnapshotResponse(StrictModel):
     workflow_runs: list[dict[str, Any]]
     entitlement_revision: int
     stats_scope: Literal["own", "all"]
+    data_scope: Literal["own", "road", "all"]
 
 
 class AnnouncementAttachmentInput(StrictModel):

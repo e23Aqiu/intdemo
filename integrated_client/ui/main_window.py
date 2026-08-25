@@ -353,6 +353,7 @@ class MainWindow(FramelessMainWindow):
                     self.captcha_learning_service,
                 )
                 self._add_page("machine_learning", self.machine_learning_page)
+        if account.is_account_manager and not self.offline_business_mode:
             if self.session_manager is not None:
                 self.account_page = OnlineAccountPage(
                     database,
@@ -415,7 +416,7 @@ class MainWindow(FramelessMainWindow):
         self.show_page(
             "workflow"
             if self.offline_business_mode
-            else ("home" if account.is_admin else "workflow")
+            else ("home" if account.is_account_manager else "workflow")
         )
         if self.announcement_service_available:
             self._start_announcement_polling()
@@ -579,6 +580,7 @@ class MainWindow(FramelessMainWindow):
                 trailing_nav_items.append(
                     ("machine_learning", "机器学习", "nav-ml.svg")
                 )
+        if self.account.is_account_manager and not self.offline_business_mode:
             trailing_nav_items.append(("accounts", "账号管理", "nav-accounts.svg"))
         if not self.offline_business_mode:
             trailing_nav_items.append(("personal", "系统设置", "nav-user.svg"))

@@ -165,6 +165,9 @@ click/<sample-uuid>.jpg
 
 ## 接口
 
+v1.2.0 的路段管理员不显示机器学习界面，也不能调用 `/admin/ml/*`；在验证码业务
+通道中与中心站一样只使用下列普通在线账号接口。
+
 普通在线账号：
 
 - `GET /api/v1/captcha/policy`

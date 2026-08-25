@@ -384,6 +384,9 @@ class ApiClient:
     def admin_accounts(self, access_token: str) -> list[dict]:
         return self._request("GET", "/admin/accounts", token=access_token)
 
+    def admin_roads(self, access_token: str) -> list[dict]:
+        return self._request("GET", "/admin/roads", token=access_token)
+
     def admin_create_account(self, access_token: str, payload: dict) -> dict:
         return self._request(
             "POST", "/admin/accounts", token=access_token, json_body=payload

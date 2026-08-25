@@ -1594,7 +1594,7 @@ class StatisticsPage(QWidget):
         title_box.addWidget(self.title_label)
         self.subtitle_label = QLabel(
             "按站点查看完成类型或违规原因统计。"
-            if account.can_view_all_stats
+            if account.can_view_shared_stats
             else "默认显示当前站点，可切换查看全部或其他站点的数据。"
         )
         self.subtitle_label.setObjectName("Muted")
@@ -1602,7 +1602,7 @@ class StatisticsPage(QWidget):
         header.addLayout(title_box)
         header.addStretch()
         self._showing_anomalies = False
-        if account.is_admin:
+        if account.is_account_manager:
             self.anomaly_button = QPushButton("异常数据（0）")
             self.anomaly_button.setObjectName("AnomalyButton")
             self.anomaly_button.setCheckable(True)
@@ -1891,8 +1891,8 @@ class StatisticsPage(QWidget):
     def set_navigation_view(self, view):
         if view not in self.NAVIGATION_VIEWS:
             raise ValueError(f"未知的数据视图：{view}")
-        if view == "anomaly" and not self.account.is_admin:
-            raise PermissionError("普通用户无权查看异常数据")
+        if view == "anomaly" and not self.account.is_account_manager:
+            raise PermissionError("当前账号无权查看异常数据")
 
         category = "completion" if view == "anomaly" else view
         category_index = self.category_combo.findData(category)
@@ -1934,13 +1934,18 @@ class StatisticsPage(QWidget):
         current_id = self.station_combo.currentData()
         restricted_online_scope = (
             self.account.server_account_id is not None
-            and not self.account.can_view_all_stats
+            and not self.account.can_view_shared_stats
         )
-        hidden_test_scope = self.account.is_test and not self.account.can_view_all_stats
+        hidden_test_scope = self.account.is_test and not self.account.can_view_shared_stats
         self.station_combo.blockSignals(True)
         self.station_combo.clear()
+        aggregate_label = (
+            "本路段"
+            if self.account.effective_data_scope == "road"
+            else "全部站点"
+        )
         self.station_combo.addItem(
-            "不参与统计" if hidden_test_scope else "全部站点",
+            "不参与统计" if hidden_test_scope else aggregate_label,
             self.account.id if hidden_test_scope else None,
         )
         order = {username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)}
@@ -1962,7 +1967,7 @@ class StatisticsPage(QWidget):
                 Qt.ToolTipRole,
             )
         target_id = current_id if had_options else (
-            None if self.account.can_view_all_stats else self.account.id
+            None if self.account.can_view_shared_stats else self.account.id
         )
         index = self.station_combo.findData(target_id)
         self.station_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -2503,7 +2508,7 @@ class StatisticsPage(QWidget):
         self.refresh()
 
     def _toggle_anomaly_view(self, checked):
-        if not self.account.is_admin:
+        if not self.account.is_account_manager:
             return
         self._showing_anomalies = bool(checked)
         self._sync_view_header()
@@ -2735,7 +2740,7 @@ class StatisticsPage(QWidget):
         restricted_user_id = (
             self.account.id
             if self.account.server_account_id is not None
-            and not self.account.can_view_all_stats
+            and not self.account.can_view_shared_stats
             else None
         )
         for row in self.database.get_all_account_totals(

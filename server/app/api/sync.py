@@ -17,9 +17,16 @@ from ..models import (
     ActivityEvent,
     ChangeLog,
     MetricDefinition,
+    Road,
     SyncReceipt,
     WorkflowBatch,
     WorkflowRun,
+)
+from ..permissions import (
+    account_type,
+    effective_data_scope,
+    legacy_stats_scope,
+    scoped_account_ids,
 )
 from ..realtime import update_hub
 from ..schemas import (
@@ -530,10 +537,6 @@ async def push(
     return SyncPushResponse(items=results, latest_revision=revision)
 
 
-def _can_view_all(account: Account) -> bool:
-    return account.role == "admin" or account.stats_scope == "all"
-
-
 @router.get("/pull", response_model=SyncPullResponse)
 def pull(
     context: BusinessContext,
@@ -541,6 +544,12 @@ def pull(
     after_revision: int = Query(default=0, ge=0),
     limit: int = Query(default=500, ge=1, le=500),
 ) -> SyncPullResponse:
+    scope = effective_data_scope(context.account, context.device.client_version)
+    visible_account_ids = scoped_account_ids(
+        db,
+        context.account,
+        context.device.client_version,
+    )
     query = select(ChangeLog).where(ChangeLog.revision > after_revision)
     test_account_ids = select(Account.id).where(Account.is_test.is_(True))
     query = query.where(
@@ -550,16 +559,49 @@ def pull(
             ChangeLog.kind == "account",
         )
     )
-    if not _can_view_all(context.account):
+    if scope != "all":
         query = query.where(
             or_(
-                ChangeLog.account_id == context.account.id,
+                ChangeLog.account_id.in_(visible_account_ids),
                 ChangeLog.account_id.is_(None),
             )
         )
     rows = db.scalars(query.order_by(ChangeLog.revision).limit(limit + 1)).all()
     has_more = len(rows) > limit
     rows = rows[:limit]
+
+    def visible_payload(row: ChangeLog) -> dict[str, Any]:
+        payload = dict(row.payload or {})
+        if row.kind == "road_membership_changed":
+            affected_roads = {
+                str(payload.get("old_road_id") or ""),
+                str(payload.get("new_road_id") or ""),
+            }
+            if (
+                scope == "road"
+                and context.account.road_id is not None
+                and str(context.account.road_id) in affected_roads
+            ):
+                return {"refresh_scope": True}
+            return {}
+        if (
+            scope == "all"
+            or row.kind != "account"
+            or row.operation != "delete"
+            or row.account_id is not None
+        ):
+            return payload
+        if (
+            scope == "road"
+            and context.account.road_id is not None
+            and str(payload.get("road_id") or "") == str(context.account.road_id)
+        ):
+            return payload
+        # Permanent deletion tombstones have no account FK.  Keep the entity
+        # id so every client can purge stale cache, but do not disclose the
+        # deleted username or hierarchy outside the viewer's data scope.
+        return {}
+
     return SyncPullResponse(
         changes=[
             ChangeView(
@@ -569,7 +611,7 @@ def pull(
                 entity_id=row.entity_id,
                 entity_revision=row.entity_revision,
                 operation=row.operation,
-                payload=row.payload,
+                payload=visible_payload(row),
                 occurred_at=row.occurred_at,
             )
             for row in rows
@@ -577,16 +619,19 @@ def pull(
         latest_revision=latest_revision(db),
         has_more=has_more,
         entitlement_revision=context.account.entitlement_revision,
-        stats_scope=context.account.stats_scope,
+        stats_scope=legacy_stats_scope(scope),
+        data_scope=scope,
     )
 
 
 @router.get("/snapshot", response_model=SnapshotResponse)
 def snapshot(context: BusinessContext, db: Db) -> SnapshotResponse:
-    if _can_view_all(context.account):
-        account_ids = list(db.scalars(select(Account.id)))
-    else:
-        account_ids = [context.account.id]
+    scope = effective_data_scope(context.account, context.device.client_version)
+    account_ids = scoped_account_ids(
+        db,
+        context.account,
+        context.device.client_version,
+    )
     accounts = db.scalars(select(Account).where(Account.id.in_(account_ids))).all()
     statistic_account_ids = [row.id for row in accounts if not row.is_test]
     metrics = db.scalars(
@@ -621,8 +666,14 @@ def snapshot(context: BusinessContext, db: Db) -> SnapshotResponse:
                 "username": row.username,
                 "display_name": row.display_name,
                 "role": row.role,
+                "account_type": account_type(row),
                 "is_test": row.is_test,
-                "stats_scope": row.stats_scope,
+                "stats_scope": legacy_stats_scope(row.data_scope),
+                "data_scope": row.data_scope,
+                "road_id": str(row.road_id) if row.road_id else None,
+                "road_name": (
+                    db.get(Road, row.road_id).name if row.road_id else None
+                ),
                 "is_active": row.is_active,
                 "is_archived": row.is_archived,
                 "entitlement_revision": row.entitlement_revision,
@@ -677,5 +728,6 @@ def snapshot(context: BusinessContext, db: Db) -> SnapshotResponse:
             for row in runs
         ],
         entitlement_revision=context.account.entitlement_revision,
-        stats_scope=context.account.stats_scope,
+        stats_scope=legacy_stats_scope(scope),
+        data_scope=scope,
     )

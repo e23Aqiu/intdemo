@@ -37,8 +37,19 @@ _CALL_FAILED = object()
 
 
 class _AccountSettingsDialog(FramelessDialog):
-    def __init__(self, account=None, parent=None):
+    def __init__(
+        self,
+        account=None,
+        parent=None,
+        *,
+        current_account=None,
+        roads=None,
+    ):
         super().__init__(parent)
+        self.editing_account = account
+        self.current_account = current_account
+        self.roads = list(roads or [])
+        self._global_manager = current_account is None or current_account.is_admin
         self.setWindowTitle("在线账号设置")
         self.setMinimumWidth(430)
         layout = QVBoxLayout(self)
@@ -52,12 +63,26 @@ class _AccountSettingsDialog(FramelessDialog):
         self.display_name = QLineEdit(account.name_label if account else "")
         self.display_name.setMaxLength(120)
         self.role = QComboBox()
-        self.role.addItem("普通用户", "user")
+        self.role.addItem("中心站账号", "station")
         self.role.addItem("测试账号", "test")
-        self.role.addItem("管理员", "admin")
+        if self._global_manager:
+            self.role.addItem("路段管理员", "road_admin")
+            self.role.addItem("管理员", "admin")
         self.scope = QComboBox()
-        self.scope.addItem("仅本人数据", "own")
-        self.scope.addItem("全部站点数据", "all")
+        self.road = QComboBox()
+        for road in self.roads:
+            road_id = str(road.get("id") or "").strip()
+            road_name = str(road.get("name") or "").strip()
+            if road_id and road_name:
+                self.road.addItem(road_name, road_id)
+        if current_account is not None and current_account.is_road_admin:
+            current_road_id = str(current_account.road_id or "")
+            if self.road.findData(current_road_id) < 0 and current_account.road_name:
+                self.road.addItem(current_account.road_name, current_road_id)
+            self.road.setCurrentIndex(
+                max(0, self.road.findData(current_road_id))
+            )
+            self.road.setEnabled(False)
         self.device_limit = QSpinBox()
         self.device_limit.setRange(1, 10000)
         self.device_limit.setSuffix(" 台")
@@ -66,9 +91,16 @@ class _AccountSettingsDialog(FramelessDialog):
         )
         self.active = QCheckBox("允许登录")
         if account:
-            account_type = "test" if account.is_test else account.role
+            account_type = (
+                "test" if account.is_test else account.resolved_account_type
+            )
             self.role.setCurrentIndex(self.role.findData(account_type))
-            self.scope.setCurrentIndex(self.scope.findData(account.stats_scope))
+            road_index = self.road.findData(str(account.road_id or ""))
+            if road_index < 0 and account.road_id and account.road_name:
+                self.road.addItem(account.road_name, str(account.road_id))
+                road_index = self.road.count() - 1
+            if road_index >= 0:
+                self.road.setCurrentIndex(road_index)
             self.device_limit.setValue(
                 int(getattr(account, "_device_limit", 10000) or 10000)
             )
@@ -77,8 +109,9 @@ class _AccountSettingsDialog(FramelessDialog):
             self.device_limit.setValue(10000)
             self.active.setChecked(True)
         form.addRow("登录名", self.username)
-        form.addRow("站点显示名", self.display_name)
+        form.addRow("账号显示名", self.display_name)
         form.addRow("角色", self.role)
+        form.addRow("所属路段", self.road)
         form.addRow("数据范围", self.scope)
         form.addRow("登录设备上限", self.device_limit)
         form.addRow("状态", self.active)
@@ -102,6 +135,55 @@ class _AccountSettingsDialog(FramelessDialog):
         buttons.addWidget(cancel)
         buttons.addWidget(save)
         layout.addLayout(buttons)
+        self.role.currentIndexChanged.connect(self._sync_hierarchy_controls)
+        self._sync_hierarchy_controls()
+        if account:
+            scope_index = self.scope.findData(account.effective_data_scope)
+            self.scope.setCurrentIndex(scope_index if scope_index >= 0 else 0)
+
+    def _sync_hierarchy_controls(self, *_args):
+        account_type = self.role.currentData()
+        current_scope = self.scope.currentData()
+        self.scope.blockSignals(True)
+        self.scope.clear()
+        if account_type == "admin":
+            scope_options = [("全部数据", "all")]
+        elif self.current_account is not None and self.current_account.is_road_admin:
+            scope_options = [("仅本人数据", "own"), ("本路段数据", "road")]
+            if (
+                self.editing_account is not None
+                and self.editing_account.effective_data_scope == "all"
+            ):
+                scope_options.append(("全部数据（仅管理员可授予）", "all"))
+        else:
+            scope_options = [
+                ("仅本人数据", "own"),
+                ("本路段数据", "road"),
+                ("全部数据", "all"),
+            ]
+        for label, value in scope_options:
+            self.scope.addItem(label, value)
+        index = self.scope.findData(current_scope)
+        if self.editing_account is None and account_type == "road_admin":
+            index = self.scope.findData("road")
+        elif index < 0 and account_type == "road_admin":
+            index = self.scope.findData("road")
+        self.scope.setCurrentIndex(index if index >= 0 else 0)
+        self.scope.blockSignals(False)
+
+        uses_road = account_type != "admin"
+        self.road.setEnabled(
+            uses_road
+            and self._global_manager
+        )
+        self.road.setEditable(
+            bool(uses_road and self._global_manager and account_type == "road_admin")
+        )
+        self.road.setToolTip(
+            "路段管理员可输入新路段名称；中心站必须选择已有路段。"
+            if self._global_manager
+            else "路段管理员只能管理自己所属路段。"
+        )
 
     def _accept_if_valid(self):
         username = self.username.text().strip()
@@ -120,19 +202,58 @@ class _AccountSettingsDialog(FramelessDialog):
             )
             self.username.setFocus()
             return
+        account_type = self.role.currentData()
+        if account_type != "admin":
+            road_id, road_name = self._road_reference()
+            if not road_id and not road_name:
+                QMessageBox.warning(self, "资料不完整", "必须分配所属路段。")
+                return
+            if account_type != "road_admin" and not road_id:
+                QMessageBox.warning(
+                    self,
+                    "所属路段无效",
+                    "中心站账号必须从已有路段中选择。",
+                )
+                return
         self.accept()
+
+    def _road_reference(self):
+        road_name = self.road.currentText().strip()
+        index = self.road.currentIndex()
+        custom_name = bool(
+            self.road.isEditable()
+            and (
+                index < 0
+                or road_name != self.road.itemText(index).strip()
+            )
+        )
+        return (
+            None if custom_name else self.road.currentData(),
+            road_name,
+        )
 
     def values(self) -> dict:
         account_type = self.role.currentData()
-        return {
+        resolved_type = "station" if account_type == "test" else account_type
+        data_scope = self.scope.currentData()
+        values = {
             "username": self.username.text().strip().lower(),
             "display_name": self.display_name.text().strip(),
-            "role": "admin" if account_type == "admin" else "user",
+            "role": "admin" if resolved_type == "admin" else "user",
+            "account_type": resolved_type,
             "is_test": account_type == "test",
-            "stats_scope": self.scope.currentData(),
+            "stats_scope": "all" if data_scope == "all" else "own",
+            "data_scope": data_scope,
             "device_limit": self.device_limit.value(),
             "is_active": self.active.isChecked(),
         }
+        if resolved_type != "admin":
+            road_id, road_name = self._road_reference()
+            if road_id:
+                values["road_id"] = str(road_id)
+            else:
+                values["road_name"] = road_name
+        return values
 
 
 class _DevicesDialog(FramelessDialog):
@@ -485,6 +606,7 @@ class OnlineAccountPage(AccountPage):
         self.session = session
         self.server_rows = {}
         self.all_accounts = []
+        self.roads = []
         super().__init__(
             database,
             current_account,
@@ -493,9 +615,16 @@ class OnlineAccountPage(AccountPage):
         )
 
         self.page_subtitle.setText(
-            "保留离线版账号管理操作，并增加数据范围、设备、归档和审计功能。"
+            "按管理员层级管理账号、所属路段、数据范围、设备、归档和审计。"
         )
         self.list_title.setText("在线账号列表")
+
+        road_admin_card, road_admin_value = self._summary_card(
+            "路段管理员",
+            "#6845bd",
+        )
+        self.summary_values["road_admin"] = road_admin_value
+        self.summary_layout.addWidget(road_admin_card, 1)
 
         online_card, online_value = self._summary_card(
             "当前在线设备",
@@ -549,7 +678,7 @@ class OnlineAccountPage(AccountPage):
         self.password_btn = self.reset_btn
         self.archive_btn = self.delete_btn
 
-        self.table.setColumnCount(12)
+        self.table.setColumnCount(13)
         self.table.setHorizontalHeaderLabels(
             [
                 "用户名称",
@@ -564,16 +693,31 @@ class OnlineAccountPage(AccountPage):
                 "最近系统",
                 "首次改密",
                 "归档",
+                "所属路段",
             ]
         )
         make_table_columns_resizable(
             self.table,
-            [160, 130, 105, 110, 90, 110, 85, 170, 170, 105, 105, 90],
+            [160, 130, 105, 110, 90, 110, 85, 170, 170, 105, 105, 90, 120],
         )
         # Do not perform a blocking HTTPS request while MainWindow is still
         # being constructed. MainWindow calls refresh() when the user opens
         # the account page, after the initial event loop has started.
         self._selection_changed()
+
+    def _refresh_summary(self):
+        super()._refresh_summary()
+        self.summary_values["user"].setText(
+            str(
+                sum(
+                    account.resolved_account_type == "station"
+                    for account in self.accounts
+                )
+            )
+        )
+        self.summary_values["road_admin"].setText(
+            str(sum(account.is_road_admin for account in self.accounts))
+        )
 
     def _call(self, function, *args):
         function_name = getattr(function, "__name__", "")
@@ -582,6 +726,7 @@ class OnlineAccountPage(AccountPage):
             if function_name
             in {
                 "admin_accounts",
+                "admin_roads",
                 "admin_devices",
                 "admin_audit",
             }
@@ -607,8 +752,12 @@ class OnlineAccountPage(AccountPage):
             "username": "登录名",
             "display_name": "站点显示名",
             "role": "角色",
+            "account_type": "账号类型",
             "is_test": "账号类型",
             "stats_scope": "数据范围",
+            "data_scope": "数据范围",
+            "road_id": "所属路段",
+            "road_name": "所属路段",
             "device_limit": "登录设备上限",
             "is_active": "账号状态",
         }
@@ -694,7 +843,19 @@ class OnlineAccountPage(AccountPage):
             QMessageBox.warning(self, "在线操作失败", self._api_error_text(exc))
             return _CALL_FAILED
 
+    @staticmethod
+    def _scope_label(scope):
+        return {"own": "本人", "road": "本路段", "all": "全部"}.get(
+            str(scope),
+            "本人",
+        )
+
     def refresh(self):
+        roads_loader = getattr(self.session.api, "admin_roads", None)
+        if callable(roads_loader):
+            roads = self._call(roads_loader)
+            if roads is not _CALL_FAILED and roads is not None:
+                self.roads = list(roads)
         rows = self._call(self.session.api.admin_accounts)
         if rows is _CALL_FAILED:
             return
@@ -715,13 +876,20 @@ class OnlineAccountPage(AccountPage):
         }
         self.accounts = []
         self.server_rows = {}
-        reconciled_accounts = self.database.reconcile_remote_accounts(rows)
-        removed_account_ids = [
-            account.id
-            for server_account_id, account in cached_remote_accounts.items()
-            if server_account_id not in server_account_ids
-            and account.id != self.current_account.id
-        ]
+        reconciled_accounts = self.database.reconcile_remote_accounts(
+            rows,
+            prune_missing=self.current_account.is_admin,
+        )
+        removed_account_ids = (
+            [
+                account.id
+                for server_account_id, account in cached_remote_accounts.items()
+                if server_account_id not in server_account_ids
+                and account.id != self.current_account.id
+            ]
+            if self.current_account.is_admin
+            else []
+        )
         for server_row, account in zip(rows, reconciled_accounts):
             object.__setattr__(
                 account,
@@ -760,7 +928,7 @@ class OnlineAccountPage(AccountPage):
                 account.name_label,
                 account.username,
                 account.role_label,
-                "全部" if account.stats_scope == "all" else "本人",
+                self._scope_label(account.effective_data_scope),
                 "启用" if account.is_active else "停用",
                 (
                     f"{server.get('active_device_count', 0)}/"
@@ -773,6 +941,7 @@ class OnlineAccountPage(AccountPage):
                 str(server.get("last_login_system") or "-"),
                 "需要修改" if account.must_change_password else "已设置",
                 "已归档" if account.is_archived else "-",
+                account.road_name or "-",
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -798,7 +967,7 @@ class OnlineAccountPage(AccountPage):
                     item.setForeground(QColor("#d33f49"))
                 item.setTextAlignment(
                     Qt.AlignLeft | Qt.AlignVCenter
-                    if column in (0, 1)
+                    if column in (0, 1, 12)
                     else Qt.AlignCenter
                 )
                 self.table.setItem(row, column, item)
@@ -813,7 +982,7 @@ class OnlineAccountPage(AccountPage):
         account = self._selected_account()
         selected = account is not None
         other = selected and account.id != self.current_account.id
-        is_station = selected and not account.is_admin
+        is_station = selected and account.resolved_account_type == "station"
         has_statistics = is_station and not account.is_test
         self.rename_btn.setEnabled(selected)
         self.permission_btn.setEnabled(selected)
@@ -848,7 +1017,8 @@ class OnlineAccountPage(AccountPage):
             )
             self.selection_hint.setText(
                 f"已选择：{account.name_label} · {account.role_label} · {state}"
-                f" · 数据范围 {'全部' if account.stats_scope == 'all' else '本人'}"
+                f" · 路段 {account.road_name or '-'}"
+                f" · 数据范围 {self._scope_label(account.effective_data_scope)}"
                 f" · 设备 {server.get('active_device_count', 0)}/"
                 f"{server.get('device_limit', 10000)}{suffix}"
             )
@@ -858,12 +1028,12 @@ class OnlineAccountPage(AccountPage):
         self.import_btn.setToolTip(
             "在线版不允许只导入本机缓存；点击可查看说明"
             if has_statistics
-            else "测试账号不参与统计" if is_station else "请选择普通用户站点"
+            else "测试账号不参与统计" if is_station else "请选择中心站账号"
         )
         self.export_btn.setToolTip(
             "导出当前客户端已同步到的站点汇总数据"
             if has_statistics
-            else "测试账号不参与统计" if is_station else "请选择普通用户站点"
+            else "测试账号不参与统计" if is_station else "请选择中心站账号"
         )
         self.toggle_btn.setObjectName(
             "DangerButton"
@@ -874,14 +1044,16 @@ class OnlineAccountPage(AccountPage):
         self.toggle_btn.style().polish(self.toggle_btn)
 
     def _create_account(self):
-        dialog = _AccountSettingsDialog(parent=self)
+        dialog = _AccountSettingsDialog(
+            parent=self,
+            current_account=self.current_account,
+            roads=self.roads,
+        )
         if dialog.exec_() != dialog.Accepted:
             return
         payload = dialog.values()
-        # v1.1.0 servers use strict request schemas and do not know the
-        # v1.1.1-only test-account marker.  Omit the default false value so
-        # ordinary users and administrators can still be managed while the
-        # server is upgraded in place.
+        # Keep the legacy marker omission for ordinary accounts.  The v1.2
+        # hierarchy fields are still sent to enforce mandatory road assignment.
         if not payload.get("is_test"):
             payload.pop("is_test", None)
         result = self._call(
@@ -917,7 +1089,12 @@ class OnlineAccountPage(AccountPage):
         account = self._selected_account()
         if not account:
             return
-        dialog = _AccountSettingsDialog(account, self)
+        dialog = _AccountSettingsDialog(
+            account,
+            self,
+            current_account=self.current_account,
+            roads=self.roads,
+        )
         if dialog.exec_() != dialog.Accepted:
             return
         requested = dialog.values()
@@ -925,13 +1102,17 @@ class OnlineAccountPage(AccountPage):
         current = {
             "display_name": account.name_label,
             "role": account.role,
+            "account_type": account.resolved_account_type,
             "is_test": bool(account.is_test),
             "stats_scope": account.stats_scope,
+            "data_scope": account.effective_data_scope,
             "device_limit": int(
                 getattr(account, "_device_limit", 10000) or 10000
             ),
             "is_active": bool(account.is_active),
         }
+        if account.resolved_account_type != "admin":
+            current["road_id"] = str(account.road_id or "")
         payload = {
             field: value
             for field, value in requested.items()
@@ -949,7 +1130,16 @@ class OnlineAccountPage(AccountPage):
                     account.id,
                     payload["display_name"],
                 )
-            if {"role", "is_test", "stats_scope", "is_active"} & payload.keys():
+            if {
+                "role",
+                "account_type",
+                "is_test",
+                "stats_scope",
+                "data_scope",
+                "road_id",
+                "road_name",
+                "is_active",
+            } & payload.keys():
                 self.account_permission_changed.emit(
                     account.id,
                     str(payload.get("role", account.role)),

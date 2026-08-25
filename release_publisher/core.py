@@ -440,14 +440,6 @@ def _version_sources(repo_root: Path) -> tuple[tuple[Path, re.Pattern[str], int]
             1,
         ),
         (
-            repo_root / "server" / "app" / "schemas.py",
-            re.compile(
-                r'(?m)^\s*client_version: str = Field'
-                r'\(default="(?P<version>[^"]+)",'
-            ),
-            1,
-        ),
-        (
             repo_root / "installer" / "intdemo.iss",
             re.compile(
                 r'(?m)^\s*#define MyAppVersion "(?P<version>[^"]+)"\s*$'
@@ -1008,11 +1000,6 @@ def set_project_version(
                 else f'{match.group(3)}{new_version}{match.group(4)}'
             ),
             2,
-        ),
-        root / "server" / "app" / "schemas.py": (
-            r'(client_version: str = Field\(default=")[^"]+(",)',
-            rf'\g<1>{new_version}\g<2>',
-            1,
         ),
         root / "installer" / "intdemo.iss": (
             r'(?m)^(\s*#define MyAppVersion ")[^"]+(")\s*$',

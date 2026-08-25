@@ -1136,9 +1136,15 @@ function global:git {
                 require_clean=False,
             )
 
-            self.assertEqual(len(changed), len(paths))
+            # LoginRequest's missing-version fallback intentionally remains
+            # on the last legacy protocol; it is not an application version.
+            self.assertEqual(len(changed), len(paths) - 1)
             self.assertEqual(project_version(root), target)
             self.assertEqual(project_version_mismatches(root, target), [])
+            schemas = (root / "server" / "app" / "schemas.py").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn('client_version: str = Field(default="1.1.2"', schemas)
             version_info = (
                 root / "installer" / "version_info.txt"
             ).read_text(encoding="utf-8")

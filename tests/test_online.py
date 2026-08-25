@@ -284,6 +284,105 @@ class OnlineClientTests(unittest.TestCase):
         self.assertEqual(refreshed.id, account.id)
         self.assertEqual(refreshed.last_login, self.api.last_login_at)
 
+    def test_road_manager_fields_and_scope_are_cached_additively(self):
+        road_id = str(uuid.uuid4())
+        account = self.database.upsert_remote_account(
+            {
+                "id": str(uuid.uuid4()),
+                "username": "road_manager",
+                "display_name": "广深高速",
+                # Legacy values remain safe for v1.1.x SQLite constraints.
+                "role": "user",
+                "stats_scope": "own",
+                "account_type": "road_admin",
+                "data_scope": "road",
+                "road_id": road_id,
+                "road_name": "广深高速",
+                "is_active": True,
+                "is_archived": False,
+                "entitlement_revision": 1,
+            }
+        )
+
+        self.assertEqual(account.role, "user")
+        self.assertEqual(account.stats_scope, "own")
+        self.assertTrue(account.is_road_admin)
+        self.assertTrue(account.is_account_manager)
+        self.assertFalse(account.is_admin)
+        self.assertEqual(account.role_label, "路段管理员")
+        self.assertEqual(account.effective_data_scope, "road")
+        self.assertTrue(account.can_view_shared_stats)
+        self.assertFalse(account.can_view_all_stats)
+        self.assertEqual(account.road_id, road_id)
+        self.assertEqual(account.road_name, "广深高速")
+
+        self.database.set_current_online_account(
+            account.server_account_id,
+            account.stats_scope,
+            account.effective_data_scope,
+        )
+        state = self.database.get_sync_state()
+        self.assertEqual(state["stats_scope"], "own")
+        self.assertEqual(state["data_scope"], "road")
+        self.assertTrue(state["needs_snapshot"])
+
+    def test_road_membership_change_requests_a_fresh_scope_snapshot(self):
+        road_id = str(uuid.uuid4())
+        manager_id = str(uuid.uuid4())
+        account_payload = {
+            "id": manager_id,
+            "username": "snapshot_manager",
+            "display_name": "广深高速",
+            "role": "user",
+            "stats_scope": "own",
+            "account_type": "road_admin",
+            "data_scope": "road",
+            "road_id": road_id,
+            "road_name": "广深高速",
+            "is_active": True,
+            "is_archived": False,
+            "entitlement_revision": 1,
+        }
+        self.database.upsert_remote_account(account_payload)
+        self.database.set_current_online_account(manager_id, "own", "road")
+        self.database.apply_sync_snapshot(
+            {
+                "revision": 5,
+                "accounts": [account_payload],
+                "metrics": [],
+                "activity_events": [],
+                "workflow_batches": [],
+                "workflow_runs": [],
+                "entitlement_revision": 1,
+                "stats_scope": "own",
+                "data_scope": "road",
+            }
+        )
+        self.assertFalse(self.database.get_sync_state()["needs_snapshot"])
+
+        self.database.apply_sync_changes(
+            {
+                "changes": [
+                    {
+                        "revision": 6,
+                        "account_id": None,
+                        "kind": "road_membership_changed",
+                        "entity_id": str(uuid.uuid4()),
+                        "entity_revision": 1,
+                        "operation": "upsert",
+                        "payload": {"refresh_scope": True},
+                        "occurred_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                ],
+                "latest_revision": 6,
+                "has_more": False,
+                "entitlement_revision": 1,
+                "stats_scope": "own",
+                "data_scope": "road",
+            }
+        )
+        self.assertTrue(self.database.get_sync_state()["needs_snapshot"])
+
     def test_first_login_cannot_start_offline(self):
         self.api.online = False
         with self.assertRaisesRegex(AuthenticationError, "首次登录"):

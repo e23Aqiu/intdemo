@@ -24,6 +24,19 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base, utcnow
 
 
+class Road(Base):
+    __tablename__ = "roads"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(120), unique=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    accounts: Mapped[list[Account]] = relationship(back_populates="road")
+
+
 class Account(Base):
     __tablename__ = "accounts"
 
@@ -32,8 +45,17 @@ class Account(Base):
     display_name: Mapped[str] = mapped_column(String(120))
     password_hash: Mapped[str] = mapped_column(String(512))
     role: Mapped[str] = mapped_column(String(16), default="user")
+    # ``role`` remains the legacy admin/user wire value.  New clients use
+    # account_type to distinguish a road administrator from a centre station.
+    account_type: Mapped[str] = mapped_column(String(20), default="station")
     is_test: Mapped[bool] = mapped_column(Boolean, default=False)
     stats_scope: Mapped[str] = mapped_column(String(8), default="own")
+    # ``stats_scope`` remains own/all for v1.1.x clients.  data_scope is the
+    # authoritative v1.2 value and additionally supports the current road.
+    data_scope: Mapped[str] = mapped_column(String(8), default="own")
+    road_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("roads.id", ondelete="SET NULL"), index=True
+    )
     device_limit: Mapped[int] = mapped_column(Integer, default=10000)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -48,6 +70,7 @@ class Account(Base):
     last_login_system: Mapped[str | None] = mapped_column(String(80))
     data_reset_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
+    road: Mapped[Road | None] = relationship(back_populates="accounts")
     devices: Mapped[list[Device]] = relationship(back_populates="account")
 
 

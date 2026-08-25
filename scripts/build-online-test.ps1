@@ -6,7 +6,7 @@ param(
     [string]$CaBundle = "",
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.1.2",
+    [string]$Version = "1.2.0",
     [switch]$SkipBuild
 )
 

@@ -151,6 +151,9 @@ class SyncEngine:
                 after_revision = int(changes[-1]["revision"])
             if not response.get("has_more"):
                 break
+        if self.database.get_sync_state().get("needs_snapshot"):
+            snapshot = self.session.api.snapshot(access_token)
+            self.database.apply_sync_snapshot(snapshot)
 
     def _delay_due_items(self, code: str, message: str) -> None:
         server_account_id = (

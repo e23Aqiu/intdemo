@@ -2180,6 +2180,142 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(dialog.values()["stats_scope"], "all")
         dialog.deleteLater()
 
+    def test_road_manager_ui_has_scoped_account_controls_without_machine_learning(self):
+        road_id = "11111111-1111-1111-1111-111111111111"
+        manager = self.db.upsert_remote_account(
+            {
+                "id": "server-road-manager",
+                "username": "road_manager",
+                "display_name": "广深高速",
+                "role": "user",
+                "stats_scope": "own",
+                "account_type": "road_admin",
+                "data_scope": "road",
+                "road_id": road_id,
+                "road_name": "广深高速",
+                "is_active": True,
+                "is_archived": False,
+                "entitlement_revision": 1,
+            }
+        )
+        roads = [{"id": road_id, "name": "广深高速"}]
+
+        dialog = _AccountSettingsDialog(
+            current_account=manager,
+            roads=roads,
+        )
+        self.assertEqual(
+            [dialog.role.itemData(index) for index in range(dialog.role.count())],
+            ["station", "test"],
+        )
+        self.assertEqual(
+            [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
+            ["own", "road"],
+        )
+        self.assertFalse(dialog.road.isEnabled())
+        values = dialog.values()
+        self.assertEqual(values["account_type"], "station")
+        self.assertEqual(values["road_id"], road_id)
+        self.assertNotIn("all", [dialog.scope.itemData(i) for i in range(dialog.scope.count())])
+        dialog.deleteLater()
+
+        class Api:
+            pass
+
+        class Session:
+            api = Api()
+
+            @staticmethod
+            def access_token():
+                return "test-token"
+
+        window = MainWindow(self.db, manager, session_manager=Session())
+        self.assertTrue(manager.is_account_manager)
+        self.assertIn("accounts", window._pages)
+        self.assertIn("accounts", window._nav_buttons)
+        self.assertNotIn("machine_learning", window._pages)
+        self.assertNotIn("announcements_admin", window._pages)
+        self.assertIsNone(window.machine_learning_page)
+        self.assertIs(window.stack.currentWidget(), window.dashboard_page)
+        self.assertTrue(hasattr(window.statistics_page, "anomaly_button"))
+        self.assertEqual(window.sidebar_role.text(), "路段管理员  ·  road_manager")
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
+    def test_global_admin_dialog_supports_road_admin_and_three_data_scopes(self):
+        roads = [
+            {
+                "id": "22222222-2222-2222-2222-222222222222",
+                "name": "广深高速",
+            }
+        ]
+        dialog = _AccountSettingsDialog(
+            current_account=self.admin,
+            roads=roads,
+        )
+        dialog.role.setCurrentIndex(dialog.role.findData("road_admin"))
+        self.assertEqual(
+            [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
+            ["own", "road", "all"],
+        )
+        self.assertEqual(dialog.scope.currentData(), "road")
+        self.assertTrue(dialog.road.isEnabled())
+        self.assertTrue(dialog.road.isEditable())
+        values = dialog.values()
+        self.assertEqual(values["account_type"], "road_admin")
+        self.assertEqual(values["data_scope"], "road")
+        self.assertEqual(values["stats_scope"], "own")
+        self.assertEqual(values["road_id"], roads[0]["id"])
+        dialog.road.setEditText("沿海高速")
+        custom = dialog.values()
+        self.assertNotIn("road_id", custom)
+        self.assertEqual(custom["road_name"], "沿海高速")
+        dialog.deleteLater()
+
+    def test_road_manager_dialog_preserves_existing_global_scope(self):
+        road_id = "33333333-3333-3333-3333-333333333333"
+        manager = self.db.upsert_remote_account(
+            {
+                "id": "scope-road-manager",
+                "username": "scope_manager",
+                "display_name": "广深高速",
+                "role": "user",
+                "stats_scope": "own",
+                "account_type": "road_admin",
+                "data_scope": "road",
+                "road_id": road_id,
+                "road_name": "广深高速",
+                "is_active": True,
+            }
+        )
+        station = self.db.upsert_remote_account(
+            {
+                "id": "global-scope-station",
+                "username": "station_all",
+                "display_name": "全量中心站",
+                "role": "user",
+                "stats_scope": "all",
+                "account_type": "station",
+                "data_scope": "all",
+                "road_id": road_id,
+                "road_name": "广深高速",
+                "is_active": True,
+            }
+        )
+        dialog = _AccountSettingsDialog(
+            station,
+            current_account=manager,
+            roads=[{"id": road_id, "name": "广深高速"}],
+        )
+        self.assertEqual(dialog.scope.currentData(), "all")
+        self.assertEqual(dialog.values()["data_scope"], "all")
+        self.assertEqual(
+            [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
+            ["own", "road", "all"],
+        )
+        dialog.deleteLater()
+
     def test_online_account_mutations_omit_test_marker_for_legacy_servers(self):
         captured = []
 
@@ -3372,9 +3508,9 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(window.statistics_page.category_filter_group.isHidden())
         self.assertFalse(hasattr(window, "top_identity"))
         self.assertEqual(window.sidebar_user.text(), "测试站点")
-        self.assertEqual(window.sidebar_role.text(), "用户  ·  normal01")
+        self.assertEqual(window.sidebar_role.text(), "中心站账号  ·  normal01")
         self.assertEqual(window.sidebar_avatar.text(), "测")
-        self.assertEqual(window.personal_center_page.identity_value.text(), "用户")
+        self.assertEqual(window.personal_center_page.identity_value.text(), "中心站账号")
         self.assertEqual(window.personal_center_page.name_value.text(), "测试站点")
         self.assertEqual(window.personal_center_page.username_value.text(), "normal01")
         self.assertEqual(

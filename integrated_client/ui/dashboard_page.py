@@ -993,9 +993,9 @@ class DashboardPage(QWidget):
         ]
         restricted_online_scope = (
             self.account.server_account_id is not None
-            and not self.account.can_view_all_stats
+            and not self.account.can_view_shared_stats
         )
-        hidden_test_scope = self.account.is_test and not self.account.can_view_all_stats
+        hidden_test_scope = self.account.is_test and not self.account.can_view_shared_stats
         if restricted_online_scope:
             stations = [
                 account for account in stations if account.id == self.account.id
@@ -1009,8 +1009,13 @@ class DashboardPage(QWidget):
 
         self.station_combo.blockSignals(True)
         self.station_combo.clear()
+        aggregate_label = (
+            "本路段"
+            if self.account.effective_data_scope == "road"
+            else "全部站点"
+        )
         self.station_combo.addItem(
-            "不参与统计" if hidden_test_scope else "全部站点",
+            "不参与统计" if hidden_test_scope else aggregate_label,
             self.account.id if hidden_test_scope else None,
         )
         for station in stations:
@@ -1024,7 +1029,7 @@ class DashboardPage(QWidget):
             target_id = None
         else:
             target_id = (
-                None if self.account.can_view_all_stats else self.account.id
+                None if self.account.can_view_shared_stats else self.account.id
             )
         target_index = self.station_combo.findData(target_id)
         self.station_combo.setCurrentIndex(target_index if target_index >= 0 else 0)

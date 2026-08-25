@@ -12,6 +12,7 @@ from .connection_test import connection_test_gate
 from .database import get_db, utcnow
 from .errors import ApiError
 from .models import Account, Device
+from .permissions import is_account_manager
 from .security import decode_access_token
 
 bearer = HTTPBearer(auto_error=False)
@@ -77,6 +78,14 @@ def admin_context(
     return context
 
 
+def account_manager_context(
+    context: Annotated[AuthContext, Depends(business_context)],
+) -> AuthContext:
+    if not is_account_manager(context.account):
+        raise ApiError("account_manager_required", "需要账号管理权限", status_code=403)
+    return context
+
+
 def control_admin_context(
     context: Annotated[AuthContext, Depends(current_context)],
 ) -> AuthContext:
@@ -101,4 +110,5 @@ Db = Annotated[Session, Depends(get_db)]
 CurrentContext = Annotated[AuthContext, Depends(current_context)]
 BusinessContext = Annotated[AuthContext, Depends(business_context)]
 AdminContext = Annotated[AuthContext, Depends(admin_context)]
+AccountManagerContext = Annotated[AuthContext, Depends(account_manager_context)]
 ControlAdminContext = Annotated[AuthContext, Depends(control_admin_context)]

@@ -179,7 +179,16 @@ class Database:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     last_login TEXT,
-                    created_by INTEGER REFERENCES accounts(id)
+                    created_by INTEGER REFERENCES accounts(id),
+                    server_account_id TEXT,
+                    stats_scope TEXT NOT NULL DEFAULT 'own',
+                    is_archived INTEGER NOT NULL DEFAULT 0,
+                    entitlement_revision INTEGER NOT NULL DEFAULT 0,
+                    is_test INTEGER NOT NULL DEFAULT 0,
+                    account_type TEXT NOT NULL DEFAULT 'station',
+                    data_scope TEXT NOT NULL DEFAULT 'own',
+                    road_id TEXT,
+                    road_name TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS metric_definitions (
@@ -287,6 +296,8 @@ class Database:
                         CHECK (needs_snapshot IN (0, 1)),
                     stats_scope TEXT NOT NULL DEFAULT 'own'
                         CHECK (stats_scope IN ('own', 'all')),
+                    data_scope TEXT NOT NULL DEFAULT 'own'
+                        CHECK (data_scope IN ('own', 'road', 'all')),
                     entitlement_revision INTEGER NOT NULL DEFAULT 0,
                     current_server_account_id TEXT,
                     last_sync_at TEXT,
@@ -415,6 +426,35 @@ class Database:
                 conn.execute(
                     "ALTER TABLE accounts ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0"
                 )
+            account_type_added = "account_type" not in account_columns
+            if account_type_added:
+                conn.execute(
+                    "ALTER TABLE accounts ADD COLUMN account_type TEXT NOT NULL DEFAULT 'station'"
+                )
+                conn.execute(
+                    "UPDATE accounts SET account_type='admin' WHERE role='admin'"
+                )
+            data_scope_added = "data_scope" not in account_columns
+            if data_scope_added:
+                conn.execute(
+                    "ALTER TABLE accounts ADD COLUMN data_scope TEXT NOT NULL DEFAULT 'own'"
+                )
+                conn.execute(
+                    "UPDATE accounts SET data_scope=stats_scope"
+                )
+            if "road_id" not in account_columns:
+                conn.execute("ALTER TABLE accounts ADD COLUMN road_id TEXT")
+            if "road_name" not in account_columns:
+                conn.execute("ALTER TABLE accounts ADD COLUMN road_name TEXT")
+            sync_state_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(sync_state)").fetchall()
+            }
+            if "data_scope" not in sync_state_columns:
+                conn.execute(
+                    "ALTER TABLE sync_state ADD COLUMN data_scope TEXT NOT NULL DEFAULT 'own'"
+                )
+                conn.execute("UPDATE sync_state SET data_scope=stats_scope")
             conn.execute(
                 "UPDATE accounts SET display_name=username WHERE TRIM(display_name)=''"
             )
@@ -529,6 +569,18 @@ class Database:
                 else 0
             ),
             is_test=bool(row["is_test"] if "is_test" in columns else False),
+            account_type=(
+                row["account_type"]
+                if "account_type" in columns
+                else ("admin" if row["role"] == "admin" else "station")
+            ),
+            data_scope=(
+                row["data_scope"]
+                if "data_scope" in columns
+                else (row["stats_scope"] if "stats_scope" in columns else "own")
+            ),
+            road_id=(row["road_id"] if "road_id" in columns else None),
+            road_name=(row["road_name"] if "road_name" in columns else None),
         )
 
     @staticmethod
@@ -2826,6 +2878,24 @@ class Database:
             last_login = str(last_login)
         is_test_provided = "is_test" in payload
         is_test = int(bool(payload.get("is_test", False)))
+        account_type_value = str(
+            payload.get("account_type")
+            or ("admin" if payload.get("role") == "admin" else "station")
+        )
+        if account_type_value not in {"admin", "road_admin", "station"}:
+            account_type_value = "station"
+        data_scope_value = str(
+            payload.get("data_scope") or payload.get("stats_scope") or "own"
+        )
+        if data_scope_value not in {"own", "road", "all"}:
+            data_scope_value = "own"
+        road_fields_provided = "road_id" in payload or "road_name" in payload
+        road_id = payload.get("road_id")
+        road_name = payload.get("road_name")
+        if road_id is not None:
+            road_id = str(road_id)
+        if road_name is not None:
+            road_name = str(road_name)
         row = conn.execute(
             """
             SELECT id FROM accounts
@@ -2845,6 +2915,9 @@ class Database:
                     stats_scope=?, is_active=?, is_archived=?,
                     must_change_password=?, entitlement_revision=?,
                     is_test=CASE WHEN ? THEN ? ELSE is_test END,
+                    account_type=?, data_scope=?,
+                    road_id=CASE WHEN ? THEN ? ELSE road_id END,
+                    road_name=CASE WHEN ? THEN ? ELSE road_name END,
                     last_login=CASE WHEN ? THEN ? ELSE last_login END,
                     updated_at=?
                 WHERE id=?
@@ -2861,6 +2934,12 @@ class Database:
                     int(payload.get("entitlement_revision") or 0),
                     int(is_test_provided),
                     is_test,
+                    account_type_value,
+                    data_scope_value,
+                    int(road_fields_provided),
+                    road_id,
+                    int(road_fields_provided),
+                    road_name,
                     int(last_login_provided),
                     last_login,
                     now,
@@ -2884,8 +2963,9 @@ class Database:
                 username, display_name, password_salt, password_hash, role,
                 is_active, must_change_password, last_login, created_at, updated_at,
                 server_account_id, stats_scope, is_archived,
-                entitlement_revision, is_test
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                entitlement_revision, is_test, account_type, data_scope,
+                road_id, road_name
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 username,
@@ -2903,6 +2983,10 @@ class Database:
                 int(bool(payload.get("is_archived", False))),
                 int(payload.get("entitlement_revision") or 0),
                 is_test,
+                account_type_value,
+                data_scope_value,
+                road_id,
+                road_name,
             ),
         )
         if is_test_provided and is_test:
@@ -2925,7 +3009,12 @@ class Database:
             ).fetchone()
             return self._account_from_row(row)
 
-    def reconcile_remote_accounts(self, payloads: Iterable[Dict]) -> List[Account]:
+    def reconcile_remote_accounts(
+        self,
+        payloads: Iterable[Dict],
+        *,
+        prune_missing: bool = True,
+    ) -> List[Account]:
         """Mirror one complete server account list into the local cache.
 
         An account delete change can be missed when a client was offline or its
@@ -2956,23 +3045,24 @@ class Database:
                 if state
                 else ""
             )
-            cached_ids = conn.execute(
-                """
-                SELECT server_account_id FROM accounts
-                WHERE server_account_id IS NOT NULL
-                """
-            ).fetchall()
-            for cached in cached_ids:
-                server_account_id = str(cached["server_account_id"] or "").strip()
-                if (
-                    server_account_id
-                    and server_account_id not in server_account_ids
-                    and server_account_id != current_server_account_id
-                ):
-                    self._purge_remote_account_cache_conn(
-                        conn,
-                        server_account_id,
-                    )
+            if prune_missing:
+                cached_ids = conn.execute(
+                    """
+                    SELECT server_account_id FROM accounts
+                    WHERE server_account_id IS NOT NULL
+                    """
+                ).fetchall()
+                for cached in cached_ids:
+                    server_account_id = str(cached["server_account_id"] or "").strip()
+                    if (
+                        server_account_id
+                        and server_account_id not in server_account_ids
+                        and server_account_id != current_server_account_id
+                    ):
+                        self._purge_remote_account_cache_conn(
+                            conn,
+                            server_account_id,
+                        )
 
             accounts = []
             for account_id in account_ids:
@@ -3073,30 +3163,30 @@ class Database:
         self,
         server_account_id: str,
         stats_scope: Optional[str] = None,
+        data_scope: Optional[str] = None,
     ) -> None:
         server_account_id = str(server_account_id)
-        normalized_scope = str(stats_scope or "own")
-        if normalized_scope not in {"own", "all"}:
+        normalized_scope = str(data_scope or stats_scope or "own")
+        if normalized_scope not in {"own", "road", "all"}:
             normalized_scope = "own"
+        legacy_scope = "all" if normalized_scope == "all" else "own"
         with self._connect() as conn:
             state = conn.execute("SELECT * FROM sync_state WHERE id=1").fetchone()
             previous_account_id = state["current_server_account_id"]
-            previous_scope = str(state["stats_scope"] or "own")
+            previous_scope = str(state["data_scope"] or state["stats_scope"] or "own")
             account_changed = previous_account_id != server_account_id
-            scope_expanded = (
+            scope_changed = (
                 previous_account_id == server_account_id
-                and previous_scope == "own"
-                and normalized_scope == "all"
+                and previous_scope != normalized_scope
             )
-            if normalized_scope == "own" and (
-                account_changed or previous_scope == "all"
-            ):
+            if account_changed or scope_changed:
                 self._purge_other_station_cache_conn(conn, server_account_id)
             conn.execute(
                 """
                 UPDATE sync_state
                 SET current_server_account_id=?,
                     stats_scope=?,
+                    data_scope=?,
                     last_revision=CASE WHEN ? THEN 0 ELSE last_revision END,
                     needs_snapshot=CASE WHEN ? THEN 1 ELSE needs_snapshot END,
                     updated_at=?
@@ -3104,9 +3194,10 @@ class Database:
                 """,
                 (
                     server_account_id,
+                    legacy_scope,
                     normalized_scope,
-                    int(account_changed or scope_expanded),
-                    int(account_changed or scope_expanded),
+                    int(account_changed or scope_changed),
+                    int(account_changed or scope_changed),
                     self._now(),
                 ),
             )
@@ -3225,6 +3316,7 @@ class Database:
                 "last_revision": int(row["last_revision"]),
                 "needs_snapshot": bool(row["needs_snapshot"]),
                 "stats_scope": row["stats_scope"],
+                "data_scope": row["data_scope"],
                 "entitlement_revision": int(row["entitlement_revision"]),
                 "current_server_account_id": row["current_server_account_id"],
                 "last_sync_at": row["last_sync_at"],
@@ -3323,7 +3415,7 @@ class Database:
             conn.execute(
                 """
                 UPDATE sync_state
-                SET stats_scope='own', updated_at=?
+                SET stats_scope='own', data_scope='own', updated_at=?
                 WHERE id=1
                 """,
                 (self._now(),),
@@ -3698,13 +3790,19 @@ class Database:
 
     def apply_sync_changes(self, response: Dict) -> None:
         changes = response.get("changes") or []
-        stats_scope = str(response.get("stats_scope") or "own")
+        data_scope = str(
+            response.get("data_scope") or response.get("stats_scope") or "own"
+        )
+        if data_scope not in {"own", "road", "all"}:
+            data_scope = "own"
+        stats_scope = "all" if data_scope == "all" else "own"
         entitlement_revision = int(response.get("entitlement_revision") or 0)
         with self._connect() as conn:
             state = conn.execute("SELECT * FROM sync_state WHERE id=1").fetchone()
-            previous_scope = state["stats_scope"]
+            previous_scope = state["data_scope"] or state["stats_scope"]
             current_server_account_id = state["current_server_account_id"]
             max_revision = int(state["last_revision"])
+            scope_snapshot_required = False
             for change in changes:
                 revision = int(change.get("revision") or 0)
                 max_revision = max(max_revision, revision)
@@ -3744,12 +3842,16 @@ class Database:
                         account_id or entity_id,
                         payload.get("reset_at"),
                     )
+                elif kind == "road_membership_changed" and payload.get(
+                    "refresh_scope"
+                ):
+                    scope_snapshot_required = True
             if not response.get("has_more"):
                 max_revision = max(
                     max_revision,
                     int(response.get("latest_revision") or 0),
                 )
-            if previous_scope == "all" and stats_scope == "own":
+            if previous_scope != "own" and data_scope == "own":
                 self._purge_other_station_cache_conn(
                     conn,
                     current_server_account_id,
@@ -3757,20 +3859,28 @@ class Database:
             conn.execute(
                 """
                 UPDATE sync_state
-                SET last_revision=?, stats_scope=?, entitlement_revision=?,
+                SET last_revision=?, stats_scope=?, data_scope=?, entitlement_revision=?,
+                    needs_snapshot=CASE WHEN ? THEN 1 ELSE needs_snapshot END,
                     last_error=NULL, updated_at=?
                 WHERE id=1
                 """,
                 (
                     max_revision,
                     stats_scope,
+                    data_scope,
                     entitlement_revision,
+                    int(scope_snapshot_required),
                     self._now(),
                 ),
             )
 
     def apply_sync_snapshot(self, snapshot: Dict) -> None:
-        stats_scope = str(snapshot.get("stats_scope") or "own")
+        data_scope = str(
+            snapshot.get("data_scope") or snapshot.get("stats_scope") or "own"
+        )
+        if data_scope not in {"own", "road", "all"}:
+            data_scope = "own"
+        stats_scope = "all" if data_scope == "all" else "own"
         with self._connect() as conn:
             state = conn.execute("SELECT * FROM sync_state WHERE id=1").fetchone()
             current_server_account_id = state["current_server_account_id"]
@@ -3822,7 +3932,7 @@ class Database:
                     int(run.get("revision") or 1),
                     run,
                 )
-            if stats_scope == "own":
+            if data_scope == "own":
                 self._purge_other_station_cache_conn(
                     conn,
                     current_server_account_id,
@@ -3848,13 +3958,14 @@ class Database:
             conn.execute(
                 """
                 UPDATE sync_state
-                SET last_revision=?, needs_snapshot=0, stats_scope=?,
+                SET last_revision=?, needs_snapshot=0, stats_scope=?, data_scope=?,
                     entitlement_revision=?, last_error=NULL, updated_at=?
                 WHERE id=1
                 """,
                 (
                     int(snapshot.get("revision") or 0),
                     stats_scope,
+                    data_scope,
                     int(snapshot.get("entitlement_revision") or 0),
                     self._now(),
                 ),

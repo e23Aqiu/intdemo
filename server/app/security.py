@@ -20,6 +20,7 @@ from pwdlib import PasswordHash
 from .config import Settings, get_settings
 from .errors import ApiError
 from .models import Account, Device
+from .permissions import account_type, data_scope, legacy_stats_scope
 
 password_hasher = PasswordHash.recommended()
 
@@ -88,6 +89,7 @@ def create_access_token(
     settings = settings or get_settings()
     now = datetime.now(UTC)
     expires = now + timedelta(minutes=settings.access_token_minutes)
+    scope = data_scope(account)
     claims = {
         "iss": settings.jwt_issuer,
         "sub": str(account.id),
@@ -95,7 +97,10 @@ def create_access_token(
         "dver": device.token_version,
         "ver": account.token_version,
         "role": account.role,
-        "scope": account.stats_scope,
+        "scope": legacy_stats_scope(scope),
+        "account_type": account_type(account),
+        "data_scope": scope,
+        "road_id": str(account.road_id) if account.road_id else None,
         "ent": account.entitlement_revision,
         "iat": now,
         "exp": expires,
@@ -138,6 +143,7 @@ def create_offline_entitlement(
     settings = settings or get_settings()
     now = datetime.now(UTC)
     expires = now + timedelta(days=settings.offline_entitlement_days)
+    scope = data_scope(account)
     body = {
         "v": 1,
         "iss": settings.jwt_issuer,
@@ -147,8 +153,11 @@ def create_offline_entitlement(
         "username": account.username,
         "display_name": account.display_name,
         "role": account.role,
+        "account_type": account_type(account),
         "is_test": account.is_test,
-        "stats_scope": account.stats_scope,
+        "stats_scope": legacy_stats_scope(scope),
+        "data_scope": scope,
+        "road_id": str(account.road_id) if account.road_id else None,
         "entitlement_revision": account.entitlement_revision,
         "issued_at": int(now.timestamp()),
         "expires_at": int(expires.timestamp()),

@@ -16,7 +16,9 @@ from .models import (
     ChangeLog,
     Device,
     RefreshSession,
+    Road,
 )
+from .permissions import account_type, data_scope, legacy_stats_scope
 
 
 def aware(value: datetime | None) -> datetime | None:
@@ -55,13 +57,19 @@ def account_view(db: Session, account: Account) -> dict[str, Any]:
         )
         or 0
     )
+    scope = data_scope(account)
+    road = db.get(Road, account.road_id) if account.road_id is not None else None
     return {
         "id": account.id,
         "username": account.username,
         "display_name": account.display_name,
         "role": account.role,
+        "account_type": account_type(account),
         "is_test": account.is_test,
-        "stats_scope": account.stats_scope,
+        "stats_scope": legacy_stats_scope(scope),
+        "data_scope": scope,
+        "road_id": account.road_id,
+        "road_name": road.name if road is not None else None,
         "device_limit": account.device_limit,
         "is_active": account.is_active,
         "is_archived": account.is_archived,
@@ -74,6 +82,10 @@ def account_view(db: Session, account: Account) -> dict[str, Any]:
         "created_at": account.created_at,
         "updated_at": account.updated_at,
     }
+
+
+def road_view(road: Road) -> dict[str, Any]:
+    return {"id": road.id, "name": road.name}
 
 
 def device_view(device: Device) -> dict[str, Any]:

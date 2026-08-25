@@ -74,7 +74,7 @@ class AccountPage(QWidget):
         for key, label, color in (
             ("total", "账号总数", "#1d8178"),
             ("admin", "管理员", "#d18400"),
-            ("user", "普通用户", "#3f8f88"),
+            ("user", "中心站账号", "#3f8f88"),
             ("active", "正常账号", "#1d8d70"),
         ):
             card, value = self._summary_card(label, color)

@@ -3,19 +3,35 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Query, Request, Response
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 
 from ..connection_test import connection_test_gate
 from ..database import utcnow
-from ..dependencies import AdminContext, ControlAdminContext, Db
+from ..dependencies import AccountManagerContext, ControlAdminContext, Db
 from ..errors import ApiError
 from ..models import (
     Account,
     ActivityEvent,
     AuditLog,
     Device,
+    Road,
     WorkflowBatch,
     WorkflowRun,
+)
+from ..permissions import (
+    DEFAULT_ROAD_NAME,
+    GLOBAL_ADMIN,
+    ROAD_ADMIN,
+    SCOPE_ALL,
+    SCOPE_OWN,
+    SCOPE_ROAD,
+    STATION,
+    account_type,
+    can_manage_account,
+    data_scope,
+    is_global_admin,
+    is_road_admin,
+    legacy_stats_scope,
 )
 from ..realtime import update_hub
 from ..schemas import (
@@ -26,6 +42,7 @@ from ..schemas import (
     ConnectionTestOverview,
     DataResetRequest,
     DeviceView,
+    RoadView,
 )
 from ..security import hash_password
 from ..services import (
@@ -36,6 +53,7 @@ from ..services import (
     device_view,
     latest_revision,
     revoke_refresh_sessions,
+    road_view,
 )
 
 router = APIRouter(prefix="/admin", tags=["administration"])
@@ -48,13 +66,73 @@ def _account_or_404(db: Db, account_id: uuid.UUID) -> Account:
     return account
 
 
-def _account_change_payload(account: Account) -> dict:
+def _default_road(db: Db) -> Road:
+    road = db.scalar(select(Road).where(Road.name == DEFAULT_ROAD_NAME))
+    if road is None:
+        road = Road(name=DEFAULT_ROAD_NAME)
+        db.add(road)
+        db.flush()
+    return road
+
+
+def _road_or_404(db: Db, road_id: uuid.UUID | None) -> Road:
+    if road_id is None:
+        raise ApiError("road_required", "账号尚未分配所属路段", status_code=422)
+    road = db.get(Road, road_id)
+    if road is None:
+        raise ApiError("road_not_found", "所属路段不存在", status_code=422)
+    return road
+
+
+def _resolve_road(
+    db: Db,
+    *,
+    road_id: uuid.UUID | None,
+    road_name: str | None,
+    allow_create: bool,
+) -> Road | None:
+    if road_id is not None:
+        return _road_or_404(db, road_id)
+    if road_name is None:
+        return None
+    road = db.scalar(select(Road).where(Road.name == road_name.strip()))
+    if road is None and allow_create:
+        road = Road(name=road_name.strip())
+        db.add(road)
+        db.flush()
+    if road is None:
+        raise ApiError("road_not_found", "所属路段不存在", status_code=422)
+    return road
+
+
+def _managed_account_or_404(
+    db: Db,
+    actor: Account,
+    account_id: uuid.UUID,
+) -> Account:
+    account = _account_or_404(db, account_id)
+    if not can_manage_account(actor, account):
+        raise ApiError(
+            "account_outside_management_scope",
+            "只能管理本路段的中心站账号",
+            status_code=403,
+        )
+    return account
+
+
+def _account_change_payload(db: Db, account: Account) -> dict:
+    scope = data_scope(account)
+    road = db.get(Road, account.road_id) if account.road_id is not None else None
     return {
         "username": account.username,
         "display_name": account.display_name,
         "role": account.role,
+        "account_type": account_type(account),
         "is_test": account.is_test,
-        "stats_scope": account.stats_scope,
+        "stats_scope": legacy_stats_scope(scope),
+        "data_scope": scope,
+        "road_id": str(account.road_id) if account.road_id else None,
+        "road_name": road.name if road is not None else None,
         "device_limit": account.device_limit,
         "is_active": account.is_active,
         "is_archived": account.is_archived,
@@ -74,27 +152,118 @@ def _connection_test_device_or_404(db: Db, device_id: uuid.UUID) -> Device:
 
 
 @router.get("/accounts", response_model=list[AccountView])
-def list_accounts(context: AdminContext, db: Db) -> list[dict]:
-    accounts = db.scalars(select(Account).order_by(Account.username)).all()
+def list_accounts(context: AccountManagerContext, db: Db) -> list[dict]:
+    statement = select(Account).order_by(Account.username)
+    if is_road_admin(context.account):
+        statement = statement.where(
+            Account.account_type == STATION,
+            Account.road_id == context.account.road_id,
+        )
+    accounts = db.scalars(statement).all()
     return [account_view(db, account) for account in accounts]
+
+
+@router.get("/roads", response_model=list[RoadView])
+def list_roads(context: AccountManagerContext, db: Db) -> list[dict]:
+    statement = select(Road).order_by(Road.name)
+    if is_road_admin(context.account):
+        statement = statement.where(Road.id == context.account.road_id)
+    return [road_view(road) for road in db.scalars(statement).all()]
 
 
 @router.post("/accounts", response_model=AccountView, status_code=201)
 async def create_account(
     payload: AccountCreate,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> dict:
     if db.scalar(select(Account.id).where(Account.username == payload.username)):
         raise ApiError("username_exists", "登录名已存在", status_code=409)
+    requested_type = payload.account_type or (
+        GLOBAL_ADMIN if payload.role == "admin" else STATION
+    )
+    if is_road_admin(context.account) and requested_type != STATION:
+        raise ApiError(
+            "account_type_not_allowed",
+            "路段管理员只能新增本路段中心站账号",
+            status_code=403,
+        )
+    if is_road_admin(context.account) and (
+        payload.road_name is not None
+        or (
+            payload.road_id is not None
+            and payload.road_id != context.account.road_id
+        )
+    ):
+        raise ApiError(
+            "road_assignment_not_allowed",
+            "路段管理员不能把中心站分配到其他路段",
+            status_code=403,
+        )
+    is_test = bool(payload.is_test)
+    if is_test and requested_type != STATION:
+        raise ApiError(
+            "invalid_test_account_role",
+            "测试账号必须属于中心站账号",
+            status_code=422,
+        )
+
+    if payload.data_scope is not None:
+        requested_scope = payload.data_scope
+    elif "stats_scope" in payload.model_fields_set:
+        requested_scope = payload.stats_scope
+    else:
+        requested_scope = SCOPE_ROAD if requested_type == ROAD_ADMIN else SCOPE_OWN
+
+    road = None
+    if requested_type == GLOBAL_ADMIN:
+        requested_scope = SCOPE_ALL
+        is_test = False
+    elif is_road_admin(context.account):
+        road = _road_or_404(db, context.account.road_id)
+        if requested_scope not in {SCOPE_OWN, SCOPE_ROAD}:
+            raise ApiError(
+                "data_scope_not_allowed",
+                "路段管理员只能设置本人或本路段数据范围",
+                status_code=403,
+            )
+    else:
+        road = _resolve_road(
+            db,
+            road_id=payload.road_id,
+            road_name=payload.road_name,
+            allow_create=requested_type == ROAD_ADMIN,
+        )
+        new_protocol = bool(
+            payload.account_type is not None
+            or payload.data_scope is not None
+            or payload.road_id is not None
+            or payload.road_name is not None
+        )
+        if road is None:
+            if new_protocol:
+                raise ApiError(
+                    "road_required",
+                    "中心站和路段管理员账号必须分配所属路段",
+                    status_code=422,
+                )
+            # Legacy administrators never send a road field.  Assigning the
+            # compatibility road keeps their existing create-account flow valid.
+            road = _default_road(db)
+    if requested_scope == SCOPE_ROAD and road is None:
+        raise ApiError("road_required", "本路段数据范围需要所属路段", status_code=422)
+
     account = Account(
         username=payload.username,
         display_name=payload.display_name.strip(),
         password_hash=hash_password("123456"),
-        role=payload.role,
-        is_test=payload.is_test,
-        stats_scope=payload.stats_scope,
+        role="admin" if requested_type == GLOBAL_ADMIN else "user",
+        account_type=requested_type,
+        is_test=is_test,
+        stats_scope=legacy_stats_scope(requested_scope),
+        data_scope=requested_scope,
+        road_id=road.id if road is not None else None,
         device_limit=payload.device_limit,
         is_active=payload.is_active,
         must_change_password=True,
@@ -107,7 +276,7 @@ async def create_account(
         kind="account",
         entity_id=str(account.id),
         entity_revision=account.entitlement_revision,
-        payload=_account_change_payload(account),
+        payload=_account_change_payload(db, account),
     )
     audit(
         db,
@@ -116,7 +285,12 @@ async def create_account(
         action="account.create",
         target_type="account",
         target_id=str(account.id),
-        details={"username": account.username},
+        details={
+            "username": account.username,
+            "account_type": requested_type,
+            "data_scope": requested_scope,
+            "road_id": str(account.road_id) if account.road_id else None,
+        },
     )
     db.commit()
     await update_hub.broadcast_revision(change.revision)
@@ -128,23 +302,79 @@ async def update_account(
     account_id: uuid.UUID,
     payload: AccountUpdate,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> dict:
-    account = _account_or_404(db, account_id)
+    account = _managed_account_or_404(db, context.account, account_id)
     changes = payload.model_dump(exclude_unset=True)
-    resulting_role = str(changes.get("role", account.role))
+    current_type = account_type(account)
+    resulting_type = str(changes.get("account_type", current_type))
+    if "account_type" not in changes and "role" in changes:
+        resulting_type = GLOBAL_ADMIN if changes["role"] == "admin" else STATION
     resulting_is_test = bool(changes.get("is_test", account.is_test))
-    if resulting_role == "admin":
-        if changes.get("is_test") is True:
+    if resulting_is_test:
+        if "account_type" in changes and resulting_type != STATION:
             raise ApiError(
                 "invalid_test_account_role",
-                "测试账号必须使用普通用户权限",
+                "测试账号必须属于中心站账号",
                 status_code=422,
             )
-        changes["is_test"] = False
-    elif resulting_is_test:
-        changes["role"] = "user"
+        resulting_type = STATION
+    if is_road_admin(context.account):
+        if resulting_type != STATION or {"road_id", "road_name"} & changes.keys():
+            raise ApiError(
+                "account_type_not_allowed",
+                "路段管理员不能修改账号层级或所属路段",
+                status_code=403,
+            )
+    if resulting_type != STATION:
+        resulting_is_test = False
+
+    resulting_road = (
+        db.get(Road, account.road_id) if account.road_id is not None else None
+    )
+    if is_global_admin(context.account) and {"road_id", "road_name"} & changes.keys():
+        resulting_road = _resolve_road(
+            db,
+            road_id=changes.get("road_id"),
+            road_name=changes.get("road_name"),
+            allow_create=resulting_type == ROAD_ADMIN,
+        )
+    if resulting_type == GLOBAL_ADMIN:
+        resulting_road = None
+    elif resulting_road is None:
+        if "account_type" in changes:
+            raise ApiError(
+                "road_required",
+                "中心站和路段管理员账号必须分配所属路段",
+                status_code=422,
+            )
+        # This path keeps legacy role demotions compatible while all new
+        # hierarchical requests are required to name a road explicitly.
+        resulting_road = _default_road(db)
+
+    if "data_scope" in changes:
+        resulting_scope = str(changes["data_scope"])
+    elif "stats_scope" in changes:
+        resulting_scope = str(changes["stats_scope"])
+    else:
+        resulting_scope = data_scope(account)
+    if resulting_type == GLOBAL_ADMIN:
+        resulting_scope = SCOPE_ALL
+    scope_was_requested = bool({"data_scope", "stats_scope"} & changes.keys())
+    if (
+        is_road_admin(context.account)
+        and scope_was_requested
+        and resulting_scope not in {SCOPE_OWN, SCOPE_ROAD}
+    ):
+        raise ApiError(
+            "data_scope_not_allowed",
+            "路段管理员只能设置本人或本路段数据范围",
+            status_code=403,
+        )
+    if resulting_scope == SCOPE_ROAD and resulting_road is None:
+        raise ApiError("road_required", "本路段数据范围需要所属路段", status_code=422)
+
     if "device_limit" in changes:
         current_active_devices = active_device_count(db, account.id)
         if changes["device_limit"] < current_active_devices:
@@ -156,19 +386,35 @@ async def update_account(
             )
     if account.id == context.account.id and changes.get("is_active") is False:
         raise ApiError("cannot_disable_self", "不能停用当前管理员账号", status_code=409)
-    if account.id == context.account.id and changes.get("role") == "user":
+    if account.id == context.account.id and resulting_type != GLOBAL_ADMIN:
         raise ApiError("cannot_demote_self", "不能降低当前管理员权限", status_code=409)
-    if account.id == context.account.id and changes.get("is_test") is True:
+    if account.id == context.account.id and resulting_is_test:
         raise ApiError("cannot_mark_self_test", "不能将当前管理员设为测试账号", status_code=409)
 
-    security_changed = any(
-        name in changes and changes[name] != getattr(account, name)
-        for name in ("role", "is_test", "stats_scope", "is_active")
+    security_before = (
+        current_type,
+        bool(account.is_test),
+        data_scope(account),
+        account.road_id,
+        bool(account.is_active),
     )
-    for name, value in changes.items():
-        if name == "display_name":
-            value = value.strip()
-        setattr(account, name, value)
+    for name in ("display_name", "device_limit", "is_active"):
+        if name in changes:
+            value = changes[name]
+            setattr(account, name, value.strip() if name == "display_name" else value)
+    account.account_type = resulting_type
+    account.role = "admin" if resulting_type == GLOBAL_ADMIN else "user"
+    account.is_test = resulting_is_test
+    account.data_scope = resulting_scope
+    account.stats_scope = legacy_stats_scope(resulting_scope)
+    account.road_id = resulting_road.id if resulting_road is not None else None
+    security_changed = security_before != (
+        account.account_type,
+        bool(account.is_test),
+        account.data_scope,
+        account.road_id,
+        bool(account.is_active),
+    )
     account.entitlement_revision += 1
     if security_changed:
         account.token_version += 1
@@ -179,8 +425,21 @@ async def update_account(
         kind="account",
         entity_id=str(account.id),
         entity_revision=account.entitlement_revision,
-        payload=_account_change_payload(account),
+        payload=_account_change_payload(db, account),
     )
+    previous_road_id = security_before[3]
+    if previous_road_id != account.road_id:
+        change = append_change(
+            db,
+            account_id=None,
+            kind="road_membership_changed",
+            entity_id=str(account.id),
+            entity_revision=account.entitlement_revision,
+            payload={
+                "old_road_id": str(previous_road_id) if previous_road_id else None,
+                "new_road_id": str(account.road_id) if account.road_id else None,
+            },
+        )
     audit(
         db,
         request,
@@ -199,10 +458,10 @@ async def update_account(
 async def archive_account(
     account_id: uuid.UUID,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> dict:
-    account = _account_or_404(db, account_id)
+    account = _managed_account_or_404(db, context.account, account_id)
     if account.id == context.account.id:
         raise ApiError("cannot_archive_self", "不能归档当前管理员账号", status_code=409)
     account.is_archived = True
@@ -217,7 +476,7 @@ async def archive_account(
         entity_id=str(account.id),
         entity_revision=account.entitlement_revision,
         operation="upsert",
-        payload=_account_change_payload(account),
+        payload=_account_change_payload(db, account),
     )
     audit(
         db,
@@ -236,10 +495,10 @@ async def archive_account(
 async def restore_account(
     account_id: uuid.UUID,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> dict:
-    account = _account_or_404(db, account_id)
+    account = _managed_account_or_404(db, context.account, account_id)
     account.is_archived = False
     account.entitlement_revision += 1
     change = append_change(
@@ -248,7 +507,7 @@ async def restore_account(
         kind="account",
         entity_id=str(account.id),
         entity_revision=account.entitlement_revision,
-        payload=_account_change_payload(account),
+        payload=_account_change_payload(db, account),
     )
     audit(
         db,
@@ -267,10 +526,10 @@ async def restore_account(
 async def delete_archived_account(
     account_id: uuid.UUID,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> Response:
-    account = _account_or_404(db, account_id)
+    account = _managed_account_or_404(db, context.account, account_id)
     if account.id == context.account.id:
         raise ApiError(
             "cannot_delete_self",
@@ -284,6 +543,8 @@ async def delete_archived_account(
             status_code=409,
         )
     username = account.username
+    deleted_account_type = account_type(account)
+    deleted_road_id = account.road_id
     entity_revision = account.entitlement_revision + 1
     audit(
         db,
@@ -310,7 +571,11 @@ async def delete_archived_account(
         entity_id=str(account_id),
         entity_revision=entity_revision,
         operation="delete",
-        payload={"username": username},
+        payload={
+            "username": username,
+            "account_type": deleted_account_type,
+            "road_id": str(deleted_road_id) if deleted_road_id else None,
+        },
     )
     db.commit()
     await update_hub.broadcast_revision(change.revision)
@@ -321,10 +586,10 @@ async def delete_archived_account(
 async def reset_password(
     account_id: uuid.UUID,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> None:
-    account = _account_or_404(db, account_id)
+    account = _managed_account_or_404(db, context.account, account_id)
     account.password_hash = hash_password("123456")
     account.must_change_password = True
     account.token_version += 1
@@ -336,7 +601,7 @@ async def reset_password(
         kind="account",
         entity_id=str(account.id),
         entity_revision=account.entitlement_revision,
-        payload=_account_change_payload(account),
+        payload=_account_change_payload(db, account),
     )
     audit(
         db,
@@ -353,10 +618,10 @@ async def reset_password(
 @router.get("/accounts/{account_id}/devices", response_model=list[DeviceView])
 def list_devices(
     account_id: uuid.UUID,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> list[dict]:
-    _account_or_404(db, account_id)
+    _managed_account_or_404(db, context.account, account_id)
     devices = db.scalars(
         select(Device).where(Device.account_id == account_id).order_by(Device.created_at.desc())
     ).all()
@@ -367,19 +632,19 @@ def list_devices(
 async def revoke_device(
     device_id: uuid.UUID,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> None:
     device = db.get(Device, device_id)
     if not device:
         raise ApiError("device_not_found", "设备不存在", status_code=404)
+    account = _managed_account_or_404(db, context.account, device.account_id)
     if device.id == context.device.id:
         raise ApiError("cannot_revoke_current_device", "不能撤销当前登录设备", status_code=409)
     if device.revoked_at is None:
         device.revoked_at = utcnow()
         device.revoked_reason = "revoked_by_admin"
         revoke_refresh_sessions(db, device_id=device.id, reason="device_revoked")
-        account = db.get(Account, device.account_id)
         account.entitlement_revision += 1
         change = append_change(
             db,
@@ -560,10 +825,10 @@ async def restore_client(
 async def reset_data(
     payload: DataResetRequest,
     request: Request,
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
 ) -> None:
-    account = _account_or_404(db, payload.account_id)
+    account = _managed_account_or_404(db, context.account, payload.account_id)
     reset_at = utcnow()
     account.data_reset_at = reset_at
     account.entitlement_revision += 1
@@ -597,12 +862,36 @@ async def reset_data(
 
 @router.get("/audit")
 def list_audit_logs(
-    context: AdminContext,
+    context: AccountManagerContext,
     db: Db,
     limit: int = Query(default=100, ge=1, le=500),
     before_id: int | None = Query(default=None, ge=1),
 ) -> dict:
     query = select(AuditLog)
+    if is_road_admin(context.account):
+        managed_account_ids = list(
+            db.scalars(
+                select(Account.id).where(
+                    Account.account_type == STATION,
+                    Account.road_id == context.account.road_id,
+                )
+            )
+        )
+        managed_device_ids = list(
+            db.scalars(
+                select(Device.id).where(Device.account_id.in_(managed_account_ids))
+            )
+        )
+        visible_target_ids = [
+            *(str(account_id) for account_id in managed_account_ids),
+            *(str(device_id) for device_id in managed_device_ids),
+        ]
+        query = query.where(
+            or_(
+                AuditLog.actor_account_id == context.account.id,
+                AuditLog.target_id.in_(visible_target_ids),
+            )
+        )
     if before_id is not None:
         query = query.where(AuditLog.id < before_id)
     rows = db.scalars(query.order_by(AuditLog.id.desc()).limit(limit + 1)).all()
