@@ -39,6 +39,7 @@ ALLOWED_PAYLOAD_KEYS = {
     "activity_event": {
         "metric_key",
         "amount",
+        "yellow_amount",
         "business_date",
         "source",
         "task_id",
@@ -171,14 +172,27 @@ def _validate_activity(payload: dict[str, Any]) -> dict[str, Any]:
         or not re.fullmatch(r"[A-Za-z0-9_.:-]+", task_id)
     ):
         raise ApiError("invalid_sync_payload", "task_id 无效", status_code=422)
+    yellow_amount = payload.get("yellow_amount")
+    if yellow_amount is not None:
+        yellow_amount = _require_int(
+            payload,
+            "yellow_amount",
+            maximum=amount,
+        )
     summary = payload.get("summary") or {}
-    if not isinstance(summary, dict) or set(summary) - {"row_count", "violation_counts"}:
+    if not isinstance(summary, dict) or set(summary) - {
+        "row_count",
+        "violation_counts",
+        "yellow_violation_counts",
+    }:
         raise ApiError("invalid_sync_payload", "summary 只允许汇总数量", status_code=422)
     normalized_summary: dict[str, Any] = {}
     if "row_count" in summary:
         normalized_summary["row_count"] = _require_int(summary, "row_count", maximum=10_000_000)
-    if "violation_counts" in summary:
-        values = summary["violation_counts"]
+    for field_name in ("violation_counts", "yellow_violation_counts"):
+        if field_name not in summary:
+            continue
+        values = summary[field_name]
         if not isinstance(values, dict) or len(values) > 200:
             raise ApiError("invalid_sync_payload", "违规原因汇总无效", status_code=422)
         normalized_counts: dict[str, dict[str, int]] = {}
@@ -204,10 +218,11 @@ def _validate_activity(payload: dict[str, Any]) -> dict[str, Any]:
                     )
                 normalized_values[key] = number
             normalized_counts[reason.strip()] = normalized_values
-        normalized_summary["violation_counts"] = normalized_counts
+        normalized_summary[field_name] = normalized_counts
     return {
         "metric_key": metric_key,
         "amount": amount,
+        "yellow_amount": yellow_amount,
         "business_date": business_date,
         "source": source,
         "task_id": task_id,
@@ -271,6 +286,7 @@ def _change_payload_for_activity(row: ActivityEvent) -> dict[str, Any]:
         "event_uid": str(row.event_uid),
         "metric_key": row.metric_key,
         "amount": row.amount,
+        "yellow_amount": row.yellow_amount,
         "business_date": row.business_date.isoformat(),
         "source": row.source,
         "task_id": row.task_id,

@@ -6379,14 +6379,14 @@ class ToolAndUiTests(unittest.TestCase):
     def test_workflow_counts_only_once_with_mutually_exclusive_categories(self):
         dataframe = pd.DataFrame(
             [
-                {"运输证号_纯数字": "", "车辆所有人/企业": "", PHONE_COL_NAME: "13800000000", "原因": "超限|证件异常"},
-                {"运输证号_纯数字": "440100001", "车辆所有人/企业": "已补缴", PHONE_COL_NAME: "", "原因": "恶意U/J形行驶|车型异常"},
-                {"运输证号_纯数字": "", "车辆所有人/企业": "无运输证号", PHONE_COL_NAME: "", "原因": "证件异常/证件异常"},
-                {"运输证号_纯数字": "", "车辆所有人/企业": "示例运输公司", PHONE_COL_NAME: "020-88886666", "原因": "车型异常"},
-                {"运输证号_纯数字": "440100002", "车辆所有人/企业": "无营运信息", PHONE_COL_NAME: "", "原因": "营运异常"},
-                {"运输证号_纯数字": "440100003", "车辆所有人/企业": "张三个体工商户", PHONE_COL_NAME: "", "原因": "经营类型"},
-                {"运输证号_纯数字": "440100004", "车辆所有人/企业": "甲运输公司", PHONE_COL_NAME: "未公示", "原因": "超限/电话异常"},
-                {"运输证号_纯数字": "440100005", "车辆所有人/企业": "乙运输公司", PHONE_COL_NAME: "13800000000", "原因": "超限/证件异常"},
+                {"车牌": "粤A00001_黄色", "运输证号_纯数字": "", "车辆所有人/企业": "", PHONE_COL_NAME: "13800000000", "原因": "超限|证件异常"},
+                {"车牌": "粤A00002_黄色", "运输证号_纯数字": "440100001", "车辆所有人/企业": "已补缴", PHONE_COL_NAME: "", "原因": "恶意U/J形行驶|车型异常"},
+                {"车牌": "粤A00003_黄色", "运输证号_纯数字": "", "车辆所有人/企业": "无运输证号", PHONE_COL_NAME: "", "原因": "证件异常/证件异常"},
+                {"车牌": "粤A00004_黄色", "运输证号_纯数字": "", "车辆所有人/企业": "示例运输公司", PHONE_COL_NAME: "020-88886666", "原因": "车型异常"},
+                {"车牌": "粤A00005_蓝色", "运输证号_纯数字": "440100002", "车辆所有人/企业": "无营运信息", PHONE_COL_NAME: "", "原因": "营运异常"},
+                {"车牌": "粤A00006_蓝色", "运输证号_纯数字": "440100003", "车辆所有人/企业": "张三个体工商户", PHONE_COL_NAME: "", "原因": "经营类型"},
+                {"车牌": "粤A00007_渐变绿", "运输证号_纯数字": "440100004", "车辆所有人/企业": "甲运输公司", PHONE_COL_NAME: "未公示", "原因": "超限/电话异常"},
+                {"车牌": "粤A00008_黄绿色", "运输证号_纯数字": "440100005", "车辆所有人/企业": "乙运输公司", PHONE_COL_NAME: "13800000000", "原因": "超限/证件异常"},
             ]
         )
         calls = []
@@ -6439,6 +6439,14 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIn("超限/证件异常", violations)
         self.assertNotIn("恶意U", violations)
         self.assertNotIn("J形行驶", violations)
+        yellow_counts = calls[0][2]["yellow_counts"]
+        self.assertEqual(yellow_counts[WORKFLOW_TOTAL_METRIC], 4)
+        self.assertEqual(yellow_counts[WORKFLOW_EMPTY_METRIC], 2)
+        self.assertEqual(yellow_counts[WORKFLOW_NO_TRANSPORT_METRIC], 2)
+        self.assertEqual(
+            calls[0][2]["yellow_violation_counts"]["超限"],
+            {"total": 1, "has_phone": 0, "other": 1},
+        )
         page.shutdown()
 
     def test_dashboard_station_legend_lines_do_not_overlap(self):
@@ -6473,6 +6481,68 @@ class ToolAndUiTests(unittest.TestCase):
 
         chart.close()
         chart.deleteLater()
+
+    def test_dashboard_and_data_center_default_to_yellow_and_can_show_all(self):
+        self.db.ensure_default_station_users()
+        station = {
+            account.username: account for account in self.db.list_accounts()
+        }["luogang"]
+        self.db.record_activity_batch(
+            station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 10,
+                WORKFLOW_HAS_PHONE_METRIC: 6,
+            },
+            source="unified_workflow",
+            details={
+                "yellow_counts": {
+                    WORKFLOW_TOTAL_METRIC: 4,
+                    WORKFLOW_HAS_PHONE_METRIC: 3,
+                },
+                "violation_counts": {
+                    "混合原因": {"total": 5, "has_phone": 3, "other": 2}
+                },
+                "yellow_violation_counts": {
+                    "混合原因": {"total": 2, "has_phone": 2, "other": 0}
+                },
+            },
+            task_id="yellow-ui-filter",
+        )
+
+        dashboard = DashboardPage(self.db, self.admin)
+        data_center = StatisticsPage(self.db, self.admin)
+        self.assertTrue(dashboard.yellow_only_check.isChecked())
+        self.assertTrue(data_center.yellow_only_check.isChecked())
+        self.assertEqual(dashboard.metric_cards["total"].value_label.text(), "4")
+        station_row = next(
+            row
+            for row in data_center.station_distribution_chart._rows
+            if row["username"] == "luogang"
+        )
+        self.assertEqual(station_row["total"], 4)
+
+        dashboard.yellow_only_check.setChecked(False)
+        data_center.yellow_only_check.setChecked(False)
+        self.app.processEvents()
+        self.assertEqual(dashboard.metric_cards["total"].value_label.text(), "10")
+        station_row = next(
+            row
+            for row in data_center.station_distribution_chart._rows
+            if row["username"] == "luogang"
+        )
+        self.assertEqual(station_row["total"], 10)
+
+        data_center.category_combo.setCurrentIndex(
+            data_center.category_combo.findData("violation")
+        )
+        data_center.station_combo.setCurrentIndex(
+            data_center.station_combo.findData(station.id)
+        )
+        self.app.processEvents()
+        self.assertEqual(data_center.violation_chart._rows[0]["total"], 5)
+        data_center.yellow_only_check.setChecked(True)
+        self.app.processEvents()
+        self.assertEqual(data_center.violation_chart._rows[0]["total"], 2)
 
     def test_dashboard_summarizes_daily_phone_violation_and_station_data(self):
         self.db.ensure_default_station_users()

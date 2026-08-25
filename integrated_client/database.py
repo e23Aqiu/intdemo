@@ -195,6 +195,7 @@ class Database:
                     user_id INTEGER NOT NULL REFERENCES accounts(id),
                     metric_key TEXT NOT NULL REFERENCES metric_definitions(metric_key),
                     amount INTEGER NOT NULL DEFAULT 1,
+                    yellow_amount INTEGER,
                     source TEXT NOT NULL DEFAULT '',
                     task_id TEXT,
                     event_uid TEXT,
@@ -426,6 +427,10 @@ class Database:
             if "remote_cached" not in activity_columns:
                 conn.execute(
                     "ALTER TABLE activity_events ADD COLUMN remote_cached INTEGER NOT NULL DEFAULT 0"
+                )
+            if "yellow_amount" not in activity_columns:
+                conn.execute(
+                    "ALTER TABLE activity_events ADD COLUMN yellow_amount INTEGER"
                 )
             workflow_run_columns = {
                 row["name"]
@@ -843,7 +848,7 @@ class Database:
             ).fetchall()
             event_rows = conn.execute(
                 f"""
-                SELECT event_uid, metric_key, amount, source, task_id,
+                SELECT event_uid, metric_key, amount, yellow_amount, source, task_id,
                        details_json, created_at
                 FROM activity_events e
                 WHERE e.user_id=?{date_sql}
@@ -865,6 +870,11 @@ class Database:
                     "event_uid": row["event_uid"],
                     "metric_key": row["metric_key"],
                     "amount": int(row["amount"]),
+                    "yellow_amount": (
+                        int(row["yellow_amount"])
+                        if row["yellow_amount"] is not None
+                        else None
+                    ),
                     "source": row["source"] or "",
                     "task_id": row["task_id"],
                     "details": details,
@@ -988,6 +998,17 @@ class Database:
                 amount = int(event.get("amount", 0))
             except (TypeError, ValueError, OverflowError) as exc:
                 raise DatabaseError("统计事件数量无效") from exc
+            raw_yellow_amount = event.get("yellow_amount")
+            try:
+                yellow_amount = (
+                    int(raw_yellow_amount)
+                    if raw_yellow_amount is not None
+                    else None
+                )
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise DatabaseError("黄牌统计数量无效") from exc
+            if yellow_amount is not None and not 0 <= yellow_amount <= amount:
+                raise DatabaseError("黄牌统计数量不能超过总数量")
             if (
                 (start_day and event_day < start_day)
                 or (end_day and event_day > end_day)
@@ -999,6 +1020,7 @@ class Database:
                     "event_uid": event_uid,
                     "metric_key": metric_key,
                     "amount": amount,
+                    "yellow_amount": yellow_amount,
                     "source": str(event.get("source") or ""),
                     "task_id": (
                         str(event["task_id"]) if event.get("task_id") is not None else None
@@ -1051,14 +1073,15 @@ class Database:
                 cursor = conn.execute(
                     """
                     INSERT OR IGNORE INTO activity_events(
-                        user_id, metric_key, amount, source, task_id, event_uid,
+                        user_id, metric_key, amount, yellow_amount, source, task_id, event_uid,
                         details_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         int(account_id),
                         event["metric_key"],
                         event["amount"],
+                        event["yellow_amount"],
                         event["source"],
                         event["task_id"],
                         event["event_uid"],
@@ -1206,8 +1229,10 @@ class Database:
         row_count = source.get("row_count")
         if isinstance(row_count, int) and not isinstance(row_count, bool):
             safe["row_count"] = max(0, row_count)
-        violation_counts = source.get("violation_counts")
-        if isinstance(violation_counts, dict):
+        for field_name in ("violation_counts", "yellow_violation_counts"):
+            violation_counts = source.get(field_name)
+            if not isinstance(violation_counts, dict):
+                continue
             safe_counts = {}
             for raw_reason, raw_values in list(violation_counts.items())[:200]:
                 reason = str(raw_reason or "").strip()[:120]
@@ -1219,7 +1244,7 @@ class Database:
                     if isinstance(value, int) and not isinstance(value, bool):
                         values[key] = max(0, value)
                 safe_counts[reason] = values
-            safe["violation_counts"] = safe_counts
+            safe[field_name] = safe_counts
         return safe
 
     @staticmethod
@@ -1313,13 +1338,40 @@ class Database:
         if not self.account_statistics_enabled(user_id):
             return
 
-        payload = json.dumps(details or {}, ensure_ascii=False, separators=(",", ":"))
-        sync_summary = self._sync_safe_details(details)
+        detail_source = dict(details) if isinstance(details, dict) else {}
+        raw_yellow_counts = detail_source.pop("yellow_counts", None)
+        yellow_counts = None
+        if raw_yellow_counts is not None:
+            if not isinstance(raw_yellow_counts, Mapping):
+                raise ValueError("黄牌统计明细格式无效")
+            yellow_counts = {}
+            for metric_key, amount in normalized:
+                if metric_key not in raw_yellow_counts:
+                    raise ValueError(f"黄牌统计缺少指标：{metric_key}")
+                yellow_amount = int(raw_yellow_counts[metric_key])
+                if not 0 <= yellow_amount <= amount:
+                    raise ValueError("黄牌统计数量不能超过总数量")
+                yellow_counts[metric_key] = yellow_amount
         created_at = self._now()
         with self._connect() as conn:
             server_account_id = self._server_account_id(conn, user_id)
             for metric_key, amount in normalized:
                 event_uid = uuid.uuid4().hex
+                yellow_amount = (
+                    yellow_counts[metric_key]
+                    if yellow_counts is not None
+                    else None
+                )
+                event_details = dict(detail_source)
+                if metric_key != WORKFLOW_TOTAL_METRIC:
+                    event_details.pop("violation_counts", None)
+                    event_details.pop("yellow_violation_counts", None)
+                payload = json.dumps(
+                    event_details,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                sync_summary = self._sync_safe_details(event_details)
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO metric_definitions(metric_key, label, unit, sort_order)
@@ -1330,14 +1382,15 @@ class Database:
                 conn.execute(
                     """
                     INSERT OR IGNORE INTO activity_events(
-                        user_id, metric_key, amount, source, task_id, event_uid,
+                        user_id, metric_key, amount, yellow_amount, source, task_id, event_uid,
                         details_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id,
                         metric_key,
                         amount,
+                        yellow_amount,
                         source,
                         task_id,
                         event_uid,
@@ -1346,6 +1399,16 @@ class Database:
                     ),
                 )
                 if server_account_id:
+                    sync_payload = {
+                        "metric_key": metric_key,
+                        "amount": amount,
+                        "business_date": created_at[:10],
+                        "source": source or "client",
+                        "task_id": str(task_id) if task_id is not None else None,
+                        "summary": sync_summary,
+                    }
+                    if yellow_amount is not None:
+                        sync_payload["yellow_amount"] = yellow_amount
                     self._enqueue_sync_item(
                         conn,
                         server_account_id=server_account_id,
@@ -1354,14 +1417,7 @@ class Database:
                         revision=1,
                         occurred_at=created_at,
                         event_uid=event_uid,
-                        payload={
-                            "metric_key": metric_key,
-                            "amount": amount,
-                            "business_date": created_at[:10],
-                            "source": source or "client",
-                            "task_id": str(task_id) if task_id is not None else None,
-                            "summary": sync_summary,
-                        },
+                        payload=sync_payload,
                     )
             if server_account_id and task_id:
                 batch = conn.execute(
@@ -1436,11 +1492,18 @@ class Database:
                 """
             ).fetchall()
 
+    @staticmethod
+    def _activity_amount_sql(yellow_only: bool, alias: str = "e") -> str:
+        if yellow_only:
+            return f"COALESCE({alias}.yellow_amount, {alias}.amount)"
+        return f"{alias}.amount"
+
     def get_user_totals(
         self,
         user_id: int,
         start_date=None,
         end_date=None,
+        yellow_only: bool = False,
     ) -> List[sqlite3.Row]:
         date_sql, date_params, _, _ = self._date_range_clause(
             "e.created_at",
@@ -1450,11 +1513,12 @@ class Database:
         effective_user_id = (
             int(user_id) if self.account_statistics_enabled(user_id) else -1
         )
+        amount_sql = self._activity_amount_sql(yellow_only)
         with self._connect() as conn:
             return conn.execute(
                 f"""
                 SELECT m.metric_key, m.label, m.unit,
-                       COALESCE(SUM(e.amount), 0) AS total
+                       COALESCE(SUM({amount_sql}), 0) AS total
                 FROM metric_definitions m
                 LEFT JOIN activity_events e
                   ON e.metric_key=m.metric_key AND e.user_id=?{date_sql}
@@ -1469,18 +1533,20 @@ class Database:
         self,
         start_date=None,
         end_date=None,
+        yellow_only: bool = False,
     ) -> List[sqlite3.Row]:
         date_sql, date_params, _, _ = self._date_range_clause(
             "e.created_at",
             start_date,
             end_date,
         )
+        amount_sql = self._activity_amount_sql(yellow_only)
         with self._connect() as conn:
             return conn.execute(
                 f"""
                 SELECT a.id AS user_id, a.username, a.display_name, a.role, a.is_active,
                        m.metric_key, m.label, m.unit,
-                       COALESCE(SUM(e.amount), 0) AS total
+                       COALESCE(SUM({amount_sql}), 0) AS total
                 FROM accounts a
                 CROSS JOIN metric_definitions m
                 LEFT JOIN activity_events e
@@ -1500,11 +1566,13 @@ class Database:
         users_only: bool = False,
         start_date=None,
         end_date=None,
+        yellow_only: bool = False,
     ) -> List[Dict]:
         """按本地自然日汇总一个指标，缺少数据的日期由调用方补零。"""
-        sql = """
+        amount_sql = self._activity_amount_sql(yellow_only)
+        sql = f"""
             SELECT SUBSTR(e.created_at, 1, 10) AS activity_date,
-                   COALESCE(SUM(e.amount), 0) AS total
+                   COALESCE(SUM({amount_sql}), 0) AS total
             FROM activity_events e
             JOIN accounts a ON a.id=e.user_id
             WHERE e.metric_key=? AND a.is_test=0
@@ -1540,6 +1608,7 @@ class Database:
         users_only: bool = False,
         start_date=None,
         end_date=None,
+        yellow_only: bool = False,
     ) -> List[Dict]:
         """汇总完整流程“原因”列拆分后的违规类型及电话分类。"""
         sql = """
@@ -1571,7 +1640,10 @@ class Database:
                 payload = json.loads(row["details_json"] or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 continue
-            violation_counts = payload.get("violation_counts") or {}
+            if yellow_only and "yellow_violation_counts" in payload:
+                violation_counts = payload.get("yellow_violation_counts") or {}
+            else:
+                violation_counts = payload.get("violation_counts") or {}
             if not isinstance(violation_counts, dict):
                 continue
             event_totals = {}
@@ -2543,10 +2615,12 @@ class Database:
         users_only: bool = False,
         start_date=None,
         end_date=None,
+        yellow_only: bool = False,
     ) -> Dict:
         """只汇总已经成功完成完整流程的批次及其全部运行时间。"""
-        completed_batches_sql = """
-            SELECT b.batch_id, COALESCE(SUM(e.amount), 0) AS completed_items
+        amount_sql = self._activity_amount_sql(yellow_only)
+        completed_batches_sql = f"""
+            SELECT b.batch_id, COALESCE(SUM({amount_sql}), 0) AS completed_items
             FROM activity_events e
             JOIN workflow_runs final_run
               ON final_run.run_id=e.task_id AND final_run.user_id=e.user_id
@@ -2595,9 +2669,9 @@ class Database:
 
         with self._connect() as conn:
             summary = conn.execute(summary_sql, params).fetchone()
-            remote_completed_sql = """
+            remote_completed_sql = f"""
                 SELECT rb.server_account_id, rb.entity_id AS batch_id,
-                       COALESCE(SUM(e.amount), 0) AS completed_items
+                       COALESCE(SUM({amount_sql}), 0) AS completed_items
                 FROM activity_events e
                 JOIN accounts a ON a.id=e.user_id
                 JOIN remote_workflow_runs final_run
@@ -3427,14 +3501,19 @@ class Database:
         conn.execute(
             """
             INSERT OR IGNORE INTO activity_events(
-                user_id, metric_key, amount, source, task_id, event_uid,
+                user_id, metric_key, amount, yellow_amount, source, task_id, event_uid,
                 details_json, created_at, remote_cached
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
             """,
             (
                 int(account_row["id"]),
                 metric_key,
                 int(payload.get("amount") or 0),
+                (
+                    int(payload["yellow_amount"])
+                    if payload.get("yellow_amount") is not None
+                    else None
+                ),
                 str(payload.get("source") or "client"),
                 payload.get("task_id"),
                 event_uid,

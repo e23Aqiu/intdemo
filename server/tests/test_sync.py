@@ -66,6 +66,128 @@ def test_activity_push_is_idempotent_and_pullable(client):
     assert len(snapshot.json()["activity_events"]) == 1
 
 
+def test_activity_preserves_yellow_vehicle_subset_and_legacy_compatibility(client):
+    admin = changed_admin(client)
+    headers = auth_header(admin)
+    yellow_item = sync_item(
+        entity_id="yellow-event",
+        payload={
+            "metric_key": "workflow_detail_total",
+            "amount": 5,
+            "yellow_amount": 2,
+            "business_date": "2026-08-25",
+            "source": "unified_workflow",
+            "summary": {
+                "row_count": 5,
+                "violation_counts": {
+                    "混合原因": {"total": 4, "has_phone": 2, "other": 2}
+                },
+                "yellow_violation_counts": {
+                    "混合原因": {"total": 1, "has_phone": 1, "other": 0}
+                },
+            },
+        },
+    )
+    legacy_item = sync_item(entity_id="legacy-event")
+    response = client.post(
+        "/api/v1/sync/push",
+        headers=headers,
+        json={"items": [yellow_item, legacy_item]},
+    )
+    assert response.status_code == 200, response.text
+    assert [row["status"] for row in response.json()["items"]] == [
+        "accepted",
+        "accepted",
+    ]
+
+    events = client.get(
+        "/api/v1/sync/snapshot",
+        headers=headers,
+    ).json()["activity_events"]
+    by_entity = {row["event_uid"]: row for row in events}
+    yellow = by_entity[yellow_item["event_uid"]]
+    legacy = by_entity[legacy_item["event_uid"]]
+    assert yellow["yellow_amount"] == 2
+    assert yellow["summary"]["yellow_violation_counts"]["混合原因"] == {
+        "total": 1,
+        "has_phone": 1,
+        "other": 0,
+    }
+    assert legacy["yellow_amount"] is None
+
+    invalid = sync_item(
+        entity_id="invalid-yellow-event",
+        payload={
+            "metric_key": "workflow_detail_total",
+            "amount": 2,
+            "yellow_amount": 3,
+            "business_date": "2026-08-25",
+            "source": "unified_workflow",
+            "summary": {},
+        },
+    )
+    rejected = client.post(
+        "/api/v1/sync/push",
+        headers=headers,
+        json={"items": [invalid]},
+    )
+    assert rejected.status_code == 200
+    assert rejected.json()["items"][0]["status"] == "rejected"
+    assert rejected.json()["items"][0]["code"] == "invalid_sync_payload"
+
+
+def test_v110_and_v111_clients_keep_login_push_and_pull_compatibility(client):
+    changed_admin(client)
+
+    for device, client_version in enumerate(("1.1.0", "1.1.1"), start=110):
+        logged_in = client.post(
+            "/api/v1/auth/login",
+            json={
+                "username": "admin",
+                "password": "Admin!23456",
+                "device_uid": str(uuid.UUID(int=device)),
+                "device_name": f"legacy-{client_version}",
+                "client_version": client_version,
+            },
+        )
+        assert logged_in.status_code == 200, logged_in.text
+        headers = auth_header(logged_in.json())
+        item = sync_item(
+            entity_id=f"legacy-{client_version}",
+            payload={
+                "metric_key": "workflow_detail_total",
+                "amount": 3,
+                "business_date": "2026-08-25",
+                "source": "unified_workflow",
+                "summary": {
+                    "row_count": 3,
+                    "violation_counts": {"旧版原因": 2},
+                },
+            },
+        )
+
+        pushed = client.post(
+            "/api/v1/sync/push",
+            headers=headers,
+            json={"items": [item]},
+        )
+        assert pushed.status_code == 200, pushed.text
+        assert pushed.json()["items"][0]["status"] == "accepted"
+
+        pulled = client.get(
+            "/api/v1/sync/pull?after_revision=0",
+            headers=headers,
+        )
+        assert pulled.status_code == 200, pulled.text
+        activity = next(
+            row
+            for row in pulled.json()["changes"]
+            if row["entity_id"] == item["entity_id"]
+        )
+        assert activity["payload"]["amount"] == 3
+        assert activity["payload"]["yellow_amount"] is None
+
+
 def test_payload_privacy_allowlist_and_batch_limit(client):
     admin = changed_admin(client)
     headers = auth_header(admin)

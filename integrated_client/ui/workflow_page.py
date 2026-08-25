@@ -77,6 +77,7 @@ from ..tools.transport_tool import (
     BusinessBackfillWorker,
     PLATE_COLUMN_ALIASES,
     Worker,
+    parse_plate,
     read_business_dataframe,
     resolve_plate_column,
     resolve_plate_header_row,
@@ -1954,6 +1955,19 @@ class WorkflowPage(QWidget):
             counts[cls.classify_workflow_row(row)] += 1
         return counts
 
+    @staticmethod
+    def yellow_plate_rows(dataframe):
+        """返回车牌字段明确标记为黄色的车辆行。"""
+        if dataframe is None:
+            return None
+        plate_column = resolve_plate_column(dataframe.columns)
+        if plate_column is None:
+            return dataframe.iloc[0:0].copy()
+        yellow_mask = dataframe[plate_column].map(
+            lambda value: parse_plate(value)[2] == "黄色"
+        )
+        return dataframe.loc[yellow_mask].copy()
+
     @classmethod
     def calculate_violation_counts(cls, dataframe):
         """仅按半角竖线拆分原因，并区分有电话与其他完成类型。"""
@@ -1985,10 +1999,16 @@ class WorkflowPage(QWidget):
             )
             return
         counts = self.calculate_workflow_counts(self.df)
+        yellow_dataframe = self.yellow_plate_rows(self.df)
+        yellow_counts = self.calculate_workflow_counts(yellow_dataframe)
         details = {
             "file_name": os.path.basename(self.file_path),
             "row_count": counts[WORKFLOW_TOTAL_METRIC],
             "violation_counts": self.calculate_violation_counts(self.df),
+            "yellow_counts": yellow_counts,
+            "yellow_violation_counts": self.calculate_violation_counts(
+                yellow_dataframe
+            ),
         }
         recorded = True
         if self._stats_recorder:
@@ -2009,6 +2029,10 @@ class WorkflowPage(QWidget):
             f"个体经营 {counts[WORKFLOW_INDIVIDUAL_METRIC]}，"
             f"公司无电话 {counts[WORKFLOW_NO_PHONE_METRIC]}，"
             f"公司有电话 {counts[WORKFLOW_HAS_PHONE_METRIC]}。"
+        )
+        self._log(
+            f"其中黄牌车辆 {yellow_counts[WORKFLOW_TOTAL_METRIC]} 条，"
+            "仪表盘和数据中心可切换查看黄牌或全部车辆。"
         )
         self._log(f"违规原因统计：共拆分出 {len(details['violation_counts'])} 种原因。")
 

@@ -824,8 +824,12 @@ class OnlineClientTests(unittest.TestCase):
             details={
                 "file_name": "绝不能上传.xlsx",
                 "row_count": 3,
+                "yellow_counts": {"workflow_detail_total": 2},
                 "violation_counts": {
                     "证件异常": {"total": 2, "has_phone": 1, "other": 1}
+                },
+                "yellow_violation_counts": {
+                    "证件异常": {"total": 1, "has_phone": 1, "other": 0}
                 },
             },
             task_id="run-safe-id",
@@ -835,11 +839,18 @@ class OnlineClientTests(unittest.TestCase):
         encoded = json.dumps(due[0]["item"], ensure_ascii=False)
         self.assertNotIn("绝不能上传", encoded)
         self.assertNotIn("file_name", encoded)
+        self.assertEqual(due[0]["item"]["payload"]["yellow_amount"], 2)
         self.assertEqual(
             due[0]["item"]["payload"]["summary"]["violation_counts"]["证件异常"][
                 "total"
             ],
             2,
+        )
+        self.assertEqual(
+            due[0]["item"]["payload"]["summary"]["yellow_violation_counts"][
+                "证件异常"
+            ]["total"],
+            1,
         )
 
         original = self.database._enqueue_sync_item

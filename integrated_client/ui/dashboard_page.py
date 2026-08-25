@@ -11,6 +11,7 @@ from PyQt5.QtGui import (
 )
 from PyQt5.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -824,6 +825,13 @@ class DashboardPage(QWidget):
         self.station_combo.setMinimumWidth(145)
         self.station_combo.currentIndexChanged.connect(self.refresh)
         scope_layout.addWidget(self.station_combo)
+        self.yellow_only_check = QCheckBox("只看黄牌车辆")
+        self.yellow_only_check.setChecked(True)
+        self.yellow_only_check.setToolTip(
+            "默认仅显示黄牌车辆；历史统计数据按黄牌车辆处理"
+        )
+        self.yellow_only_check.toggled.connect(self.refresh)
+        scope_layout.addWidget(self.yellow_only_check)
         header.addWidget(scope_group)
 
         self.updated_label = QLabel("")
@@ -1016,9 +1024,14 @@ class DashboardPage(QWidget):
 
     def _metric_totals(self, start_date=None, end_date=None):
         user_id, users_only = self._scope()
+        yellow_only = self.yellow_only_check.isChecked()
         if users_only:
             totals = {}
-            for row in self.database.get_all_account_totals(start_date, end_date):
+            for row in self.database.get_all_account_totals(
+                start_date,
+                end_date,
+                yellow_only=yellow_only,
+            ):
                 if row["role"] != "user":
                     continue
                 totals[row["metric_key"]] = (
@@ -1031,6 +1044,7 @@ class DashboardPage(QWidget):
                 user_id,
                 start_date,
                 end_date,
+                yellow_only=yellow_only,
             )
         }
 
@@ -1050,7 +1064,10 @@ class DashboardPage(QWidget):
             username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
         }
         stations = {}
-        for row in self.database.get_all_account_totals():
+        yellow_only = self.yellow_only_check.isChecked()
+        for row in self.database.get_all_account_totals(
+            yellow_only=yellow_only
+        ):
             if row["role"] != "user":
                 continue
             station = stations.setdefault(
@@ -1075,7 +1092,10 @@ class DashboardPage(QWidget):
             )
         )
         for row in rows:
-            timing = self.database.get_workflow_timing_totals(row["user_id"])
+            timing = self.database.get_workflow_timing_totals(
+                row["user_id"],
+                yellow_only=yellow_only,
+            )
             row["no_phone"] = max(0, row["total"] - row["phone"])
             row["total_ms"] = int(timing["total_ms"])
         return rows
@@ -1110,6 +1130,7 @@ class DashboardPage(QWidget):
             users_only=users_only,
             start_date=week_start,
             end_date=today,
+            yellow_only=self.yellow_only_check.isChecked(),
         )
         daily_phone_rows = self.database.get_daily_metric_totals(
             WORKFLOW_HAS_PHONE_METRIC,
@@ -1117,6 +1138,7 @@ class DashboardPage(QWidget):
             users_only=users_only,
             start_date=week_start,
             end_date=today,
+            yellow_only=self.yellow_only_check.isChecked(),
         )
         daily_totals = {row["date"]: row["total"] for row in daily_rows}
         daily_phone_totals = {
@@ -1131,6 +1153,7 @@ class DashboardPage(QWidget):
         timing = self.database.get_workflow_timing_totals(
             user_id,
             users_only=users_only,
+            yellow_only=self.yellow_only_check.isChecked(),
         )
 
         phone_share = phone_count / total_count * 100 if total_count else 0
@@ -1175,6 +1198,7 @@ class DashboardPage(QWidget):
         all_violation_rows = self.database.get_violation_totals(
             user_id,
             users_only=users_only,
+            yellow_only=self.yellow_only_check.isChecked(),
         )
         violation_total = sum(row["total"] for row in all_violation_rows)
         violation_rows = all_violation_rows[:5]

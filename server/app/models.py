@@ -119,6 +119,7 @@ class ActivityEvent(Base):
     event_uid: Mapped[uuid.UUID] = mapped_column(Uuid, index=True)
     metric_key: Mapped[str] = mapped_column(String(80), index=True)
     amount: Mapped[int] = mapped_column(Integer)
+    yellow_amount: Mapped[int | None] = mapped_column(Integer)
     business_date: Mapped[date] = mapped_column(Date, index=True)
     source: Mapped[str] = mapped_column(String(60), default="client")
     task_id: Mapped[str | None] = mapped_column(String(120))

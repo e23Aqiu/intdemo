@@ -18,6 +18,7 @@ from PyQt5.QtGui import (
 from PyQt5.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QCheckBox,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -1631,6 +1632,11 @@ class StatisticsPage(QWidget):
         self.category_combo.addItem("按完成类型", "completion")
         self.category_combo.addItem("按违规类型", "violation")
         self.date_range_selector = DateRangeSelector()
+        self.yellow_only_check = QCheckBox("只看黄牌车辆")
+        self.yellow_only_check.setChecked(True)
+        self.yellow_only_check.setToolTip(
+            "默认仅显示黄牌车辆；历史统计数据按黄牌车辆处理"
+        )
         (
             self.station_filter_group,
             self.station_filter_label,
@@ -1646,9 +1652,14 @@ class StatisticsPage(QWidget):
             "日期范围",
             self.date_range_selector,
         )
+        (
+            self.plate_filter_group,
+            self.plate_filter_label,
+        ) = self._create_filter_group("车辆范围", self.yellow_only_check)
         self.filter_layout.addWidget(self.station_filter_group)
         self.filter_layout.addWidget(self.category_filter_group)
         self.filter_layout.addWidget(self.date_filter_group)
+        self.filter_layout.addWidget(self.plate_filter_group)
         self.filter_layout.addStretch(1)
         self.filter_layout.activate()
         self.filter_card.setMinimumWidth(
@@ -1694,6 +1705,7 @@ class StatisticsPage(QWidget):
         self.station_combo.currentIndexChanged.connect(self.refresh)
         self.category_combo.currentIndexChanged.connect(self._on_category_changed)
         self.date_range_selector.range_changed.connect(self.refresh)
+        self.yellow_only_check.toggled.connect(self.refresh)
 
         self.kpi_layout = QGridLayout()
         self.kpi_layout.setSpacing(10)
@@ -1984,6 +1996,7 @@ class StatisticsPage(QWidget):
             users_only=(user_id is None),
             start_date=start_date,
             end_date=end_date,
+            yellow_only=self.yellow_only_check.isChecked(),
         )
         completed_items = int(totals["completed_items"])
         basis_key = "active_ms" if self._timing_basis == "active" else "total_ms"
@@ -2073,6 +2086,7 @@ class StatisticsPage(QWidget):
                 account.id,
                 start_date=start_date,
                 end_date=end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
             )
             values = []
             for row in rows:
@@ -2101,6 +2115,7 @@ class StatisticsPage(QWidget):
                 account.id,
                 start_date,
                 end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
             )
         }
         if category == "station_distribution":
@@ -2534,6 +2549,7 @@ class StatisticsPage(QWidget):
             users_only=(user_id is None),
             start_date=start_date,
             end_date=end_date,
+            yellow_only=self.yellow_only_check.isChecked(),
         )
         completed_items = int(totals["completed_items"])
         basis_key = "active_ms" if self._timing_basis == "active" else "total_ms"
@@ -2698,7 +2714,11 @@ class StatisticsPage(QWidget):
             and not self.account.can_view_all_stats
             else None
         )
-        for row in self.database.get_all_account_totals(start_date, end_date):
+        for row in self.database.get_all_account_totals(
+            start_date,
+            end_date,
+            yellow_only=self.yellow_only_check.isChecked(),
+        ):
             if row["role"] != "user":
                 continue
             if restricted_user_id is not None and row["user_id"] != restricted_user_id:
@@ -2724,6 +2744,7 @@ class StatisticsPage(QWidget):
                 row["user_id"],
                 start_date=start_date,
                 end_date=end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
             )
             row["total_time_ms"] = timing["total_ms"]
             row["active_ms"] = timing["active_ms"]
@@ -2762,7 +2783,11 @@ class StatisticsPage(QWidget):
         }
         stations = {}
         start_date, end_date = self._date_range()
-        for row in self.database.get_all_account_totals(start_date, end_date):
+        for row in self.database.get_all_account_totals(
+            start_date,
+            end_date,
+            yellow_only=self.yellow_only_check.isChecked(),
+        ):
             if row["role"] != "user":
                 continue
             if user_id is not None and row["user_id"] != user_id:
@@ -2895,7 +2920,11 @@ class StatisticsPage(QWidget):
 
         if user_id is None:
             totals_by_metric = {metric["metric_key"]: 0 for metric in metrics}
-            for row in self.database.get_all_account_totals(start_date, end_date):
+            for row in self.database.get_all_account_totals(
+                start_date,
+                end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
+            ):
                 if row["role"] == "user":
                     totals_by_metric[row["metric_key"]] = (
                         totals_by_metric.get(row["metric_key"], 0)
@@ -2908,6 +2937,7 @@ class StatisticsPage(QWidget):
                     user_id,
                     start_date,
                     end_date,
+                    yellow_only=self.yellow_only_check.isChecked(),
                 )
             }
 
@@ -2954,6 +2984,7 @@ class StatisticsPage(QWidget):
             users_only=(user_id is None),
             start_date=start_date,
             end_date=end_date,
+            yellow_only=self.yellow_only_check.isChecked(),
         )
         rows = sorted(
             rows,

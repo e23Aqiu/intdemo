@@ -207,6 +207,94 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaisesRegex(DatabaseError, "不是有效"):
             self.db.import_station_data(target.id, invalid_path)
 
+    def test_yellow_vehicle_totals_filter_new_events_and_keep_legacy_events(self):
+        self.db.ensure_default_admin()
+        admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
+        station = self.db.create_account(
+            "yellow_station",
+            "Worker@123",
+            "user",
+            admin.id,
+        )
+
+        # Historical events have no yellow subset and must therefore count as yellow.
+        self.db.record_activity_batch(
+            station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 4,
+                WORKFLOW_HAS_PHONE_METRIC: 2,
+            },
+            "unified_workflow",
+            details={
+                "violation_counts": {
+                    "历史原因": {"total": 4, "has_phone": 2, "other": 2}
+                }
+            },
+            task_id="legacy-yellow-compatible",
+        )
+        self.db.record_activity_batch(
+            station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 6,
+                WORKFLOW_HAS_PHONE_METRIC: 3,
+            },
+            "unified_workflow",
+            details={
+                "yellow_counts": {
+                    WORKFLOW_TOTAL_METRIC: 2,
+                    WORKFLOW_HAS_PHONE_METRIC: 1,
+                },
+                "violation_counts": {
+                    "混合原因": {"total": 5, "has_phone": 3, "other": 2}
+                },
+                "yellow_violation_counts": {
+                    "混合原因": {"total": 2, "has_phone": 1, "other": 1}
+                },
+            },
+            task_id="new-yellow-breakdown",
+        )
+
+        all_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(station.id)
+        }
+        yellow_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(station.id, yellow_only=True)
+        }
+        self.assertEqual(all_totals[WORKFLOW_TOTAL_METRIC], 10)
+        self.assertEqual(all_totals[WORKFLOW_HAS_PHONE_METRIC], 5)
+        self.assertEqual(yellow_totals[WORKFLOW_TOTAL_METRIC], 6)
+        self.assertEqual(yellow_totals[WORKFLOW_HAS_PHONE_METRIC], 3)
+
+        all_violations = {
+            row["reason"]: row for row in self.db.get_violation_totals(station.id)
+        }
+        yellow_violations = {
+            row["reason"]: row
+            for row in self.db.get_violation_totals(station.id, yellow_only=True)
+        }
+        self.assertEqual(all_violations["历史原因"]["total"], 4)
+        self.assertEqual(yellow_violations["历史原因"]["total"], 4)
+        self.assertEqual(all_violations["混合原因"]["total"], 5)
+        self.assertEqual(yellow_violations["混合原因"]["total"], 2)
+
+        target = self.db.create_account(
+            "yellow_import_target",
+            "Worker@123",
+            "user",
+            admin.id,
+        )
+        export_path = Path(self.temp_dir.name) / "yellow-statistics.json"
+        self.db.export_station_data(station.id, export_path)
+        self.db.import_station_data(target.id, export_path)
+        imported_yellow_totals = {
+            row["metric_key"]: row["total"]
+            for row in self.db.get_user_totals(target.id, yellow_only=True)
+        }
+        self.assertEqual(imported_yellow_totals[WORKFLOW_TOTAL_METRIC], 6)
+        self.assertEqual(imported_yellow_totals[WORKFLOW_HAS_PHONE_METRIC], 3)
+
     def test_date_ranges_filter_dashboard_transfer_and_reset_data(self):
         self.db.ensure_default_admin()
         admin = self.db.authenticate(DEFAULT_ADMIN_USERNAME, DEFAULT_ADMIN_PASSWORD)
