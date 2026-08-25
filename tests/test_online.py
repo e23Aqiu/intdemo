@@ -982,9 +982,11 @@ class OnlineClientTests(unittest.TestCase):
         engine = SyncEngine(self.database, self.session)
         status = engine.run_once()
         self.assertEqual(status.state, "online")
+        self.assertTrue(status.data_changed)
         self.assertEqual(status.pending_count, 0)
         self.assertEqual(len(self.api.push_calls), 1)
-        engine.run_once()
+        unchanged = engine.run_once()
+        self.assertFalse(unchanged.data_changed)
         self.assertEqual(len(self.api.push_calls), 1)
 
     def test_revoked_session_stays_offline_and_uploads_after_reauthentication(self):

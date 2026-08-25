@@ -184,6 +184,135 @@ def test_bootstrap_reconciles_legacy_writes_during_rolling_upgrade(client):
         assert legacy_promoted.road_id is None
 
 
+def test_bootstrap_detaches_test_accounts_without_revoking_sessions(client):
+    with SessionLocal() as db:
+        default_road = db.scalar(
+            select(Road).where(Road.name == DEFAULT_ROAD_NAME)
+        )
+        test_account = Account(
+            username="bootstrap_direct_test",
+            display_name="直属测试账号",
+            password_hash=hash_password("123456"),
+            role="user",
+            account_type="station",
+            is_test=True,
+            stats_scope="own",
+            data_scope="road",
+            road_id=default_road.id,
+            token_version=7,
+        )
+        db.add(test_account)
+        db.commit()
+        account_id = test_account.id
+
+        bootstrap_database(db)
+        refreshed = db.get(Account, account_id)
+        assert refreshed.account_type == "station"
+        assert refreshed.data_scope == "own"
+        assert refreshed.stats_scope == "own"
+        assert refreshed.road_id is None
+        assert refreshed.token_version == 7
+
+
+def test_test_accounts_are_managed_only_by_global_admin_without_roads(client):
+    admin = changed_admin(client)
+    admin_headers = auth_header(admin)
+    road = client.get("/api/v1/admin/roads", headers=admin_headers).json()[0]
+    manager_row = _create_account(
+        client,
+        admin_headers,
+        username="test_scope_manager",
+        display_name="测试路段管理员",
+        account_type="road_admin",
+        data_scope="road",
+        road_id=road["id"],
+    )
+    manager = _activate(
+        client,
+        "test_scope_manager",
+        device=221,
+        password="Manager!23456",
+    )
+    manager_headers = auth_header(manager)
+
+    direct_test = _create_account(
+        client,
+        admin_headers,
+        username="direct_test_account",
+        display_name="直属测试账号",
+        account_type="station",
+        is_test=True,
+        data_scope="all",
+    )
+    assert direct_test["is_test"] is True
+    assert direct_test["road_id"] is None
+    assert direct_test["road_name"] is None
+    assert direct_test["data_scope"] == "all"
+    assert direct_test["id"] in {
+        row["id"]
+        for row in client.get(
+            "/api/v1/admin/accounts",
+            headers=admin_headers,
+        ).json()
+    }
+    assert direct_test["id"] not in {
+        row["id"]
+        for row in client.get(
+            "/api/v1/admin/accounts",
+            headers=manager_headers,
+        ).json()
+    }
+
+    manager_create = client.post(
+        "/api/v1/admin/accounts",
+        headers=manager_headers,
+        json={
+            "username": "manager_test_forbidden",
+            "display_name": "越权测试账号",
+            "account_type": "station",
+            "is_test": True,
+            "data_scope": "own",
+        },
+    )
+    assert manager_create.status_code == 403
+    assert manager_create.json()["code"] == "test_account_not_allowed"
+    manager_update = client.patch(
+        f"/api/v1/admin/accounts/{direct_test['id']}",
+        headers=manager_headers,
+        json={"display_name": "越权修改"},
+    )
+    assert manager_update.status_code == 403
+    assert manager_update.json()["code"] == "account_outside_management_scope"
+
+    assign_road = client.patch(
+        f"/api/v1/admin/accounts/{direct_test['id']}",
+        headers=admin_headers,
+        json={"road_id": road["id"]},
+    )
+    assert assign_road.status_code == 422
+    assert assign_road.json()["code"] == "test_account_has_no_road"
+
+    station = _create_account(
+        client,
+        admin_headers,
+        username="station_becomes_test",
+        display_name="转测试账号",
+        account_type="station",
+        data_scope="road",
+        road_id=road["id"],
+    )
+    converted = client.patch(
+        f"/api/v1/admin/accounts/{station['id']}",
+        headers=admin_headers,
+        json={"is_test": True},
+    )
+    assert converted.status_code == 200, converted.text
+    assert converted.json()["is_test"] is True
+    assert converted.json()["road_id"] is None
+    assert converted.json()["data_scope"] == "own"
+    assert manager_row["id"] != direct_test["id"]
+
+
 def test_road_manager_can_only_manage_own_road_stations(client):
     admin = changed_admin(client)
     admin_headers = auth_header(admin)
@@ -664,3 +793,101 @@ def test_0014_migration_upgrades_legacy_accounts_in_place(monkeypatch):
             {"id": rows["luogang"].road_id},
         ).scalar_one()
         assert road_name == DEFAULT_ROAD_NAME
+
+
+def test_0015_migration_detaches_existing_test_accounts(monkeypatch):
+    engine = sa.create_engine("sqlite:///:memory:")
+    metadata = sa.MetaData()
+    roads = sa.Table(
+        "roads",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("name", sa.String(120), nullable=False),
+    )
+    accounts = sa.Table(
+        "accounts",
+        metadata,
+        sa.Column("id", sa.Uuid(), primary_key=True),
+        sa.Column("role", sa.String(16), nullable=False),
+        sa.Column("is_test", sa.Boolean(), nullable=False),
+        sa.Column("account_type", sa.String(20), nullable=False),
+        sa.Column("stats_scope", sa.String(8), nullable=False),
+        sa.Column("data_scope", sa.String(8), nullable=False),
+        sa.Column("road_id", sa.Uuid(), nullable=True),
+        sa.Column("token_version", sa.Integer(), nullable=False),
+    )
+    road_id = uuid.uuid4()
+    test_id = uuid.uuid4()
+    station_id = uuid.uuid4()
+    with engine.begin() as connection:
+        metadata.create_all(connection)
+        connection.execute(
+            roads.insert(),
+            {"id": road_id, "name": DEFAULT_ROAD_NAME},
+        )
+        connection.execute(
+            accounts.insert(),
+            [
+                {
+                    "id": test_id,
+                    "role": "user",
+                    "is_test": True,
+                    "account_type": "station",
+                    "stats_scope": "own",
+                    "data_scope": "road",
+                    "road_id": road_id,
+                    "token_version": 9,
+                },
+                {
+                    "id": station_id,
+                    "role": "user",
+                    "is_test": False,
+                    "account_type": "station",
+                    "stats_scope": "own",
+                    "data_scope": "road",
+                    "road_id": road_id,
+                    "token_version": 5,
+                },
+            ],
+        )
+
+        migration_path = (
+            Path(__file__).resolve().parents[1]
+            / "alembic"
+            / "versions"
+            / "0015_detach_test_accounts_from_roads.py"
+        )
+        spec = spec_from_file_location("migration_0015", migration_path)
+        assert spec is not None and spec.loader is not None
+        migration = module_from_spec(spec)
+        spec.loader.exec_module(migration)
+        operations = Operations(MigrationContext.configure(connection))
+        monkeypatch.setattr(migration, "op", operations)
+
+        migration.upgrade()
+        migration.upgrade()
+        rows = {
+            uuid.UUID(str(row.id)): row
+            for row in connection.execute(
+                sa.text(
+                    """
+                    SELECT id, is_test, account_type, stats_scope, data_scope,
+                           road_id, token_version
+                    FROM accounts
+                    """
+                )
+            )
+        }
+        assert rows[test_id].road_id is None
+        assert rows[test_id].account_type == "station"
+        assert rows[test_id].stats_scope == "own"
+        assert rows[test_id].data_scope == "own"
+        assert rows[test_id].token_version == 9
+        assert rows[station_id].road_id is not None
+        assert rows[station_id].token_version == 5
+
+        migration.downgrade()
+        restored_road_id = connection.execute(
+            sa.select(accounts.c.road_id).where(accounts.c.id == test_id)
+        ).scalar_one()
+        assert restored_road_id is not None

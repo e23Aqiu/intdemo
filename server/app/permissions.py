@@ -62,6 +62,7 @@ def can_manage_account(actor: Account, target: Account) -> bool:
         and actor.road_id is not None
         and target.id != actor.id
         and account_type(target) == STATION
+        and not target.is_test
         and target.road_id == actor.road_id
     )
 
@@ -99,6 +100,11 @@ def scoped_account_ids(
         return list(db.scalars(select(Account.id)))
     if scope == SCOPE_ROAD and account.road_id is not None:
         return list(
-            db.scalars(select(Account.id).where(Account.road_id == account.road_id))
+            db.scalars(
+                select(Account.id).where(
+                    Account.road_id == account.road_id,
+                    Account.is_test.is_(False),
+                )
+            )
         )
     return [account.id]

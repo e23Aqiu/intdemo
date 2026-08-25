@@ -155,7 +155,8 @@ class SyncCoordinator(QObject):
             self.stop()
             return
         if status.state == "online":
-            self.data_changed.emit()
+            if status.data_changed:
+                self.data_changed.emit()
             if self._websocket.state() == QAbstractSocket.UnconnectedState:
                 self._connect_websocket()
         if self._rerun_requested and not self._stopped:

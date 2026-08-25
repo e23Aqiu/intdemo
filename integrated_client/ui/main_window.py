@@ -1787,12 +1787,18 @@ class MainWindow(FramelessMainWindow):
         self.sidebar_avatar.setText(self._sidebar_avatar_text(account.name_label))
         self.setWindowTitle(f"{APP_NAME} - {account.name_label}")
 
+    def _refresh_statistics_after_data_change(self):
+        if self.statistics_page is None:
+            return
+        self.statistics_page.invalidate_data_cache()
+        self.statistics_page.refresh()
+
     def _online_data_changed(self):
         refreshed_account = self.database.get_account(self.account.id)
         if refreshed_account is not None:
             self._apply_current_account(refreshed_account)
         self.dashboard_page.refresh()
-        self.statistics_page.refresh()
+        self._refresh_statistics_after_data_change()
 
     def _add_page(self, key, widget):
         self._pages[key] = widget
@@ -1800,7 +1806,7 @@ class MainWindow(FramelessMainWindow):
 
     def _account_name_changed(self, account_id, display_name):
         self.dashboard_page.refresh()
-        self.statistics_page.refresh()
+        self._refresh_statistics_after_data_change()
         if account_id != self.account.id:
             return
         self.account = replace(self.account, display_name=display_name)
@@ -1817,7 +1823,7 @@ class MainWindow(FramelessMainWindow):
 
     def _account_data_changed(self, *_args):
         self.dashboard_page.refresh()
-        self.statistics_page.refresh()
+        self._refresh_statistics_after_data_change()
 
     def show_page(self, key):
         data_view = self.DATA_CENTER_VIEWS.get(key)
@@ -1873,7 +1879,7 @@ class MainWindow(FramelessMainWindow):
             if self.stack.currentWidget() is self.dashboard_page:
                 self.dashboard_page.refresh()
             elif self.stack.currentWidget() is self.statistics_page:
-                self.statistics_page.refresh()
+                self._refresh_statistics_after_data_change()
             if self.sync_coordinator is not None:
                 self._update_sync_status(self.sync_coordinator.engine.status())
         except Exception as exc:
@@ -1895,7 +1901,7 @@ class MainWindow(FramelessMainWindow):
             if self.stack.currentWidget() is self.dashboard_page:
                 self.dashboard_page.refresh()
             elif self.stack.currentWidget() is self.statistics_page:
-                self.statistics_page.refresh()
+                self._refresh_statistics_after_data_change()
             if self.sync_coordinator is not None:
                 self._update_sync_status(self.sync_coordinator.engine.status())
             return True

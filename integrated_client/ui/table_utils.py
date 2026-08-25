@@ -45,12 +45,28 @@ class _TableColumnWidthController(QObject):
         self._fit_scheduled = False
 
     def configure(self, initial_widths, minimum_width):
-        self.initial_widths = dict(initial_widths)
-        self.minimum_width = max(1, int(minimum_width))
+        normalized_widths = dict(initial_widths)
+        normalized_minimum = max(1, int(minimum_width))
+        unchanged = (
+            self.initial_widths == normalized_widths
+            and self.minimum_width == normalized_minimum
+            and self._fitted
+            and self._column_count() == self._fitted_column_count
+        )
+        self.initial_widths = normalized_widths
+        self.minimum_width = normalized_minimum
+        self._connect_model()
+        if unchanged:
+            return
         self._fitted = False
         self._fitted_column_count = 0
-        self._connect_model()
         self.schedule_fit()
+
+    def accept_current_widths(self):
+        if not self._table_is_alive():
+            return
+        self._fitted = True
+        self._fitted_column_count = self._column_count()
 
     def _column_count(self):
         if not self._table_is_alive():
@@ -215,3 +231,10 @@ def refit_table_columns(table) -> None:
     controller = getattr(table, "_intdemo_column_width_controller", None)
     if controller is not None:
         controller.refit()
+
+
+def preserve_table_column_widths(table) -> None:
+    """Prevent a queued initial fit from overwriting restored user widths."""
+    controller = getattr(table, "_intdemo_column_width_controller", None)
+    if controller is not None:
+        controller.accept_current_widths()

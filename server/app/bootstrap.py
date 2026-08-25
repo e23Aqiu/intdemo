@@ -63,7 +63,6 @@ def bootstrap_database(db: Session) -> None:
         if (
             existing.account_type not in ACCOUNT_TYPES
             or existing.account_type == GLOBAL_ADMIN
-            or existing.is_test
         ):
             existing.account_type = STATION
         legacy_scope = legacy_stats_scope(existing.data_scope)
@@ -78,6 +77,13 @@ def bootstrap_database(db: Session) -> None:
             existing.data_scope = (
                 SCOPE_ALL if existing.stats_scope == SCOPE_ALL else SCOPE_OWN
             )
+        if existing.is_test:
+            existing.account_type = STATION
+            if existing.data_scope == "road":
+                existing.data_scope = SCOPE_OWN
+            existing.stats_scope = legacy_stats_scope(existing.data_scope)
+            existing.road_id = None
+            continue
         existing.stats_scope = legacy_stats_scope(existing.data_scope)
         if existing.road_id is None:
             existing.road_id = default_road.id

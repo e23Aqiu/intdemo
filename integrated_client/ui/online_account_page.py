@@ -64,8 +64,8 @@ class _AccountSettingsDialog(FramelessDialog):
         self.display_name.setMaxLength(120)
         self.role = QComboBox()
         self.role.addItem("中心站账号", "station")
-        self.role.addItem("测试账号", "test")
         if self._global_manager:
+            self.role.addItem("测试账号", "test")
             self.role.addItem("路段管理员", "road_admin")
             self.role.addItem("管理员", "admin")
         self.scope = QComboBox()
@@ -148,6 +148,8 @@ class _AccountSettingsDialog(FramelessDialog):
         self.scope.clear()
         if account_type == "admin":
             scope_options = [("全部数据", "all")]
+        elif account_type == "test":
+            scope_options = [("仅本人数据", "own"), ("全部数据", "all")]
         elif self.current_account is not None and self.current_account.is_road_admin:
             scope_options = [("仅本人数据", "own"), ("本路段数据", "road")]
             if (
@@ -171,7 +173,7 @@ class _AccountSettingsDialog(FramelessDialog):
         self.scope.setCurrentIndex(index if index >= 0 else 0)
         self.scope.blockSignals(False)
 
-        uses_road = account_type != "admin"
+        uses_road = account_type in {"station", "road_admin"}
         self.road.setEnabled(
             uses_road
             and self._global_manager
@@ -180,7 +182,8 @@ class _AccountSettingsDialog(FramelessDialog):
             bool(uses_road and self._global_manager and account_type == "road_admin")
         )
         self.road.setToolTip(
-            "路段管理员可输入新路段名称；中心站必须选择已有路段。"
+            "测试账号直属管理员且不分配路段；"
+            "路段管理员可输入新路段名称，中心站必须选择已有路段。"
             if self._global_manager
             else "路段管理员只能管理自己所属路段。"
         )
@@ -203,7 +206,7 @@ class _AccountSettingsDialog(FramelessDialog):
             self.username.setFocus()
             return
         account_type = self.role.currentData()
-        if account_type != "admin":
+        if account_type in {"station", "road_admin"}:
             road_id, road_name = self._road_reference()
             if not road_id and not road_name:
                 QMessageBox.warning(self, "资料不完整", "必须分配所属路段。")
@@ -247,7 +250,7 @@ class _AccountSettingsDialog(FramelessDialog):
             "device_limit": self.device_limit.value(),
             "is_active": self.active.isChecked(),
         }
-        if resolved_type != "admin":
+        if account_type in {"station", "road_admin"}:
             road_id, road_name = self._road_reference()
             if road_id:
                 values["road_id"] = str(road_id)
@@ -1017,7 +1020,7 @@ class OnlineAccountPage(AccountPage):
             )
             self.selection_hint.setText(
                 f"已选择：{account.name_label} · {account.role_label} · {state}"
-                f" · 路段 {account.road_name or '-'}"
+                f" · {'直属管理员' if account.is_test else '路段 ' + (account.road_name or '-')}"
                 f" · 数据范围 {self._scope_label(account.effective_data_scope)}"
                 f" · 设备 {server.get('active_device_count', 0)}/"
                 f"{server.get('device_limit', 10000)}{suffix}"

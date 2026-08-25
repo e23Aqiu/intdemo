@@ -147,6 +147,10 @@ class AccountCreate(StrictModel):
             raise ValueError("测试账号必须使用普通用户权限")
         if self.is_test and self.account_type not in {None, "station"}:
             raise ValueError("测试账号必须属于中心站账号")
+        if self.is_test and (self.road_id is not None or self.road_name is not None):
+            raise ValueError("测试账号不分配所属路段")
+        if self.is_test and self.data_scope == "road":
+            raise ValueError("测试账号不能使用本路段数据范围")
         if self.road_id is not None and self.road_name is not None:
             raise ValueError("所属路段不能同时使用编号和名称")
         return self

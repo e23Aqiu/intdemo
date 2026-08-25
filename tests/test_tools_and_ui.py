@@ -2013,6 +2013,49 @@ class ToolAndUiTests(unittest.TestCase):
         window._prepared_to_close = True
         window.close()
 
+    def test_data_center_refresh_preserves_view_style_and_reuses_cached_queries(self):
+        self.db.ensure_default_station_users()
+        window = MainWindow(self.db, self.admin)
+        window.show()
+        window.show_page("data_completion")
+        page = window.statistics_page
+        page.detail_tabs.setCurrentWidget(page.data_tab)
+        self.app.processEvents()
+
+        page.summary_table.setColumnWidth(0, 217)
+        page.invalidate_data_cache()
+        page.refresh()
+        self.app.processEvents()
+        self.assertIs(page.detail_tabs.currentWidget(), page.data_tab)
+        self.assertEqual(page.summary_table.columnWidth(0), 217)
+
+        with patch.object(
+            self.db,
+            "get_violation_totals",
+            wraps=self.db.get_violation_totals,
+        ) as violation_query, patch.object(
+            page,
+            "_refresh_content",
+            wraps=page._refresh_content,
+        ) as render:
+            window.show_page("data_violation")
+            self.assertEqual(violation_query.call_count, 1)
+            self.assertEqual(render.call_count, 1)
+
+            render.reset_mock()
+            window.show_page("data_completion")
+            self.assertEqual(render.call_count, 1)
+            self.assertEqual(page.summary_table.columnWidth(0), 217)
+
+            render.reset_mock()
+            window.show_page("data_violation")
+            self.assertEqual(render.call_count, 1)
+            self.assertEqual(violation_query.call_count, 1)
+
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
     def test_online_admin_page_does_not_request_network_during_construction(self):
         class Api:
             def __init__(self):
@@ -2175,9 +2218,16 @@ class ToolAndUiTests(unittest.TestCase):
         dialog.scope.setCurrentIndex(dialog.scope.findData("all"))
         dialog.role.setCurrentIndex(dialog.role.findData("test"))
         self.assertTrue(dialog.scope.isEnabled())
+        self.assertFalse(dialog.road.isEnabled())
+        self.assertEqual(
+            [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
+            ["own", "all"],
+        )
         self.assertEqual(dialog.values()["role"], "user")
         self.assertTrue(dialog.values()["is_test"])
         self.assertEqual(dialog.values()["stats_scope"], "all")
+        self.assertNotIn("road_id", dialog.values())
+        self.assertNotIn("road_name", dialog.values())
         dialog.deleteLater()
 
     def test_road_manager_ui_has_scoped_account_controls_without_machine_learning(self):
@@ -2206,7 +2256,7 @@ class ToolAndUiTests(unittest.TestCase):
         )
         self.assertEqual(
             [dialog.role.itemData(index) for index in range(dialog.role.count())],
-            ["station", "test"],
+            ["station"],
         )
         self.assertEqual(
             [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
@@ -2547,6 +2597,37 @@ class ToolAndUiTests(unittest.TestCase):
             coordinator._on_worker_finished(status)
         connect.assert_called_once_with()
         self.assertFalse(coordinator._running)
+        coordinator.stop()
+        coordinator.deleteLater()
+
+    def test_sync_coordinator_refreshes_pages_only_when_data_changed(self):
+        coordinator = SyncCoordinator(Mock())
+        changes = []
+        coordinator.data_changed.connect(lambda: changes.append(True))
+
+        coordinator._running = True
+        unchanged = SyncStatus(
+            state="online",
+            pending_count=0,
+            quarantined_count=0,
+            last_sync_at="2026-08-25T12:00:00+08:00",
+            data_changed=False,
+        )
+        with patch.object(coordinator, "_connect_websocket"):
+            coordinator._on_worker_finished(unchanged)
+        self.assertEqual(changes, [])
+
+        coordinator._running = True
+        changed = SyncStatus(
+            state="online",
+            pending_count=0,
+            quarantined_count=0,
+            last_sync_at="2026-08-25T12:00:05+08:00",
+            data_changed=True,
+        )
+        with patch.object(coordinator, "_connect_websocket"):
+            coordinator._on_worker_finished(changed)
+        self.assertEqual(changes, [True])
         coordinator.stop()
         coordinator.deleteLater()
 

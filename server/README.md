@@ -32,4 +32,7 @@ and `road_id` account fields. The legacy `role` (`admin/user`) and
 Road administrators are projected as legacy users, and a road scope is
 downgraded to own for devices older than 1.2.0. Migration 0014 assigns existing
 non-admin accounts to `广深高速` without changing passwords, token versions,
-active state, or refresh sessions.
+active state, or refresh sessions. Migration 0015 detaches test accounts from
+all roads while preserving those same security and session fields. Test accounts
+are managed directly by a global administrator and are never visible to road
+administrators.

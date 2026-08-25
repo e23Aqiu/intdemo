@@ -157,6 +157,7 @@ def list_accounts(context: AccountManagerContext, db: Db) -> list[dict]:
     if is_road_admin(context.account):
         statement = statement.where(
             Account.account_type == STATION,
+            Account.is_test.is_(False),
             Account.road_id == context.account.road_id,
         )
     accounts = db.scalars(statement).all()
@@ -202,6 +203,12 @@ async def create_account(
             status_code=403,
         )
     is_test = bool(payload.is_test)
+    if is_road_admin(context.account) and is_test:
+        raise ApiError(
+            "test_account_not_allowed",
+            "测试账号只能由管理员直接管理",
+            status_code=403,
+        )
     if is_test and requested_type != STATION:
         raise ApiError(
             "invalid_test_account_role",
@@ -220,6 +227,19 @@ async def create_account(
     if requested_type == GLOBAL_ADMIN:
         requested_scope = SCOPE_ALL
         is_test = False
+    elif is_test:
+        if payload.road_id is not None or payload.road_name is not None:
+            raise ApiError(
+                "test_account_has_no_road",
+                "测试账号不分配所属路段",
+                status_code=422,
+            )
+        if requested_scope == SCOPE_ROAD:
+            raise ApiError(
+                "test_account_scope_not_allowed",
+                "测试账号不能使用本路段数据范围",
+                status_code=422,
+            )
     elif is_road_admin(context.account):
         road = _road_or_404(db, context.account.road_id)
         if requested_scope not in {SCOPE_OWN, SCOPE_ROAD}:
@@ -333,7 +353,15 @@ async def update_account(
     resulting_road = (
         db.get(Road, account.road_id) if account.road_id is not None else None
     )
-    if is_global_admin(context.account) and {"road_id", "road_name"} & changes.keys():
+    if resulting_is_test:
+        if {"road_id", "road_name"} & changes.keys():
+            raise ApiError(
+                "test_account_has_no_road",
+                "测试账号不分配所属路段",
+                status_code=422,
+            )
+        resulting_road = None
+    elif is_global_admin(context.account) and {"road_id", "road_name"} & changes.keys():
         resulting_road = _resolve_road(
             db,
             road_id=changes.get("road_id"),
@@ -342,7 +370,7 @@ async def update_account(
         )
     if resulting_type == GLOBAL_ADMIN:
         resulting_road = None
-    elif resulting_road is None:
+    elif not resulting_is_test and resulting_road is None:
         if "account_type" in changes:
             raise ApiError(
                 "road_required",
@@ -362,6 +390,14 @@ async def update_account(
     if resulting_type == GLOBAL_ADMIN:
         resulting_scope = SCOPE_ALL
     scope_was_requested = bool({"data_scope", "stats_scope"} & changes.keys())
+    if resulting_is_test and resulting_scope == SCOPE_ROAD:
+        if scope_was_requested:
+            raise ApiError(
+                "test_account_scope_not_allowed",
+                "测试账号不能使用本路段数据范围",
+                status_code=422,
+            )
+        resulting_scope = SCOPE_OWN
     if (
         is_road_admin(context.account)
         and scope_was_requested
@@ -873,6 +909,7 @@ def list_audit_logs(
             db.scalars(
                 select(Account.id).where(
                     Account.account_type == STATION,
+                    Account.is_test.is_(False),
                     Account.road_id == context.account.road_id,
                 )
             )

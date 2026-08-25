@@ -18,6 +18,7 @@ class SyncStatus:
     quarantined_count: int
     last_sync_at: str | None
     error: str | None = None
+    data_changed: bool = False
 
 
 class SyncEngine:
@@ -45,7 +46,13 @@ class SyncEngine:
         except (AttributeError, TypeError, ValueError):
             return text.casefold()
 
-    def status(self, state: str | None = None, error: str | None = None) -> SyncStatus:
+    def status(
+        self,
+        state: str | None = None,
+        error: str | None = None,
+        *,
+        data_changed: bool = False,
+    ) -> SyncStatus:
         sync_state = self.database.get_sync_state()
         server_account_id = (
             self.session.state.account.server_account_id if self.session.state else None
@@ -68,6 +75,7 @@ class SyncEngine:
             ),
             last_sync_at=sync_state.get("last_sync_at"),
             error=error or sync_state.get("last_error"),
+            data_changed=bool(data_changed),
         )
 
     def _push(self, access_token: str) -> None:
@@ -136,24 +144,29 @@ class SyncEngine:
                 "服务器响应中缺少该同步项的确认结果",
             )
 
-    def _pull(self, access_token: str) -> None:
+    def _pull(self, access_token: str) -> bool:
         state = self.database.get_sync_state()
+        data_changed = False
         if state.get("needs_snapshot"):
             snapshot = self.session.api.snapshot(access_token)
             self.database.apply_sync_snapshot(snapshot)
             state = self.database.get_sync_state()
+            data_changed = True
         after_revision = int(state.get("last_revision") or 0)
         while True:
             response = self.session.api.pull(access_token, after_revision)
             self.database.apply_sync_changes(response)
             changes = response.get("changes") or []
             if changes:
+                data_changed = True
                 after_revision = int(changes[-1]["revision"])
             if not response.get("has_more"):
                 break
         if self.database.get_sync_state().get("needs_snapshot"):
             snapshot = self.session.api.snapshot(access_token)
             self.database.apply_sync_snapshot(snapshot)
+            data_changed = True
+        return data_changed
 
     def _delay_due_items(self, code: str, message: str) -> None:
         server_account_id = (
@@ -179,11 +192,11 @@ class SyncEngine:
         try:
             access_token = self.session.access_token()
             self._push(access_token)
-            self._pull(access_token)
+            data_changed = self._pull(access_token)
             now = datetime.now().astimezone().isoformat(timespec="seconds")
             self.database.mark_sync_success(now)
             self.session.note_online()
-            return self.status("online")
+            return self.status("online", data_changed=data_changed)
         except NetworkUnavailable as exc:
             self._delay_due_items("network_unavailable", str(exc))
             self.database.mark_sync_error(str(exc))

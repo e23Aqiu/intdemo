@@ -49,7 +49,10 @@ from .date_range import DateRangeSelector
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
 from .loading_dialog import run_ui_with_loading
-from .table_utils import make_table_columns_resizable
+from .table_utils import (
+    make_table_columns_resizable,
+    preserve_table_column_widths,
+)
 
 
 MILLISECONDS_PER_HOUR = 60 * 60 * 1000
@@ -438,9 +441,12 @@ class WorkflowDistributionChart(AnimatedDonutChart):
         self.setMinimumHeight(DISTRIBUTION_CHART_HEIGHT)
 
     def set_values(self, values, scope=""):
-        self._values = {key: int(value or 0) for key, value in values.items()}
-        self._scope = scope
-        self._reset_meter_scroll()
+        normalized = {key: int(value or 0) for key, value in values.items()}
+        normalized_scope = str(scope)
+        if self._values == normalized and self._scope == normalized_scope:
+            return
+        self._values = normalized
+        self._scope = normalized_scope
         self.update()
 
     def paintEvent(self, event):
@@ -670,15 +676,18 @@ class ViolationReasonChart(AnimatedDonutChart):
         self.setMinimumHeight(DISTRIBUTION_CHART_HEIGHT)
 
     def set_rows(self, rows, scope=""):
-        self._rows = sorted(
+        normalized = sorted(
             (dict(row) for row in rows),
             key=lambda row: (
                 -int(row.get("total") or 0),
                 str(row.get("reason") or ""),
             ),
         )
-        self._scope = scope
-        self._reset_meter_scroll()
+        normalized_scope = str(scope)
+        if self._rows == normalized and self._scope == normalized_scope:
+            return
+        self._rows = normalized
+        self._scope = normalized_scope
         self.update()
 
     def set_bar_mode(self, mode):
@@ -982,7 +991,10 @@ class StationDistributionChart(AnimatedDonutChart):
         self.setMinimumHeight(DISTRIBUTION_CHART_HEIGHT)
 
     def set_rows(self, rows):
-        self._rows = [dict(row) for row in rows]
+        normalized = [dict(row) for row in rows]
+        if self._rows == normalized:
+            return
+        self._rows = normalized
         station_keys = sorted(
             {self._station_key(row) for row in self._rows},
             key=str.casefold,
@@ -994,7 +1006,6 @@ class StationDistributionChart(AnimatedDonutChart):
         self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
-        self._reset_meter_scroll()
         self.update()
 
     @staticmethod
@@ -1024,28 +1035,30 @@ class StationDistributionChart(AnimatedDonutChart):
     def set_series_mode(self, mode):
         if mode not in {"counts", "timing"}:
             raise ValueError(f"Unsupported station distribution mode: {mode}")
-        self._series_mode = mode
         show_count_switch = mode == "counts"
         self.count_metric_button.setVisible(show_count_switch)
+        if self._series_mode == mode:
+            return
+        self._series_mode = mode
         self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
-        self._reset_meter_scroll()
         self.update()
 
     def set_count_metric(self, metric):
         if metric not in {"total", "has_phone"}:
             raise ValueError(f"Unsupported station count metric: {metric}")
-        self._count_metric = metric
         self.count_metric_button.setChecked(metric == "has_phone")
         self.count_metric_button.setText(
             "计量条：总计数"
             if metric == "total"
             else "计量条：有电话计数"
         )
+        if self._count_metric == metric:
+            return
+        self._count_metric = metric
         self._sort_rows()
         self._hover_card.hide()
-        self._reset_meter_scroll()
         self.update()
 
     def resizeEvent(self, event):
@@ -1063,11 +1076,12 @@ class StationDistributionChart(AnimatedDonutChart):
     def set_timing_basis(self, basis):
         if basis not in {"total", "active"}:
             raise ValueError(f"Unsupported timing basis: {basis}")
+        if self._timing_basis == basis:
+            return
         self._timing_basis = basis
         self._sort_rows()
         self._hovered_slice = None
         self._hover_card.hide()
-        self._reset_meter_scroll()
         self.update()
 
     @staticmethod
@@ -1582,6 +1596,10 @@ class StatisticsPage(QWidget):
         self.account_key = str(account_key or account.username or "")
         self._sidebar_navigation = False
         self._timing_basis = "total"
+        self._data_cache = {}
+        self._summary_view_states = {}
+        self._kpi_card_pool = []
+        self._timing_kpi_card_pool = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 20, 22, 22)
@@ -1866,7 +1884,40 @@ class StatisticsPage(QWidget):
         return self.category_combo.currentData() or "station_distribution"
 
     def _refresh_with_loading(self, _checked=False):
+        self.invalidate_data_cache()
         return run_ui_with_loading(self, "正在加载统计数据…", self.refresh)
+
+    def invalidate_data_cache(self):
+        self._data_cache.clear()
+
+    def _database_change_token(self):
+        database_path = Path(self.database.path)
+        token = []
+        for path in (
+            database_path,
+            Path(f"{database_path}-wal"),
+        ):
+            try:
+                stat = path.stat()
+            except OSError:
+                token.append((0, 0))
+            else:
+                token.append((stat.st_mtime_ns, stat.st_size))
+        return tuple(token)
+
+    def _cached_query(self, name, discriminator, loader):
+        start_date, end_date = self._date_range()
+        key = (
+            str(name),
+            discriminator,
+            start_date,
+            end_date,
+            bool(self.yellow_only_check.isChecked()),
+            self._database_change_token(),
+        )
+        if key not in self._data_cache:
+            self._data_cache[key] = loader()
+        return self._data_cache[key]
 
     def _toggle_yellow_only(self, checked):
         if self.client_preferences is not None and self.account_key:
@@ -1899,7 +1950,10 @@ class StatisticsPage(QWidget):
         if category_index < 0:
             raise ValueError(f"数据分类不可用：{category}")
         if self.category_combo.currentIndex() != category_index:
+            self.category_combo.blockSignals(True)
             self.category_combo.setCurrentIndex(category_index)
+            self.category_combo.blockSignals(False)
+            self._prepare_category_change(category)
 
         self._showing_anomalies = view == "anomaly"
         anomaly_button = getattr(self, "anomaly_button", None)
@@ -1937,16 +1991,10 @@ class StatisticsPage(QWidget):
             and not self.account.can_view_shared_stats
         )
         hidden_test_scope = self.account.is_test and not self.account.can_view_shared_stats
-        self.station_combo.blockSignals(True)
-        self.station_combo.clear()
         aggregate_label = (
             "本路段"
             if self.account.effective_data_scope == "road"
             else "全部站点"
-        )
-        self.station_combo.addItem(
-            "不参与统计" if hidden_test_scope else aggregate_label,
-            self.account.id if hidden_test_scope else None,
         )
         order = {username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)}
         accounts = [
@@ -1959,13 +2007,41 @@ class StatisticsPage(QWidget):
                 account for account in accounts if account.id == self.account.id
             ]
         accounts.sort(key=lambda item: (order.get(item.username, 999), item.name_label))
-        for station in accounts:
-            self.station_combo.addItem(station.name_label, station.id)
-            self.station_combo.setItemData(
-                self.station_combo.count() - 1,
-                f"账号：{station.username}",
-                Qt.ToolTipRole,
+        options = [
+            (
+                "不参与统计" if hidden_test_scope else aggregate_label,
+                self.account.id if hidden_test_scope else None,
+                "",
             )
+        ]
+        for station in accounts:
+            options.append(
+                (
+                    station.name_label,
+                    station.id,
+                    f"账号：{station.username}",
+                )
+            )
+        signature = (
+            restricted_online_scope,
+            hidden_test_scope,
+            tuple((label, value, tooltip) for label, value, tooltip in options),
+        )
+        if getattr(self, "_station_options_signature", None) == signature:
+            self.station_combo.setEnabled(not restricted_online_scope)
+            return
+
+        self._station_options_signature = signature
+        self.station_combo.blockSignals(True)
+        self.station_combo.clear()
+        for label, value, tooltip in options:
+            self.station_combo.addItem(label, value)
+            if tooltip:
+                self.station_combo.setItemData(
+                    self.station_combo.count() - 1,
+                    tooltip,
+                    Qt.ToolTipRole,
+                )
         target_id = current_id if had_options else (
             None if self.account.can_view_shared_stats else self.account.id
         )
@@ -2018,24 +2094,72 @@ class StatisticsPage(QWidget):
             return float(value), "0.00"
         return value, None
 
-    def _timing_detail_rows(self, user_id):
+    def _workflow_timing_totals(self, user_id):
         start_date, end_date = self._date_range()
-        totals = self.database.get_workflow_timing_totals(
-            user_id,
-            users_only=(user_id is None),
-            start_date=start_date,
-            end_date=end_date,
-            yellow_only=self.yellow_only_check.isChecked(),
+        return self._cached_query(
+            "workflow_timing_totals",
+            (user_id, user_id is None),
+            lambda: self.database.get_workflow_timing_totals(
+                user_id,
+                users_only=(user_id is None),
+                start_date=start_date,
+                end_date=end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
+            ),
         )
+
+    def _all_account_totals(self):
+        start_date, end_date = self._date_range()
+        return self._cached_query(
+            "all_account_totals",
+            None,
+            lambda: self.database.get_all_account_totals(
+                start_date,
+                end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
+            ),
+        )
+
+    def _user_totals(self, user_id):
+        start_date, end_date = self._date_range()
+        return self._cached_query(
+            "user_totals",
+            user_id,
+            lambda: self.database.get_user_totals(
+                user_id,
+                start_date,
+                end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
+            ),
+        )
+
+    def _violation_totals(self, user_id):
+        start_date, end_date = self._date_range()
+        return self._cached_query(
+            "violation_totals",
+            (user_id, user_id is None),
+            lambda: self.database.get_violation_totals(
+                user_id,
+                users_only=(user_id is None),
+                start_date=start_date,
+                end_date=end_date,
+                yellow_only=self.yellow_only_check.isChecked(),
+            ),
+        )
+
+    def _metric_definitions(self):
+        return self._cached_query(
+            "metric_definitions",
+            None,
+            self.database.get_metric_definitions,
+        )
+
+    def _timing_detail_rows(self, user_id):
+        totals = self._workflow_timing_totals(user_id)
         completed_items = int(totals["completed_items"])
         basis_key = "active_ms" if self._timing_basis == "active" else "total_ms"
         basis_label = "有效用时" if self._timing_basis == "active" else "总用时"
         basis_ms = totals[basis_key]
-        average_basis_ms = (
-            basis_ms / completed_items
-            if completed_items and basis_ms > 0
-            else None
-        )
         throughput_per_hour = (
             completed_items * MILLISECONDS_PER_HOUR / basis_ms
             if completed_items and basis_ms > 0
@@ -2483,6 +2607,11 @@ class StatisticsPage(QWidget):
 
     def _on_category_changed(self, _index):
         category = self.category_combo.currentData()
+        self._prepare_category_change(category)
+        self._sync_view_header()
+        self.refresh()
+
+    def _prepare_category_change(self, category):
         if category != "completion":
             self._showing_anomalies = False
             anomaly_button = getattr(self, "anomaly_button", None)
@@ -2504,8 +2633,6 @@ class StatisticsPage(QWidget):
             self.station_combo.blockSignals(False)
             self._has_saved_station_before_distribution = False
         self._active_category = category
-        self._sync_view_header()
-        self.refresh()
 
     def _toggle_anomaly_view(self, checked):
         if not self.account.is_account_manager:
@@ -2523,7 +2650,6 @@ class StatisticsPage(QWidget):
             item = self.kpi_layout.takeAt(0)
             if item.widget():
                 item.widget().hide()
-                item.widget().deleteLater()
 
     def _toggle_timing_basis(self, checked):
         self._timing_basis = "active" if checked else "total"
@@ -2562,24 +2688,36 @@ class StatisticsPage(QWidget):
             number.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         box.addWidget(caption)
         box.addWidget(number)
+        card._intdemo_caption_label = caption
+        card._intdemo_value_label = number
         return card
+
+    @staticmethod
+    def _update_metric_card(
+        card,
+        label,
+        value,
+        unit,
+        *,
+        hover_details=None,
+        hover_accent="#1d8178",
+    ):
+        card._intdemo_caption_label.setText(str(label))
+        card._intdemo_value_label.setText(f"{value} {unit}".rstrip())
+        if isinstance(card, TimingMetricCard):
+            card._hover_title = f"{label}明细"
+            card._hover_details = list(hover_details or [])
+            card._hover_accent = QColor(hover_accent)
+            card._hover_card.hide()
 
     def _refresh_timing_kpis(self, user_id):
         while self.timing_kpi_layout.count():
             item = self.timing_kpi_layout.takeAt(0)
             if item.widget():
                 item.widget().hide()
-                item.widget().deleteLater()
         self.timing_kpi_cards = {}
 
-        start_date, end_date = self._date_range()
-        totals = self.database.get_workflow_timing_totals(
-            user_id,
-            users_only=(user_id is None),
-            start_date=start_date,
-            end_date=end_date,
-            yellow_only=self.yellow_only_check.isChecked(),
-        )
+        totals = self._workflow_timing_totals(user_id)
         completed_items = int(totals["completed_items"])
         basis_key = "active_ms" if self._timing_basis == "active" else "total_ms"
         basis_label = "有效用时" if self._timing_basis == "active" else "总用时"
@@ -2679,7 +2817,19 @@ class StatisticsPage(QWidget):
             hover_details,
             hover_accent,
         ) in enumerate(values):
-            card = self._metric_card(
+            if index >= len(self._timing_kpi_card_pool):
+                self._timing_kpi_card_pool.append(
+                    self._metric_card(
+                        label,
+                        value,
+                        unit,
+                        hover_details=hover_details,
+                        hover_accent=hover_accent,
+                    )
+                )
+            card = self._timing_kpi_card_pool[index]
+            self._update_metric_card(
+                card,
                 label,
                 value,
                 unit,
@@ -2688,6 +2838,7 @@ class StatisticsPage(QWidget):
             )
             self.timing_kpi_cards[label] = card
             self.timing_kpi_layout.addWidget(card, 0, index)
+            card.show()
 
         self.timing_scope_label.setText(
             f"完成数据：{completed_items} 条 · 当前按{basis_label}计量"
@@ -2700,11 +2851,104 @@ class StatisticsPage(QWidget):
                 1 if column < columns else 0,
             )
         for index, (label, value, unit) in enumerate(values):
+            if index >= len(self._kpi_card_pool):
+                self._kpi_card_pool.append(
+                    self._metric_card(label, value, unit)
+                )
+            card = self._kpi_card_pool[index]
+            self._update_metric_card(card, label, value, unit)
             self.kpi_layout.addWidget(
-                self._metric_card(label, value, unit),
+                card,
                 index // columns,
                 index % columns,
             )
+            card.show()
+
+    def _summary_headers(self):
+        return tuple(
+            self.summary_table.horizontalHeaderItem(column).text()
+            if self.summary_table.horizontalHeaderItem(column) is not None
+            else ""
+            for column in range(self.summary_table.columnCount())
+        )
+
+    def _view_context(self):
+        start_date, end_date = self._date_range()
+        return (
+            self.navigation_view,
+            self.station_combo.currentData(),
+            start_date,
+            end_date,
+            bool(self.yellow_only_check.isChecked()),
+            self._timing_basis,
+            self.account.id,
+            self.account.effective_data_scope,
+        )
+
+    def _capture_refresh_state(self):
+        context = self._view_context()
+        headers = self._summary_headers()
+        table_state = {
+            "widths": tuple(
+                self.summary_table.columnWidth(column)
+                for column in range(self.summary_table.columnCount())
+            ),
+            "horizontal_scroll": self.summary_table.horizontalScrollBar().value(),
+            "vertical_scroll": self.summary_table.verticalScrollBar().value(),
+            "row": self.summary_table.currentRow(),
+            "column": self.summary_table.currentColumn(),
+        }
+        if headers:
+            self._summary_view_states[headers] = table_state
+        return {
+            "tab": self.detail_tabs.currentWidget(),
+            "headers": headers,
+            "table": table_state,
+            "preserve_interaction": context
+            == getattr(self, "_last_render_context", None),
+        }
+
+    def _restore_refresh_state(self, state):
+        current_headers = self._summary_headers()
+        table_state = (
+            state["table"]
+            if current_headers == state["headers"]
+            else self._summary_view_states.get(current_headers)
+        )
+        if table_state is not None and len(table_state["widths"]) == len(
+            current_headers
+        ):
+            for column, width in enumerate(table_state["widths"]):
+                self.summary_table.setColumnWidth(column, width)
+            preserve_table_column_widths(self.summary_table)
+            if state["preserve_interaction"]:
+                self.summary_table.horizontalScrollBar().setValue(
+                    table_state["horizontal_scroll"]
+                )
+                self.summary_table.verticalScrollBar().setValue(
+                    table_state["vertical_scroll"]
+                )
+                row = int(table_state["row"])
+                column = int(table_state["column"])
+                if (
+                    0 <= row < self.summary_table.rowCount()
+                    and 0 <= column < self.summary_table.columnCount()
+                ):
+                    self.summary_table.setCurrentCell(row, column)
+            else:
+                self.summary_table.scrollToTop()
+        elif current_headers != state["headers"] or not state["preserve_interaction"]:
+            self.summary_table.scrollToTop()
+
+        tab = state["tab"]
+        tab_index = self.detail_tabs.indexOf(tab)
+        if (
+            state["preserve_interaction"]
+            and tab_index >= 0
+            and self.detail_tabs.isTabEnabled(tab_index)
+        ):
+            self.detail_tabs.setCurrentIndex(tab_index)
+        self._last_render_context = self._view_context()
 
     def _finish_summary_table(self, scope, detail, stretch_columns=(0,)):
         self.data_description.setText(f"{scope} · {detail}")
@@ -2717,7 +2961,6 @@ class StatisticsPage(QWidget):
             },
             minimum_width=80,
         )
-        self.summary_table.scrollToTop()
 
     @staticmethod
     def _ordered_completion_metrics(metrics):
@@ -2736,18 +2979,13 @@ class StatisticsPage(QWidget):
 
     def _get_station_distribution_rows(self):
         stations = {}
-        start_date, end_date = self._date_range()
         restricted_user_id = (
             self.account.id
             if self.account.server_account_id is not None
             and not self.account.can_view_shared_stats
             else None
         )
-        for row in self.database.get_all_account_totals(
-            start_date,
-            end_date,
-            yellow_only=self.yellow_only_check.isChecked(),
-        ):
+        for row in self._all_account_totals():
             if row["role"] != "user":
                 continue
             if restricted_user_id is not None and row["user_id"] != restricted_user_id:
@@ -2769,12 +3007,7 @@ class StatisticsPage(QWidget):
 
         rows = list(stations.values())
         for row in rows:
-            timing = self.database.get_workflow_timing_totals(
-                row["user_id"],
-                start_date=start_date,
-                end_date=end_date,
-                yellow_only=self.yellow_only_check.isChecked(),
-            )
+            timing = self._workflow_timing_totals(row["user_id"])
             row["total_time_ms"] = timing["total_ms"]
             row["active_ms"] = timing["active_ms"]
         all_total = sum(row["total"] for row in rows)
@@ -2811,12 +3044,7 @@ class StatisticsPage(QWidget):
             username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
         }
         stations = {}
-        start_date, end_date = self._date_range()
-        for row in self.database.get_all_account_totals(
-            start_date,
-            end_date,
-            yellow_only=self.yellow_only_check.isChecked(),
-        ):
+        for row in self._all_account_totals():
             if row["role"] != "user":
                 continue
             if user_id is not None and row["user_id"] != user_id:
@@ -2938,22 +3166,17 @@ class StatisticsPage(QWidget):
 
     def _render_completion(self, user_id, scope):
         metrics = self._ordered_completion_metrics(
-            self.database.get_metric_definitions()
+            self._metric_definitions()
         )
         self.distribution_chart.show()
         self.violation_chart.hide()
         self.station_distribution_chart.hide()
         self.detail_tabs.setTabEnabled(0, True)
         self.data_title.setText("完整数据")
-        start_date, end_date = self._date_range()
 
         if user_id is None:
             totals_by_metric = {metric["metric_key"]: 0 for metric in metrics}
-            for row in self.database.get_all_account_totals(
-                start_date,
-                end_date,
-                yellow_only=self.yellow_only_check.isChecked(),
-            ):
+            for row in self._all_account_totals():
                 if row["role"] == "user":
                     totals_by_metric[row["metric_key"]] = (
                         totals_by_metric.get(row["metric_key"], 0)
@@ -2962,12 +3185,7 @@ class StatisticsPage(QWidget):
         else:
             totals_by_metric = {
                 row["metric_key"]: int(row["total"])
-                for row in self.database.get_user_totals(
-                    user_id,
-                    start_date,
-                    end_date,
-                    yellow_only=self.yellow_only_check.isChecked(),
-                )
+                for row in self._user_totals(user_id)
             }
 
         self._add_kpis(
@@ -3007,14 +3225,7 @@ class StatisticsPage(QWidget):
         self._finish_summary_table(scope, "完成类型累计明细")
 
     def _render_violation(self, user_id, scope):
-        start_date, end_date = self._date_range()
-        rows = self.database.get_violation_totals(
-            user_id,
-            users_only=(user_id is None),
-            start_date=start_date,
-            end_date=end_date,
-            yellow_only=self.yellow_only_check.isChecked(),
-        )
+        rows = self._violation_totals(user_id)
         rows = sorted(
             rows,
             key=lambda row: (
@@ -3126,7 +3337,14 @@ class StatisticsPage(QWidget):
             (0,),
         )
 
-    def refresh(self):
+    def refresh(self, *_args):
+        state = self._capture_refresh_state()
+        try:
+            self._refresh_content()
+        finally:
+            self._restore_refresh_state(state)
+
+    def _refresh_content(self):
         self._sync_view_header()
         self._populate_station_options()
         self._clear_kpis()
