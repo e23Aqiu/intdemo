@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Query, Request, Response
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import delete, exists, or_, select, update
 
 from ..connection_test import connection_test_gate
 from ..database import utcnow
@@ -19,7 +19,6 @@ from ..models import (
     WorkflowRun,
 )
 from ..permissions import (
-    DEFAULT_ROAD_NAME,
     GLOBAL_ADMIN,
     ROAD_ADMIN,
     SCOPE_ALL,
@@ -66,21 +65,81 @@ def _account_or_404(db: Db, account_id: uuid.UUID) -> Account:
     return account
 
 
-def _default_road(db: Db) -> Road:
-    road = db.scalar(select(Road).where(Road.name == DEFAULT_ROAD_NAME))
-    if road is None:
-        road = Road(name=DEFAULT_ROAD_NAME)
-        db.add(road)
-        db.flush()
-    return road
-
-
 def _road_or_404(db: Db, road_id: uuid.UUID | None) -> Road:
     if road_id is None:
         raise ApiError("road_required", "账号尚未分配所属路段", status_code=422)
     road = db.get(Road, road_id)
     if road is None:
         raise ApiError("road_not_found", "所属路段不存在", status_code=422)
+    return road
+
+
+def _road_has_manager(
+    db: Db,
+    road_id: uuid.UUID,
+    *,
+    exclude_account_id: uuid.UUID | None = None,
+) -> bool:
+    statement = select(Account.id).where(
+        Account.account_type == ROAD_ADMIN,
+        Account.road_id == road_id,
+    )
+    if exclude_account_id is not None:
+        statement = statement.where(Account.id != exclude_account_id)
+    return db.scalar(statement.limit(1)) is not None
+
+
+def _manager_road(
+    db: Db,
+    *,
+    display_name: str,
+    road_id: uuid.UUID | None,
+    road_name: str | None,
+    exclude_account_id: uuid.UUID | None = None,
+) -> Road:
+    manager_name = display_name.strip()
+    if road_name is not None and road_name.strip() != manager_name:
+        raise ApiError(
+            "road_name_must_match_manager",
+            "路段管理员账号显示名必须与路段名称一致",
+            status_code=422,
+        )
+    if road_id is not None:
+        road = _road_or_404(db, road_id)
+        if road.name != manager_name:
+            raise ApiError(
+                "road_name_must_match_manager",
+                "路段管理员账号显示名必须与路段名称一致",
+                status_code=422,
+            )
+    else:
+        road = _resolve_road(
+            db,
+            road_id=None,
+            road_name=manager_name,
+            allow_create=True,
+        )
+        assert road is not None
+    if _road_has_manager(
+        db,
+        road.id,
+        exclude_account_id=exclude_account_id,
+    ):
+        raise ApiError(
+            "road_manager_exists",
+            "该路段已有路段管理员账号",
+            status_code=409,
+        )
+    return road
+
+
+def _require_managed_road(db: Db, road: Road | None) -> Road | None:
+    if road is not None and not _road_has_manager(db, road.id):
+        raise ApiError(
+            "road_manager_required",
+            "该路段尚未创建路段管理员账号",
+            status_code=422,
+        )
     return road
 
 
@@ -140,6 +199,92 @@ def _account_change_payload(db: Db, account: Account) -> dict:
     }
 
 
+def _release_unmanaged_road(
+    db: Db,
+    road_id: uuid.UUID | None,
+) -> tuple[int, object | None]:
+    if road_id is None or _road_has_manager(db, road_id):
+        return 0, None
+    road = db.get(Road, road_id)
+    if road is None:
+        return 0, None
+    stations = list(
+        db.scalars(
+            select(Account)
+            .where(
+                Account.account_type == STATION,
+                Account.road_id == road_id,
+            )
+            .order_by(Account.username)
+        )
+    )
+    last_change = None
+    for station in stations:
+        station.road_id = None
+        if data_scope(station) == SCOPE_ROAD:
+            station.data_scope = SCOPE_OWN
+        station.stats_scope = legacy_stats_scope(station.data_scope)
+        station.entitlement_revision += 1
+        station.token_version += 1
+        revoke_refresh_sessions(
+            db,
+            account_id=station.id,
+            reason="road_manager_deleted",
+        )
+        last_change = append_change(
+            db,
+            account_id=station.id,
+            kind="account",
+            entity_id=str(station.id),
+            entity_revision=station.entitlement_revision,
+            payload=_account_change_payload(db, station),
+        )
+        last_change = append_change(
+            db,
+            account_id=None,
+            kind="road_membership_changed",
+            entity_id=str(station.id),
+            entity_revision=station.entitlement_revision,
+            payload={
+                "old_road_id": str(road_id),
+                "new_road_id": None,
+            },
+        )
+    db.flush()
+    db.execute(delete(Road).where(Road.id == road_id))
+    return len(stations), last_change
+
+
+def _append_road_member_name_changes(
+    db: Db,
+    road_id: uuid.UUID,
+    *,
+    exclude_account_id: uuid.UUID,
+) -> object | None:
+    last_change = None
+    members = list(
+        db.scalars(
+            select(Account)
+            .where(
+                Account.road_id == road_id,
+                Account.id != exclude_account_id,
+            )
+            .order_by(Account.username)
+        )
+    )
+    for member in members:
+        member.entitlement_revision += 1
+        last_change = append_change(
+            db,
+            account_id=member.id,
+            kind="account",
+            entity_id=str(member.id),
+            entity_revision=member.entitlement_revision,
+            payload=_account_change_payload(db, member),
+        )
+    return last_change
+
+
 def _connection_test_device_or_404(db: Db, device_id: uuid.UUID) -> Device:
     device = db.get(Device, device_id)
     if (
@@ -166,7 +311,12 @@ def list_accounts(context: AccountManagerContext, db: Db) -> list[dict]:
 
 @router.get("/roads", response_model=list[RoadView])
 def list_roads(context: AccountManagerContext, db: Db) -> list[dict]:
-    statement = select(Road).order_by(Road.name)
+    statement = select(Road).where(
+        exists().where(
+            Account.account_type == ROAD_ADMIN,
+            Account.road_id == Road.id,
+        )
+    ).order_by(Road.name)
     if is_road_admin(context.account):
         statement = statement.where(Road.id == context.account.road_id)
     return [road_view(road) for road in db.scalars(statement).all()]
@@ -248,29 +398,23 @@ async def create_account(
                 "路段管理员只能设置本人或本路段数据范围",
                 status_code=403,
             )
-    else:
-        road = _resolve_road(
+    elif requested_type == ROAD_ADMIN:
+        road = _manager_road(
             db,
+            display_name=payload.display_name,
             road_id=payload.road_id,
             road_name=payload.road_name,
-            allow_create=requested_type == ROAD_ADMIN,
         )
-        new_protocol = bool(
-            payload.account_type is not None
-            or payload.data_scope is not None
-            or payload.road_id is not None
-            or payload.road_name is not None
+    else:
+        road = _require_managed_road(
+            db,
+            _resolve_road(
+                db,
+                road_id=payload.road_id,
+                road_name=payload.road_name,
+                allow_create=False,
+            ),
         )
-        if road is None:
-            if new_protocol:
-                raise ApiError(
-                    "road_required",
-                    "中心站和路段管理员账号必须分配所属路段",
-                    status_code=422,
-                )
-            # Legacy administrators never send a road field.  Assigning the
-            # compatibility road keeps their existing create-account flow valid.
-            road = _default_road(db)
     if requested_scope == SCOPE_ROAD and road is None:
         raise ApiError("road_required", "本路段数据范围需要所属路段", status_code=422)
 
@@ -350,36 +494,88 @@ async def update_account(
     if resulting_type != STATION:
         resulting_is_test = False
 
+    resulting_display_name = str(
+        changes.get("display_name", account.display_name)
+    ).strip()
     resulting_road = (
         db.get(Road, account.road_id) if account.road_id is not None else None
     )
+    road_renamed = False
+    road_fields_requested = bool({"road_id", "road_name"} & changes.keys())
     if resulting_is_test:
-        if {"road_id", "road_name"} & changes.keys():
+        if "road_name" in changes or changes.get("road_id") is not None:
             raise ApiError(
                 "test_account_has_no_road",
                 "测试账号不分配所属路段",
                 status_code=422,
             )
         resulting_road = None
-    elif is_global_admin(context.account) and {"road_id", "road_name"} & changes.keys():
-        resulting_road = _resolve_road(
-            db,
-            road_id=changes.get("road_id"),
-            road_name=changes.get("road_name"),
-            allow_create=resulting_type == ROAD_ADMIN,
-        )
-    if resulting_type == GLOBAL_ADMIN:
-        resulting_road = None
-    elif not resulting_is_test and resulting_road is None:
-        if "account_type" in changes:
-            raise ApiError(
-                "road_required",
-                "中心站和路段管理员账号必须分配所属路段",
-                status_code=422,
+    elif resulting_type == ROAD_ADMIN:
+        if current_type == ROAD_ADMIN and resulting_road is not None:
+            if "road_id" in changes and changes["road_id"] != resulting_road.id:
+                raise ApiError(
+                    "road_reassignment_not_allowed",
+                    "路段管理员不能直接改绑到其他路段；可修改账号显示名重命名路段",
+                    status_code=409,
+                )
+            if (
+                "road_name" in changes
+                and changes["road_name"] != resulting_display_name
+            ):
+                raise ApiError(
+                    "road_name_must_match_manager",
+                    "路段管理员账号显示名必须与路段名称一致",
+                    status_code=422,
+                )
+            if _road_has_manager(
+                db,
+                resulting_road.id,
+                exclude_account_id=account.id,
+            ):
+                raise ApiError(
+                    "road_manager_exists",
+                    "该路段已有路段管理员账号",
+                    status_code=409,
+                )
+            if resulting_road.name != resulting_display_name:
+                conflicting_road = db.scalar(
+                    select(Road).where(Road.name == resulting_display_name)
+                )
+                if (
+                    conflicting_road is not None
+                    and conflicting_road.id != resulting_road.id
+                ):
+                    raise ApiError(
+                        "road_name_exists",
+                        "该路段名称已存在",
+                        status_code=409,
+                    )
+                resulting_road.name = resulting_display_name
+                road_renamed = True
+        else:
+            resulting_road = _manager_road(
+                db,
+                display_name=resulting_display_name,
+                road_id=changes.get("road_id") if road_fields_requested else None,
+                road_name=changes.get("road_name") if road_fields_requested else None,
+                exclude_account_id=account.id,
             )
-        # This path keeps legacy role demotions compatible while all new
-        # hierarchical requests are required to name a road explicitly.
-        resulting_road = _default_road(db)
+    elif resulting_type == GLOBAL_ADMIN:
+        resulting_road = None
+    elif current_type == ROAD_ADMIN:
+        # Removing the manager role also removes this account's road
+        # ownership.  The road is released after the account update below.
+        resulting_road = None
+    elif is_global_admin(context.account) and road_fields_requested:
+        resulting_road = _require_managed_road(
+            db,
+            _resolve_road(
+                db,
+                road_id=changes.get("road_id"),
+                road_name=changes.get("road_name"),
+                allow_create=False,
+            ),
+        )
 
     if "data_scope" in changes:
         resulting_scope = str(changes["data_scope"])
@@ -409,7 +605,13 @@ async def update_account(
             status_code=403,
         )
     if resulting_scope == SCOPE_ROAD and resulting_road is None:
-        raise ApiError("road_required", "本路段数据范围需要所属路段", status_code=422)
+        if scope_was_requested:
+            raise ApiError(
+                "road_required",
+                "本路段数据范围需要所属路段",
+                status_code=422,
+            )
+        resulting_scope = SCOPE_OWN
 
     if "device_limit" in changes:
         current_active_devices = active_device_count(db, account.id)
@@ -476,6 +678,25 @@ async def update_account(
                 "new_road_id": str(account.road_id) if account.road_id else None,
             },
         )
+    released_station_count = 0
+    if current_type == ROAD_ADMIN and (
+        account.account_type != ROAD_ADMIN or previous_road_id != account.road_id
+    ):
+        released_station_count, release_change = _release_unmanaged_road(
+            db,
+            previous_road_id,
+        )
+        if release_change is not None:
+            change = release_change
+    elif road_renamed and account.road_id is not None:
+        db.flush()
+        rename_change = _append_road_member_name_changes(
+            db,
+            account.road_id,
+            exclude_account_id=account.id,
+        )
+        if rename_change is not None:
+            change = rename_change
     audit(
         db,
         request,
@@ -483,7 +704,10 @@ async def update_account(
         action="account.update",
         target_type="account",
         target_id=str(account.id),
-        details={"fields": sorted(changes)},
+        details={
+            "fields": sorted(changes),
+            "released_station_count": released_station_count,
+        },
     )
     db.commit()
     await update_hub.broadcast_revision(change.revision)
@@ -582,15 +806,6 @@ async def delete_archived_account(
     deleted_account_type = account_type(account)
     deleted_road_id = account.road_id
     entity_revision = account.entitlement_revision + 1
-    audit(
-        db,
-        request,
-        actor_id=context.account.id,
-        action="account.delete",
-        target_type="account",
-        target_id=str(account.id),
-        details={"username": username, "permanent": True},
-    )
     # Delete the business rows explicitly before the account.  This keeps the
     # permanent-delete contract reliable even on an older deployment whose
     # account foreign keys were created without ON DELETE CASCADE.
@@ -611,6 +826,27 @@ async def delete_archived_account(
             "username": username,
             "account_type": deleted_account_type,
             "road_id": str(deleted_road_id) if deleted_road_id else None,
+        },
+    )
+    released_station_count = 0
+    if deleted_account_type == ROAD_ADMIN:
+        released_station_count, release_change = _release_unmanaged_road(
+            db,
+            deleted_road_id,
+        )
+        if release_change is not None:
+            change = release_change
+    audit(
+        db,
+        request,
+        actor_id=context.account.id,
+        action="account.delete",
+        target_type="account",
+        target_id=str(account_id),
+        details={
+            "username": username,
+            "permanent": True,
+            "released_station_count": released_station_count,
         },
     )
     db.commit()

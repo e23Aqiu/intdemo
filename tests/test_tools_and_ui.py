@@ -2304,23 +2304,44 @@ class ToolAndUiTests(unittest.TestCase):
             current_account=self.admin,
             roads=roads,
         )
+        dialog.display_name.setText("沿海高速")
         dialog.role.setCurrentIndex(dialog.role.findData("road_admin"))
         self.assertEqual(
             [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
             ["own", "road", "all"],
         )
         self.assertEqual(dialog.scope.currentData(), "road")
-        self.assertTrue(dialog.road.isEnabled())
+        self.assertFalse(dialog.road.isEnabled())
         self.assertTrue(dialog.road.isEditable())
+        self.assertEqual(dialog.road.currentText(), "沿海高速")
         values = dialog.values()
         self.assertEqual(values["account_type"], "road_admin")
         self.assertEqual(values["data_scope"], "road")
         self.assertEqual(values["stats_scope"], "own")
-        self.assertEqual(values["road_id"], roads[0]["id"])
-        dialog.road.setEditText("沿海高速")
-        custom = dialog.values()
-        self.assertNotIn("road_id", custom)
-        self.assertEqual(custom["road_name"], "沿海高速")
+        self.assertNotIn("road_id", values)
+        self.assertNotIn("road_name", values)
+        dialog.deleteLater()
+
+    def test_global_admin_can_leave_station_unassigned_or_choose_managed_road(self):
+        road_id = "22222222-2222-2222-2222-222222222222"
+        dialog = _AccountSettingsDialog(
+            current_account=self.admin,
+            roads=[{"id": road_id, "name": "广深高速"}],
+        )
+        self.assertEqual(dialog.role.currentData(), "station")
+        self.assertEqual(dialog.road.currentData(), None)
+        self.assertEqual(
+            [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
+            ["own", "all"],
+        )
+        self.assertIsNone(dialog.values()["road_id"])
+
+        dialog.road.setCurrentIndex(dialog.road.findData(road_id))
+        self.assertEqual(
+            [dialog.scope.itemData(index) for index in range(dialog.scope.count())],
+            ["own", "road", "all"],
+        )
+        self.assertEqual(dialog.values()["road_id"], road_id)
         dialog.deleteLater()
 
     def test_road_manager_dialog_preserves_existing_global_scope(self):

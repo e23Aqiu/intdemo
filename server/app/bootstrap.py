@@ -3,11 +3,10 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from .models import Account, CaptchaLearningPolicy, MetricDefinition, Road
+from .models import Account, CaptchaLearningPolicy, MetricDefinition
 from .permissions import (
     ACCOUNT_TYPES,
     DATA_SCOPES,
-    DEFAULT_ROAD_NAME,
     GLOBAL_ADMIN,
     SCOPE_ALL,
     SCOPE_OWN,
@@ -38,11 +37,6 @@ DEFAULT_METRICS = (
 
 
 def bootstrap_database(db: Session) -> None:
-    default_road = db.scalar(select(Road).where(Road.name == DEFAULT_ROAD_NAME))
-    if default_road is None:
-        default_road = Road(name=DEFAULT_ROAD_NAME)
-        db.add(default_road)
-        db.flush()
     if db.get(CaptchaLearningPolicy, 1) is None:
         db.add(
             CaptchaLearningPolicy(
@@ -84,9 +78,9 @@ def bootstrap_database(db: Session) -> None:
             existing.stats_scope = legacy_stats_scope(existing.data_scope)
             existing.road_id = None
             continue
+        if existing.road_id is None and existing.data_scope == "road":
+            existing.data_scope = SCOPE_OWN
         existing.stats_scope = legacy_stats_scope(existing.data_scope)
-        if existing.road_id is None:
-            existing.road_id = default_road.id
 
     existing_usernames = {account.username for account in existing_accounts}
     for username, display_name, role, scope, active in BOOTSTRAP_ACCOUNTS:
@@ -100,7 +94,7 @@ def bootstrap_database(db: Session) -> None:
             account_type=GLOBAL_ADMIN if role == "admin" else STATION,
             stats_scope=scope,
             data_scope=scope,
-            road_id=None if role == "admin" else default_road.id,
+            road_id=None,
             device_limit=10000,
             is_active=active,
             must_change_password=True,
@@ -121,7 +115,7 @@ def bootstrap_database(db: Session) -> None:
                 "stats_scope": account.stats_scope,
                 "data_scope": account.data_scope,
                 "road_id": str(account.road_id) if account.road_id else None,
-                "road_name": default_road.name if account.road_id else None,
+                "road_name": None,
                 "is_active": account.is_active,
                 "is_archived": account.is_archived,
             },

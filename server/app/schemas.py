@@ -190,7 +190,10 @@ class AccountUpdate(StrictModel):
 
     @model_validator(mode="after")
     def reject_explicit_nulls(self) -> AccountUpdate:
-        if any(getattr(self, field_name) is None for field_name in self.model_fields_set):
+        if any(
+            field_name != "road_id" and getattr(self, field_name) is None
+            for field_name in self.model_fields_set
+        ):
             raise ValueError("更新字段不能为 null")
         if self.road_id is not None and self.road_name is not None:
             raise ValueError("所属路段不能同时使用编号和名称")

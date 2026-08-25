@@ -79,6 +79,24 @@ def _create_account(client, headers, **payload) -> dict:
     return response.json()
 
 
+def _create_road_manager(
+    client,
+    headers,
+    *,
+    username: str,
+    road_name: str,
+) -> dict:
+    return _create_account(
+        client,
+        headers,
+        username=username,
+        display_name=road_name,
+        account_type="road_admin",
+        data_scope="road",
+        road_name=road_name,
+    )
+
+
 def _activity_item(entity_id: str, amount: int) -> dict:
     return {
         "schema_version": 1,
@@ -97,7 +115,7 @@ def _activity_item(entity_id: str, amount: int) -> dict:
     }
 
 
-def test_bootstrap_assigns_existing_accounts_without_revoking_sessions(client):
+def test_bootstrap_preserves_unassigned_accounts_without_revoking_sessions(client):
     admin = changed_admin(client)
     headers = auth_header(admin)
 
@@ -105,13 +123,13 @@ def test_bootstrap_assigns_existing_accounts_without_revoking_sessions(client):
         road = db.scalar(select(Road).where(Road.name == DEFAULT_ROAD_NAME))
         admin_row = db.scalar(select(Account).where(Account.username == "admin"))
         station = db.scalar(select(Account).where(Account.username == "luogang"))
-        assert road is not None
+        assert road is None
         assert admin_row.account_type == "admin"
         assert admin_row.data_scope == "all"
         assert admin_row.road_id is None
         assert station.account_type == "station"
         assert station.data_scope == "own"
-        assert station.road_id == road.id
+        assert station.road_id is None
         bootstrap_database(db)
 
     # Bootstrap and migration-style backfills do not touch token versions.
@@ -170,15 +188,12 @@ def test_bootstrap_reconciles_legacy_writes_during_rolling_upgrade(client):
         db.commit()
 
         bootstrap_database(db)
-        default_road = db.scalar(
-            select(Road).where(Road.name == DEFAULT_ROAD_NAME)
-        )
         assert legacy_all.account_type == "station"
         assert legacy_all.data_scope == "all"
-        assert legacy_all.road_id == default_road.id
+        assert legacy_all.road_id is None
         assert legacy_demoted.account_type == "station"
         assert legacy_demoted.data_scope == "own"
-        assert legacy_demoted.road_id == default_road.id
+        assert legacy_demoted.road_id is None
         assert legacy_promoted.account_type == "admin"
         assert legacy_promoted.data_scope == "all"
         assert legacy_promoted.road_id is None
@@ -186,9 +201,9 @@ def test_bootstrap_reconciles_legacy_writes_during_rolling_upgrade(client):
 
 def test_bootstrap_detaches_test_accounts_without_revoking_sessions(client):
     with SessionLocal() as db:
-        default_road = db.scalar(
-            select(Road).where(Road.name == DEFAULT_ROAD_NAME)
-        )
+        default_road = Road(name=DEFAULT_ROAD_NAME)
+        db.add(default_road)
+        db.flush()
         test_account = Account(
             username="bootstrap_direct_test",
             display_name="直属测试账号",
@@ -217,16 +232,14 @@ def test_bootstrap_detaches_test_accounts_without_revoking_sessions(client):
 def test_test_accounts_are_managed_only_by_global_admin_without_roads(client):
     admin = changed_admin(client)
     admin_headers = auth_header(admin)
-    road = client.get("/api/v1/admin/roads", headers=admin_headers).json()[0]
-    manager_row = _create_account(
+    assert client.get("/api/v1/admin/roads", headers=admin_headers).json() == []
+    manager_row = _create_road_manager(
         client,
         admin_headers,
         username="test_scope_manager",
-        display_name="测试路段管理员",
-        account_type="road_admin",
-        data_scope="road",
-        road_id=road["id"],
+        road_name="测试路段管理员",
     )
+    road = {"id": manager_row["road_id"], "name": manager_row["road_name"]}
     manager = _activate(
         client,
         "test_scope_manager",
@@ -316,25 +329,24 @@ def test_test_accounts_are_managed_only_by_global_admin_without_roads(client):
 def test_road_manager_can_only_manage_own_road_stations(client):
     admin = changed_admin(client)
     admin_headers = auth_header(admin)
-    roads = client.get("/api/v1/admin/roads", headers=admin_headers).json()
-    guangshen = next(road for road in roads if road["name"] == DEFAULT_ROAD_NAME)
-
-    manager_row = _create_account(
+    manager_row = _create_road_manager(
         client,
         admin_headers,
         username="guangshen_manager",
-        display_name="广深高速",
-        account_type="road_admin",
-        data_scope="road",
-        road_id=guangshen["id"],
+        road_name=DEFAULT_ROAD_NAME,
     )
-    other_manager = _create_account(
+    guangshen = next(
+        road
+        for road in client.get(
+            "/api/v1/admin/roads",
+            headers=admin_headers,
+        ).json()
+        if road["id"] == manager_row["road_id"]
+    )
+    other_manager = _create_road_manager(
         client,
         admin_headers,
         username="other_manager",
-        display_name="京港澳高速",
-        account_type="road_admin",
-        data_scope="road",
         road_name="京港澳高速",
     )
     assert manager_row["role"] == "user"
@@ -351,8 +363,7 @@ def test_road_manager_can_only_manage_own_road_stations(client):
     manager_headers = auth_header(manager)
     listed = client.get("/api/v1/admin/accounts", headers=manager_headers)
     assert listed.status_code == 200, listed.text
-    assert {row["account_type"] for row in listed.json()} == {"station"}
-    assert {row["road_id"] for row in listed.json()} == {guangshen["id"]}
+    assert listed.json() == []
     assert manager_row["id"] not in {row["id"] for row in listed.json()}
     assert other_manager["id"] not in {row["id"] for row in listed.json()}
     assert client.get("/api/v1/admin/roads", headers=manager_headers).json() == [
@@ -495,29 +506,229 @@ def test_road_manager_can_only_manage_own_road_stations(client):
     assert restored.status_code == 200
 
 
+def test_deleting_last_road_manager_releases_stations_until_manual_reassignment(
+    client,
+):
+    admin = changed_admin(client)
+    admin_headers = auth_header(admin)
+    manager = _create_road_manager(
+        client,
+        admin_headers,
+        username="release_manager",
+        road_name=DEFAULT_ROAD_NAME,
+    )
+    road_id = manager["road_id"]
+    own_station = _create_account(
+        client,
+        admin_headers,
+        username="release_own",
+        display_name="本人范围中心站",
+        account_type="station",
+        data_scope="own",
+        road_id=road_id,
+    )
+    road_station = _create_account(
+        client,
+        admin_headers,
+        username="release_road",
+        display_name="路段范围中心站",
+        account_type="station",
+        data_scope="road",
+        road_id=road_id,
+    )
+    all_station = _create_account(
+        client,
+        admin_headers,
+        username="release_all",
+        display_name="全部范围中心站",
+        account_type="station",
+        data_scope="all",
+        road_id=road_id,
+    )
+
+    archived = client.post(
+        f"/api/v1/admin/accounts/{manager['id']}/archive",
+        headers=admin_headers,
+    )
+    assert archived.status_code == 200, archived.text
+    assert archived.json()["road_id"] == road_id
+    assert {
+        row["id"]
+        for row in client.get(
+            "/api/v1/admin/roads",
+            headers=admin_headers,
+        ).json()
+    } == {road_id}
+
+    deleted = client.delete(
+        f"/api/v1/admin/accounts/{manager['id']}",
+        headers=admin_headers,
+    )
+    assert deleted.status_code == 204, deleted.text
+    assert client.get("/api/v1/admin/roads", headers=admin_headers).json() == []
+    rows = {
+        row["id"]: row
+        for row in client.get(
+            "/api/v1/admin/accounts",
+            headers=admin_headers,
+        ).json()
+    }
+    assert manager["id"] not in rows
+    for station in (own_station, road_station, all_station):
+        assert rows[station["id"]]["road_id"] is None
+        assert rows[station["id"]]["road_name"] is None
+    assert rows[own_station["id"]]["data_scope"] == "own"
+    assert rows[road_station["id"]]["data_scope"] == "own"
+    assert rows[road_station["id"]]["stats_scope"] == "own"
+    assert rows[all_station["id"]]["data_scope"] == "all"
+
+    direct_update = client.patch(
+        f"/api/v1/admin/accounts/{own_station['id']}",
+        headers=admin_headers,
+        json={"display_name": "直属管理员中心站"},
+    )
+    assert direct_update.status_code == 200, direct_update.text
+    with SessionLocal() as db:
+        assert db.get(Road, uuid.UUID(road_id)) is None
+
+    replacement = _create_road_manager(
+        client,
+        admin_headers,
+        username="release_manager_replacement",
+        road_name=DEFAULT_ROAD_NAME,
+    )
+    assert replacement["road_id"] != road_id
+    replacement_bundle = _activate(
+        client,
+        "release_manager_replacement",
+        device=251,
+        password="Replacement!23456",
+    )
+    replacement_headers = auth_header(replacement_bundle)
+    assert client.get(
+        "/api/v1/admin/accounts",
+        headers=replacement_headers,
+    ).json() == []
+
+    reassigned = client.patch(
+        f"/api/v1/admin/accounts/{own_station['id']}",
+        headers=admin_headers,
+        json={"road_id": replacement["road_id"]},
+    )
+    assert reassigned.status_code == 200, reassigned.text
+    assert reassigned.json()["road_id"] == replacement["road_id"]
+    assert {
+        row["id"]
+        for row in client.get(
+            "/api/v1/admin/accounts",
+            headers=replacement_headers,
+        ).json()
+    } == {own_station["id"]}
+    cleared = client.patch(
+        f"/api/v1/admin/accounts/{own_station['id']}",
+        headers=admin_headers,
+        json={"road_id": None},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["road_id"] is None
+
+
+def test_road_manager_display_name_owns_and_renames_the_category(client):
+    admin = changed_admin(client)
+    admin_headers = auth_header(admin)
+    manager = _create_road_manager(
+        client,
+        admin_headers,
+        username="rename_manager",
+        road_name=DEFAULT_ROAD_NAME,
+    )
+    station = _create_account(
+        client,
+        admin_headers,
+        username="rename_station",
+        display_name="跟随重命名中心站",
+        account_type="station",
+        data_scope="own",
+        road_id=manager["road_id"],
+    )
+
+    renamed = client.patch(
+        f"/api/v1/admin/accounts/{manager['id']}",
+        headers=admin_headers,
+        json={"display_name": "广深高速北段"},
+    )
+    assert renamed.status_code == 200, renamed.text
+    assert renamed.json()["road_id"] == manager["road_id"]
+    assert renamed.json()["road_name"] == "广深高速北段"
+    assert client.get(
+        "/api/v1/admin/roads",
+        headers=admin_headers,
+    ).json() == [{"id": manager["road_id"], "name": "广深高速北段"}]
+    station_row = next(
+        row
+        for row in client.get(
+            "/api/v1/admin/accounts",
+            headers=admin_headers,
+        ).json()
+        if row["id"] == station["id"]
+    )
+    assert station_row["road_name"] == "广深高速北段"
+
+    duplicate = client.post(
+        "/api/v1/admin/accounts",
+        headers=admin_headers,
+        json={
+            "username": "duplicate_manager",
+            "display_name": "广深高速北段",
+            "account_type": "road_admin",
+            "data_scope": "road",
+            "road_name": "广深高速北段",
+        },
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["code"] == "road_manager_exists"
+
+
+def test_legacy_account_create_without_road_stays_unassigned(client):
+    admin = changed_admin(client)
+    response = client.post(
+        "/api/v1/admin/accounts",
+        headers=auth_header(admin),
+        json={
+            "username": "legacy_unassigned",
+            "display_name": "旧版新建中心站",
+            "role": "user",
+            "stats_scope": "own",
+            "device_limit": 10000,
+            "is_active": True,
+        },
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["road_id"] is None
+    assert response.json()["data_scope"] == "own"
+
+
 def test_road_data_scope_and_legacy_client_downgrade(client):
     admin = changed_admin(client)
     admin_headers = auth_header(admin)
-    guangshen = client.get(
-        "/api/v1/admin/roads",
-        headers=admin_headers,
-    ).json()[0]
-    manager_row = _create_account(
+    manager_row = _create_road_manager(
         client,
         admin_headers,
         username="scope_manager",
-        display_name="广深数据管理员",
-        account_type="road_admin",
-        data_scope="road",
-        road_id=guangshen["id"],
+        road_name=DEFAULT_ROAD_NAME,
     )
-    other_manager = _create_account(
+    guangshen = next(
+        road
+        for road in client.get(
+            "/api/v1/admin/roads",
+            headers=admin_headers,
+        ).json()
+        if road["id"] == manager_row["road_id"]
+    )
+    other_manager = _create_road_manager(
         client,
         admin_headers,
         username="scope_other_manager",
-        display_name="沿海高速",
-        account_type="road_admin",
-        data_scope="road",
         road_name="沿海高速",
     )
     same_station = _create_account(
@@ -677,15 +888,11 @@ def test_road_data_scope_and_legacy_client_downgrade(client):
 def test_v110_admin_receives_legacy_safe_rows_for_new_account_types(client):
     admin = changed_admin(client)
     admin_headers = auth_header(admin)
-    road = client.get("/api/v1/admin/roads", headers=admin_headers).json()[0]
-    manager = _create_account(
+    manager = _create_road_manager(
         client,
         admin_headers,
         username="legacy_visible_manager",
-        display_name="旧版可见路段管理员",
-        account_type="road_admin",
-        data_scope="road",
-        road_id=road["id"],
+        road_name="旧版可见路段管理员",
     )
 
     legacy = _login(

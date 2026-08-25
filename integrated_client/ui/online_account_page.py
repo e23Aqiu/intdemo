@@ -70,6 +70,8 @@ class _AccountSettingsDialog(FramelessDialog):
             self.role.addItem("管理员", "admin")
         self.scope = QComboBox()
         self.road = QComboBox()
+        if self._global_manager:
+            self.road.addItem("未分配（直属管理员）", None)
         for road in self.roads:
             road_id = str(road.get("id") or "").strip()
             road_name = str(road.get("name") or "").strip()
@@ -95,7 +97,9 @@ class _AccountSettingsDialog(FramelessDialog):
                 "test" if account.is_test else account.resolved_account_type
             )
             self.role.setCurrentIndex(self.role.findData(account_type))
-            road_index = self.road.findData(str(account.road_id or ""))
+            road_index = self.road.findData(
+                str(account.road_id) if account.road_id else None
+            )
             if road_index < 0 and account.road_id and account.road_name:
                 self.road.addItem(account.road_name, str(account.road_id))
                 road_index = self.road.count() - 1
@@ -136,6 +140,8 @@ class _AccountSettingsDialog(FramelessDialog):
         buttons.addWidget(save)
         layout.addLayout(buttons)
         self.role.currentIndexChanged.connect(self._sync_hierarchy_controls)
+        self.road.currentIndexChanged.connect(self._sync_hierarchy_controls)
+        self.display_name.textChanged.connect(self._sync_road_manager_name)
         self._sync_hierarchy_controls()
         if account:
             scope_index = self.scope.findData(account.effective_data_scope)
@@ -144,6 +150,7 @@ class _AccountSettingsDialog(FramelessDialog):
     def _sync_hierarchy_controls(self, *_args):
         account_type = self.role.currentData()
         current_scope = self.scope.currentData()
+        has_assigned_road = bool(self.road.currentData())
         self.scope.blockSignals(True)
         self.scope.clear()
         if account_type == "admin":
@@ -157,12 +164,14 @@ class _AccountSettingsDialog(FramelessDialog):
                 and self.editing_account.effective_data_scope == "all"
             ):
                 scope_options.append(("全部数据（仅管理员可授予）", "all"))
-        else:
+        elif account_type == "road_admin" or has_assigned_road:
             scope_options = [
                 ("仅本人数据", "own"),
                 ("本路段数据", "road"),
                 ("全部数据", "all"),
             ]
+        else:
+            scope_options = [("仅本人数据", "own"), ("全部数据", "all")]
         for label, value in scope_options:
             self.scope.addItem(label, value)
         index = self.scope.findData(current_scope)
@@ -173,20 +182,26 @@ class _AccountSettingsDialog(FramelessDialog):
         self.scope.setCurrentIndex(index if index >= 0 else 0)
         self.scope.blockSignals(False)
 
-        uses_road = account_type in {"station", "road_admin"}
-        self.road.setEnabled(
-            uses_road
-            and self._global_manager
-        )
-        self.road.setEditable(
-            bool(uses_road and self._global_manager and account_type == "road_admin")
-        )
+        if account_type == "road_admin":
+            self.road.setEditable(True)
+            self.road.setEditText(self.display_name.text().strip())
+            self.road.setEnabled(False)
+        else:
+            self.road.setEditable(False)
+            if self.road.currentIndex() < 0 and self.road.count():
+                self.road.setCurrentIndex(0)
+            self.road.setEnabled(account_type == "station" and self._global_manager)
         self.road.setToolTip(
             "测试账号直属管理员且不分配路段；"
-            "路段管理员可输入新路段名称，中心站必须选择已有路段。"
+            "路段管理员的账号显示名就是路段分类名称；"
+            "中心站可选择已有路段或未分配。"
             if self._global_manager
             else "路段管理员只能管理自己所属路段。"
         )
+
+    def _sync_road_manager_name(self, text):
+        if self.role.currentData() == "road_admin":
+            self.road.setEditText(str(text).strip())
 
     def _accept_if_valid(self):
         username = self.username.text().strip()
@@ -206,16 +221,13 @@ class _AccountSettingsDialog(FramelessDialog):
             self.username.setFocus()
             return
         account_type = self.role.currentData()
-        if account_type in {"station", "road_admin"}:
-            road_id, road_name = self._road_reference()
-            if not road_id and not road_name:
-                QMessageBox.warning(self, "资料不完整", "必须分配所属路段。")
-                return
-            if account_type != "road_admin" and not road_id:
+        if account_type == "station":
+            road_id, _road_name = self._road_reference()
+            if self.scope.currentData() == "road" and not road_id:
                 QMessageBox.warning(
                     self,
                     "所属路段无效",
-                    "中心站账号必须从已有路段中选择。",
+                    "本路段数据范围必须先选择所属路段。",
                 )
                 return
         self.accept()
@@ -250,12 +262,12 @@ class _AccountSettingsDialog(FramelessDialog):
             "device_limit": self.device_limit.value(),
             "is_active": self.active.isChecked(),
         }
-        if account_type in {"station", "road_admin"}:
-            road_id, road_name = self._road_reference()
+        if account_type == "station":
+            road_id, _road_name = self._road_reference()
             if road_id:
                 values["road_id"] = str(road_id)
             else:
-                values["road_name"] = road_name
+                values["road_id"] = None
         return values
 
 
@@ -944,7 +956,7 @@ class OnlineAccountPage(AccountPage):
                 str(server.get("last_login_system") or "-"),
                 "需要修改" if account.must_change_password else "已设置",
                 "已归档" if account.is_archived else "-",
-                account.road_name or "-",
+                account.road_name or "未分配",
             ]
             for column, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -1018,9 +1030,18 @@ class OnlineAccountPage(AccountPage):
                 if account.id == self.current_account.id
                 else ""
             )
+            hierarchy = (
+                "全部路段"
+                if account.is_admin
+                else (
+                    f"路段 {account.road_name}"
+                    if account.road_name
+                    else "未分配 · 直属管理员"
+                )
+            )
             self.selection_hint.setText(
                 f"已选择：{account.name_label} · {account.role_label} · {state}"
-                f" · {'直属管理员' if account.is_test else '路段 ' + (account.road_name or '-')}"
+                f" · {hierarchy}"
                 f" · 数据范围 {self._scope_label(account.effective_data_scope)}"
                 f" · 设备 {server.get('active_device_count', 0)}/"
                 f"{server.get('device_limit', 10000)}{suffix}"
@@ -1238,7 +1259,13 @@ class OnlineAccountPage(AccountPage):
             self,
             "永久删除归档账号",
             "将永久删除该账号、业务统计、计时记录、设备和会话数据，"
-            "且无法恢复。\n\n"
+            "且无法恢复。"
+            + (
+                "该路段下的中心站将改为“未分配”，并由管理员直接管理。"
+                if account.is_road_admin
+                else ""
+            )
+            + "\n\n"
             f"确定永久删除“{account.name_label}（{account.username}）”吗？",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -1252,7 +1279,15 @@ class OnlineAccountPage(AccountPage):
             return
         self.database.purge_remote_account_cache(account.server_account_id)
         self.account_deleted.emit(account.id)
-        QMessageBox.information(self, "删除完成", "归档账号及其数据已永久删除。")
+        QMessageBox.information(
+            self,
+            "删除完成",
+            (
+                "路段管理员已永久删除；所属中心站已改为未分配并由管理员直接管理。"
+                if account.is_road_admin
+                else "归档账号及其数据已永久删除。"
+            ),
+        )
         self.refresh()
 
     def _reset_station_statistics(self):

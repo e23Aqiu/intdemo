@@ -35,4 +35,9 @@ non-admin accounts to `广深高速` without changing passwords, token versions,
 active state, or refresh sessions. Migration 0015 detaches test accounts from
 all roads while preserving those same security and session fields. Test accounts
 are managed directly by a global administrator and are never visible to road
-administrators.
+administrators. A road is assignable only while a same-named road-administrator
+account owns it. Unassigned stations are managed directly by a global
+administrator. Permanently deleting the last manager releases every station on
+that road and removes the road; archiving keeps the relationship so it can be
+restored. Legacy v1.1.x account creation without a road remains valid and creates
+an unassigned station.
