@@ -2208,6 +2208,170 @@ class ToolAndUiTests(unittest.TestCase):
         )
         page.deleteLater()
 
+    def test_online_account_page_filters_by_role_and_road_without_reloading(self):
+        guangshen_id = "11111111-1111-1111-1111-111111111111"
+        coastal_id = "22222222-2222-2222-2222-222222222222"
+        rows = [
+            {
+                "id": "filter-admin",
+                "username": self.admin.username,
+                "display_name": self.admin.name_label,
+                "role": "admin",
+                "account_type": "admin",
+                "data_scope": "all",
+                "stats_scope": "all",
+                "is_active": True,
+            },
+            {
+                "id": "filter-road-manager",
+                "username": "guangshen_manager",
+                "display_name": "广深高速",
+                "role": "user",
+                "account_type": "road_admin",
+                "data_scope": "road",
+                "stats_scope": "own",
+                "road_id": guangshen_id,
+                "road_name": "广深高速",
+                "is_active": True,
+            },
+            {
+                "id": "filter-guangshen-station",
+                "username": "guangshen_station",
+                "display_name": "广深中心站",
+                "role": "user",
+                "account_type": "station",
+                "data_scope": "road",
+                "stats_scope": "own",
+                "road_id": guangshen_id,
+                "road_name": "广深高速",
+                "is_active": True,
+            },
+            {
+                "id": "filter-coastal-station",
+                "username": "coastal_station",
+                "display_name": "沿海中心站",
+                "role": "user",
+                "account_type": "station",
+                "data_scope": "road",
+                "stats_scope": "own",
+                "road_id": coastal_id,
+                "road_name": "沿海高速",
+                "is_active": True,
+            },
+            {
+                "id": "filter-unassigned-station",
+                "username": "unassigned_station",
+                "display_name": "未分配中心站",
+                "role": "user",
+                "account_type": "station",
+                "data_scope": "own",
+                "stats_scope": "own",
+                "is_active": True,
+            },
+            {
+                "id": "filter-test-account",
+                "username": "filter_test",
+                "display_name": "筛选测试账号",
+                "role": "user",
+                "account_type": "station",
+                "is_test": True,
+                "data_scope": "own",
+                "stats_scope": "own",
+                "is_active": True,
+            },
+        ]
+
+        class Api:
+            def __init__(self):
+                self.account_requests = 0
+                self.road_requests = 0
+
+            def admin_accounts(self, _token):
+                self.account_requests += 1
+                return rows
+
+            def admin_roads(self, _token):
+                self.road_requests += 1
+                return [
+                    {"id": guangshen_id, "name": "广深高速"},
+                    {"id": coastal_id, "name": "沿海高速"},
+                ]
+
+        class Session:
+            def __init__(self):
+                self.api = Api()
+
+            @staticmethod
+            def access_token():
+                return "test-token"
+
+        session = Session()
+        page = OnlineAccountPage(self.db, self.admin, session)
+        with patch(
+            "integrated_client.ui.online_account_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            page.refresh()
+
+        def visible_usernames():
+            return {
+                page.table.item(row, 1).text()
+                for row in range(page.table.rowCount())
+            }
+
+        self.assertEqual(page.table.rowCount(), 6)
+        self.assertEqual(page.summary_values["total"].text(), "6")
+        self.assertGreaterEqual(page.road_filter.findData(guangshen_id), 0)
+        self.assertGreaterEqual(page.road_filter.findData(coastal_id), 0)
+        request_counts = (
+            session.api.account_requests,
+            session.api.road_requests,
+        )
+
+        page.role_filter.setCurrentIndex(
+            page.role_filter.findData("road_admin")
+        )
+        page.road_filter.setCurrentIndex(
+            page.road_filter.findData(guangshen_id)
+        )
+        self.assertEqual(visible_usernames(), {"guangshen_manager"})
+
+        page.role_filter.setCurrentIndex(page.role_filter.findData("station"))
+        self.assertEqual(visible_usernames(), {"guangshen_station"})
+        self.assertEqual(page._selected_account(), None)
+
+        page.road_filter.setCurrentIndex(
+            page.road_filter.findData("unassigned")
+        )
+        self.assertEqual(visible_usernames(), {"unassigned_station"})
+        page.role_filter.setCurrentIndex(page.role_filter.findData("test"))
+        self.assertEqual(visible_usernames(), {"filter_test"})
+
+        page.role_filter.setCurrentIndex(page.role_filter.findData("all"))
+        self.assertEqual(
+            visible_usernames(),
+            {"unassigned_station", "filter_test"},
+        )
+        self.assertEqual(
+            request_counts,
+            (session.api.account_requests, session.api.road_requests),
+        )
+        self.assertEqual(page.summary_values["total"].text(), "6")
+
+        page.role_filter.setCurrentIndex(page.role_filter.findData("station"))
+        page.road_filter.setCurrentIndex(
+            page.road_filter.findData(guangshen_id)
+        )
+        with patch(
+            "integrated_client.ui.online_account_page.run_with_loading",
+            side_effect=lambda _parent, _message, function: function(),
+        ):
+            page.refresh()
+        self.assertEqual(page.role_filter.currentData(), "station")
+        self.assertEqual(page.road_filter.currentData(), guangshen_id)
+        self.assertEqual(visible_usernames(), {"guangshen_station"})
+        page.deleteLater()
+
     def test_online_account_settings_exposes_device_limit(self):
         dialog = _AccountSettingsDialog()
         self.assertEqual(dialog.device_limit.minimum(), 1)
@@ -2327,6 +2491,115 @@ class ToolAndUiTests(unittest.TestCase):
         own_window.workflow_page.shutdown()
         own_window._prepared_to_close = True
         own_window.close()
+
+    def test_road_manager_identity_and_historical_totals_stay_out_of_statistics_ui(self):
+        road_id = "44444444-4444-4444-4444-444444444444"
+        former_station = self.db.upsert_remote_account(
+            {
+                "id": "hidden-road-manager",
+                "username": "road_manager_hidden",
+                "display_name": "路段管理员隐藏标识",
+                "role": "user",
+                "account_type": "station",
+                "data_scope": "road",
+                "road_id": road_id,
+                "road_name": "路段管理员隐藏标识",
+                "is_active": True,
+            }
+        )
+        self.db.record_activity_batch(
+            former_station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 9,
+                WORKFLOW_HAS_PHONE_METRIC: 7,
+            },
+            source="historical-road-manager",
+        )
+        manager = self.db.upsert_remote_account(
+            {
+                "id": "hidden-road-manager",
+                "username": "road_manager_hidden",
+                "display_name": "路段管理员隐藏标识",
+                "role": "user",
+                "account_type": "road_admin",
+                "data_scope": "road",
+                "road_id": road_id,
+                "road_name": "路段管理员隐藏标识",
+                "is_active": True,
+            }
+        )
+        station = self.db.upsert_remote_account(
+            {
+                "id": "visible-road-station",
+                "username": "visible_station",
+                "display_name": "可见中心站",
+                "role": "user",
+                "account_type": "station",
+                "data_scope": "road",
+                "road_id": road_id,
+                "road_name": "路段管理员隐藏标识",
+                "is_active": True,
+            }
+        )
+        self.db.record_activity_batch(
+            station.id,
+            {
+                WORKFLOW_TOTAL_METRIC: 3,
+                WORKFLOW_HAS_PHONE_METRIC: 2,
+            },
+            source="visible-station",
+        )
+
+        dashboard = DashboardPage(self.db, self.admin)
+        data_center = StatisticsPage(self.db, self.admin)
+        hidden_values = {manager.name_label, manager.username}
+
+        dashboard_options = {
+            dashboard.station_combo.itemText(index)
+            for index in range(dashboard.station_combo.count())
+        }
+        data_center_options = {
+            data_center.station_combo.itemText(index)
+            for index in range(data_center.station_combo.count())
+        }
+        self.assertTrue(hidden_values.isdisjoint(dashboard_options))
+        self.assertTrue(hidden_values.isdisjoint(data_center_options))
+        self.assertEqual(
+            dashboard._metric_totals()[WORKFLOW_TOTAL_METRIC],
+            3,
+        )
+        self.assertEqual(
+            {row["username"] for row in dashboard._station_rows()},
+            {"visible_station"},
+        )
+        self.assertEqual(
+            {
+                row["username"]
+                for row in data_center._get_station_distribution_rows()
+            },
+            {"visible_station"},
+        )
+        self.assertEqual(
+            {account.username for account in data_center._export_station_accounts()},
+            {"visible_station"},
+        )
+
+        target = Path(self.temp_dir.name) / "road-manager-hidden.xlsx"
+        data_center._save_dashboard_excel(target)
+        workbook = load_workbook(target, read_only=True, data_only=True)
+        exported_text = "\n".join(
+            str(cell.value)
+            for sheet in workbook.worksheets
+            for row in sheet.iter_rows()
+            for cell in row
+            if cell.value is not None
+        )
+        workbook.close()
+        for hidden_value in hidden_values:
+            self.assertNotIn(hidden_value, exported_text)
+
+        dashboard.deleteLater()
+        data_center.deleteLater()
 
     def test_global_admin_dialog_supports_road_admin_and_three_data_scopes(self):
         roads = [

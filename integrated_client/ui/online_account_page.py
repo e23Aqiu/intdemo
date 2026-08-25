@@ -34,6 +34,7 @@ from .loading_dialog import run_with_loading
 from .table_utils import make_table_columns_resizable
 
 _CALL_FAILED = object()
+_FILTER_SELECTION_UNSET = object()
 
 
 class _AccountSettingsDialog(FramelessDialog):
@@ -671,7 +672,7 @@ class OnlineAccountPage(AccountPage):
         self.audit_btn.clicked.connect(self._show_audit)
         self.account_action_layout.insertWidget(1, self.audit_btn)
 
-        filter_label = QLabel("查看")
+        filter_label = QLabel("账号状态")
         filter_label.setObjectName("Muted")
         self.account_filter = QComboBox()
         self.account_filter.setObjectName("AccountArchiveFilter")
@@ -679,9 +680,41 @@ class OnlineAccountPage(AccountPage):
         self.account_filter.addItem("已归档账号", "archived")
         self.account_filter.addItem("全部账号", "all")
         self.account_filter.setToolTip("切换在用账号和已归档账号")
+
+        role_filter_label = QLabel("角色")
+        role_filter_label.setObjectName("Muted")
+        self.role_filter = QComboBox()
+        self.role_filter.setObjectName("AccountRoleFilter")
+        self.role_filter.addItem("全部角色", "all")
+        self.role_filter.addItem("管理员", "admin")
+        self.role_filter.addItem("路段管理员", "road_admin")
+        self.role_filter.addItem("中心站账号", "station")
+        self.role_filter.addItem("测试账号", "test")
+        self.role_filter.setToolTip("按账号角色筛选")
+
+        road_filter_label = QLabel("所属路段")
+        road_filter_label.setObjectName("Muted")
+        self.road_filter = QComboBox()
+        self.road_filter.setObjectName("AccountRoadFilter")
+        self.road_filter.setMinimumWidth(130)
+        self.road_filter.setToolTip("按所属路段筛选；未分配包含测试账号")
+        self._refresh_road_filter_options()
+
         self.list_header_layout.insertWidget(1, filter_label)
         self.list_header_layout.insertWidget(2, self.account_filter)
-        self.account_filter.currentIndexChanged.connect(self.refresh)
+        self.list_header_layout.insertWidget(3, role_filter_label)
+        self.list_header_layout.insertWidget(4, self.role_filter)
+        self.list_header_layout.insertWidget(5, road_filter_label)
+        self.list_header_layout.insertWidget(6, self.road_filter)
+        self.account_filter.currentIndexChanged.connect(
+            self._apply_account_filters
+        )
+        self.role_filter.currentIndexChanged.connect(
+            self._apply_account_filters
+        )
+        self.road_filter.currentIndexChanged.connect(
+            self._apply_account_filters
+        )
 
         self.reset_stats_btn.setText("重置在线统计")
         self.reset_stats_btn.setToolTip(
@@ -721,17 +754,24 @@ class OnlineAccountPage(AccountPage):
         self._selection_changed()
 
     def _refresh_summary(self):
-        super()._refresh_summary()
+        accounts = self.all_accounts or self.accounts
+        self.summary_values["total"].setText(str(len(accounts)))
+        self.summary_values["admin"].setText(
+            str(sum(account.is_admin for account in accounts))
+        )
         self.summary_values["user"].setText(
             str(
                 sum(
-                    account.resolved_account_type == "station"
-                    for account in self.accounts
+                    account.is_station and not account.is_test
+                    for account in accounts
                 )
             )
         )
+        self.summary_values["active"].setText(
+            str(sum(account.is_active for account in accounts))
+        )
         self.summary_values["road_admin"].setText(
-            str(sum(account.is_road_admin for account in self.accounts))
+            str(sum(account.is_road_admin for account in accounts))
         )
 
     def _call(self, function, *args):
@@ -865,6 +905,149 @@ class OnlineAccountPage(AccountPage):
             "本人",
         )
 
+    @staticmethod
+    def _account_role_filter_key(account):
+        if account.is_test:
+            return "test"
+        return account.resolved_account_type
+
+    def _refresh_road_filter_options(self):
+        current_value = (
+            self.road_filter.currentData()
+            if self.road_filter.count()
+            else "all"
+        )
+        road_options = {}
+        for road in self.roads:
+            road_id = str(road.get("id") or "").strip()
+            road_name = str(road.get("name") or "").strip()
+            if road_id and road_name:
+                road_options[road_id] = road_name
+        # Older compatible services may not expose the roads endpoint. The
+        # account rows still carry enough information to build the filter.
+        for account in self.all_accounts:
+            road_id = str(account.road_id or "").strip()
+            road_name = str(account.road_name or "").strip()
+            if road_id and road_name:
+                road_options.setdefault(road_id, road_name)
+
+        self.road_filter.blockSignals(True)
+        self.road_filter.clear()
+        self.road_filter.addItem("全部路段", "all")
+        self.road_filter.addItem("未分配", "unassigned")
+        for road_id, road_name in sorted(
+            road_options.items(),
+            key=lambda item: item[1].casefold(),
+        ):
+            self.road_filter.addItem(road_name, road_id)
+        current_index = self.road_filter.findData(current_value)
+        self.road_filter.setCurrentIndex(max(current_index, 0))
+        self.road_filter.blockSignals(False)
+
+    def _matches_account_filters(self, account):
+        archive_mode = self.account_filter.currentData()
+        if archive_mode == "active" and account.is_archived:
+            return False
+        if archive_mode == "archived" and not account.is_archived:
+            return False
+
+        role_mode = self.role_filter.currentData()
+        if (
+            role_mode != "all"
+            and self._account_role_filter_key(account) != role_mode
+        ):
+            return False
+
+        road_mode = self.road_filter.currentData()
+        if road_mode == "all":
+            return True
+        # Global administrators have no road membership; "unassigned" is
+        # reserved for directly managed station/test accounts.
+        if account.is_admin:
+            return False
+        if road_mode == "unassigned":
+            return account.is_test or not account.road_id
+        return not account.is_test and str(account.road_id or "") == str(
+            road_mode
+        )
+
+    def _apply_account_filters(
+        self,
+        _index=None,
+        *,
+        selected_server_id=_FILTER_SELECTION_UNSET,
+    ):
+        if selected_server_id is _FILTER_SELECTION_UNSET:
+            selected = self._selected_account()
+            selected_server_id = (
+                selected.server_account_id if selected else None
+            )
+        self.accounts = [
+            account
+            for account in self.all_accounts
+            if self._matches_account_filters(account)
+        ]
+        self.table.blockSignals(True)
+        self.table.clearSelection()
+        self.table.setRowCount(len(self.accounts))
+        for row, account in enumerate(self.accounts):
+            server = self.server_rows[account.server_account_id]
+            values = [
+                account.name_label,
+                account.username,
+                account.role_label,
+                self._scope_label(account.effective_data_scope),
+                "启用" if account.is_active else "停用",
+                (
+                    f"{server.get('active_device_count', 0)}/"
+                    f"{server.get('device_limit', 10000)}"
+                ),
+                str(server.get("online_device_count", 0)),
+                str(server.get("created_at") or account.created_at)
+                .replace("T", " ")[:19],
+                (account.last_login or "-").replace("T", " ")[:19],
+                str(server.get("last_login_system") or "-"),
+                "需要修改" if account.must_change_password else "已设置",
+                "已归档" if account.is_archived else "-",
+                (
+                    "不适用"
+                    if account.is_admin
+                    else account.road_name or "未分配"
+                ),
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                if column == 0:
+                    item.setData(Qt.UserRole, account.id)
+                if column == 2:
+                    item.setForeground(
+                        QColor("#6845bd")
+                        if account.is_account_manager
+                        else QColor("#26718b")
+                    )
+                if column == 4:
+                    item.setForeground(
+                        QColor("#188b57")
+                        if account.is_active and not account.is_archived
+                        else QColor("#d33f49")
+                    )
+                if column == 6 and int(server.get("online_device_count") or 0):
+                    item.setForeground(QColor("#188b57"))
+                if column == 10 and account.must_change_password:
+                    item.setForeground(QColor("#b26a00"))
+                if column == 11 and account.is_archived:
+                    item.setForeground(QColor("#d33f49"))
+                item.setTextAlignment(
+                    Qt.AlignLeft | Qt.AlignVCenter
+                    if column in (0, 1, 12)
+                    else Qt.AlignCenter
+                )
+                self.table.setItem(row, column, item)
+            if account.server_account_id == selected_server_id:
+                self.table.selectRow(row)
+        self.table.blockSignals(False)
+        self._selection_changed()
+
     def refresh(self):
         roads_loader = getattr(self.session.api, "admin_roads", None)
         if callable(roads_loader):
@@ -914,6 +1097,7 @@ class OnlineAccountPage(AccountPage):
             self.accounts.append(account)
             self.server_rows[account.server_account_id] = server_row
         self.all_accounts = list(self.accounts)
+        self._refresh_road_filter_options()
         self._refresh_summary()
         self.summary_values["online"].setText(
             str(
@@ -923,73 +1107,9 @@ class OnlineAccountPage(AccountPage):
                 )
             )
         )
-        filter_mode = self.account_filter.currentData()
-        if filter_mode == "active":
-            self.accounts = [
-                account for account in self.all_accounts if not account.is_archived
-            ]
-        elif filter_mode == "archived":
-            self.accounts = [
-                account for account in self.all_accounts if account.is_archived
-            ]
-        else:
-            self.accounts = list(self.all_accounts)
-        self.table.blockSignals(True)
-        self.table.clearSelection()
-        self.table.setRowCount(len(self.accounts))
-        for row, account in enumerate(self.accounts):
-            server = self.server_rows[account.server_account_id]
-            values = [
-                account.name_label,
-                account.username,
-                account.role_label,
-                self._scope_label(account.effective_data_scope),
-                "启用" if account.is_active else "停用",
-                (
-                    f"{server.get('active_device_count', 0)}/"
-                    f"{server.get('device_limit', 10000)}"
-                ),
-                str(server.get("online_device_count", 0)),
-                str(server.get("created_at") or account.created_at)
-                .replace("T", " ")[:19],
-                (account.last_login or "-").replace("T", " ")[:19],
-                str(server.get("last_login_system") or "-"),
-                "需要修改" if account.must_change_password else "已设置",
-                "已归档" if account.is_archived else "-",
-                account.road_name or "未分配",
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                if column == 0:
-                    item.setData(Qt.UserRole, account.id)
-                if column == 2:
-                    item.setForeground(
-                        QColor("#6845bd")
-                        if account.is_admin
-                        else QColor("#26718b")
-                    )
-                if column == 4:
-                    item.setForeground(
-                        QColor("#188b57")
-                        if account.is_active and not account.is_archived
-                        else QColor("#d33f49")
-                    )
-                if column == 6 and int(server.get("online_device_count") or 0):
-                    item.setForeground(QColor("#188b57"))
-                if column == 10 and account.must_change_password:
-                    item.setForeground(QColor("#b26a00"))
-                if column == 11 and account.is_archived:
-                    item.setForeground(QColor("#d33f49"))
-                item.setTextAlignment(
-                    Qt.AlignLeft | Qt.AlignVCenter
-                    if column in (0, 1, 12)
-                    else Qt.AlignCenter
-                )
-                self.table.setItem(row, column, item)
-            if account.server_account_id == selected_server_id:
-                self.table.selectRow(row)
-        self.table.blockSignals(False)
-        self._selection_changed()
+        self._apply_account_filters(
+            selected_server_id=selected_server_id,
+        )
         for account_id in removed_account_ids:
             self.account_deleted.emit(account_id)
 
