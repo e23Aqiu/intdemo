@@ -130,6 +130,68 @@ def test_uos_arm64_client_receives_deb_package(client, update_manifest_file):
     assert "deltas" not in payload
 
 
+def test_update_server_advertises_source_version_targeting(client):
+    response = client.get("/updates/capabilities.json")
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert "source-version-targeting-v1" in response.json()["capabilities"]
+
+
+def test_targeted_update_only_reaches_exact_client_versions(
+    client,
+    update_manifest_file,
+):
+    path, canonical = update_manifest_file
+    targeted = dict(canonical)
+    targeted["eligible_client_versions"] = ["1.1.0"]
+    path.write_text(json.dumps(targeted), encoding="utf-8")
+
+    eligible = client.get(
+        "/updates/test.json",
+        headers={"User-Agent": "IntDemoUpdater/1.1.0"},
+    )
+    other = client.get(
+        "/updates/test.json",
+        headers={"User-Agent": "IntDemoUpdater/1.1.1"},
+    )
+    headerless = client.get("/updates/test.json")
+
+    assert eligible.status_code == 200
+    assert eligible.json()["installer_path"].endswith(".exe")
+    assert eligible.headers["x-intdemo-update-targeting"] == (
+        "source-version-targeting-v1"
+    )
+    for response in (other, headerless):
+        assert response.status_code == 204
+        assert response.content == b""
+        assert response.headers["x-intdemo-update-package"] == "not-targeted"
+        assert response.headers["x-intdemo-update-distribution"] == "not-targeted"
+    assert other.headers["x-intdemo-client-version"] == "1.1.1"
+
+
+@pytest.mark.parametrize(
+    "targeting",
+    [[], "1.1.0", ["bad"], ["1.1.0", "1.1.0"], [1, 2]],
+)
+def test_invalid_targeting_manifest_fails_closed(
+    client,
+    update_manifest_file,
+    targeting,
+):
+    path, canonical = update_manifest_file
+    targeted = dict(canonical)
+    targeted["eligible_client_versions"] = targeting
+    path.write_text(json.dumps(targeted), encoding="utf-8")
+
+    response = client.get(
+        "/updates/test.json",
+        headers={"User-Agent": "IntDemoUpdater/1.1.0"},
+    )
+
+    assert response.status_code == 503
+
+
 def test_uos_delta_requires_explicit_client_capability(client, update_manifest_file):
     _path, canonical = update_manifest_file
     response = client.get(

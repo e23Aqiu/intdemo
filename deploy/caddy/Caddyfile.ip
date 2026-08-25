@@ -11,7 +11,7 @@ https://{$SERVER_ADDRESS} {
 		max_size 7MB
 	}
 
-	@update_manifest path /updates/test.json /updates/stable.json
+	@update_manifest path /updates/test.json /updates/stable.json /updates/capabilities.json
 	handle @update_manifest {
 		reverse_proxy api:8000
 	}

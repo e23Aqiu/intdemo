@@ -34,6 +34,9 @@ GIT_REMOTE_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9._-]+$")
 REQUEST_FILE = "windows-build-request.json"
 RESULT_FILE = "windows-build-result.json"
 UOS_RESULT_FILE = "uos-build-result.json"
+UOS_DELTA_BASE_FILE = "uos-delta-base.json"
+SOURCE_VERSION_TARGETING_CAPABILITY = "source-version-targeting-v1"
+MAX_ELIGIBLE_CLIENT_VERSIONS = 32
 WINDOWS_WORKFLOW_NAME = "Windows release build"
 WINDOWS_TAG_PREFIX = "intdemo-windows/v"
 GITHUB_UNAVAILABLE_EXIT = 20
@@ -98,6 +101,30 @@ def version_key(value: str) -> tuple[int, int, int]:
     if not VERSION_PATTERN.fullmatch(normalized):
         raise ReleaseTaskError(f"版本号必须使用 x.y.z 格式：{normalized or '-'}")
     return tuple(int(item) for item in normalized.split("."))
+
+
+def normalize_eligible_client_versions(
+    values: list[str] | tuple[str, ...] | None,
+    *,
+    target_version: str,
+) -> tuple[str, ...]:
+    normalized: list[str] = []
+    target_key = version_key(target_version)
+    for value in values or ():
+        version = str(value or "").strip()
+        candidate_key = version_key(version)
+        if candidate_key >= target_key:
+            raise ReleaseTaskError(
+                f"定向更新来源版本必须低于目标版本：{version}"
+            )
+        if version in normalized:
+            raise ReleaseTaskError(f"定向更新客户端版本重复：{version}")
+        normalized.append(version)
+    if len(normalized) > MAX_ELIGIBLE_CLIENT_VERSIONS:
+        raise ReleaseTaskError(
+            f"定向更新最多允许 {MAX_ELIGIBLE_CLIENT_VERSIONS} 个客户端版本"
+        )
+    return tuple(normalized)
 
 
 def normalize_base_url(value: str) -> str:
@@ -1281,6 +1308,49 @@ def validate_uos_deb_payload(
         )
 
 
+def validate_published_uos_base(
+    source_deb: Path,
+    source_receipt_path: Path,
+    *,
+    version: str,
+) -> dict[str, Any]:
+    version_key(version)
+    source_receipt = load_json_object(
+        source_receipt_path,
+        "UOS 来源发布收据",
+    )
+    try:
+        receipt_schema_version = int(source_receipt.get("schema_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseTaskError("UOS 来源发布收据版本无效") from exc
+    if receipt_schema_version != 1:
+        raise ReleaseTaskError("UOS 来源发布收据版本无效")
+    if str(source_receipt.get("version") or "") != version:
+        raise ReleaseTaskError("UOS 来源发布收据版本与增量基线不一致")
+    source_artifacts = source_receipt.get("artifacts")
+    source_artifact = (
+        source_artifacts.get("uos_installer")
+        if isinstance(source_artifacts, dict)
+        else None
+    )
+    if not isinstance(source_artifact, dict):
+        raise ReleaseTaskError("UOS 来源发布收据缺少完整 DEB")
+    expected_name = f"IntDemo-UOS-arm64-{version}.deb"
+    if source_deb.name != expected_name or not source_deb.is_file():
+        raise ReleaseTaskError("UOS 增量基线不是正式发布 DEB")
+    source_expected = {
+        "name": expected_name,
+        "size": source_deb.stat().st_size,
+        "sha256": sha256(source_deb),
+    }
+    if any(
+        source_artifact.get(key) != value
+        for key, value in source_expected.items()
+    ):
+        raise ReleaseTaskError("UOS 来源发布收据与真实发布 DEB 增量基线不一致")
+    return source_receipt
+
+
 def validate_uos_delta_candidate(
     root: Path,
     *,
@@ -1346,24 +1416,12 @@ def validate_uos_delta_candidate(
         / from_version
         / "publish-receipt.json"
     )
-    source_receipt = load_json_object(source_receipt_path, "UOS 来源发布收据")
-    source_artifact = source_receipt.get("artifacts", {}).get("uos_installer")
-    if str(source_receipt.get("version") or "") != from_version:
-        raise ReleaseTaskError("UOS 来源发布收据版本与增量基线不一致")
-    if not isinstance(source_artifact, dict):
-        raise ReleaseTaskError("UOS 来源发布收据缺少完整 DEB")
-    source_expected = {
-        "name": source_deb.name,
-        "size": base_size,
-        "sha256": base_sha256,
-    }
-    if any(source_artifact.get(key) != value for key, value in source_expected.items()):
-        raise ReleaseTaskError("UOS 来源发布收据与增量基线不一致")
-    if (
-        not source_deb.is_file()
-        or source_deb.stat().st_size != base_size
-        or sha256(source_deb) != base_sha256
-    ):
+    validate_published_uos_base(
+        source_deb,
+        source_receipt_path,
+        version=from_version,
+    )
+    if source_deb.stat().st_size != base_size or sha256(source_deb) != base_sha256:
         raise ReleaseTaskError("UOS 增量基线不是经过收据校验的真实发布 DEB")
     return patch, report_path, report
 
@@ -1444,7 +1502,13 @@ def record_uos_result(
 
 
 def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
-    if not isinstance(payload, dict) or int(payload.get("schema_version") or 0) != 1:
+    if not isinstance(payload, dict):
+        raise ReleaseTaskError("UOS 构建结果版本不受支持")
+    try:
+        schema_version = int(payload.get("schema_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseTaskError("UOS 构建结果版本不受支持") from exc
+    if schema_version != 1:
         raise ReleaseTaskError("UOS 构建结果版本不受支持")
     platform_key = str(payload.get("platform") or "")
     version = str(payload.get("version") or "")
@@ -1486,6 +1550,230 @@ def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
         "builder": builder,
         "uos_delta_from_version": uos_delta_from_version,
     }
+
+
+def validate_uos_delta_base_payload(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        raise ReleaseTaskError("UOS 增量基线包版本不受支持")
+    try:
+        schema_version = int(payload.get("schema_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseTaskError("UOS 增量基线包版本不受支持") from exc
+    if schema_version != 1:
+        raise ReleaseTaskError("UOS 增量基线包版本不受支持")
+    if str(payload.get("kind") or "") != "uos-delta-base":
+        raise ReleaseTaskError("所选文件不是 UOS 增量基线包")
+    version = str(payload.get("version") or "").strip()
+    version_key(version)
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "uos_installer",
+        "publish_receipt",
+    }:
+        raise ReleaseTaskError("UOS 增量基线包的产物集合不完整")
+    return {**payload, "version": version, "artifacts": artifacts}
+
+
+def _inspect_uos_delta_base_archive(
+    base_archive: str | Path,
+) -> tuple[Path, dict[str, Any]]:
+    archive_path = Path(base_archive).expanduser().resolve()
+    if not archive_path.is_file():
+        raise ReleaseTaskError(f"UOS 增量基线包不存在：{archive_path}")
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = _validated_zip_members(archive)
+            metadata = members.get(UOS_DELTA_BASE_FILE)
+            if metadata is None or metadata.is_dir():
+                raise ReleaseTaskError("UOS 增量基线包缺少元数据")
+            if metadata.file_size > 2 * 1024 * 1024:
+                raise ReleaseTaskError("UOS 增量基线包元数据过大")
+            payload = validate_uos_delta_base_payload(
+                json.loads(archive.read(metadata).decode("utf-8"))
+            )
+            for key, label in (
+                ("uos_installer", "完整 DEB"),
+                ("publish_receipt", "发布收据"),
+            ):
+                descriptor = validate_descriptor(payload["artifacts"][key], label)
+                member = members.get(descriptor["file"])
+                if member is None or member.is_dir():
+                    raise ReleaseTaskError(f"UOS 增量基线包缺少{label}")
+                if member.file_size != descriptor["size"]:
+                    raise ReleaseTaskError(f"UOS 增量基线包中的{label}大小不匹配")
+    except ReleaseTaskError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        RuntimeError,
+    ) as exc:
+        raise ReleaseTaskError(f"无法读取 UOS 增量基线包：{archive_path}") from exc
+    return archive_path, payload
+
+
+def detect_uos_delta_base_version(base_archive: str | Path) -> str:
+    _archive, payload = _inspect_uos_delta_base_archive(base_archive)
+    return str(payload["version"])
+
+
+def export_uos_delta_base(
+    root: Path,
+    *,
+    version: str,
+    output: Path | None = None,
+) -> Path:
+    version_key(version)
+    source_deb = (
+        root
+        / "dist/update-release/files"
+        / f"IntDemo-UOS-arm64-{version}.deb"
+    )
+    source_receipt = (
+        root / "dist/release-results" / version / "publish-receipt.json"
+    )
+    receipt = validate_published_uos_base(
+        source_deb,
+        source_receipt,
+        version=version,
+    )
+    result = (
+        output.expanduser().resolve()
+        if output is not None
+        else (
+            root
+            / "dist/uos-delta-bases"
+            / version
+            / f"uos-delta-base-{version}.zip"
+        )
+    )
+    with tempfile.TemporaryDirectory(prefix="intdemo-uos-delta-base-") as temporary:
+        staging = Path(temporary)
+        staged_deb = staging / "artifacts" / source_deb.name
+        staged_receipt = staging / "publish-receipt.json"
+        staged_deb.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_deb, staged_deb)
+        shutil.copy2(source_receipt, staged_receipt)
+        write_json(
+            staging / UOS_DELTA_BASE_FILE,
+            {
+                "schema_version": 1,
+                "kind": "uos-delta-base",
+                "version": version,
+                "source_commit": str(receipt.get("source_commit") or ""),
+                "exported_at": utc_now(),
+                "artifacts": {
+                    "uos_installer": artifact_descriptor(
+                        staged_deb,
+                        f"artifacts/{staged_deb.name}",
+                    ),
+                    "publish_receipt": artifact_descriptor(
+                        staged_receipt,
+                        staged_receipt.name,
+                    ),
+                },
+            },
+        )
+        make_zip(staging, result)
+    write_bytes_atomic(
+        result.with_suffix(result.suffix + ".sha256"),
+        f"{sha256(result)}  {result.name}\n".encode("ascii"),
+    )
+    print(f"UOS 增量基线包：{result}", flush=True)
+    print(f"SHA-256：{sha256(result)}", flush=True)
+    return result
+
+
+def import_uos_delta_base(
+    root: Path,
+    *,
+    base_archive: Path,
+) -> str:
+    archive_path, inspected = _inspect_uos_delta_base_archive(base_archive)
+    version = str(inspected["version"])
+    with tempfile.TemporaryDirectory(prefix="intdemo-uos-delta-import-") as temporary:
+        extracted = Path(temporary)
+        extract_zip_safely(archive_path, extracted)
+        payload = validate_uos_delta_base_payload(
+            load_json_object(extracted / UOS_DELTA_BASE_FILE, "UOS 增量基线元数据")
+        )
+        if payload["version"] != version:
+            raise ReleaseTaskError("UOS 增量基线包版本在读取期间发生变化")
+        source_deb = verify_file(
+            extracted,
+            payload["artifacts"]["uos_installer"],
+            "UOS 增量基线 DEB",
+        )
+        source_receipt = verify_file(
+            extracted,
+            payload["artifacts"]["publish_receipt"],
+            "UOS 增量基线发布收据",
+        )
+        validate_published_uos_base(
+            source_deb,
+            source_receipt,
+            version=version,
+        )
+        targets = (
+            (
+                source_deb,
+                root / "dist/update-release/files" / source_deb.name,
+            ),
+            (
+                source_receipt,
+                root
+                / "dist/release-results"
+                / version
+                / "publish-receipt.json",
+            ),
+        )
+        for source, target in targets:
+            if target.exists() and (
+                not target.is_file() or sha256(target) != sha256(source)
+            ):
+                raise ReleaseTaskError(
+                    f"本地已有不同的同版本 UOS 增量基线，拒绝覆盖：{target}"
+                )
+        for source, target in targets:
+            if not target.is_file():
+                copy_atomic(source, target)
+    print(f"UOS 增量基线已导入：{version}", flush=True)
+    return version
+
+
+def detect_uos_result_delta_source(result_archive: str | Path) -> str:
+    archive_path = Path(result_archive).expanduser().resolve()
+    if not archive_path.is_file():
+        raise ReleaseTaskError(f"UOS 构建结果包不存在：{archive_path}")
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = _validated_zip_members(archive)
+            metadata = members.get(UOS_RESULT_FILE)
+            if metadata is None or metadata.is_dir():
+                raise ReleaseTaskError("UOS 构建结果缺少结果元数据")
+            if metadata.file_size > 2 * 1024 * 1024:
+                raise ReleaseTaskError("UOS 构建结果元数据过大")
+            payload = validate_uos_result_payload(
+                json.loads(archive.read(metadata).decode("utf-8"))
+            )
+            expected = {"uos_installer"}
+            if payload["uos_delta_from_version"]:
+                expected.update({"uos_delta", "uos_delta_report"})
+            if set(payload["artifacts"]) != expected:
+                raise ReleaseTaskError("UOS 构建结果的增量产物集合不完整")
+    except ReleaseTaskError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        RuntimeError,
+    ) as exc:
+        raise ReleaseTaskError(f"无法读取 UOS 构建结果：{archive_path}") from exc
+    return str(payload["uos_delta_from_version"])
 
 
 def uos_result_archive_path(root: Path, version: str, commit: str) -> Path:
@@ -1857,7 +2145,12 @@ def prepare_update_manifest(
     delta_from_version: str,
     uos_delta: dict[str, Any] | None = None,
     uos_delta_from_version: str = "",
+    eligible_client_versions: tuple[str, ...] | list[str] = (),
 ) -> dict[str, Any]:
+    eligible_versions = normalize_eligible_client_versions(
+        eligible_client_versions,
+        target_version=version,
+    )
     windows_full = {
         "installer_path": f"/updates/files/{windows['name']}",
         "sha256": windows["sha256"],
@@ -1888,6 +2181,8 @@ def prepare_update_manifest(
             },
         },
     }
+    if eligible_versions:
+        manifest["eligible_client_versions"] = list(eligible_versions)
     if delta is not None:
         delta_payload = {
             "from_version": delta_from_version,
@@ -2407,7 +2702,51 @@ def assert_platform_server_support(
     base_url: str,
     channel: str,
     ca_bundle: Path | None,
+    *,
+    require_source_version_targeting: bool = False,
 ) -> None:
+    if require_source_version_targeting:
+        request = urllib.request.Request(
+            f"{base_url.rstrip('/')}/updates/capabilities.json",
+            headers={"User-Agent": "IntDemoReleasePublisher/1"},
+        )
+        context = (
+            ssl.create_default_context(cafile=str(ca_bundle))
+            if ca_bundle is not None
+            else ssl.create_default_context()
+        )
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=20,
+                context=context,
+            ) as response:
+                status = int(response.status)
+                body = response.read()
+        except urllib.error.HTTPError as exc:
+            with exc:
+                status = int(exc.code)
+                body = exc.read()
+        except (OSError, ssl.SSLError, urllib.error.URLError) as exc:
+            raise ReleaseTaskError(f"无法读取更新服务器能力：{exc}") from exc
+        try:
+            capability_payload = json.loads(body.decode("utf-8")) if body else {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ReleaseTaskError("更新服务器能力响应不是有效 JSON") from exc
+        capabilities = (
+            capability_payload.get("capabilities")
+            if isinstance(capability_payload, dict)
+            else None
+        )
+        if (
+            status != 200
+            or not isinstance(capabilities, list)
+            or SOURCE_VERSION_TARGETING_CAPABILITY not in capabilities
+        ):
+            raise ReleaseTaskError(
+                "在线 API 尚未启用按客户端版本定向推送；"
+                "必须先升级服务器，不能发布定向更新清单"
+            )
     status, _payload, headers = request_manifest(
         base_url,
         channel,
@@ -2565,6 +2904,7 @@ def publish_release(
     delta_from_version: str,
     build_portable: bool,
     uos_delta_from_version: str = "",
+    eligible_client_versions: tuple[str, ...] | list[str] = (),
     notes: str,
     mandatory: bool,
     remote_host: str,
@@ -2573,6 +2913,10 @@ def publish_release(
     confirm_version: str,
 ) -> Path:
     version_key(version)
+    eligible_versions = normalize_eligible_client_versions(
+        eligible_client_versions,
+        target_version=version,
+    )
     normalized_url = normalize_base_url(base_url)
     if confirm_version != version:
         raise ReleaseTaskError(f"发布必须明确确认版本：--confirm-version {version}")
@@ -2611,7 +2955,12 @@ def publish_release(
     )
     _branch, commit = source_state(root)
     ca_path = Path(ca_bundle).expanduser().resolve() if ca_bundle else None
-    assert_platform_server_support(normalized_url, channel, ca_path)
+    assert_platform_server_support(
+        normalized_url,
+        channel,
+        ca_path,
+        require_source_version_targeting=bool(eligible_versions),
+    )
 
     files_root = root / "dist" / "update-release" / "files"
     windows = stage_release_artifact(
@@ -2663,6 +3012,7 @@ def publish_release(
         delta_from_version=delta_from_version,
         uos_delta=uos_delta,
         uos_delta_from_version=uos_delta_from_version,
+        eligible_client_versions=eligible_versions,
     )
     manifest_path = root / "dist" / "update-release" / f"{channel}.json"
     write_json(manifest_path, manifest)
@@ -2692,6 +3042,7 @@ def publish_release(
         "resumed_paused_distribution": was_paused,
         "windows_request_id": windows_receipt.get("request_id"),
         "uos_delta_from_version": str(uos_delta_from_version or ""),
+        "eligible_client_versions": list(eligible_versions),
         "artifacts": {
             key: {
                 "name": value["name"],
@@ -3157,6 +3508,13 @@ def build_parser() -> argparse.ArgumentParser:
     import_uos.add_argument("--uos-delta-from-version", default="")
     import_uos.add_argument("--result-archive", required=True)
 
+    export_uos_base = commands.add_parser("export-uos-delta-base")
+    export_uos_base.add_argument("--version", required=True)
+    export_uos_base.add_argument("--output", default="")
+
+    import_uos_base = commands.add_parser("import-uos-delta-base")
+    import_uos_base.add_argument("--base-archive", required=True)
+
     publish = commands.add_parser("publish")
     add_common_build_arguments(publish)
     publish.add_argument("--notes", required=True)
@@ -3166,6 +3524,11 @@ def build_parser() -> argparse.ArgumentParser:
     publish.add_argument("--identity-file", default="")
     publish.add_argument("--confirm-version", required=True)
     publish.add_argument("--uos-delta-from-version", default="")
+    publish.add_argument(
+        "--eligible-client-version",
+        action="append",
+        default=[],
+    )
 
     pause = commands.add_parser("pause")
     pause.add_argument("--channel", choices=("test", "stable"), required=True)
@@ -3269,6 +3632,17 @@ def main(argv: list[str] | None = None) -> int:
                 ca_bundle=args.ca_bundle,
                 uos_delta_from_version=args.uos_delta_from_version,
             )
+        elif args.command == "export-uos-delta-base":
+            export_uos_delta_base(
+                root,
+                version=args.version,
+                output=Path(args.output) if args.output else None,
+            )
+        elif args.command == "import-uos-delta-base":
+            import_uos_delta_base(
+                root,
+                base_archive=Path(args.base_archive),
+            )
         elif args.command == "publish":
             publish_release(
                 root,
@@ -3279,6 +3653,7 @@ def main(argv: list[str] | None = None) -> int:
                 delta_from_version=args.delta_from_version,
                 build_portable=args.build_portable,
                 uos_delta_from_version=args.uos_delta_from_version,
+                eligible_client_versions=args.eligible_client_version,
                 notes=args.notes,
                 mandatory=args.mandatory,
                 remote_host=args.remote_host,

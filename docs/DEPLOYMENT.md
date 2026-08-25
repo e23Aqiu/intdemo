@@ -228,11 +228,20 @@ CA 证书也是 HTTPS 校验的一部分。安装包位于
 ```
 
 Compose 将服务器的 `deploy/updates/` 同时只读挂载给 API 和 Caddy。
-`/updates/test.json`、`/updates/stable.json` 由 API 根据
+`/updates/test.json`、`/updates/stable.json` 和 `/updates/capabilities.json` 由
+API 处理；部署时必须同步更新 Caddy 配置，不能让能力地址落入静态
+`/updates/*` 文件服务。清单接口根据
 `X-IntDemo-Platform`、`X-IntDemo-Version` 或 `IntDemoUpdater/<版本>` User-Agent
 动态选择 Windows x64/UOS ARM64 包；
 其余 `/updates/files/*` 仍由 Caddy 直接下载。只有当前版本精确匹配
 `deltas.from_version` 才返回增量包，其余情况返回完整包。
+
+打包发布器填写“仅允许更新的当前版本”后，清单会增加
+`eligible_client_versions`。API 只向当前版本精确位于列表中的客户端返回更新，
+其他版本和未上报版本返回 HTTP 204；字段缺省时行为完全不变。发布器会先验证
+`/updates/capabilities.json` 包含 `source-version-targeting-v1`，不满足时拒绝
+定向发布。该升级没有数据库迁移，不改变账号或会话，v1.1.0/v1.1.1 客户端无需
+升级即可上报版本并把 HTTP 204 作为“暂无更新”。
 
 `-LegacyDeltaPrimary` 仅作为旧发布命令的兼容参数保留，已经不会把增量包
 写入公共清单顶层，新的发布命令无需使用。

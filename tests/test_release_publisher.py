@@ -29,8 +29,11 @@ from release_publisher.core import (
     build_pause_distribution_steps,
     build_publish_steps,
     build_release_plan,
+    build_uos_delta_base_export_steps,
+    build_uos_delta_base_import_steps,
     find_inno_compiler,
     git_status,
+    parse_eligible_client_versions,
     project_version,
     project_version_mismatches,
     release_readiness,
@@ -44,6 +47,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class ReleasePublisherCoreTests(unittest.TestCase):
+    def test_caddy_proxies_update_server_capabilities(self):
+        for relative_path in (
+            "deploy/caddy/Caddyfile.ip",
+            "deploy/caddy/Caddyfile.domain",
+        ):
+            with self.subTest(relative_path=relative_path):
+                content = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+                matcher = content.index("@update_manifest path")
+                capabilities = content.index("/updates/capabilities.json")
+                static_updates = content.index("handle /updates/*")
+                self.assertLessEqual(matcher, capabilities)
+                self.assertLess(capabilities, static_updates)
+
     def test_inno_discovery_skips_inaccessible_candidate(self):
         inaccessible = Path("C:/restricted/Inno Setup 6/ISCC.exe")
         available = Path("C:/tools/Inno Setup 6/ISCC.exe")
@@ -141,6 +157,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
                 github_remote="github",
                 github_repo="e23Aqiu/intdemo",
                 gitee_url="https://gitee.com/e23aqiu/intdemo.git",
+                eligible_client_versions="1.1.0, 1.1.1",
             )
 
             store.save(settings)
@@ -423,6 +440,51 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         self.assertIn("--uos-delta-from-version", build_steps[2].arguments)
         self.assertIn("--delta-from-version", publish_step.arguments)
         self.assertIn("--uos-delta-from-version", publish_step.arguments)
+
+    def test_publish_can_target_exact_client_versions(self):
+        self.assertEqual(
+            parse_eligible_client_versions("1.1.0， 1.1.1; 1.1.0"),
+            ("1.1.0", "1.1.1"),
+        )
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.1",
+            base_url="https://api.example.com",
+            notes="targeted rollout",
+            eligible_client_versions=("1.1.0", "1.1.1"),
+            remote_host="release-server",
+        )
+
+        step = build_publish_steps(options)[0]
+
+        positions = [
+            index
+            for index, item in enumerate(step.arguments)
+            if item == "--eligible-client-version"
+        ]
+        self.assertEqual(len(positions), 2)
+        self.assertEqual(
+            [step.arguments[index + 1] for index in positions],
+            ["1.1.0", "1.1.1"],
+        )
+
+    def test_uos_delta_base_transfer_steps_use_the_selected_source(self):
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.2",
+            base_url="https://api.example.com",
+            notes="uos transfer",
+            uos_delta_from_version="1.2.1",
+        )
+        archive = REPO_ROOT / "dist" / "uos-delta-base-1.2.1.zip"
+
+        export_step = build_uos_delta_base_export_steps(options, archive)[0]
+        import_step = build_uos_delta_base_import_steps(options, archive)[0]
+
+        self.assertEqual(export_step.key, "export_uos_delta_base")
+        self.assertIn("1.2.1", export_step.arguments)
+        self.assertEqual(import_step.key, "import_uos_delta_base")
+        self.assertIn(str(archive.resolve()), import_step.arguments)
 
     def test_output_mode_can_separate_native_and_result_exports(self):
         uos_native = ReleaseOptions(
@@ -1429,6 +1491,8 @@ class ReleasePublisherUiTests(unittest.TestCase):
         )
         self.assertEqual(window.current_version_value.text(), f"v{project_version(REPO_ROOT)}")
         self.assertEqual(window.channel_combo.currentData(), "test")
+        self.assertEqual(window.eligible_versions_edit.text(), "")
+        self.assertIn("精确匹配", window.eligible_versions_edit.toolTip())
         self.assertFalse(window.mandatory_check.isChecked())
         self.assertFalse(window.cancel_button.isEnabled())
         self.assertEqual(window.pause_distribution_button.text(), "暂停分发")
@@ -1453,6 +1517,8 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertFalse(hasattr(window, "export_windows_request_button"))
         self.assertTrue(window.import_windows_result_button.isEnabled())
         self.assertTrue(window.import_uos_result_button.isEnabled())
+        self.assertTrue(window.import_uos_delta_base_button.isEnabled())
+        self.assertTrue(window.export_uos_delta_base_button.isEnabled())
         self.assertEqual(window.control_username_edit.text(), "admin")
         self.assertEqual(window.control_password_edit.text(), "")
         self.assertIn("断开全部", window.disconnect_all_button.text())
@@ -1565,9 +1631,15 @@ class ReleasePublisherUiTests(unittest.TestCase):
 
     def test_import_uos_result_is_available_on_windows(self):
         selected = str(REPO_ROOT / "uos-build-result.zip")
-        with patch(
-            "release_publisher.ui.QFileDialog.getOpenFileName",
-            return_value=(selected, "ZIP 文件 (*.zip)"),
+        with (
+            patch(
+                "release_publisher.ui.QFileDialog.getOpenFileName",
+                return_value=(selected, "ZIP 文件 (*.zip)"),
+            ),
+            patch(
+                "release_publisher.ui.detect_uos_result_delta_source",
+                return_value="1.2.1",
+            ) as detect_result,
         ):
             window = ReleasePublisherWindow(REPO_ROOT)
             with (
@@ -1581,6 +1653,8 @@ class ReleasePublisherUiTests(unittest.TestCase):
             ):
                 window._import_uos_result()
 
+        detect_result.assert_called_once_with(selected)
+        self.assertEqual(window.uos_delta_edit.text(), "1.2.1")
         step = run_steps.call_args.args[0][0]
         self.assertEqual(step.key, "import_uos_result")
         self.assertIn("import-uos-result", step.arguments)

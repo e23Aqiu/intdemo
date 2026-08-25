@@ -44,12 +44,15 @@ from .core import (
     build_git_mirror_push_plans,
     build_pause_distribution_steps,
     build_release_plan,
+    build_uos_delta_base_export_steps,
+    build_uos_delta_base_import_steps,
     build_uos_result_import_steps,
     build_windows_result_import_steps,
     find_inno_compiler,
     git_remote_url,
     git_status,
     is_native_uos_arm64_builder,
+    parse_eligible_client_versions,
     project_version,
     release_readiness,
     set_project_version,
@@ -57,7 +60,12 @@ from .core import (
     validate_release_options,
     validate_test_environment,
 )
-from .release_tasks import ReleaseTaskError, detect_windows_result_portable
+from .release_tasks import (
+    ReleaseTaskError,
+    detect_uos_delta_base_version,
+    detect_uos_result_delta_source,
+    detect_windows_result_portable,
+)
 
 
 class ReleasePublisherWindow(QMainWindow):
@@ -168,6 +176,15 @@ class ReleasePublisherWindow(QMainWindow):
             "stable",
         )
         version_form.addRow("发布通道", self.channel_combo)
+        self.eligible_versions_edit = QLineEdit()
+        self.eligible_versions_edit.setPlaceholderText(
+            "留空=所有版本；例如 1.1.0, 1.1.1"
+        )
+        self.eligible_versions_edit.setToolTip(
+            "只向当前版本精确匹配的客户端返回更新；未上报版本和其他版本均无更新。"
+            "使用前必须先升级更新服务器。"
+        )
+        version_form.addRow("仅允许更新的当前版本", self.eligible_versions_edit)
         self.mandatory_check = QCheckBox(
             "强制更新提示（当前为客户端弹窗约束）"
         )
@@ -429,9 +446,29 @@ class ReleasePublisherWindow(QMainWindow):
         self.push_button.clicked.connect(self._push_changes)
         actions.addWidget(self.push_button, 1, 4, 1, 2)
 
+        baseline_label = QLabel("UOS 增量基线")
+        baseline_label.setObjectName("ActionGroupTitle")
+        actions.addWidget(baseline_label, 2, 0)
+        self.import_uos_delta_base_button = QPushButton("导入已发布基线包")
+        self.import_uos_delta_base_button.setToolTip(
+            "在统信构建机导入 Windows 发布器导出的真实已发布 DEB 与发布收据"
+        )
+        self.import_uos_delta_base_button.clicked.connect(
+            self._import_uos_delta_base
+        )
+        actions.addWidget(self.import_uos_delta_base_button, 2, 1)
+        self.export_uos_delta_base_button = QPushButton("导出已发布基线包")
+        self.export_uos_delta_base_button.setToolTip(
+            "在 Windows 发布完成后导出基线包，带到统信真机构建下一版本补丁"
+        )
+        self.export_uos_delta_base_button.clicked.connect(
+            self._export_uos_delta_base
+        )
+        actions.addWidget(self.export_uos_delta_base_button, 2, 2)
+
         publish_label = QLabel("发布控制")
         publish_label.setObjectName("ActionGroupTitle")
-        actions.addWidget(publish_label, 2, 0)
+        actions.addWidget(publish_label, 3, 0)
         self.pause_distribution_button = QPushButton("暂停分发")
         self.pause_distribution_button.setObjectName("DangerButton")
         self.pause_distribution_button.setToolTip(
@@ -440,21 +477,21 @@ class ReleasePublisherWindow(QMainWindow):
         self.pause_distribution_button.clicked.connect(
             self._run_pause_distribution
         )
-        actions.addWidget(self.pause_distribution_button, 2, 1)
+        actions.addWidget(self.pause_distribution_button, 3, 1)
         self.publish_button = QPushButton("发布双端更新")
         self.publish_button.setToolTip(
             "大文件使用 SFTP 断点续传；网络中断会自动重试，重新发布也可继续断点"
         )
         self.publish_button.clicked.connect(self._run_publish)
-        actions.addWidget(self.publish_button, 2, 2)
+        actions.addWidget(self.publish_button, 3, 2)
         self.pipeline_button = QPushButton("测试 → 双端构建 → 双端发布")
         self.pipeline_button.setObjectName("PrimaryButton")
         self.pipeline_button.clicked.connect(self._run_full_pipeline)
-        actions.addWidget(self.pipeline_button, 2, 3, 1, 2)
+        actions.addWidget(self.pipeline_button, 3, 3, 1, 2)
         self.cancel_button = QPushButton("停止")
         self.cancel_button.setObjectName("DangerButton")
         self.cancel_button.clicked.connect(self._cancel)
-        actions.addWidget(self.cancel_button, 2, 5)
+        actions.addWidget(self.cancel_button, 3, 5)
         actions.setColumnStretch(6, 1)
         return panel
 
@@ -532,6 +569,7 @@ class ReleasePublisherWindow(QMainWindow):
         self.remote_host_edit.setText(settings.remote_host)
         self.remote_path_edit.setText(settings.remote_path)
         self.identity_edit.setText(settings.identity_file)
+        self.eligible_versions_edit.setText(settings.eligible_client_versions)
         index = self.channel_combo.findData(settings.channel)
         self.channel_combo.setCurrentIndex(max(0, index))
         self.portable_check.setChecked(settings.build_portable)
@@ -569,6 +607,7 @@ class ReleasePublisherWindow(QMainWindow):
             self.version_edit,
             self.delta_edit,
             self.uos_delta_edit,
+            self.eligible_versions_edit,
             self.base_url_edit,
             self.ca_edit,
         ):
@@ -845,6 +884,8 @@ class ReleasePublisherWindow(QMainWindow):
         if self.process is None:
             self.import_windows_result_button.setEnabled(windows)
             self.import_uos_result_button.setEnabled(uos)
+            self.import_uos_delta_base_button.setEnabled(uos)
+            self.export_uos_delta_base_button.setEnabled(uos)
 
     def _save_settings(self) -> None:
         settings = PublisherSettings(
@@ -866,6 +907,7 @@ class ReleasePublisherWindow(QMainWindow):
             gitee_url=self.gitee_url_edit.text().strip(),
             uos_builder_host=self.uos_builder_host_edit.text().strip(),
             uos_builder_path=self.uos_builder_path_edit.text().strip(),
+            eligible_client_versions=self.eligible_versions_edit.text().strip(),
         )
         self.settings_store.save(settings)
 
@@ -914,6 +956,9 @@ class ReleasePublisherWindow(QMainWindow):
             github_repo=self.github_repo_edit.text().strip(),
             uos_builder_host=self.uos_builder_host_edit.text().strip(),
             uos_builder_path=self.uos_builder_path_edit.text().strip(),
+            eligible_client_versions=parse_eligible_client_versions(
+                self.eligible_versions_edit.text()
+            ),
         )
 
     def _validate(
@@ -953,6 +998,8 @@ class ReleasePublisherWindow(QMainWindow):
             f"通道：{options.channel}\n"
             f"Windows 增量来源：{options.delta_from_version or '无'}\n"
             f"UOS 增量来源：{options.uos_delta_from_version or '无'}\n"
+            "定向更新版本："
+            f"{', '.join(options.eligible_client_versions) or '全部版本'}\n"
             f"远程主机：{options.remote_host or '仅本地'}"
         )
         self._append_log(message)
@@ -1037,6 +1084,20 @@ class ReleasePublisherWindow(QMainWindow):
         )
         if not selected:
             return
+        try:
+            delta_source = detect_uos_result_delta_source(selected)
+        except ReleaseTaskError as exc:
+            QMessageBox.warning(self, "无法识别统信结果", str(exc))
+            return
+        self.uos_delta_edit.setText(delta_source)
+        delta_status = (
+            f"包含 {delta_source} → {self.version_edit.text().strip()} 增量补丁"
+            if delta_source
+            else "仅包含完整 DEB"
+        )
+        self._append_log(
+            f"已自动识别统信结果：{delta_status}，界面选项已同步。"
+        )
         options = self._validate()
         if options is None:
             return
@@ -1044,6 +1105,55 @@ class ReleasePublisherWindow(QMainWindow):
         self._run_steps(
             build_uos_result_import_steps(options, selected),
             completion_message="统信构建包已导入并校验",
+        )
+
+    def _import_uos_delta_base(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 UOS 增量基线包",
+            str(self.repo_root / "dist"),
+            "UOS 增量基线 (uos-delta-base*.zip);;ZIP 文件 (*.zip)",
+        )
+        if not selected:
+            return
+        try:
+            version = detect_uos_delta_base_version(selected)
+        except ReleaseTaskError as exc:
+            QMessageBox.warning(self, "无法识别 UOS 增量基线", str(exc))
+            return
+        self.uos_delta_edit.setText(version)
+        self._save_settings()
+        self._run_steps(
+            build_uos_delta_base_import_steps(self._options(), selected),
+            completion_message=f"UOS {version} 已发布增量基线已导入",
+        )
+
+    def _export_uos_delta_base(self) -> None:
+        options = self._options()
+        source_version = options.uos_delta_from_version
+        if not source_version:
+            QMessageBox.warning(
+                self,
+                "缺少来源版本",
+                "请先填写“UOS 增量来源”，再导出已发布基线包。",
+            )
+            return
+        output = (
+            self.repo_root
+            / "dist"
+            / "uos-delta-bases"
+            / source_version
+            / f"uos-delta-base-{source_version}.zip"
+        )
+        try:
+            steps = build_uos_delta_base_export_steps(options, output)
+        except PublisherError as exc:
+            QMessageBox.warning(self, "无法导出 UOS 增量基线", str(exc))
+            return
+        self._save_settings()
+        self._run_steps(
+            steps,
+            completion_message=f"UOS 增量基线包已导出：{output}",
         )
 
     def _confirm_publish(self, options: ReleaseOptions) -> bool:
@@ -1055,6 +1165,11 @@ class ReleasePublisherWindow(QMainWindow):
             packages.append(f"UOS {options.uos_delta_from_version} 增量包")
         package = " + ".join(packages)
         warning = "是（在线检查到后不可忽略）" if options.mandatory else "否"
+        audience = (
+            ", ".join(options.eligible_client_versions)
+            if options.eligible_client_versions
+            else "全部客户端版本"
+        )
         reply = QMessageBox.warning(
             self,
             "确认发布",
@@ -1062,6 +1177,7 @@ class ReleasePublisherWindow(QMainWindow):
             f"目标：{destination}\n"
             f"通道：{options.channel}\n"
             f"包类型：{package}\n"
+            f"允许更新：{audience}\n"
             f"强制更新：{warning}\n\n"
             "大文件会使用 SFTP 断点续传，网络中断时自动重试；重新点击发布也会"
             "继续已有断点。发布清单会在安装包校验完成后原子替换。确定继续吗？",
@@ -1504,6 +1620,8 @@ class ReleasePublisherWindow(QMainWindow):
             self.build_button,
             self.import_windows_result_button,
             self.import_uos_result_button,
+            self.import_uos_delta_base_button,
+            self.export_uos_delta_base_button,
             self.commit_changes_button,
             self.push_button,
             self.pause_distribution_button,

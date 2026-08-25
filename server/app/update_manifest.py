@@ -23,7 +23,14 @@ _PACKAGE_KEYS = (*_PACKAGE_FIELDS, "full", "delta", "deltas")
 _PLATFORMS = {"windows-x86_64", "linux-aarch64"}
 _LEGACY_PLATFORM = "windows-x86_64"
 _UOS_DELTA_FORMAT = "uos-deb-xdelta-v1"
+_SOURCE_VERSION_TARGETING = "source-version-targeting-v1"
+_UPDATE_SERVER_CAPABILITIES = (
+    "platform-selection-v1",
+    _SOURCE_VERSION_TARGETING,
+    _UOS_DELTA_FORMAT,
+)
 _CAPABILITY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+_MAX_TARGET_CLIENT_VERSIONS = 32
 
 
 def request_client_version(request: Request) -> str | None:
@@ -51,6 +58,39 @@ def request_update_capabilities(request: Request) -> frozenset[str]:
     return frozenset(
         item for item in values if _CAPABILITY_PATTERN.fullmatch(item)
     )
+
+
+def manifest_eligible_client_versions(
+    payload: dict[str, Any],
+) -> frozenset[str] | None:
+    if "eligible_client_versions" not in payload:
+        return None
+    raw = payload.get("eligible_client_versions")
+    if not isinstance(raw, list) or not 0 < len(raw) <= _MAX_TARGET_CLIENT_VERSIONS:
+        raise HTTPException(
+            status_code=503,
+            detail="update manifest client targeting is invalid",
+        )
+    normalized: set[str] = set()
+    for item in raw:
+        if not isinstance(item, str):
+            raise HTTPException(
+                status_code=503,
+                detail="update manifest client targeting is invalid",
+            )
+        version = item.strip()
+        if not _VERSION_PATTERN.fullmatch(version):
+            raise HTTPException(
+                status_code=503,
+                detail="update manifest client targeting is invalid",
+            )
+        normalized.add(version)
+    if len(normalized) != len(raw):
+        raise HTTPException(
+            status_code=503,
+            detail="update manifest client targeting contains duplicates",
+        )
+    return frozenset(normalized)
 
 
 def select_platform_manifest(
@@ -152,6 +192,17 @@ def _load_manifest(path: Path) -> dict[str, Any]:
     return payload
 
 
+@router.get("/updates/capabilities.json", include_in_schema=False)
+def update_capabilities() -> JSONResponse:
+    return JSONResponse(
+        {
+            "schema_version": 1,
+            "capabilities": list(_UPDATE_SERVER_CAPABILITIES),
+        },
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @router.get("/updates/{channel}.json", include_in_schema=False)
 def update_manifest(channel: str, request: Request) -> Response:
     if channel not in _CHANNELS:
@@ -167,6 +218,7 @@ def update_manifest(channel: str, request: Request) -> Response:
             "X-IntDemo-Update-Package": "paused",
             "X-IntDemo-Update-Distribution": "paused",
             "X-IntDemo-Platform": platform_key,
+            "X-IntDemo-Update-Targeting": _SOURCE_VERSION_TARGETING,
         }
         if current_version is None:
             return Response(status_code=204, headers=headers)
@@ -182,6 +234,18 @@ def update_manifest(channel: str, request: Request) -> Response:
             },
             headers=headers,
         )
+    eligible_versions = manifest_eligible_client_versions(payload)
+    if eligible_versions is not None and current_version not in eligible_versions:
+        headers = {
+            "Cache-Control": "no-store",
+            "X-IntDemo-Update-Package": "not-targeted",
+            "X-IntDemo-Update-Distribution": "not-targeted",
+            "X-IntDemo-Platform": platform_key,
+            "X-IntDemo-Update-Targeting": _SOURCE_VERSION_TARGETING,
+        }
+        if current_version is not None:
+            headers["X-IntDemo-Client-Version"] = current_version
+        return Response(status_code=204, headers=headers)
     platform_manifest = select_platform_manifest(payload, platform_key)
     if platform_manifest is None:
         return Response(
@@ -190,6 +254,7 @@ def update_manifest(channel: str, request: Request) -> Response:
                 "Cache-Control": "no-store",
                 "X-IntDemo-Update-Package": "unavailable",
                 "X-IntDemo-Platform": platform_key,
+                "X-IntDemo-Update-Targeting": _SOURCE_VERSION_TARGETING,
             },
         )
     selected, package_kind = select_manifest_package(
@@ -202,6 +267,7 @@ def update_manifest(channel: str, request: Request) -> Response:
         "Cache-Control": "no-store",
         "X-IntDemo-Update-Package": package_kind,
         "X-IntDemo-Platform": platform_key,
+        "X-IntDemo-Update-Targeting": _SOURCE_VERSION_TARGETING,
     }
     if current_version is not None:
         headers["X-IntDemo-Client-Version"] = current_version

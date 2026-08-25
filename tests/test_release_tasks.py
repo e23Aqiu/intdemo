@@ -125,12 +125,36 @@ def create_uos_result_archive(
     channel: str = "test",
     ca_hash: str = "",
     tamper_installer: bool = False,
+    uos_delta_from_version: str = "",
 ) -> Path:
     staging = root / "uos-result-source"
     artifacts_root = staging / "artifacts"
     artifacts_root.mkdir(parents=True)
     installer = artifacts_root / f"IntDemo-UOS-arm64-{version}.deb"
     installer.write_bytes(b"uos arm64 installer")
+    artifacts = {
+        "uos_installer": tasks.artifact_descriptor(
+            installer,
+            f"artifacts/{installer.name}",
+        )
+    }
+    if uos_delta_from_version:
+        patch_name = (
+            f"IntDemo-UOS-arm64-Patch-{uos_delta_from_version}"
+            f"-to-{version}.intdelta"
+        )
+        delta = artifacts_root / patch_name
+        report = artifacts_root / f"{patch_name}.json"
+        delta.write_bytes(b"uos delta")
+        report.write_text("{}", encoding="utf-8")
+        artifacts["uos_delta"] = tasks.artifact_descriptor(
+            delta,
+            f"artifacts/{delta.name}",
+        )
+        artifacts["uos_delta_report"] = tasks.artifact_descriptor(
+            report,
+            f"artifacts/{report.name}",
+        )
     result = tasks.validate_uos_result_payload(
         {
             "schema_version": 1,
@@ -141,14 +165,10 @@ def create_uos_result_archive(
             "channel": channel,
             "ca_sha256": ca_hash,
             "payload_validated": True,
+            "uos_delta_from_version": uos_delta_from_version,
             "built_at": "2026-08-05T00:01:00Z",
             "builder": {"kind": "uos-native", "machine": "aarch64"},
-            "artifacts": {
-                "uos_installer": tasks.artifact_descriptor(
-                    installer,
-                    f"artifacts/{installer.name}",
-                )
-            },
+            "artifacts": artifacts,
         }
     )
     tasks.write_json(staging / tasks.UOS_RESULT_FILE, result)
@@ -160,6 +180,102 @@ def create_uos_result_archive(
 
 
 class ReleaseTasksTests(unittest.TestCase):
+    def test_targeted_manifest_lists_only_explicit_source_versions(self):
+        windows = {"name": "client.exe", "sha256": "1" * 64, "size": 200}
+        uos = {"name": "client.deb", "sha256": "2" * 64, "size": 300}
+
+        manifest = tasks.prepare_update_manifest(
+            version="1.2.1",
+            channel="test",
+            source_commit=COMMIT,
+            notes="targeted test",
+            mandatory=False,
+            windows=windows,
+            uos=uos,
+            delta=None,
+            delta_from_version="",
+            eligible_client_versions=("1.1.0", "1.1.1"),
+        )
+
+        self.assertEqual(
+            manifest["eligible_client_versions"],
+            ["1.1.0", "1.1.1"],
+        )
+        with self.assertRaisesRegex(tasks.ReleaseTaskError, "低于目标版本"):
+            tasks.prepare_update_manifest(
+                version="1.2.1",
+                channel="test",
+                source_commit=COMMIT,
+                notes="invalid target",
+                mandatory=False,
+                windows=windows,
+                uos=uos,
+                delta=None,
+                delta_from_version="",
+                eligible_client_versions=("1.2.1",),
+            )
+
+    def test_targeted_publish_requires_server_capability(self):
+        class CapabilityResponse:
+            status = 200
+
+            def __init__(self, capabilities):
+                self.capabilities = capabilities
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "schema_version": 1,
+                        "capabilities": self.capabilities,
+                    }
+                ).encode("utf-8")
+
+        with (
+            patch.object(
+                tasks.urllib.request,
+                "urlopen",
+                return_value=CapabilityResponse([]),
+            ),
+            self.assertRaisesRegex(tasks.ReleaseTaskError, "必须先升级服务器"),
+        ):
+            tasks.assert_platform_server_support(
+                "https://api.example.com",
+                "test",
+                None,
+                require_source_version_targeting=True,
+            )
+
+        with (
+            patch.object(
+                tasks.urllib.request,
+                "urlopen",
+                return_value=CapabilityResponse(
+                    [tasks.SOURCE_VERSION_TARGETING_CAPABILITY]
+                ),
+            ),
+            patch.object(
+                tasks,
+                "request_manifest",
+                return_value=(
+                    200,
+                    {},
+                    {"x-intdemo-platform": "linux-aarch64"},
+                ),
+            ),
+        ):
+            tasks.assert_platform_server_support(
+                "https://api.example.com",
+                "test",
+                None,
+                require_source_version_targeting=True,
+            )
+
     def test_windows_builder_accepts_exact_detached_commit(self):
         with patch.object(
             tasks,
@@ -493,6 +609,108 @@ class ReleaseTasksTests(unittest.TestCase):
             )
             self.assertTrue(installer.with_suffix(".deb.sha256").is_file())
 
+    def test_uos_result_auto_detects_delta_source_for_windows_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = create_uos_result_archive(
+                root,
+                uos_delta_from_version="1.2.2",
+            )
+
+            source = tasks.detect_uos_result_delta_source(archive)
+
+            self.assertEqual(source, "1.2.2")
+
+    def test_uos_published_base_round_trips_between_windows_and_uos(self):
+        with (
+            tempfile.TemporaryDirectory() as source_directory,
+            tempfile.TemporaryDirectory() as target_directory,
+        ):
+            source_root = Path(source_directory)
+            target_root = Path(target_directory)
+            version = "1.2.1"
+            deb = (
+                source_root
+                / "dist/update-release/files"
+                / f"IntDemo-UOS-arm64-{version}.deb"
+            )
+            receipt = (
+                source_root
+                / "dist/release-results"
+                / version
+                / "publish-receipt.json"
+            )
+            deb.parent.mkdir(parents=True)
+            receipt.parent.mkdir(parents=True)
+            deb.write_bytes(b"real published uos deb")
+            tasks.write_json(
+                receipt,
+                {
+                    "schema_version": 1,
+                    "version": version,
+                    "source_commit": COMMIT,
+                    "artifacts": {
+                        "uos_installer": {
+                            "name": deb.name,
+                            "size": deb.stat().st_size,
+                            "sha256": tasks.sha256(deb),
+                        }
+                    },
+                },
+            )
+            archive = source_root / "uos-delta-base.zip"
+
+            tasks.export_uos_delta_base(
+                source_root,
+                version=version,
+                output=archive,
+            )
+            self.assertEqual(
+                tasks.detect_uos_delta_base_version(archive),
+                version,
+            )
+            imported = tasks.import_uos_delta_base(
+                target_root,
+                base_archive=archive,
+            )
+
+            self.assertEqual(imported, version)
+            imported_deb = (
+                target_root / "dist/update-release/files" / deb.name
+            )
+            imported_receipt = (
+                target_root
+                / "dist/release-results"
+                / version
+                / "publish-receipt.json"
+            )
+            self.assertEqual(imported_deb.read_bytes(), deb.read_bytes())
+            self.assertEqual(tasks.sha256(imported_receipt), tasks.sha256(receipt))
+
+            tampered_staging = target_root / "tampered-staging"
+            tasks.extract_zip_safely(archive, tampered_staging)
+            tampered_deb = next((tampered_staging / "artifacts").glob("*.deb"))
+            tampered_deb.write_bytes(b"tampered transfer")
+            tampered_archive = target_root / "tampered-uos-delta-base.zip"
+            tasks.make_zip(tampered_staging, tampered_archive)
+            with self.assertRaisesRegex(tasks.ReleaseTaskError, "大小|SHA-256"):
+                tasks.import_uos_delta_base(
+                    target_root / "tampered-import",
+                    base_archive=tampered_archive,
+                )
+
+            imported_deb.write_bytes(b"different local baseline")
+            with self.assertRaisesRegex(tasks.ReleaseTaskError, "拒绝覆盖"):
+                tasks.import_uos_delta_base(
+                    target_root,
+                    base_archive=archive,
+                )
+
+            with self.assertRaisesRegex(tasks.ReleaseTaskError, "版本不受支持"):
+                tasks.validate_uos_delta_base_payload(
+                    {"schema_version": "invalid"}
+                )
+
     def test_uos_result_import_rejects_tampering_and_config_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -666,6 +884,7 @@ class ReleaseTasksTests(unittest.TestCase):
             receipt_path.write_text(
                 json.dumps(
                     {
+                        "schema_version": 1,
                         "version": "1.2.2",
                         "artifacts": {
                             "uos_installer": {

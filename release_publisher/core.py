@@ -18,6 +18,8 @@ VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 REMOTE_HOST_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9._@:-]+$")
 REMOTE_PATH_PATTERN = re.compile(r"^/[A-Za-z0-9._/-]+$")
 GIT_REMOTE_PATTERN = re.compile(r"^(?!-)[A-Za-z0-9._-]+$")
+CLIENT_VERSION_SEPARATOR_PATTERN = re.compile(r"[,，;；\s]+")
+MAX_ELIGIBLE_CLIENT_VERSIONS = 32
 
 
 def _safe_remote_path(value: str) -> bool:
@@ -40,6 +42,18 @@ def _version_key(value: str) -> tuple[int, int, int]:
     return tuple(int(part) for part in normalized.split("."))
 
 
+def parse_eligible_client_versions(value: str) -> tuple[str, ...]:
+    normalized = str(value or "").strip()
+    if not normalized:
+        return ()
+    versions: list[str] = []
+    for item in CLIENT_VERSION_SEPARATOR_PATTERN.split(normalized):
+        version = item.strip()
+        if version and version not in versions:
+            versions.append(version)
+    return tuple(versions)
+
+
 @dataclass(frozen=True)
 class PublisherSettings:
     base_url: str = ""
@@ -60,6 +74,7 @@ class PublisherSettings:
     gitee_url: str = ""
     uos_builder_host: str = ""
     uos_builder_path: str = "/opt/intdemo"
+    eligible_client_versions: str = ""
 
 
 class SettingsStore:
@@ -143,6 +158,7 @@ class ReleaseOptions:
     github_repo: str = ""
     uos_builder_host: str = ""
     uos_builder_path: str = "/opt/intdemo"
+    eligible_client_versions: tuple[str, ...] = ()
 
     @property
     def full_installer(self) -> Path:
@@ -1214,6 +1230,26 @@ def validate_release_options(
     if (for_publish or for_pipeline) and not str(options.notes or "").strip():
         errors.append("更新说明不能为空")
 
+    if len(options.eligible_client_versions) > MAX_ELIGIBLE_CLIENT_VERSIONS:
+        errors.append(
+            f"定向更新最多允许 {MAX_ELIGIBLE_CLIENT_VERSIONS} 个客户端版本"
+        )
+    if len(set(options.eligible_client_versions)) != len(
+        options.eligible_client_versions
+    ):
+        errors.append("定向更新客户端版本不能重复")
+    for client_version in options.eligible_client_versions:
+        try:
+            client_key = _version_key(client_version)
+            if target_key is not None and client_key >= target_key:
+                errors.append(
+                    f"定向更新来源版本必须低于目标版本：{client_version}"
+                )
+        except PublisherError:
+            errors.append(
+                f"定向更新客户端版本必须使用 x.y.z 格式：{client_version or '-'}"
+            )
+
     if not options.build_windows and not options.build_uos:
         errors.append("请至少选择一个构建平台")
     if (for_publish or for_pipeline) and not (
@@ -1886,6 +1922,46 @@ def build_uos_result_import_steps(
     ]
 
 
+def build_uos_delta_base_export_steps(
+    options: ReleaseOptions,
+    output: str | Path,
+) -> list[CommandStep]:
+    if not options.uos_delta_from_version:
+        raise PublisherError("请先填写 UOS 增量来源版本")
+    return [
+        _release_task_step(
+            options,
+            key="export_uos_delta_base",
+            title=f"导出 UOS {options.uos_delta_from_version} 增量基线包",
+            command="export-uos-delta-base",
+            arguments=(
+                "--version",
+                options.uos_delta_from_version,
+                "--output",
+                str(Path(output).expanduser().resolve()),
+            ),
+        )
+    ]
+
+
+def build_uos_delta_base_import_steps(
+    options: ReleaseOptions,
+    base_archive: str | Path,
+) -> list[CommandStep]:
+    return [
+        _release_task_step(
+            options,
+            key="import_uos_delta_base",
+            title="导入已发布的 UOS 增量基线",
+            command="import-uos-delta-base",
+            arguments=(
+                "--base-archive",
+                str(Path(base_archive).expanduser().resolve()),
+            ),
+        )
+    ]
+
+
 def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
     arguments = [
         "--version",
@@ -1910,6 +1986,8 @@ def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
         arguments.extend(
             ["--uos-delta-from-version", options.uos_delta_from_version]
         )
+    for client_version in options.eligible_client_versions:
+        arguments.extend(["--eligible-client-version", client_version])
     if options.build_portable:
         arguments.append("--build-portable")
     if options.mandatory:

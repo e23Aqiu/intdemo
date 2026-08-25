@@ -53,3 +53,13 @@ update-manifest endpoint. UOS clients without the
 `X-IntDemo-Update-Capabilities` header—including v1.1.0, v1.1.1 and v1.2.0—
 continue to receive the complete DEB. This routing does not read or mutate
 access tokens, refresh sessions, account permissions or synchronization data.
+
+The same endpoint supports an optional manifest field such as
+`"eligible_client_versions": ["1.1.0"]`. When present, only an exact
+`X-IntDemo-Version` or `IntDemoUpdater/<version>` match receives the manifest;
+other and unversioned requests receive HTTP 204. When absent, distribution is
+unchanged. `/updates/capabilities.json` advertises
+`source-version-targeting-v1`, and both Caddy configurations proxy that path to
+the API. The publisher refuses targeted manifests until this capability is
+reachable, so an older server cannot silently ignore targeting. This change has
+no database migration and does not invalidate existing v1.1.0/v1.1.1 sessions.
