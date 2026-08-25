@@ -302,9 +302,10 @@ sudo apt remove com.e23aqiu.intdemo
 2. 源码启动后登录页中文字体正常，窗口可拖动、最大化、缩放，无黑边或透明块。
 3. 在线登录成功；勾选“记住密码”，关闭并重开后资料可解密；断网时可用有效的
    本机离线授权登录。
-4. “系统设置”显示版本并可检查更新；UOS 只接受 `linux-aarch64` 的 `.deb`，
-   下载和 SHA-256 校验完成后打开 Deepin DEB 安装器；确认安装时应出现
-   PolicyKit 密码授权界面并完成安装。规划中的增量方案尚未启用，参见
+4. “系统设置”显示版本并可检查更新；完整更新只接受 `linux-aarch64` 的 `.deb`。
+   v1.2.1 起可选择经过能力协商的 `.intdelta`，在用户缓存中重建并校验完整 DEB；
+   任一增量条件失败时自动回退完整包。最终都由 Deepin DEB 安装器显示
+   PolicyKit 密码授权界面并完成安装。正式补丁仍受 50% 收益门槛限制，参见
    [`UOS_ARM64_INCREMENTAL_UPDATE.md`](UOS_ARM64_INCREMENTAL_UPDATE.md)。
 5. “运行设置”中的 Chromium 健康检查通过，并显示软件包内
    `browser/chrome` 的真实路径和版本。

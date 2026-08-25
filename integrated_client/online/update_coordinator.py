@@ -25,6 +25,7 @@ class _UpdateTask(QRunnable):
                     progress_callback=self.coordinator.download_progress.emit,
                     speed_callback=self.coordinator.download_speed.emit,
                     cancelled_callback=self.coordinator._download_cancel.is_set,
+                    state_callback=self.coordinator.state_changed.emit,
                 )
             self.coordinator._task_finished.emit(self.action, result, "")
         except UpdateCancelled:

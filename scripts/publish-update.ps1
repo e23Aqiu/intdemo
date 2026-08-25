@@ -21,6 +21,13 @@ param(
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$DeltaFromVersion = "",
 
+    [string]$UosDeltaInstaller = "",
+
+    [string]$UosDeltaReport = "",
+
+    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [string]$UosDeltaFromVersion = "",
+
     [switch]$LegacyDeltaPrimary,
 
     [string]$RemoteHost = "",
@@ -67,6 +74,10 @@ $publishedName = "IntDemoOnline-Setup-$Version.exe"
 $publishedInstaller = Join-Path $filesRoot $publishedName
 $uosPublishedName = "IntDemo-UOS-arm64-$Version.deb"
 $publishedUosInstaller = Join-Path $filesRoot $uosPublishedName
+$uosDeltaPublishedName = (
+    "IntDemo-UOS-arm64-Patch-$UosDeltaFromVersion-to-$Version.intdelta"
+)
+$publishedUosDelta = Join-Path $filesRoot $uosDeltaPublishedName
 $manifestPath = Join-Path $releaseRoot "$Channel.json"
 
 $sourceCommit = [string](& git -C $repoRoot rev-parse HEAD)
@@ -96,6 +107,79 @@ if ($sourceUosInstaller) {
         Get-FileHash -LiteralPath $publishedUosInstaller -Algorithm SHA256
     ).Hash.ToLowerInvariant()
 }
+$uosDeltaFile = $null
+$uosDeltaHash = ""
+$uosDeltaPayload = $null
+if ($UosDeltaInstaller -or $UosDeltaReport -or $UosDeltaFromVersion) {
+    if (-not $UosDeltaInstaller -or -not $UosDeltaReport -or
+        -not $UosDeltaFromVersion -or -not $sourceUosInstaller) {
+        throw (
+            "UosDeltaInstaller, UosDeltaReport, UosDeltaFromVersion and " +
+            "UosInstaller must be provided together"
+        )
+    }
+    if ([version]$UosDeltaFromVersion -ge [version]$Version) {
+        throw "UosDeltaFromVersion must be lower than Version"
+    }
+    $sourceUosDelta = (Resolve-Path -LiteralPath $UosDeltaInstaller).Path
+    $sourceUosDeltaReport = (Resolve-Path -LiteralPath $UosDeltaReport).Path
+    if ([System.IO.Path]::GetExtension($sourceUosDelta) -ne ".intdelta") {
+        throw "UosDeltaInstaller must be an .intdelta package"
+    }
+    $uosDeltaPayload = Get-Content -LiteralPath $sourceUosDeltaReport -Raw |
+        ConvertFrom-Json
+    $sourceUosDeltaFile = Get-Item -LiteralPath $sourceUosDelta
+    $sourceUosDeltaHash = (
+        Get-FileHash -LiteralPath $sourceUosDelta -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    if ($uosDeltaPayload.format -ne "uos-deb-xdelta-v1" -or
+        $uosDeltaPayload.algorithm -ne "xdelta3" -or
+        $uosDeltaPayload.from_version -ne $UosDeltaFromVersion -or
+        $uosDeltaPayload.target_version -ne $Version -or
+        $uosDeltaPayload.eligible -ne $true -or
+        $uosDeltaPayload.byte_identical -ne $true -or
+        [long]$uosDeltaPayload.patch_size -ne $sourceUosDeltaFile.Length -or
+        ([string]$uosDeltaPayload.patch_sha256).ToLowerInvariant() -ne
+            $sourceUosDeltaHash -or
+        [long]$uosDeltaPayload.target_size -ne $uosFile.Length -or
+        ([string]$uosDeltaPayload.target_sha256).ToLowerInvariant() -ne $uosHash -or
+        $sourceUosDeltaFile.Length * 2 -ge $uosFile.Length) {
+        throw "UOS delta report, target DEB or 50% threshold verification failed"
+    }
+    $releasedSource = Join-Path (
+        Join-Path $releaseRoot "files"
+    ) "IntDemo-UOS-arm64-$UosDeltaFromVersion.deb"
+    $sourceReceipt = Join-Path (
+        Join-Path $repoRoot "dist\release-results\$UosDeltaFromVersion"
+    ) "publish-receipt.json"
+    if (-not (Test-Path -LiteralPath $releasedSource -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $sourceReceipt -PathType Leaf)) {
+        throw "The real released UOS base DEB or publish receipt is missing"
+    }
+    $sourceReceiptPayload = Get-Content -LiteralPath $sourceReceipt -Raw |
+        ConvertFrom-Json
+    $releasedSourceFile = Get-Item -LiteralPath $releasedSource
+    $releasedSourceHash = (
+        Get-FileHash -LiteralPath $releasedSource -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    if ([string]$sourceReceiptPayload.version -ne $UosDeltaFromVersion -or
+        $sourceReceiptPayload.artifacts.uos_installer.name -ne
+            $releasedSourceFile.Name -or
+        [long]$sourceReceiptPayload.artifacts.uos_installer.size -ne
+            $releasedSourceFile.Length -or
+        ([string]$sourceReceiptPayload.artifacts.uos_installer.sha256).ToLowerInvariant() -ne
+            $releasedSourceHash -or
+        [long]$uosDeltaPayload.base_size -ne $releasedSourceFile.Length -or
+        ([string]$uosDeltaPayload.base_sha256).ToLowerInvariant() -ne
+            $releasedSourceHash) {
+        throw "UOS delta base is not the receipt-verified released DEB"
+    }
+    Copy-Item -LiteralPath $sourceUosDelta -Destination $publishedUosDelta -Force
+    $uosDeltaFile = Get-Item -LiteralPath $publishedUosDelta
+    $uosDeltaHash = (
+        Get-FileHash -LiteralPath $publishedUosDelta -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+}
 $windowsFull = [ordered]@{
     installer_path = "/updates/files/$publishedName"
     sha256 = $hash
@@ -122,13 +206,30 @@ $manifest = [ordered]@{
     }
 }
 if ($uosFile) {
-    $manifest.platforms["linux-aarch64"] = [ordered]@{
+    $uosPlatform = [ordered]@{
         full = [ordered]@{
             installer_path = "/updates/files/$uosPublishedName"
             sha256 = $uosHash
             size = $uosFile.Length
         }
     }
+    if ($uosDeltaFile) {
+        $uosPlatform.deltas = @(
+            [ordered]@{
+                format = "uos-deb-xdelta-v1"
+                algorithm = "xdelta3"
+                from_version = $UosDeltaFromVersion
+                base_sha256 = ([string]$uosDeltaPayload.base_sha256).ToLowerInvariant()
+                base_size = [long]$uosDeltaPayload.base_size
+                installer_path = "/updates/files/$uosDeltaPublishedName"
+                sha256 = $uosDeltaHash
+                size = $uosDeltaFile.Length
+                target_sha256 = $uosHash
+                target_size = $uosFile.Length
+            }
+        )
+    }
+    $manifest.platforms["linux-aarch64"] = $uosPlatform
 }
 $publishedDelta = $null
 $deltaPublishedName = ""
@@ -193,6 +294,10 @@ if ($uosFile) {
 if ($publishedDelta) {
     Write-Host "Delta installer: $publishedDelta"
     Write-Host "Delta SHA-256: $deltaHash"
+}
+if ($uosDeltaFile) {
+    Write-Host "UOS ARM64 delta: $publishedUosDelta"
+    Write-Host "UOS ARM64 delta SHA-256: $uosDeltaHash"
 }
 
 if ($RemoteHost) {
@@ -296,6 +401,25 @@ if ($RemoteHost) {
             Write-Host "Remote UOS ARM64 installer already matches; upload skipped"
         }
     }
+    $uosDeltaUploaded = $false
+    if ($uosDeltaFile) {
+        $remoteUosDeltaHashOutput = @(
+            & ssh @sshArgs $RemoteHost `
+                "if [ -f '$RemotePath/files/$uosDeltaPublishedName' ]; then sha256sum '$RemotePath/files/$uosDeltaPublishedName' | cut -d ' ' -f 1; fi"
+        )
+        $remoteUosDeltaHash = ($remoteUosDeltaHashOutput -join "").Trim()
+        $uosDeltaUploaded = $remoteUosDeltaHash -ne $uosDeltaHash
+        if ($uosDeltaUploaded) {
+            & scp @scpArgs $publishedUosDelta (
+                "${RemoteHost}:$incoming/$uosDeltaPublishedName"
+            )
+            if ($LASTEXITCODE -ne 0) {
+                throw "Could not upload the UOS ARM64 delta"
+            }
+        } else {
+            Write-Host "Remote UOS ARM64 delta already matches; upload skipped"
+        }
+    }
     & scp @scpArgs $manifestPath "${RemoteHost}:$incoming/$Channel.json"
     if ($LASTEXITCODE -ne 0) {
         throw "Could not upload the manifest"
@@ -309,6 +433,12 @@ if ($RemoteHost) {
     }
     if ($uosFile -and $uosUploaded) {
         $publishSteps += "mv '$incoming/$uosPublishedName' '$RemotePath/files/$uosPublishedName'"
+    }
+    if ($uosDeltaFile -and $uosDeltaUploaded) {
+        $publishSteps += (
+            "mv '$incoming/$uosDeltaPublishedName' " +
+            "'$RemotePath/files/$uosDeltaPublishedName'"
+        )
     }
     $publishSteps += "mv '$incoming/$Channel.json' '$RemotePath/$Channel.json'"
     $publishCommand = $publishSteps -join " && "

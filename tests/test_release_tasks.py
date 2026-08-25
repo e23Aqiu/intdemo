@@ -606,6 +606,136 @@ class ReleaseTasksTests(unittest.TestCase):
         )
         self.assertNotIn("deltas", manifest["platforms"]["linux-aarch64"])
 
+    def test_dual_manifest_can_publish_capability_gated_uos_delta(self):
+        windows = {"name": "setup.exe", "size": 10, "sha256": "1" * 64}
+        uos = {"name": "client.deb", "size": 200, "sha256": "2" * 64}
+        uos_delta = {
+            "name": "client.intdelta",
+            "size": 80,
+            "sha256": "3" * 64,
+            "base_size": 190,
+            "base_sha256": "4" * 64,
+        }
+
+        manifest = tasks.prepare_update_manifest(
+            version="1.2.3",
+            channel="stable",
+            source_commit=COMMIT,
+            notes="release",
+            mandatory=False,
+            windows=windows,
+            uos=uos,
+            delta=None,
+            delta_from_version="",
+            uos_delta=uos_delta,
+            uos_delta_from_version="1.2.2",
+        )
+
+        delta = manifest["platforms"]["linux-aarch64"]["deltas"][0]
+        self.assertEqual(delta["format"], "uos-deb-xdelta-v1")
+        self.assertEqual(delta["algorithm"], "xdelta3")
+        self.assertEqual(delta["from_version"], "1.2.2")
+        self.assertEqual(delta["base_sha256"], "4" * 64)
+        self.assertEqual(delta["base_size"], 190)
+        self.assertEqual(delta["target_sha256"], uos["sha256"])
+        self.assertEqual(delta["target_size"], uos["size"])
+        self.assertEqual(delta["installer_path"], "/updates/files/client.intdelta")
+
+    def test_uos_delta_candidate_requires_real_released_base_and_replay_report(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = (
+                root
+                / "dist/update-release/files/IntDemo-UOS-arm64-1.2.2.deb"
+            )
+            target = root / "dist/uos-arm64/IntDemo-UOS-arm64-1.2.3.deb"
+            patch_file = (
+                root
+                / "dist/uos-arm64/IntDemo-UOS-arm64-Patch-"
+                "1.2.2-to-1.2.3.intdelta"
+            )
+            receipt_path = (
+                root / "dist/release-results/1.2.2/publish-receipt.json"
+            )
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            receipt_path.parent.mkdir(parents=True)
+            source.write_bytes(b"s" * 90)
+            target.write_bytes(b"t" * 100)
+            patch_file.write_bytes(b"p" * 40)
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "version": "1.2.2",
+                        "artifacts": {
+                            "uos_installer": {
+                                "name": source.name,
+                                "size": source.stat().st_size,
+                                "sha256": tasks.sha256(source),
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report = {
+                "schema_version": 1,
+                "format": "uos-deb-xdelta-v1",
+                "algorithm": "xdelta3",
+                "from_version": "1.2.2",
+                "target_version": "1.2.3",
+                "base_name": source.name,
+                "base_size": source.stat().st_size,
+                "base_sha256": tasks.sha256(source),
+                "target_name": target.name,
+                "target_size": target.stat().st_size,
+                "target_sha256": tasks.sha256(target),
+                "patch_name": patch_file.name,
+                "patch_size": patch_file.stat().st_size,
+                "patch_sha256": tasks.sha256(patch_file),
+                "ratio_percent": 40.0,
+                "threshold_percent": 50,
+                "eligible": True,
+                "byte_identical": True,
+            }
+            patch_file.with_suffix(".intdelta.json").write_text(
+                json.dumps(report),
+                encoding="utf-8",
+            )
+
+            patch_path, report_path, loaded = tasks.validate_uos_delta_candidate(
+                root,
+                from_version="1.2.2",
+                target_version="1.2.3",
+                target_deb=target,
+            )
+
+            self.assertEqual(patch_path, patch_file)
+            self.assertEqual(report_path, patch_file.with_suffix(".intdelta.json"))
+            self.assertEqual(loaded["base_sha256"], tasks.sha256(source))
+
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["version"] = "1.2.1"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+            with self.assertRaisesRegex(tasks.ReleaseTaskError, "收据版本"):
+                tasks.validate_uos_delta_candidate(
+                    root,
+                    from_version="1.2.2",
+                    target_version="1.2.3",
+                    target_deb=target,
+                )
+            receipt["version"] = "1.2.2"
+            receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+
+            source.write_bytes(b"tampered")
+            with self.assertRaisesRegex(tasks.ReleaseTaskError, "真实发布 DEB"):
+                tasks.validate_uos_delta_candidate(
+                    root,
+                    from_version="1.2.2",
+                    target_version="1.2.3",
+                    target_deb=target,
+                )
+
     def test_remote_guards_refuse_equal_or_higher_versions(self):
         for current in ("1.2.3", "1.2.4"):
             with self.subTest(current=current), self.assertRaisesRegex(

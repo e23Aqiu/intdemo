@@ -58,8 +58,8 @@ from .frameless import (
 from .frameless import (
     FramelessMessageBox as QMessageBox,
 )
-from .machine_learning_page import MachineLearningPage
 from .loading_dialog import run_ui_with_loading
+from .machine_learning_page import MachineLearningPage
 from .online_account_page import OnlineAccountPage
 from .personal_center_page import PersonalCenterPage
 from .statistics_page import StatisticsPage
@@ -1279,6 +1279,16 @@ class MainWindow(FramelessMainWindow):
             QMessageBox.warning(self, "检查更新失败", message)
         elif state == "downloading":
             self._set_update_busy(True)
+        elif state in {"reconstructing", "verifying_target"}:
+            self._set_update_busy(True)
+            dialog = self.update_dialog
+            if dialog is not None:
+                dialog.set_preparing(message)
+        elif state == "fallback_full":
+            self._set_update_busy(True)
+            dialog = self.update_dialog
+            if dialog is not None:
+                dialog.set_fallback_full(message)
         elif state == "cancelling":
             self._set_update_busy(True)
         elif state == "download_cancelled":

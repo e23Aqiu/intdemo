@@ -2,12 +2,14 @@
 
 ## 1. 文档状态
 
-- 状态：待实施设计，当前正式发布链路尚未启用 UOS 增量更新。
+- 状态：v1.2.1 代码实现完成；客户端、服务端能力协商、补丁脚本与发布器协议
+  已实现，尚待 UOS ARM64 真机构建与灰度，正式清单未启用 UOS 增量包。
 - 目标平台：统信 UOS Desktop 20 Professional ARM64（`linux-aarch64`）。
-- 建议过渡版本：若 v1.2.0 尚未正式发布，则由 v1.2.0 完整 DEB
-  首次携带增量更新能力，v1.2.1 开始可从 v1.2.0 增量升级。若 v1.2.0
-  已发布，则顺延一个版本执行相同过渡。
-- 本文档不代表当前客户端已具备 UOS 增量更新能力。
+- 过渡版本：v1.2.1。v1.2.0 及更早客户端不具备补丁处理能力，因此升级到
+  v1.2.1 时仍使用完整 DEB；由旧版应用内完整更新并保留的 v1.2.1 DEB 可在后续
+  版本作为基线。
+- 首个候选增量目标为 v1.2.2，但只有真实补丁低于完整 DEB 的 50% 且 ARM64
+  真机测试通过时才允许发布，否则继续使用完整 DEB。
 
 ## 2. 现状与问题
 
@@ -113,7 +115,7 @@ UOS 平台示例：
   "platforms": {
     "linux-aarch64": {
       "full": {
-        "installer_path": "/updates/files/IntDemo-UOS-arm64-1.2.1.deb",
+        "installer_path": "/updates/files/IntDemo-UOS-arm64-1.2.2.deb",
         "sha256": "<target-deb-sha256>",
         "size": 327000000
       },
@@ -121,9 +123,10 @@ UOS 平台示例：
         {
           "format": "uos-deb-xdelta-v1",
           "algorithm": "xdelta3",
-          "from_version": "1.2.0",
-          "base_sha256": "<released-1.2.0-deb-sha256>",
-          "installer_path": "/updates/files/IntDemo-UOS-arm64-Patch-1.2.0-to-1.2.1.intdelta",
+          "from_version": "1.2.1",
+          "base_sha256": "<released-1.2.1-deb-sha256>",
+          "base_size": 327000000,
+          "installer_path": "/updates/files/IntDemo-UOS-arm64-Patch-1.2.1-to-1.2.2.intdelta",
           "sha256": "<patch-sha256>",
           "size": 24000000,
           "target_sha256": "<target-deb-sha256>",
@@ -139,7 +142,7 @@ UOS 平台示例：
 
 - `from_version` 必须精确等于客户端当前版本。
 - `format` 必须为客户端声明支持的格式。
-- `base_sha256` 校验客户端缓存的旧完整 DEB。
+- `base_sha256` 和 `base_size` 校验客户端缓存的旧完整 DEB。
 - `sha256` 和 `size` 校验下载的补丁。
 - `target_sha256` 和 `target_size` 必须与同平台 `full` 完全一致。
 - 增量包和完整包必须来自相同 HTTPS 服务和信任链。
@@ -166,13 +169,13 @@ Windows 现有增量选择规则不受影响。
 ```text
 <get_data_dir()>/updates/
 ├── base/
-│   ├── IntDemo-UOS-arm64-1.2.0.deb
+│   ├── IntDemo-UOS-arm64-1.2.1.deb
 │   └── metadata.json
 ├── pending/
-│   ├── IntDemo-UOS-arm64-1.2.1.deb.part
+│   ├── IntDemo-UOS-arm64-1.2.2.deb.part
 │   └── pending-install.json
 └── patches/
-    └── IntDemo-UOS-arm64-Patch-1.2.0-to-1.2.1.intdelta
+    └── IntDemo-UOS-arm64-Patch-1.2.1-to-1.2.2.intdelta
 ```
 
 `metadata.json` 至少包含：
@@ -181,8 +184,8 @@ Windows 现有增量选择规则不受影响。
 {
   "schema_version": 1,
   "platform": "linux-aarch64",
-  "version": "1.2.0",
-  "file": "IntDemo-UOS-arm64-1.2.0.deb",
+  "version": "1.2.1",
+  "file": "IntDemo-UOS-arm64-1.2.1.deb",
   "size": 327000000,
   "sha256": "<released-full-deb-sha256>",
   "installed_confirmed_at": "<UTC timestamp>"
@@ -448,9 +451,9 @@ checking
 
 ## 18. 实施前检查表
 
-- [ ] 确认 v1.2.0 是否作为过渡完整版本。
+- [x] 确认 v1.2.1 作为过渡完整版本。
 - [ ] 确认正式 UOS 构建机可构建/运行 ARM64 `xdelta3`。
-- [ ] 完成真实 DEB 差异效果基准并做 Go/No-Go 决策。
+- [x] 完成两组真实 DEB 尺寸基准；整包差异均超过 50%，当前补丁不可发布。
 - [ ] 确认 UOS 发布服务器保留真实历史完整 DEB。
 - [ ] 确认客户端用户数据目录可接受常态约 327 MB 基线缓存。
 - [ ] 确认更新期间最低可用空间提示文案。
@@ -458,14 +461,12 @@ checking
 - [ ] 确认试点 UOS ARM64 机器、系统管理员授权和可回退完整 DEB。
 - [ ] 确认监控项：增量选中率、节省比例、补丁失败率、完整包回退率和安装成功率。
 
-## 19. 第一个实施任务
+## 19. 当前实施结论
 
-第一个开发任务只做阶段 0，不修改客户端更新行为：
+真实 1.0.7→1.1.0 和 1.1.0→1.1.1 补丁均能逐字节重建目标 DEB，但尺寸分别为
+完整包的 65.17% 和 61.65%，未达到 50% 门槛。详细结果见
+[`UOS_ARM64_INCREMENTAL_BENCHMARK.md`](UOS_ARM64_INCREMENTAL_BENCHMARK.md)。
 
-1. 在 UOS ARM64/glibc 2.28 环境准备可内置的补丁引擎候选。
-2. 对真实 1.1.0、1.1.1 和当前完整 DEB 生成补丁。
-3. 使用目标 UOS 真机重建并校验目标 DEB。
-4. 输出一份只包含尺寸、耗时、内存、哈希和 Go/No-Go 结论的基准报告。
-5. 只有 Go 后才进入客户端、发布器和服务端实施。
-
-这一顺序可避免在未确认 XZ 压缩 DEB 差异收益前，先投入完整更新链路改造。
+因此 v1.2.1 只启用安全能力、基线缓存、完整包回退、构建与发布门槛，不在正式
+清单中发布上述历史补丁。下一步必须在 UOS ARM64 真机验证 v1.2.1→候选版本；若
+仍超过门槛，则转入运行库/Chromium 分层方案，不降低门槛强行发布。

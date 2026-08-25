@@ -1,4 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+import shutil
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all
@@ -19,6 +21,29 @@ datas.append(
     )
 )
 binaries = []
+xdelta3_path = Path(
+    os.environ.get("INTDEMO_XDELTA3_PATH", "")
+    or shutil.which("xdelta3")
+    or ""
+)
+if not xdelta3_path.is_file():
+    raise SystemExit(
+        "UOS ARM64 构建缺少 xdelta3；请安装构建依赖或设置 "
+        "INTDEMO_XDELTA3_PATH"
+    )
+binaries.append((str(xdelta3_path), "tools"))
+xdelta_license_candidates = (
+    Path("/usr/share/doc/xdelta3/copyright"),
+    xdelta3_path.parent.parent / "share" / "licenses" / "xdelta3" / "COPYING",
+    xdelta3_path.parent.parent / "share" / "doc" / "xdelta3" / "COPYING",
+)
+xdelta_license = next(
+    (candidate for candidate in xdelta_license_candidates if candidate.is_file()),
+    None,
+)
+if xdelta_license is None:
+    raise SystemExit("UOS ARM64 构建缺少 xdelta3 许可证文件")
+datas.append((str(xdelta_license), "licenses/xdelta3"))
 hiddenimports = [
     "PyQt5",
     "PyQt5.sip",

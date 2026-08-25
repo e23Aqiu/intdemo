@@ -667,6 +667,10 @@ class OnlineClientTests(unittest.TestCase):
             session.headers["X-IntDemo-Platform"],
             "linux-aarch64",
         )
+        self.assertEqual(
+            session.headers["X-IntDemo-Update-Capabilities"],
+            "uos-deb-xdelta-v1",
+        )
 
         response.json.return_value["platforms"]["linux-aarch64"]["full"][
             "installer_path"
@@ -677,6 +681,200 @@ class OnlineClientTests(unittest.TestCase):
                 session=session,
                 platform_key="linux-aarch64",
             ).check()
+
+    def test_uos_manifest_uses_delta_only_with_verified_local_base(self):
+        target_version = _next_patch_version(APP_VERSION)
+        base = b"released-uos-base-deb"
+        target = b"target-uos-deb"
+        patch_content = b"xdelta-patch"
+        full_name = f"IntDemo-UOS-arm64-{target_version}.deb"
+        patch_name = (
+            f"IntDemo-UOS-arm64-Patch-{APP_VERSION}-to-"
+            f"{target_version}.intdelta"
+        )
+        manifest = {
+            "schema_version": 1,
+            "channel": "test",
+            "version": target_version,
+            "notes": "UOS 增量更新测试",
+            "platforms": {
+                "linux-aarch64": {
+                    "full": {
+                        "installer_path": f"/updates/files/{full_name}",
+                        "sha256": hashlib.sha256(target).hexdigest(),
+                        "size": len(target),
+                    },
+                    "deltas": [
+                        {
+                            "format": "uos-deb-xdelta-v1",
+                            "algorithm": "xdelta3",
+                            "from_version": APP_VERSION,
+                            "base_sha256": hashlib.sha256(base).hexdigest(),
+                            "base_size": len(base),
+                            "installer_path": f"/updates/files/{patch_name}",
+                            "sha256": hashlib.sha256(patch_content).hexdigest(),
+                            "size": len(patch_content),
+                            "target_sha256": hashlib.sha256(target).hexdigest(),
+                            "target_size": len(target),
+                        }
+                    ],
+                }
+            },
+        }
+        response = Mock(status_code=200)
+        response.raise_for_status.return_value = None
+        response.json.return_value = manifest
+        session = Mock()
+        session.headers = {}
+        session.get.return_value = response
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+        previous = os.environ.get("INTDEMO_DATA_DIR")
+        os.environ["INTDEMO_DATA_DIR"] = self.temp_dir.name
+        try:
+            updates = Path(self.temp_dir.name) / "updates"
+            updates.mkdir()
+            (updates / f"IntDemo-UOS-arm64-{APP_VERSION}.deb").write_bytes(base)
+
+            update = UpdateClient(
+                config,
+                session=session,
+                platform_key="linux-aarch64",
+            ).check()
+
+            self.assertTrue(update.is_uos_delta)
+            self.assertEqual(update.installer_name, patch_name)
+            self.assertEqual(update.full_installer_name, full_name)
+            self.assertEqual(update.base_size, len(base))
+            self.assertTrue(
+                (
+                    updates
+                    / "base"
+                    / f"IntDemo-UOS-arm64-{APP_VERSION}.deb"
+                ).is_file()
+            )
+
+            # Removing the verified base must silently restore the full path.
+            (
+                updates / "base" / f"IntDemo-UOS-arm64-{APP_VERSION}.deb"
+            ).unlink()
+            update = UpdateClient(
+                config,
+                session=session,
+                platform_key="linux-aarch64",
+            ).check()
+            self.assertFalse(update.is_delta)
+            self.assertEqual(update.installer_name, full_name)
+        finally:
+            if previous is None:
+                os.environ.pop("INTDEMO_DATA_DIR", None)
+            else:
+                os.environ["INTDEMO_DATA_DIR"] = previous
+
+    def test_uos_delta_failure_falls_back_to_verified_full_deb(self):
+        target_version = _next_patch_version(APP_VERSION)
+        base = b"base-deb"
+        patch_content = b"invalid-patch"
+        target = b"complete-target-deb"
+        base_hash = hashlib.sha256(base).hexdigest()
+        target_hash = hashlib.sha256(target).hexdigest()
+        patch_hash = hashlib.sha256(patch_content).hexdigest()
+        full_name = f"IntDemo-UOS-arm64-{target_version}.deb"
+        patch_name = (
+            f"IntDemo-UOS-arm64-Patch-{APP_VERSION}-to-"
+            f"{target_version}.intdelta"
+        )
+
+        class DownloadResponse:
+            def __init__(self, content):
+                self.content = content
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            def iter_content(self, chunk_size):
+                assert chunk_size > 0
+                yield self.content
+
+        session = Mock()
+        session.headers = {}
+        session.get.side_effect = [
+            DownloadResponse(patch_content),
+            DownloadResponse(target),
+        ]
+        config = OnlineConfig(
+            base_url="https://203.0.113.10",
+            ca_bundle=str(self.database.path),
+        )
+        update = UpdateInfo(
+            version=target_version,
+            installer_url=f"https://203.0.113.10/updates/files/{patch_name}",
+            installer_name=patch_name,
+            sha256=patch_hash,
+            size=len(patch_content),
+            notes="",
+            package_kind="delta",
+            from_version=APP_VERSION,
+            platform_key="linux-aarch64",
+            full_installer_url=(
+                f"https://203.0.113.10/updates/files/{full_name}"
+            ),
+            full_installer_name=full_name,
+            full_sha256=target_hash,
+            full_size=len(target),
+            delta_format="uos-deb-xdelta-v1",
+            delta_algorithm="xdelta3",
+            base_sha256=base_hash,
+            base_size=len(base),
+            target_sha256=target_hash,
+            target_size=len(target),
+        )
+        previous_data = os.environ.get("INTDEMO_DATA_DIR")
+        previous_engine = os.environ.get("INTDEMO_XDELTA3_PATH")
+        os.environ["INTDEMO_DATA_DIR"] = self.temp_dir.name
+        os.environ["INTDEMO_XDELTA3_PATH"] = str(
+            Path(self.temp_dir.name) / "missing-xdelta3"
+        )
+        states = []
+        try:
+            updates = Path(self.temp_dir.name) / "updates"
+            updates.mkdir()
+            (updates / f"IntDemo-UOS-arm64-{APP_VERSION}.deb").write_bytes(base)
+            client = UpdateClient(
+                config,
+                session=session,
+                platform_key="linux-aarch64",
+            )
+            result = client.download(
+                update,
+                state_callback=lambda state, message: states.append(
+                    (state, message)
+                ),
+            )
+            self.assertEqual(result.read_bytes(), target)
+            self.assertEqual(result.name, full_name)
+            self.assertTrue(
+                (updates / "pending" / "pending-install.json").is_file()
+            )
+            self.assertIn("fallback_full", {state for state, _ in states})
+        finally:
+            if previous_data is None:
+                os.environ.pop("INTDEMO_DATA_DIR", None)
+            else:
+                os.environ["INTDEMO_DATA_DIR"] = previous_data
+            if previous_engine is None:
+                os.environ.pop("INTDEMO_XDELTA3_PATH", None)
+            else:
+                os.environ["INTDEMO_XDELTA3_PATH"] = previous_engine
 
     def test_update_manifest_prefers_matching_delta(self):
         full = b"full"

@@ -392,6 +392,38 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         )
         self.assertEqual([step.key for step in publish], ["publish"])
 
+    def test_uos_delta_source_is_independent_from_windows_delta_source(self):
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.3",
+            base_url="https://api.example.com",
+            notes="uos delta",
+            delta_from_version="1.2.1",
+            uos_delta_from_version="1.2.2",
+            build_windows=False,
+            build_uos=True,
+            remote_host="release-server",
+        )
+
+        with patch(
+            "release_publisher.core.is_native_uos_arm64_builder",
+            return_value=True,
+        ):
+            build_steps = build_package_steps(options)
+        publish_step = build_publish_steps(options)[0]
+
+        self.assertEqual(
+            [step.key for step in build_steps],
+            ["build_uos_package", "build_uos_delta", "export_uos_result"],
+        )
+        delta_step = build_steps[1]
+        self.assertIn("--from-version", delta_step.arguments)
+        self.assertIn("1.2.2", delta_step.arguments)
+        self.assertNotIn("1.2.1", delta_step.arguments)
+        self.assertIn("--uos-delta-from-version", build_steps[2].arguments)
+        self.assertIn("--delta-from-version", publish_step.arguments)
+        self.assertIn("--uos-delta-from-version", publish_step.arguments)
+
     def test_output_mode_can_separate_native_and_result_exports(self):
         uos_native = ReleaseOptions(
             repo_root=REPO_ROOT,

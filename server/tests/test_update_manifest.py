@@ -60,7 +60,24 @@ def update_manifest_file():
                     ),
                     "sha256": "c" * 64,
                     "size": 620_000_000,
-                }
+                },
+                "deltas": [
+                    {
+                        "format": "uos-deb-xdelta-v1",
+                        "algorithm": "xdelta3",
+                        "from_version": "0.2.4",
+                        "base_sha256": "d" * 64,
+                        "base_size": 619_000_000,
+                        "installer_path": (
+                            "/updates/files/IntDemo-UOS-arm64-Patch-"
+                            "0.2.4-to-0.2.5.intdelta"
+                        ),
+                        "sha256": "e" * 64,
+                        "size": 24_000_000,
+                        "target_sha256": "c" * 64,
+                        "target_size": 620_000_000,
+                    }
+                ],
             },
         },
     }
@@ -110,6 +127,53 @@ def test_uos_arm64_client_receives_deb_package(client, update_manifest_file):
     assert payload["installer_path"].endswith(".deb")
     assert payload["primary_kind"] == "full"
     assert response.headers["x-intdemo-platform"] == "linux-aarch64"
+    assert "deltas" not in payload
+
+
+def test_uos_delta_requires_explicit_client_capability(client, update_manifest_file):
+    _path, canonical = update_manifest_file
+    response = client.get(
+        "/updates/test.json",
+        headers={
+            "X-IntDemo-Version": "0.2.4",
+            "X-IntDemo-Platform": "linux-aarch64",
+            "X-IntDemo-Update-Capabilities": "uos-deb-xdelta-v1",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    delta = canonical["platforms"]["linux-aarch64"]["deltas"][0]
+    assert payload["installer_path"] == delta["installer_path"]
+    assert payload["primary_kind"] == "delta"
+    assert payload["primary_from_version"] == "0.2.4"
+    assert payload["full"] == canonical["platforms"]["linux-aarch64"]["full"]
+    assert response.headers["x-intdemo-update-package"] == "delta"
+
+
+@pytest.mark.parametrize("version", ["1.1.0", "1.1.1", "1.2.0", "0.2.4"])
+def test_old_uos_clients_always_receive_full_deb(
+    client,
+    update_manifest_file,
+    version,
+):
+    response = client.get(
+        "/updates/test.json",
+        headers={
+            "X-IntDemo-Version": version,
+            "X-IntDemo-Platform": "linux-aarch64",
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["installer_path"].endswith(".deb")
+    assert payload["primary_kind"] == "full"
+    assert "deltas" not in payload
+    nested = payload["platforms"]["linux-aarch64"]
+    assert "delta" not in nested
+    assert "deltas" not in nested
+    assert nested["full"]["installer_path"].endswith(".deb")
 
 
 def test_exact_version_receives_legacy_compatible_delta(client, update_manifest_file):

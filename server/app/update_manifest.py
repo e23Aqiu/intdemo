@@ -22,6 +22,8 @@ _PACKAGE_FIELDS = ("installer_path", "sha256", "size")
 _PACKAGE_KEYS = (*_PACKAGE_FIELDS, "full", "delta", "deltas")
 _PLATFORMS = {"windows-x86_64", "linux-aarch64"}
 _LEGACY_PLATFORM = "windows-x86_64"
+_UOS_DELTA_FORMAT = "uos-deb-xdelta-v1"
+_CAPABILITY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 
 
 def request_client_version(request: Request) -> str | None:
@@ -35,6 +37,20 @@ def request_client_version(request: Request) -> str | None:
 def request_client_platform(request: Request) -> str:
     explicit = request.headers.get("x-intdemo-platform", "").strip().casefold()
     return explicit if explicit in _PLATFORMS else _LEGACY_PLATFORM
+
+
+def request_update_capabilities(request: Request) -> frozenset[str]:
+    raw = request.headers.get("x-intdemo-update-capabilities", "")
+    if len(raw) > 512:
+        return frozenset()
+    values = {
+        item.strip().casefold()
+        for item in raw.split(",")
+        if item.strip()
+    }
+    return frozenset(
+        item for item in values if _CAPABILITY_PATTERN.fullmatch(item)
+    )
 
 
 def select_platform_manifest(
@@ -80,12 +96,37 @@ def matching_delta(payload: dict[str, Any], current_version: str | None) -> dict
 def select_manifest_package(
     payload: dict[str, Any],
     current_version: str | None,
+    *,
+    platform_key: str = _LEGACY_PLATFORM,
+    capabilities: frozenset[str] = frozenset(),
 ) -> tuple[dict[str, Any], str]:
     """Flatten the exact package into schema-v1 fields for legacy clients."""
 
     selected = dict(payload)
     full = payload.get("full") if isinstance(payload.get("full"), dict) else payload
     delta = matching_delta(payload, current_version)
+    if platform_key == "linux-aarch64" and (
+        delta is None
+        or str(delta.get("format") or "").strip().casefold()
+        != _UOS_DELTA_FORMAT
+        or _UOS_DELTA_FORMAT not in capabilities
+    ):
+        delta = None
+        # Do not expose optional UOS patch metadata to old clients. v1.1.0,
+        # v1.1.1 and v1.2.0 therefore see the same full-DEB response shape
+        # they already understand even when their version matches a patch.
+        selected.pop("delta", None)
+        selected.pop("deltas", None)
+        platforms = selected.get("platforms")
+        if isinstance(platforms, dict):
+            sanitized_platforms = dict(platforms)
+            nested_platform = sanitized_platforms.get(platform_key)
+            if isinstance(nested_platform, dict):
+                sanitized_platform = dict(nested_platform)
+                sanitized_platform.pop("delta", None)
+                sanitized_platform.pop("deltas", None)
+                sanitized_platforms[platform_key] = sanitized_platform
+                selected["platforms"] = sanitized_platforms
     package = delta if delta is not None else full
     kind = "delta" if delta is not None else "full"
 
@@ -119,6 +160,7 @@ def update_manifest(channel: str, request: Request) -> Response:
     payload = _load_manifest(settings.updates_dir / f"{channel}.json")
     current_version = request_client_version(request)
     platform_key = request_client_platform(request)
+    capabilities = request_update_capabilities(request)
     if payload.get("paused") is True:
         headers = {
             "Cache-Control": "no-store",
@@ -153,6 +195,8 @@ def update_manifest(channel: str, request: Request) -> Response:
     selected, package_kind = select_manifest_package(
         platform_manifest,
         current_version,
+        platform_key=platform_key,
+        capabilities=capabilities,
     )
     headers = {
         "Cache-Control": "no-store",

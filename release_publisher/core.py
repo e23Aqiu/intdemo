@@ -127,6 +127,7 @@ class ReleaseOptions:
     notes: str
     ca_bundle: str = ""
     delta_from_version: str = ""
+    uos_delta_from_version: str = ""
     channel: str = "test"
     mandatory: bool = False
     build_portable: bool = False
@@ -173,6 +174,20 @@ class ReleaseOptions:
             / "dist"
             / "uos-arm64"
             / f"IntDemo-UOS-arm64-{self.version}.deb"
+        )
+
+    @property
+    def uos_delta_installer(self) -> Path | None:
+        if not self.uos_delta_from_version:
+            return None
+        return (
+            self.repo_root
+            / "dist"
+            / "uos-arm64"
+            / (
+                f"IntDemo-UOS-arm64-Patch-{self.uos_delta_from_version}"
+                f"-to-{self.version}.intdelta"
+            )
         )
 
     @property
@@ -283,6 +298,10 @@ def _candidate_receipt_matches(
         receipt.get("delta_from_version") != options.delta_from_version
         or receipt.get("build_portable") is not bool(options.build_portable)
     ):
+        return False
+    if platform_key == "linux-aarch64" and str(
+        receipt.get("uos_delta_from_version") or ""
+    ) != options.uos_delta_from_version:
         return False
     artifacts = receipt.get("artifacts")
     if not isinstance(artifacts, dict) or not artifacts:
@@ -1220,6 +1239,34 @@ def validate_release_options(
         if (for_build or for_publish or for_pipeline) and not snapshot.is_file():
             errors.append(f"缺少增量来源快照：{snapshot}")
 
+    if options.uos_delta_from_version:
+        if not options.build_uos:
+            errors.append("UOS 增量更新必须选择统信 UOS ARM64")
+        try:
+            uos_delta_key = _version_key(options.uos_delta_from_version)
+            if target_key is not None and uos_delta_key >= target_key:
+                errors.append("UOS 增量来源版本必须低于目标版本")
+        except PublisherError as exc:
+            errors.append(str(exc))
+        source_receipt = (
+            root
+            / "dist"
+            / "release-results"
+            / options.uos_delta_from_version
+            / "publish-receipt.json"
+        )
+        source_deb = (
+            root
+            / "dist"
+            / "update-release"
+            / "files"
+            / f"IntDemo-UOS-arm64-{options.uos_delta_from_version}.deb"
+        )
+        if (for_build or for_publish or for_pipeline) and not source_receipt.is_file():
+            errors.append(f"缺少 UOS 增量来源发布收据：{source_receipt}")
+        if (for_build or for_publish or for_pipeline) and not source_deb.is_file():
+            errors.append(f"缺少真实已发布 UOS 来源 DEB：{source_deb}")
+
     if (
         os.name == "nt"
         and options.inno_compiler
@@ -1279,6 +1326,11 @@ def validate_release_options(
             errors.append(f"增量安装包不存在：{options.delta_installer}")
         if options.build_uos and not options.uos_installer.is_file():
             errors.append(f"UOS ARM64 安装包不存在：{options.uos_installer}")
+        if (
+            options.uos_delta_installer is not None
+            and not options.uos_delta_installer.is_file()
+        ):
+            errors.append(f"UOS ARM64 增量包不存在：{options.uos_delta_installer}")
         if not options.windows_result_receipt.is_file():
             errors.append(
                 f"缺少已校验的 Windows 构建收据：{options.windows_result_receipt}"
@@ -1626,6 +1678,54 @@ def build_package_steps(
                         working_directory=options.repo_root,
                     )
                 )
+                if options.uos_delta_from_version:
+                    source_deb = (
+                        options.repo_root
+                        / "dist"
+                        / "update-release"
+                        / "files"
+                        / (
+                            f"IntDemo-UOS-arm64-"
+                            f"{options.uos_delta_from_version}.deb"
+                        )
+                    )
+                    source_receipt = (
+                        options.repo_root
+                        / "dist"
+                        / "release-results"
+                        / options.uos_delta_from_version
+                        / "publish-receipt.json"
+                    )
+                    uos_steps.append(
+                        CommandStep(
+                            key="build_uos_delta",
+                            title=(
+                                "生成并回放验证 UOS ARM64 增量包 "
+                                f"{options.uos_delta_from_version} → "
+                                f"{options.version}"
+                            ),
+                            program=shutil.which("bash") or "bash",
+                            arguments=(
+                                str(
+                                    options.repo_root
+                                    / "scripts/uos-arm64/build-delta.sh"
+                                ),
+                                "--source-deb",
+                                str(source_deb),
+                                "--target-deb",
+                                str(options.uos_installer),
+                                "--from-version",
+                                options.uos_delta_from_version,
+                                "--target-version",
+                                options.version,
+                                "--source-receipt",
+                                str(source_receipt),
+                                "--output",
+                                str(options.uos_delta_installer),
+                            ),
+                            working_directory=options.repo_root,
+                        )
+                    )
             record_arguments = [
                 "--version",
                 options.version,
@@ -1636,6 +1736,10 @@ def build_package_steps(
             ]
             if options.ca_bundle:
                 record_arguments.extend(["--ca-bundle", options.ca_bundle])
+            if options.uos_delta_from_version:
+                record_arguments.extend(
+                    ["--uos-delta-from-version", options.uos_delta_from_version]
+                )
             if output_mode in {"result", "both"}:
                 uos_steps.append(
                     _release_task_step(
@@ -1663,6 +1767,10 @@ def build_package_steps(
                 remote_arguments.extend(["-IdentityFile", options.identity_file])
             if options.ca_bundle:
                 remote_arguments.extend(["-CaBundle", options.ca_bundle])
+            if options.uos_delta_from_version:
+                remote_arguments.extend(
+                    ["-UosDeltaFromVersion", options.uos_delta_from_version]
+                )
             if output_mode in {"result", "both"}:
                 remote_arguments.append("-ExportResult")
             uos_steps.append(
@@ -1763,6 +1871,10 @@ def build_uos_result_import_steps(
     ]
     if options.ca_bundle:
         arguments.extend(["--ca-bundle", options.ca_bundle])
+    if options.uos_delta_from_version:
+        arguments.extend(
+            ["--uos-delta-from-version", options.uos_delta_from_version]
+        )
     return [
         _release_task_step(
             options,
@@ -1794,6 +1906,10 @@ def build_publish_steps(options: ReleaseOptions) -> list[CommandStep]:
         arguments.extend(["--ca-bundle", options.ca_bundle])
     if options.delta_from_version:
         arguments.extend(["--delta-from-version", options.delta_from_version])
+    if options.uos_delta_from_version:
+        arguments.extend(
+            ["--uos-delta-from-version", options.uos_delta_from_version]
+        )
     if options.build_portable:
         arguments.append("--build-portable")
     if options.mandatory:

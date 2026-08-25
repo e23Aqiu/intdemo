@@ -204,6 +204,29 @@ class UpdatePromptDialog(FramelessDialog):
     def set_speed(self, bytes_per_second: float):
         self.speed_label.setText(f"下载速度：{_format_speed(bytes_per_second)}")
 
+    def set_preparing(self, message: str):
+        self._download_active = True
+        self.state_label.setText(message)
+        self.speed_label.hide()
+        self.progress.show()
+        self.progress.setRange(0, 0)
+        self.update_button.setEnabled(False)
+        self.update_button.setText("正在准备…")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("停止更新")
+
+    def set_fallback_full(self, message: str):
+        self._download_active = True
+        self.state_label.setText(message)
+        self.speed_label.show()
+        self.progress.show()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.update_button.setEnabled(False)
+        self.update_button.setText("正在下载…")
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("停止下载")
+
     def _restore_retry_state(self, message: str):
         self._download_active = False
         self.state_label.setText(message)

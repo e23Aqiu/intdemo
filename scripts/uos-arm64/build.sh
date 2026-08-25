@@ -122,6 +122,26 @@ if [[ ! -d "$browser_cache" ]]; then
   exit 1
 fi
 
+xdelta3_path="${INTDEMO_XDELTA3_PATH:-$(command -v xdelta3 || true)}"
+if [[ -z "$xdelta3_path" || ! -x "$xdelta3_path" ]]; then
+  echo "错误：缺少 ARM64 xdelta3；请先运行 prepare-env.sh。" >&2
+  exit 1
+fi
+xdelta_file_info="$(file -Lb "$xdelta3_path")"
+if [[ "$xdelta_file_info" != *"ARM aarch64"* && \
+      "$xdelta_file_info" != *"ARM64"* ]]; then
+  echo "错误：xdelta3 不是 ARM64 可执行文件：$xdelta_file_info" >&2
+  exit 1
+fi
+xdelta_ldd_output="$(ldd "$xdelta3_path" 2>&1 || true)"
+if grep -Fqi "not found" <<<"$xdelta_ldd_output"; then
+  echo "错误：xdelta3 存在缺失动态库：" >&2
+  echo "$xdelta_ldd_output" >&2
+  exit 1
+fi
+export INTDEMO_XDELTA3_PATH="$xdelta3_path"
+echo "内置补丁引擎: $xdelta3_path"
+
 version="$("$conda_cmd" run --prefix "$env_prefix" python -c 'from integrated_client.config import APP_VERSION; print(APP_VERSION)')"
 version="$(printf '%s' "$version" | tr -d '\r' | tail -n 1)"
 if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
@@ -368,6 +388,23 @@ chmod +x \
   "$package_root/uninstall-user.sh" \
   "$package_root/app/intdemo-client" \
   "$package_root/browser/chrome"
+bundled_xdelta3="$package_root/app/_internal/tools/xdelta3"
+if [[ ! -x "$bundled_xdelta3" ]]; then
+  echo "错误：PyInstaller 产物缺少可执行的内置 xdelta3：$bundled_xdelta3" >&2
+  exit 1
+fi
+bundled_xdelta_info="$(file -Lb "$bundled_xdelta3")"
+if [[ "$bundled_xdelta_info" != *"ARM aarch64"* && \
+      "$bundled_xdelta_info" != *"ARM64"* ]]; then
+  echo "错误：包内 xdelta3 架构无效：$bundled_xdelta_info" >&2
+  exit 1
+fi
+if [[ ! -f "$package_root/app/_internal/licenses/xdelta3/$(basename /usr/share/doc/xdelta3/copyright)" ]]; then
+  echo "错误：PyInstaller 产物缺少 xdelta3 许可证。" >&2
+  exit 1
+fi
+"$bundled_xdelta3" -V >/dev/null
+echo "包内 ARM64 补丁引擎检查: 正常"
 
 echo "=== 检查打包后的在线配置 ==="
 INTDEMO_CONNECTION_CONFIG="$package_root/client-online.json" \

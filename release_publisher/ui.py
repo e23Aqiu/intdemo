@@ -154,8 +154,13 @@ class ReleasePublisherWindow(QMainWindow):
         version_row.addWidget(self.sync_version_button)
         version_form.addRow("目标版本", version_row)
         self.delta_edit = QLineEdit()
-        self.delta_edit.setPlaceholderText("留空则不构建增量包，例如 0.2.5")
-        version_form.addRow("增量来源版本", self.delta_edit)
+        self.delta_edit.setPlaceholderText("留空则不构建 Windows 增量包")
+        version_form.addRow("Windows 增量来源", self.delta_edit)
+        self.uos_delta_edit = QLineEdit()
+        self.uos_delta_edit.setPlaceholderText(
+            "过渡版本留空；后续填写已发布的 UOS 基线版本"
+        )
+        version_form.addRow("UOS 增量来源", self.uos_delta_edit)
         self.channel_combo = QComboBox()
         self.channel_combo.addItem("test（当前客户端通道）", "test")
         self.channel_combo.addItem(
@@ -563,6 +568,7 @@ class ReleasePublisherWindow(QMainWindow):
         for edit in (
             self.version_edit,
             self.delta_edit,
+            self.uos_delta_edit,
             self.base_url_edit,
             self.ca_edit,
         ):
@@ -833,6 +839,9 @@ class ReleasePublisherWindow(QMainWindow):
         self.inno_edit.setEnabled(not native_uos and windows)
         self.uos_builder_host_edit.setEnabled(not native_uos and uos)
         self.uos_builder_path_edit.setEnabled(not native_uos and uos)
+        self.uos_delta_edit.setEnabled(
+            uos or bool(self.uos_delta_edit.text().strip())
+        )
         if self.process is None:
             self.import_windows_result_button.setEnabled(windows)
             self.import_uos_result_button.setEnabled(uos)
@@ -889,6 +898,7 @@ class ReleasePublisherWindow(QMainWindow):
             notes=self.notes_edit.toPlainText().strip(),
             ca_bundle=self.ca_edit.text().strip(),
             delta_from_version=self.delta_edit.text().strip(),
+            uos_delta_from_version=self.uos_delta_edit.text().strip(),
             channel=str(self.channel_combo.currentData()),
             mandatory=self.mandatory_check.isChecked(),
             build_portable=self.portable_check.isChecked(),
@@ -941,7 +951,8 @@ class ReleasePublisherWindow(QMainWindow):
             f"构建平台：{platform_label}\n"
             f"输出类型：{self.output_mode_combo.currentText()}\n"
             f"通道：{options.channel}\n"
-            f"增量来源：{options.delta_from_version or '无'}\n"
+            f"Windows 增量来源：{options.delta_from_version or '无'}\n"
+            f"UOS 增量来源：{options.uos_delta_from_version or '无'}\n"
             f"远程主机：{options.remote_host or '仅本地'}"
         )
         self._append_log(message)
@@ -1037,11 +1048,12 @@ class ReleasePublisherWindow(QMainWindow):
 
     def _confirm_publish(self, options: ReleaseOptions) -> bool:
         destination = options.remote_host or "本地 dist/update-release"
-        package = (
-            f"Windows 完整包 + {options.delta_from_version} 增量包 + UOS ARM64 DEB"
-            if options.delta_from_version
-            else "Windows x64 完整包 + UOS ARM64 DEB"
-        )
+        packages = ["Windows x64 完整包", "UOS ARM64 完整 DEB"]
+        if options.delta_from_version:
+            packages.append(f"Windows {options.delta_from_version} 增量包")
+        if options.uos_delta_from_version:
+            packages.append(f"UOS {options.uos_delta_from_version} 增量包")
+        package = " + ".join(packages)
         warning = "是（在线检查到后不可忽略）" if options.mandatory else "否"
         reply = QMessageBox.warning(
             self,

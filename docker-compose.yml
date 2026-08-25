@@ -32,7 +32,7 @@ services:
       args:
         PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
       dockerfile: Dockerfile
-    image: intdemo-api:1.2.0
+    image: intdemo-api:1.2.1
     restart: unless-stopped
     read_only: true
     tmpfs:

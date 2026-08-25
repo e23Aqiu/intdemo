@@ -245,6 +245,27 @@ class PersonalCenterPage(QWidget):
             self.update_action_btn.setEnabled(True)
             self.update_action_btn.setText("停止下载")
             self.update_action_btn.show()
+        elif state in {"reconstructing", "verifying_target"}:
+            self.update_downloaded = False
+            self.update_downloading = True
+            self.update_speed_label.hide()
+            self.update_progress.show()
+            self.update_progress.setRange(0, 0)
+            self.check_update_btn.setEnabled(False)
+            self.update_action_btn.setEnabled(True)
+            self.update_action_btn.setText("停止更新")
+            self.update_action_btn.show()
+        elif state == "fallback_full":
+            self.update_downloaded = False
+            self.update_downloading = True
+            self.update_speed_label.hide()
+            self.update_progress.show()
+            self.update_progress.setRange(0, 100)
+            self.update_progress.setValue(0)
+            self.check_update_btn.setEnabled(False)
+            self.update_action_btn.setEnabled(True)
+            self.update_action_btn.setText("停止下载")
+            self.update_action_btn.show()
         elif state == "cancelling":
             self.update_action_btn.setEnabled(False)
             self.update_action_btn.setText("正在停止…")

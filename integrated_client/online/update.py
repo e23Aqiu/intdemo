@@ -17,11 +17,18 @@ from ..platform_support import (
     update_platform_key,
 )
 from .config import OnlineConfig
+from .uos_delta import (
+    UOS_DELTA_ALGORITHM,
+    UOS_DELTA_FORMAT,
+    UosDeltaCache,
+    UosDeltaCancelled,
+    UosDeltaError,
+)
 
 _VERSION_PATTERN = re.compile(r"^\d+(?:\.\d+){1,3}$")
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PACKAGE_PATH_PATTERN = re.compile(
-    r"^/updates/files/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:exe|deb)$",
+    r"^/updates/files/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:exe|deb|intdelta)$",
     re.IGNORECASE,
 )
 _MAX_INSTALLER_BYTES = 2 * 1024 * 1024 * 1024
@@ -55,10 +62,50 @@ class UpdateInfo:
     package_kind: str = "full"
     from_version: str | None = None
     platform_key: str = ""
+    full_installer_url: str = ""
+    full_installer_name: str = ""
+    full_sha256: str = ""
+    full_size: int = 0
+    delta_format: str = ""
+    delta_algorithm: str = ""
+    base_sha256: str = ""
+    base_size: int = 0
+    target_sha256: str = ""
+    target_size: int = 0
 
     @property
     def is_delta(self) -> bool:
         return self.package_kind == "delta"
+
+    @property
+    def is_uos_delta(self) -> bool:
+        return self.is_delta and self.platform_key == UOS_UPDATE_PLATFORM
+
+    def full_fallback(self) -> UpdateInfo:
+        if not (
+            self.full_installer_url
+            and self.full_installer_name
+            and self.full_sha256
+            and self.full_size > 0
+        ):
+            raise UpdateError("更新清单缺少可回退的完整安装包")
+        return UpdateInfo(
+            version=self.version,
+            installer_url=self.full_installer_url,
+            installer_name=self.full_installer_name,
+            sha256=self.full_sha256,
+            size=self.full_size,
+            notes=self.notes,
+            mandatory=self.mandatory,
+            package_kind="full",
+            platform_key=self.platform_key,
+            full_installer_url=self.full_installer_url,
+            full_installer_name=self.full_installer_name,
+            full_sha256=self.full_sha256,
+            full_size=self.full_size,
+            target_sha256=self.full_sha256,
+            target_size=self.full_size,
+        )
 
 
 class UpdateClient:
@@ -89,6 +136,19 @@ class UpdateClient:
                 "X-IntDemo-Platform": self.platform_key,
             }
         )
+        self.uos_delta_cache: UosDeltaCache | None = None
+        if self.platform_key == UOS_UPDATE_PLATFORM:
+            self.session.headers.update(
+                {"X-IntDemo-Update-Capabilities": UOS_DELTA_FORMAT}
+            )
+            self.uos_delta_cache = UosDeltaCache(
+                current_version=self.current_version
+            )
+            try:
+                self.uos_delta_cache.confirm_pending()
+            except (OSError, UosDeltaError):
+                # Cache damage must never stop the application or full update.
+                pass
 
     @property
     def manifest_url(self) -> str:
@@ -106,14 +166,18 @@ class UpdateClient:
             "verify": self.config.ca_bundle or True,
         }
 
-    def _validated_package(self, payload: dict, *, label: str) -> dict:
+    def _validated_package(
+        self,
+        payload: dict,
+        *,
+        label: str,
+        expected_suffix: str | None = None,
+    ) -> dict:
         installer_path = str(payload.get("installer_path") or "").strip()
         if not _PACKAGE_PATH_PATTERN.fullmatch(installer_path):
             raise UpdateError(f"服务器{label}路径无效")
-        expected_suffix = (
-            ".exe"
-            if self.platform_key == WINDOWS_UPDATE_PLATFORM
-            else ".deb"
+        expected_suffix = expected_suffix or (
+            ".exe" if self.platform_key == WINDOWS_UPDATE_PLATFORM else ".deb"
         )
         if not installer_path.casefold().endswith(expected_suffix):
             raise UpdateError(f"服务器{label}与当前平台不匹配")
@@ -143,6 +207,43 @@ class UpdateClient:
             "installer_name": installer_path.rsplit("/", 1)[-1],
             "sha256": sha256,
             "size": size,
+        }
+
+    def _validated_uos_delta(self, payload: dict, *, full: dict) -> dict:
+        if str(payload.get("format") or "").strip() != UOS_DELTA_FORMAT:
+            raise UpdateError("服务器 UOS 增量包格式不受支持")
+        if str(payload.get("algorithm") or "").strip() != UOS_DELTA_ALGORITHM:
+            raise UpdateError("服务器 UOS 增量算法不受支持")
+        package = self._validated_package(
+            payload,
+            label="UOS 增量更新包",
+            expected_suffix=".intdelta",
+        )
+        base_sha256 = str(payload.get("base_sha256") or "").strip().lower()
+        target_sha256 = str(payload.get("target_sha256") or "").strip().lower()
+        if not _HASH_PATTERN.fullmatch(base_sha256):
+            raise UpdateError("服务器 UOS 增量基线校验值无效")
+        if not _HASH_PATTERN.fullmatch(target_sha256):
+            raise UpdateError("服务器 UOS 增量目标校验值无效")
+        try:
+            base_size = int(payload.get("base_size"))
+            target_size = int(payload.get("target_size"))
+        except (TypeError, ValueError) as exc:
+            raise UpdateError("服务器 UOS 增量基线或目标大小无效") from exc
+        if not 0 < base_size <= _MAX_INSTALLER_BYTES:
+            raise UpdateError("服务器 UOS 增量基线大小超出允许范围")
+        if not 0 < target_size <= _MAX_INSTALLER_BYTES:
+            raise UpdateError("服务器 UOS 增量目标大小超出允许范围")
+        if target_sha256 != full["sha256"] or target_size != full["size"]:
+            raise UpdateError("服务器 UOS 增量目标与完整 DEB 不一致")
+        return {
+            **package,
+            "delta_format": UOS_DELTA_FORMAT,
+            "delta_algorithm": UOS_DELTA_ALGORITHM,
+            "base_sha256": base_sha256,
+            "base_size": base_size,
+            "target_sha256": target_sha256,
+            "target_size": target_size,
         }
 
     def _platform_manifest(self, payload: dict) -> dict:
@@ -235,23 +336,39 @@ class UpdateClient:
             if isinstance(payload.get("full"), dict)
             else payload
         )
-        package = self._validated_package(full_payload, label="全量更新包")
+        full_package = self._validated_package(full_payload, label="全量更新包")
+        package = dict(full_package)
         package_kind = "full"
         from_version = None
         delta = self._matching_delta(payload, self.current_version)
         if delta is not None:
             try:
-                package = self._validated_package(delta, label="增量更新包")
+                if self.platform_key == UOS_UPDATE_PLATFORM:
+                    package = self._validated_uos_delta(
+                        delta,
+                        full=full_package,
+                    )
+                    cache = self.uos_delta_cache
+                    if cache is None or cache.locate_base(
+                        version=self.current_version,
+                        size=package["base_size"],
+                        sha256=package["base_sha256"],
+                    ) is None:
+                        raise UpdateError("本机没有可用的 UOS 增量基线")
+                else:
+                    package = self._validated_package(
+                        delta,
+                        label="增量更新包",
+                    )
             except UpdateError:
                 # A malformed optional delta must never prevent the full update.
-                package = self._validated_package(
-                    full_payload,
-                    label="全量更新包",
-                )
+                package = dict(full_package)
             else:
                 package_kind = "delta"
                 from_version = self.current_version
 
+        package.setdefault("target_sha256", full_package["sha256"])
+        package.setdefault("target_size", full_package["size"])
         return UpdateInfo(
             version=version,
             **package,
@@ -260,6 +377,10 @@ class UpdateClient:
             package_kind=package_kind,
             from_version=from_version,
             platform_key=self.platform_key,
+            full_installer_url=full_package["installer_url"],
+            full_installer_name=full_package["installer_name"],
+            full_sha256=full_package["sha256"],
+            full_size=full_package["size"],
         )
 
     @staticmethod
@@ -276,10 +397,63 @@ class UpdateClient:
         progress_callback=None,
         speed_callback=None,
         cancelled_callback=None,
+        state_callback=None,
     ) -> Path:
+        if update.is_uos_delta:
+            return self._download_uos_delta(
+                update,
+                progress_callback=progress_callback,
+                speed_callback=speed_callback,
+                cancelled_callback=cancelled_callback,
+                state_callback=state_callback,
+            )
+
+        destination = self._download_destination(update)
+        result = self._download_file(
+            update,
+            destination,
+            progress_callback=progress_callback,
+            speed_callback=speed_callback,
+            cancelled_callback=cancelled_callback,
+        )
+        if update.platform_key == UOS_UPDATE_PLATFORM:
+            cache = self.uos_delta_cache
+            if cache is None:
+                raise UpdateError("UOS 更新缓存不可用")
+            try:
+                cache.register_pending(
+                    result,
+                    version=update.version,
+                    size=update.size,
+                    sha256=update.sha256,
+                )
+            except UosDeltaError as exc:
+                raise UpdateError(str(exc)) from exc
+        return result
+
+    def _download_destination(self, update: UpdateInfo) -> Path:
+        if update.platform_key == UOS_UPDATE_PLATFORM:
+            cache = self.uos_delta_cache
+            if cache is None:
+                raise UpdateError("UOS 更新缓存不可用")
+            return cache.pending_path(
+                name=update.installer_name,
+                version=update.version,
+            )
         update_dir = get_data_dir() / "updates"
         update_dir.mkdir(parents=True, exist_ok=True)
-        destination = update_dir / update.installer_name
+        return update_dir / update.installer_name
+
+    def _download_file(
+        self,
+        update: UpdateInfo,
+        destination: Path,
+        *,
+        progress_callback=None,
+        speed_callback=None,
+        cancelled_callback=None,
+    ) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
         partial = destination.with_suffix(destination.suffix + ".part")
 
         def ensure_not_cancelled():
@@ -364,3 +538,81 @@ class UpdateClient:
             raise UpdateError(f"下载更新失败：{exc}") from exc
         finally:
             partial.unlink(missing_ok=True)
+
+    def _download_uos_delta(
+        self,
+        update: UpdateInfo,
+        *,
+        progress_callback=None,
+        speed_callback=None,
+        cancelled_callback=None,
+        state_callback=None,
+    ) -> Path:
+        cache = self.uos_delta_cache
+        if cache is None:
+            raise UpdateError("UOS 增量更新缓存不可用")
+
+        def fallback(reason: str) -> Path:
+            if state_callback is not None:
+                state_callback(
+                    "fallback_full",
+                    f"{reason}，已自动切换完整 UOS 更新包。",
+                )
+            full = update.full_fallback()
+            destination = self._download_destination(full)
+            result = self._download_file(
+                full,
+                destination,
+                progress_callback=progress_callback,
+                speed_callback=speed_callback,
+                cancelled_callback=cancelled_callback,
+            )
+            try:
+                return cache.register_pending(
+                    result,
+                    version=full.version,
+                    size=full.size,
+                    sha256=full.sha256,
+                )
+            except UosDeltaError as exc:
+                raise UpdateError(str(exc)) from exc
+
+        base = cache.locate_base(
+            version=str(update.from_version or self.current_version),
+            size=update.base_size,
+            sha256=update.base_sha256,
+        )
+        if base is None:
+            return fallback("本机增量基线不可用")
+        try:
+            patch_path = cache.patch_path(update.installer_name)
+            self._download_file(
+                update,
+                patch_path,
+                progress_callback=progress_callback,
+                speed_callback=speed_callback,
+                cancelled_callback=cancelled_callback,
+            )
+            # Revalidate after the network transfer in case the user cleaned
+            # the cache while the patch was downloading.
+            base = cache.locate_base(
+                version=str(update.from_version or self.current_version),
+                size=update.base_size,
+                sha256=update.base_sha256,
+            )
+            if base is None:
+                raise UosDeltaError("本机增量基线已被清理")
+            return cache.reconstruct(
+                base_path=base,
+                patch_path=patch_path,
+                target_name=update.full_installer_name,
+                target_version=update.version,
+                target_size=update.target_size,
+                target_sha256=update.target_sha256,
+                cancelled_callback=cancelled_callback,
+                state_callback=state_callback,
+            )
+        except (UpdateCancelled, UosDeltaCancelled):
+            raise UpdateCancelled("更新下载已停止")
+        except (UpdateError, UosDeltaError, OSError) as exc:
+            return fallback(str(exc) or "UOS 增量更新不可用")

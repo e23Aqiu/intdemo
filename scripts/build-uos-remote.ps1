@@ -22,6 +22,9 @@ param(
 
     [string]$IdentityFile = "",
 
+    [ValidatePattern('^$|^\d+\.\d+\.\d+$')]
+    [string]$UosDeltaFromVersion = "",
+
     [switch]$ExportResult
 )
 
@@ -107,6 +110,63 @@ if ($CaBundle) {
     }
     $remoteCaArgument = " --ca-bundle " + (Quote-Posix $remoteCaBundle)
 }
+$remoteDeltaCommand = ""
+$remoteDeltaExportArgument = ""
+if ($UosDeltaFromVersion) {
+    $sourceName = "IntDemo-UOS-arm64-$UosDeltaFromVersion.deb"
+    $localSourceDeb = Join-Path $repoRoot "dist\update-release\files\$sourceName"
+    $localSourceReceipt = Join-Path (
+        Join-Path $repoRoot "dist\release-results\$UosDeltaFromVersion"
+    ) "publish-receipt.json"
+    if (-not (Test-Path -LiteralPath $localSourceDeb -PathType Leaf)) {
+        throw "The real released UOS delta source DEB is missing: $localSourceDeb"
+    }
+    if (-not (Test-Path -LiteralPath $localSourceReceipt -PathType Leaf)) {
+        throw "The UOS delta source publish receipt is missing: $localSourceReceipt"
+    }
+    $remoteSourceDirectory = "$BuilderRepoPath/dist/update-release/files"
+    $remoteReceiptDirectory = (
+        "$BuilderRepoPath/dist/release-results/$UosDeltaFromVersion"
+    )
+    & ssh @sshArgs $BuilderHost (
+        "mkdir -p " + (Quote-Posix $remoteSourceDirectory) + " " +
+        (Quote-Posix $remoteReceiptDirectory)
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not create UOS delta source directories on the builder"
+    }
+    & scp @scpArgs $localSourceDeb (
+        "${BuilderHost}:$remoteSourceDirectory/$sourceName"
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not upload the real released UOS source DEB"
+    }
+    & scp @scpArgs $localSourceReceipt (
+        "${BuilderHost}:$remoteReceiptDirectory/publish-receipt.json"
+    )
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not upload the UOS source publish receipt"
+    }
+    $remoteTargetDeb = "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-$Version.deb"
+    $remotePatch = (
+        "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-Patch-" +
+        "$UosDeltaFromVersion-to-$Version.intdelta"
+    )
+    $remoteDeltaCommand = (
+        " && bash scripts/uos-arm64/build-delta.sh" +
+        " --source-deb " + (Quote-Posix "$remoteSourceDirectory/$sourceName") +
+        " --target-deb " + (Quote-Posix $remoteTargetDeb) +
+        " --from-version " + (Quote-Posix $UosDeltaFromVersion) +
+        " --target-version " + (Quote-Posix $Version) +
+        " --source-receipt " + (
+            Quote-Posix "$remoteReceiptDirectory/publish-receipt.json"
+        ) +
+        " --output " + (Quote-Posix $remotePatch)
+    )
+    $remoteDeltaExportArgument = (
+        " --uos-delta-from-version " + (Quote-Posix $UosDeltaFromVersion)
+    )
+}
 $remoteCommand = (
     "cd $quotedRepo" +
     " && test -z `"`$(git status --porcelain=v1)`"" +
@@ -117,12 +177,14 @@ $remoteCommand = (
     " && bash scripts/uos-arm64/build.sh" +
     " --base-url $quotedBaseUrl --channel $quotedChannel" +
     $remoteCaArgument +
+    $remoteDeltaCommand +
     $(
         if ($ExportResult) {
             " && ./.conda-uos-arm64/bin/python -m release_publisher.release_tasks" +
             " export-uos-result --version " + (Quote-Posix $Version) +
             " --base-url $quotedBaseUrl --channel $quotedChannel" +
             $remoteCaArgument +
+            $remoteDeltaExportArgument +
             " --output $quotedResultArchive --allow-detached"
         } else {
             ""
@@ -165,6 +227,32 @@ if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$' -or
 
 Write-Host "UOS ARM64 package downloaded: $artifact"
 Write-Host "SHA-256: $actualHash"
+if ($UosDeltaFromVersion) {
+    $patchName = (
+        "IntDemo-UOS-arm64-Patch-$UosDeltaFromVersion-to-$Version.intdelta"
+    )
+    $patch = Join-Path $outputRoot $patchName
+    $patchReport = "$patch.json"
+    $remotePatch = "$BuilderRepoPath/dist/uos-arm64/$patchName"
+    & scp @scpArgs "${BuilderHost}:$remotePatch" $patch
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not download the UOS ARM64 delta package"
+    }
+    & scp @scpArgs "${BuilderHost}:$remotePatch.json" $patchReport
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not download the UOS ARM64 delta report"
+    }
+    $reportPayload = Get-Content -LiteralPath $patchReport -Raw | ConvertFrom-Json
+    $actualPatchHash = (
+        Get-FileHash -LiteralPath $patch -Algorithm SHA256
+    ).Hash.ToLowerInvariant()
+    if ($reportPayload.eligible -ne $true -or
+        $reportPayload.byte_identical -ne $true -or
+        $actualPatchHash -ne ([string]$reportPayload.patch_sha256).ToLowerInvariant()) {
+        throw "The downloaded UOS ARM64 delta package failed report verification"
+    }
+    Write-Host "UOS ARM64 delta downloaded: $patch"
+}
 if ($ExportResult) {
     $resultRoot = Join-Path $repoRoot "dist\uos-build-results\$Version"
     New-Item -ItemType Directory -Force -Path $resultRoot | Out-Null

@@ -23,6 +23,20 @@ case "$(uname -m)" in
     ;;
 esac
 
+if ! command -v xdelta3 >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+错误：UOS 构建机缺少 xdelta3 构建依赖。
+请由系统管理员在构建机安装 ARM64 xdelta3，例如：
+  sudo apt install xdelta3
+它只会被复制进客户端完整 DEB，最终用户不需要另行安装。
+EOF
+  exit 1
+fi
+if [[ ! -f /usr/share/doc/xdelta3/copyright ]]; then
+  echo "错误：缺少 /usr/share/doc/xdelta3/copyright，无法合规打包补丁引擎。" >&2
+  exit 1
+fi
+
 find_conda() {
   if command -v conda >/dev/null 2>&1; then
     command -v conda

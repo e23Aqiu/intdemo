@@ -10,12 +10,12 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from integrated_client import browser, platform_support
-from integrated_client.tools.aiqicha_tool import create_browser
 from integrated_client.online.config import OnlineConfig
 from integrated_client.online.secure import (
     SecretServiceProtector,
     SecureStorageUnavailable,
 )
+from integrated_client.tools.aiqicha_tool import create_browser
 from integrated_client.ui import file_dialogs
 
 
@@ -977,6 +977,12 @@ class UosCompatibilityTests(unittest.TestCase):
         build_script = (root / "scripts/uos-arm64/build.sh").read_text(
             encoding="utf-8"
         )
+        spec = (root / "integrated_client_uos_arm64.spec").read_text(
+            encoding="utf-8"
+        )
+        prepare_script = (
+            root / "scripts/uos-arm64/prepare-env.sh"
+        ).read_text(encoding="utf-8")
         entrypoint = (root / "main.py").read_text(encoding="utf-8")
         self.assertIn("libgcc-ng>=12", environment)
         self.assertIn("libstdcxx-ng>=12", environment)
@@ -1003,6 +1009,10 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn('"$package_root/intdemo-client" --self-check', build_script)
         self.assertIn('runtime_self_check = "--self-check" in sys.argv', entrypoint)
         self.assertIn("app.inputMethod().locale()", entrypoint)
+        self.assertIn('binaries.append((str(xdelta3_path), "tools"))', spec)
+        self.assertIn('datas.append((str(xdelta_license)', spec)
+        self.assertIn("包内 ARM64 补丁引擎检查", build_script)
+        self.assertIn("最终用户不需要另行安装", prepare_script)
 
     def test_uos_package_contains_verified_online_service_config(self):
         root = Path(__file__).resolve().parents[1]

@@ -45,3 +45,11 @@ statistics: legacy client uploads are acknowledged for outbox compatibility but
 do not create metric or workflow rows, and existing rows are omitted from pull
 and snapshot results. Their permitted road/all scopes still expose centre-station
 statistics in the assigned data range.
+
+## UOS update compatibility
+
+Version 1.2.1 adds optional `uos-deb-xdelta-v1` capability negotiation to the
+update-manifest endpoint. UOS clients without the
+`X-IntDemo-Update-Capabilities` header—including v1.1.0, v1.1.1 and v1.2.0—
+continue to receive the complete DEB. This routing does not read or mutate
+access tokens, refresh sessions, account permissions or synchronization data.
