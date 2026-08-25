@@ -218,7 +218,10 @@ SFTP 会被终止并进入自动续传，服务器断点继续保留；大文件
 
 ## 4. 增量包规则
 
-增量包目前只用于 Windows；UOS 每次发布完整 DEB。Windows 增量来源版本必须满足：
+增量包目前只用于 Windows；UOS 每次发布完整 DEB。UOS ARM64 应用内增量更新仍处于
+设计与基准验证阶段，尚未启用，实施方案见
+[`UOS_ARM64_INCREMENTAL_UPDATE.md`](UOS_ARM64_INCREMENTAL_UPDATE.md)。
+Windows 增量来源版本必须满足：
 
 - 使用 `x.y.z` 格式；
 - 低于目标版本；

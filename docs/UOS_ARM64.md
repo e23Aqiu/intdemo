@@ -304,7 +304,8 @@ sudo apt remove com.e23aqiu.intdemo
    本机离线授权登录。
 4. “系统设置”显示版本并可检查更新；UOS 只接受 `linux-aarch64` 的 `.deb`，
    下载和 SHA-256 校验完成后打开 Deepin DEB 安装器；确认安装时应出现
-   PolicyKit 密码授权界面并完成安装。
+   PolicyKit 密码授权界面并完成安装。规划中的增量方案尚未启用，参见
+   [`UOS_ARM64_INCREMENTAL_UPDATE.md`](UOS_ARM64_INCREMENTAL_UPDATE.md)。
 5. “运行设置”中的 Chromium 健康检查通过，并显示软件包内
    `browser/chrome` 的真实路径和版本。
 6. 用一份脱敏 `.xlsx` 分别跑运输证、营运企业回填、爱企查；检查人工验证码、
