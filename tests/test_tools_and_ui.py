@@ -7319,6 +7319,7 @@ class ToolAndUiTests(unittest.TestCase):
             service.finish_run("succeeded")
 
         record_timing(luogang, "dashboard-hover-luogang-today", 3600)
+        record_timing(luogang, "dashboard-hover-luogang-yesterday", 7200)
         record_timing(taiping, "dashboard-hover-taiping-today", 1800)
 
         page = DashboardPage(self.db, self.admin)
@@ -7333,6 +7334,14 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(page.metric_cards["no_phone"].value_label.text(), "7")
         self.assertEqual(page.trend_chart._rows[-1]["has_phone"], 12)
         self.assertEqual(page.trend_chart._rows[-1]["no_phone"], 6)
+        station_actions = page.station_today_toggle.parentWidget()
+        self.assertIs(station_actions, page.station_view_toggle.parentWidget())
+        self.assertLess(
+            station_actions.layout().indexOf(page.station_today_toggle),
+            station_actions.layout().indexOf(page.station_view_toggle),
+        )
+        self.assertFalse(page.station_today_toggle.isChecked())
+        self.assertEqual(page.station_today_toggle.text(), "查看今日统计")
 
         page.station_combo.setCurrentIndex(
             page.station_combo.findData(luogang.id)
@@ -7446,9 +7455,63 @@ class ToolAndUiTests(unittest.TestCase):
             f"{luogang.name_label} · 总用时占比",
         )
         self.assertIn(
-            ("小时数", "1.0 小时"),
+            ("小时数", "3.0 小时"),
             page.station_share_chart._hover_card.details,
         )
+
+        global_values = {
+            key: card.value_label.text() for key, card in page.metric_cards.items()
+        }
+        violation_values = [
+            page.violation_table.item(row, 2).text()
+            for row in range(page.violation_table.rowCount())
+        ]
+        page.station_today_toggle.click()
+        self.app.processEvents()
+
+        self.assertTrue(page.station_today_toggle.isChecked())
+        self.assertEqual(page.station_today_toggle.text(), "查看累计统计")
+        today_station_row = next(
+            row
+            for row in page.station_share_chart._rows
+            if row["username"] == "luogang"
+        )
+        self.assertEqual(today_station_row["total"], 10)
+        self.assertEqual(today_station_row["phone"], 7)
+        self.assertEqual(today_station_row["no_phone"], 3)
+        self.assertEqual(today_station_row["total_ms"], 3600 * 1000)
+        self.assertEqual(
+            {key: card.value_label.text() for key, card in page.metric_cards.items()},
+            global_values,
+        )
+        self.assertEqual(
+            [
+                page.violation_table.item(row, 2).text()
+                for row in range(page.violation_table.rowCount())
+            ],
+            violation_values,
+        )
+
+        page.refresh()
+        self.assertTrue(page.station_today_toggle.isChecked())
+        refreshed_today_row = next(
+            row
+            for row in page.station_share_chart._rows
+            if row["username"] == "luogang"
+        )
+        self.assertEqual(refreshed_today_row["total"], 10)
+
+        page.station_today_toggle.click()
+        self.app.processEvents()
+        cumulative_station_row = next(
+            row
+            for row in page.station_share_chart._rows
+            if row["username"] == "luogang"
+        )
+        self.assertFalse(page.station_today_toggle.isChecked())
+        self.assertEqual(page.station_today_toggle.text(), "查看今日统计")
+        self.assertEqual(cumulative_station_row["total"], 15)
+        self.assertEqual(cumulative_station_row["total_ms"], 3 * 3600 * 1000)
         page.close()
         page.deleteLater()
 

@@ -886,12 +886,24 @@ class DashboardPage(QWidget):
         violation_body.addWidget(self.violation_table)
         analysis_layout.addWidget(violation_panel, 1, 0)
 
+        self.station_today_toggle = QPushButton("查看今日统计")
+        self.station_today_toggle.setObjectName("DashboardPanelAction")
+        self.station_today_toggle.setCheckable(True)
+        self.station_today_toggle.setToolTip(
+            "仅切换各站查询统计的今日/累计口径"
+        )
         self.station_view_toggle = QPushButton("查看占比图")
         self.station_view_toggle.setObjectName("DashboardPanelAction")
         self.station_view_toggle.setCheckable(True)
+        station_actions = QWidget()
+        station_actions_layout = QHBoxLayout(station_actions)
+        station_actions_layout.setContentsMargins(0, 0, 0, 0)
+        station_actions_layout.setSpacing(8)
+        station_actions_layout.addWidget(self.station_today_toggle)
+        station_actions_layout.addWidget(self.station_view_toggle)
         station_panel, station_body = self._panel(
             "各站查询统计",
-            self.station_view_toggle,
+            station_actions,
         )
         self.station_view_stack = QStackedWidget()
         self.station_table = self._table(
@@ -912,6 +924,7 @@ class DashboardPage(QWidget):
             persist=False,
         )
         self.station_view_toggle.toggled.connect(self._toggle_station_view)
+        self.station_today_toggle.toggled.connect(self._toggle_station_today)
         analysis_layout.addWidget(station_panel, 1, 1)
         analysis_layout.setRowStretch(0, 1)
         analysis_layout.setRowStretch(1, 1)
@@ -955,6 +968,12 @@ class DashboardPage(QWidget):
                 self.account_key,
                 "chart" if show_charts else "table",
             )
+
+    def _toggle_station_today(self, today_only):
+        self.station_today_toggle.setText(
+            "查看累计统计" if today_only else "查看今日统计"
+        )
+        self._refresh_station_statistics()
 
     def _toggle_yellow_only(self, checked):
         if self.client_preferences is not None and self.account_key:
@@ -1080,14 +1099,16 @@ class DashboardPage(QWidget):
         sign = "+" if difference > 0 else ""
         return f"较昨日 {sign}{difference} 条", "#6f8583"
 
-    def _station_rows(self):
+    def _station_rows(self, start_date=None, end_date=None):
         default_order = {
             username: index for index, (_, username) in enumerate(DEFAULT_STATION_USERS)
         }
         stations = {}
         yellow_only = self.yellow_only_check.isChecked()
         for row in self.database.get_all_account_totals(
-            yellow_only=yellow_only
+            start_date,
+            end_date,
+            yellow_only=yellow_only,
         ):
             if row["role"] != "user" or row["account_type"] != "station":
                 continue
@@ -1115,11 +1136,37 @@ class DashboardPage(QWidget):
         for row in rows:
             timing = self.database.get_workflow_timing_totals(
                 row["user_id"],
+                start_date=start_date,
+                end_date=end_date,
                 yellow_only=yellow_only,
             )
             row["no_phone"] = max(0, row["total"] - row["phone"])
             row["total_ms"] = int(timing["total_ms"])
         return rows
+
+    def _refresh_station_statistics(self):
+        today = date.today() if self.station_today_toggle.isChecked() else None
+        station_rows = self._station_rows(start_date=today, end_date=today)
+        self.station_share_chart.set_rows(station_rows)
+        self.station_table.setRowCount(len(station_rows))
+        for row_index, row in enumerate(station_rows):
+            values = (
+                row["station"],
+                f"{row['total']:,}",
+                f"{row['phone']:,}",
+                f"{row['no_phone']:,}",
+                f"{row['total_ms'] / MILLISECONDS_PER_HOUR:.1f} 小时",
+            )
+            for column, value in enumerate(values):
+                self._set_table_item(
+                    self.station_table,
+                    row_index,
+                    column,
+                    value,
+                    Qt.AlignCenter if column else Qt.AlignLeft | Qt.AlignVCenter,
+                    "#1d8178" if column in (1, 2) else None,
+                    bold=column == 1,
+                )
 
     @staticmethod
     def _set_table_item(table, row, column, value, alignment=None, color=None, bold=False):
@@ -1238,27 +1285,7 @@ class DashboardPage(QWidget):
                     bold=column == 2,
                 )
 
-        station_rows = self._station_rows()
-        self.station_share_chart.set_rows(station_rows)
-        self.station_table.setRowCount(len(station_rows))
-        for row_index, row in enumerate(station_rows):
-            values = (
-                row["station"],
-                f"{row['total']:,}",
-                f"{row['phone']:,}",
-                f"{row['no_phone']:,}",
-                f"{row['total_ms'] / MILLISECONDS_PER_HOUR:.1f} 小时",
-            )
-            for column, value in enumerate(values):
-                self._set_table_item(
-                    self.station_table,
-                    row_index,
-                    column,
-                    value,
-                    Qt.AlignCenter if column else Qt.AlignLeft | Qt.AlignVCenter,
-                    "#1d8178" if column in (1, 2) else None,
-                    bold=column == 1,
-                )
+        self._refresh_station_statistics()
 
         self.updated_label.setText(
             f"更新于 {datetime.now():%Y-%m-%d %H:%M:%S}"
