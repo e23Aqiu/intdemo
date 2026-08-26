@@ -3,7 +3,9 @@ import hashlib
 import json
 import os
 import runpy
+import shutil
 import ssl
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -743,6 +745,95 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertEqual(arguments[:2], ["/usr/bin/dpkg", "--install"])
         self.assertTrue(arguments[-1].endswith(".deb"))
 
+    def test_uos_layer_install_command_restarts_through_stable_launcher(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher = self._make_executable(Path(directory) / "intdemo-client")
+            with patch.object(
+                platform_support,
+                "update_platform_key",
+                return_value=platform_support.UOS_UPDATE_PLATFORM,
+            ), patch.dict(
+                os.environ,
+                {"INTDEMO_UOS_LAUNCHER": str(launcher)},
+                clear=False,
+            ):
+                program, arguments = platform_support.update_install_command(
+                    Path(directory) / "update.intlayer"
+                )
+
+        self.assertEqual(program, str(launcher.resolve()))
+        self.assertEqual(arguments[0], "--intdemo-apply-layer")
+        self.assertEqual(arguments[1], str(os.getpid()))
+
+    @unittest.skipUnless(
+        os.name == "posix" and shutil.which("bash"),
+        "requires a POSIX bash runtime",
+    )
+    def test_uos_launcher_trials_once_then_rolls_back_unconfirmed_layer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            data = root / "data"
+            layer = data / "uos-layers/versions/1.2.3"
+            output = root / "selected.txt"
+            for candidate in (package, layer):
+                (candidate / "app/_internal").mkdir(parents=True)
+                (candidate / "browser").mkdir()
+                app = candidate / "app/intdemo-client"
+                app.write_text(
+                    "#!/usr/bin/env bash\n"
+                    "printf '%s|%s\\n' \"${INTDEMO_LAYER_ROOT:-seed}\" "
+                    "\"${INTDEMO_LAYER_PENDING_VERSION:-}\" "
+                    "> \"$INTDEMO_TEST_OUTPUT\"\n",
+                    encoding="utf-8",
+                )
+                app.chmod(0o755)
+                browser_entry = candidate / "browser/chrome"
+                browser_entry.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+                browser_entry.chmod(0o755)
+            (package / "build-info.txt").write_text(
+                "version=1.2.2\n", encoding="ascii"
+            )
+            (layer / "layer-layout.json").write_text("{}\n", encoding="ascii")
+            launcher = package / "intdemo-client"
+            launcher.write_bytes(
+                (
+                    Path(__file__).resolve().parents[1]
+                    / "packaging/uos-arm64/intdemo-client"
+                ).read_bytes()
+            )
+            launcher.chmod(0o755)
+            marker_root = data / "uos-layers"
+            marker_root.mkdir(parents=True, exist_ok=True)
+            (marker_root / "pending-version").write_text(
+                "1.2.3\n", encoding="ascii"
+            )
+            environment = {
+                **os.environ,
+                "HOME": str(root / "home"),
+                "INTDEMO_DATA_DIR": str(data),
+                "INTDEMO_TEST_OUTPUT": str(output),
+            }
+
+            subprocess.run(
+                ["bash", str(launcher)],
+                check=True,
+                env=environment,
+            )
+            selected, pending = output.read_text(encoding="utf-8").strip().split("|")
+            self.assertEqual(Path(selected), layer)
+            self.assertEqual(pending, "1.2.3")
+            self.assertTrue((marker_root / "pending-attempted").is_file())
+
+            subprocess.run(
+                ["bash", str(launcher)],
+                check=True,
+                env=environment,
+            )
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "seed|")
+            self.assertFalse((marker_root / "pending-version").exists())
+            self.assertFalse((marker_root / "pending-attempted").exists())
+
     def test_uos_installer_environment_drops_bundled_runtime_paths(self):
         source = {
             "LD_LIBRARY_PATH": "/opt/intdemo/_internal",
@@ -885,7 +976,8 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("python -m playwright install chromium", prepare_script)
         self.assertIn('cp -a "$browser_source_dir/."', build_script)
         self.assertIn('browser/chrome', build_script)
-        self.assertIn('bundled_browser="$package_root/browser/chrome"', launcher)
+        self.assertIn('bundled_browser="$selected_root/browser/chrome"', launcher)
+        self.assertIn('INTDEMO_LAYER_PENDING_VERSION', launcher)
         self.assertIn("INTDEMO_CHROMIUM_PATH", launcher)
         self.assertIn("launcher.log", launcher)
         self.assertIn("GIO_LAUNCHED_DESKTOP_FILE", launcher)

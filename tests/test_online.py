@@ -669,7 +669,7 @@ class OnlineClientTests(unittest.TestCase):
         )
         self.assertEqual(
             session.headers["X-IntDemo-Update-Capabilities"],
-            "uos-deb-xdelta-v1",
+            "uos-layered-v1, uos-deb-xdelta-v1",
         )
 
         response.json.return_value["platforms"]["linux-aarch64"]["full"][

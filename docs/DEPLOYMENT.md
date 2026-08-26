@@ -227,6 +227,9 @@ CA 证书也是 HTTPS 校验的一部分。安装包位于
   -RemotePath /opt/intdemo/deploy/updates
 ```
 
+该兼容脚本的 UOS 参数直接发布完整 DEB。三层更新应使用双端打包发布器导入 UOS
+真机生成的标准结果 ZIP，避免绕过来源收据、布局回放和 50% 体积门禁。
+
 Compose 将服务器的 `deploy/updates/` 同时只读挂载给 API 和 Caddy。
 `/updates/test.json`、`/updates/stable.json` 和 `/updates/capabilities.json` 由
 API 处理；部署时必须同步更新 Caddy 配置，不能让能力地址落入静态
@@ -234,7 +237,8 @@ API 处理；部署时必须同步更新 Caddy 配置，不能让能力地址落
 `X-IntDemo-Platform`、`X-IntDemo-Version` 或 `IntDemoUpdater/<版本>` User-Agent
 动态选择 Windows x64/UOS ARM64 包；
 其余 `/updates/files/*` 仍由 Caddy 直接下载。只有当前版本精确匹配
-`deltas.from_version` 才返回增量包，其余情况返回完整包。
+`deltas.from_version` 才返回 Windows 增量包；UOS 还要求当前版本精确匹配
+`layered_updates.from_version` 并声明 `uos-layered-v1` 能力，其他情况返回完整包。
 
 打包发布器填写“仅允许更新的当前版本”后，清单会增加
 `eligible_client_versions`。API 只向当前版本精确位于列表中的客户端返回更新，
@@ -268,8 +272,9 @@ API 处理；部署时必须同步更新 Caddy 配置，不能让能力地址落
 检查仍以暂停前版本为准。
 
 客户端只接受与 API 相同主机、相同 HTTPS 信任链下的更新地址，并在运行
-安装包前核对清单声明的大小及 SHA-256。UOS 使用 `.deb` 并调用系统提权安装，
-Windows 使用 Inno Setup `.exe`。未购买 Windows 代码签名证书前，
+安装包前核对清单声明的大小及 SHA-256。UOS 完整更新使用 `.deb` 并调用系统提权
+安装；v1.2.2 之后的匹配客户端也可在用户目录应用 `.intlayer`，失败时回退完整
+DEB。Windows 使用 Inno Setup `.exe`。未购买 Windows 代码签名证书前，
 其他电脑首次运行安装包可能显示“未知发布者”；这不应通过关闭
 SmartScreen 或禁用 TLS 校验来规避，正式发布建议购买组织代码签名证书。
 

@@ -440,12 +440,21 @@ echo "Qt 插件隔离检查: 正常"
 
 if [[ -n "${DISPLAY:-}" ]]; then
   echo "=== 检查打包客户端的 XCB 图形初始化 ==="
+  self_check_data="$(mktemp -d "$pyinstaller_work/self-check-data.XXXXXX")"
+  cleanup_self_check_data() {
+    rm -rf -- "$self_check_data"
+  }
+  trap cleanup_self_check_data EXIT
+  INTDEMO_DATA_DIR="$self_check_data" \
   INTDEMO_QT_QPA_PLATFORM=xcb \
     QT_IM_MODULE=compose \
     "$package_root/intdemo-client" --self-check
+  INTDEMO_DATA_DIR="$self_check_data" \
   INTDEMO_QT_QPA_PLATFORM=xcb \
     QT_IM_MODULE=fcitx \
     "$package_root/intdemo-client" --self-check
+  cleanup_self_check_data
+  trap - EXIT
 else
   echo "提示：当前构建会话没有 DISPLAY，已跳过 XCB 真机启动检查。"
 fi
@@ -467,6 +476,16 @@ fi
   printf 'libstdcxx=%s\n' "$bundled_glibcxx_max"
   printf 'chromium=%s\n' "$("$browser_path" --version 2>&1 | head -n 1)"
 } > "$package_root/build-info.txt"
+
+echo "=== 生成 UOS 三层更新基线 ==="
+"$conda_cmd" run --prefix "$env_prefix" \
+  python -m integrated_client.online.uos_layers write-layout \
+  --package-root "$package_root" \
+  --version "$version"
+if [[ ! -f "$package_root/layer-layout.json" ]]; then
+  echo "错误：未生成 UOS 分层布局基线。" >&2
+  exit 1
+fi
 
 mkdir -p "$package_parent"
 tar -C "$package_parent" -czf "$artifact" "$package_name"

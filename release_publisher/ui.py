@@ -166,9 +166,9 @@ class ReleasePublisherWindow(QMainWindow):
         version_form.addRow("Windows 增量来源", self.delta_edit)
         self.uos_delta_edit = QLineEdit()
         self.uos_delta_edit.setPlaceholderText(
-            "过渡版本留空；后续填写已发布的 UOS 基线版本"
+            "填写已发布的 UOS 基线；不可分层时自动改发完整包"
         )
-        version_form.addRow("UOS 增量来源", self.uos_delta_edit)
+        version_form.addRow("UOS 分层来源", self.uos_delta_edit)
         self.channel_combo = QComboBox()
         self.channel_combo.addItem("test（当前客户端通道）", "test")
         self.channel_combo.addItem(
@@ -446,12 +446,13 @@ class ReleasePublisherWindow(QMainWindow):
         self.push_button.clicked.connect(self._push_changes)
         actions.addWidget(self.push_button, 1, 4, 1, 2)
 
-        baseline_label = QLabel("UOS 增量基线")
+        baseline_label = QLabel("UOS 分层基线")
         baseline_label.setObjectName("ActionGroupTitle")
         actions.addWidget(baseline_label, 2, 0)
         self.import_uos_delta_base_button = QPushButton("导入已发布基线包")
         self.import_uos_delta_base_button.setToolTip(
-            "在统信构建机导入 Windows 发布器导出的真实已发布 DEB 与发布收据"
+            "在统信构建机导入 Windows 发布器导出的真实已发布 DEB 与发布收据；"
+            "v1.2.2 起自动用于三层更新"
         )
         self.import_uos_delta_base_button.clicked.connect(
             self._import_uos_delta_base
@@ -459,7 +460,7 @@ class ReleasePublisherWindow(QMainWindow):
         actions.addWidget(self.import_uos_delta_base_button, 2, 1)
         self.export_uos_delta_base_button = QPushButton("导出已发布基线包")
         self.export_uos_delta_base_button.setToolTip(
-            "在 Windows 发布完成后导出基线包，带到统信真机构建下一版本补丁"
+            "在 Windows 发布完成后导出基线包，带到统信真机构建下一版本分层更新"
         )
         self.export_uos_delta_base_button.clicked.connect(
             self._export_uos_delta_base
@@ -997,7 +998,7 @@ class ReleasePublisherWindow(QMainWindow):
             f"输出类型：{self.output_mode_combo.currentText()}\n"
             f"通道：{options.channel}\n"
             f"Windows 增量来源：{options.delta_from_version or '无'}\n"
-            f"UOS 增量来源：{options.uos_delta_from_version or '无'}\n"
+            f"UOS 分层来源：{options.uos_delta_from_version or '无'}\n"
             "定向更新版本："
             f"{', '.join(options.eligible_client_versions) or '全部版本'}\n"
             f"远程主机：{options.remote_host or '仅本地'}"
@@ -1110,16 +1111,16 @@ class ReleasePublisherWindow(QMainWindow):
     def _import_uos_delta_base(self) -> None:
         selected, _ = QFileDialog.getOpenFileName(
             self,
-            "选择 UOS 增量基线包",
+            "选择 UOS 分层基线包",
             str(self.repo_root / "dist"),
-            "UOS 增量基线 (uos-delta-base*.zip);;ZIP 文件 (*.zip)",
+            "UOS 分层基线 (uos-delta-base*.zip);;ZIP 文件 (*.zip)",
         )
         if not selected:
             return
         try:
             version = detect_uos_delta_base_version(selected)
         except ReleaseTaskError as exc:
-            QMessageBox.warning(self, "无法识别 UOS 增量基线", str(exc))
+            QMessageBox.warning(self, "无法识别 UOS 分层基线", str(exc))
             return
         self.uos_delta_edit.setText(version)
         self._save_settings()
@@ -1135,7 +1136,7 @@ class ReleasePublisherWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "缺少来源版本",
-                "请先填写“UOS 增量来源”，再导出已发布基线包。",
+                "请先填写“UOS 分层来源”，再导出已发布基线包。",
             )
             return
         output = (
@@ -1148,12 +1149,12 @@ class ReleasePublisherWindow(QMainWindow):
         try:
             steps = build_uos_delta_base_export_steps(options, output)
         except PublisherError as exc:
-            QMessageBox.warning(self, "无法导出 UOS 增量基线", str(exc))
+            QMessageBox.warning(self, "无法导出 UOS 分层基线", str(exc))
             return
         self._save_settings()
         self._run_steps(
             steps,
-            completion_message=f"UOS 增量基线包已导出：{output}",
+            completion_message=f"UOS 分层基线包已导出：{output}",
         )
 
     def _confirm_publish(self, options: ReleaseOptions) -> bool:
@@ -1162,7 +1163,9 @@ class ReleasePublisherWindow(QMainWindow):
         if options.delta_from_version:
             packages.append(f"Windows {options.delta_from_version} 增量包")
         if options.uos_delta_from_version:
-            packages.append(f"UOS {options.uos_delta_from_version} 增量包")
+            packages.append(
+                f"UOS {options.uos_delta_from_version} 分层包（不合格自动完整包）"
+            )
         package = " + ".join(packages)
         warning = "是（在线检查到后不可忽略）" if options.mandatory else "否"
         audience = (

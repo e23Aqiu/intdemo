@@ -544,6 +544,21 @@ class ReleaseTasksTests(unittest.TestCase):
                     "ca_bundle": "certs/root.crt",
                 },
             )
+            (package / "app/_internal").mkdir(parents=True)
+            (package / "browser").mkdir()
+            launcher = package / "intdemo-client"
+            launcher.write_bytes(b"stable launcher")
+            launcher.chmod(0o755)
+            app = package / "app/intdemo-client"
+            app.write_bytes(b"arm64 app")
+            app.chmod(0o755)
+            (package / "app/_internal/runtime.bin").write_bytes(b"runtime")
+            browser = package / "browser/chrome"
+            browser.write_bytes(b"chromium")
+            browser.chmod(0o755)
+            from integrated_client.online.uos_layers import write_layout
+
+            write_layout(package, "1.2.3")
             deb = root / "dist" / "uos-arm64" / "IntDemo-UOS-arm64-1.2.3.deb"
             deb.write_bytes(b"deb package")
             with (
@@ -797,6 +812,68 @@ class ReleaseTasksTests(unittest.TestCase):
                 )
             self.assertEqual(packaged.name, "IntDemo-UOS-arm64-1.2.3.deb")
 
+    def test_uos_result_export_keeps_full_fallback_report_without_layer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            installer = (
+                root / "dist/uos-arm64/IntDemo-UOS-arm64-1.2.3.deb"
+            )
+            report = (
+                root
+                / "dist/uos-arm64/IntDemo-UOS-arm64-Layers-"
+                "1.2.2-to-1.2.3.intlayer.json"
+            )
+            installer.parent.mkdir(parents=True)
+            installer.write_bytes(b"validated uos installer")
+            report.write_text('{"eligible": false}', encoding="utf-8")
+            receipt_path = (
+                root
+                / "dist/uos-build-results/1.2.3/validated-result.json"
+            )
+            tasks.write_json(
+                receipt_path,
+                {
+                    "schema_version": 1,
+                    "platform": "linux-aarch64",
+                    "version": "1.2.3",
+                    "source_commit": COMMIT,
+                    "base_url": "https://api.example.com",
+                    "channel": "test",
+                    "ca_sha256": "",
+                    "validated_at": "2026-08-05T00:01:00Z",
+                    "uos_delta_from_version": "1.2.2",
+                    "uos_update_kind": "full",
+                    "artifacts": {
+                        "uos_installer": tasks.receipt_artifact(root, installer),
+                        "uos_layer_report": tasks.receipt_artifact(root, report),
+                    },
+                },
+            )
+            output = root / "uos-result.zip"
+            with patch.object(tasks, "record_uos_result", return_value=receipt_path):
+                tasks.export_uos_result(
+                    root,
+                    version="1.2.3",
+                    base_url="https://api.example.com",
+                    channel="test",
+                    ca_bundle="",
+                    uos_delta_from_version="1.2.2",
+                    output=output,
+                )
+
+            with zipfile.ZipFile(output) as archive:
+                payload = tasks.validate_uos_result_payload(
+                    json.loads(archive.read(tasks.UOS_RESULT_FILE))
+                )
+                self.assertEqual(payload["uos_update_kind"], "full")
+                self.assertEqual(
+                    set(payload["artifacts"]),
+                    {"uos_installer", "uos_layer_report"},
+                )
+                self.assertFalse(
+                    any(name.endswith(".intlayer") for name in archive.namelist())
+                )
+
     def test_dual_manifest_keeps_legacy_windows_fields(self):
         windows = {"name": "setup.exe", "size": 10, "sha256": "1" * 64}
         uos = {"name": "client.deb", "size": 20, "sha256": "2" * 64}
@@ -858,6 +935,147 @@ class ReleaseTasksTests(unittest.TestCase):
         self.assertEqual(delta["target_sha256"], uos["sha256"])
         self.assertEqual(delta["target_size"], uos["size"])
         self.assertEqual(delta["installer_path"], "/updates/files/client.intdelta")
+
+    def test_dual_manifest_can_publish_capability_gated_uos_layers(self):
+        windows = {"name": "setup.exe", "size": 10, "sha256": "1" * 64}
+        uos = {"name": "client.deb", "size": 200, "sha256": "2" * 64}
+        layer = {
+            "name": "client.intlayer",
+            "size": 40,
+            "sha256": "3" * 64,
+            "source_layout_sha256": "4" * 64,
+            "target_layout_sha256": "5" * 64,
+        }
+
+        manifest = tasks.prepare_update_manifest(
+            version="1.2.3",
+            channel="stable",
+            source_commit=COMMIT,
+            notes="layered release",
+            mandatory=False,
+            windows=windows,
+            uos=uos,
+            delta=None,
+            delta_from_version="",
+            uos_layer=layer,
+            uos_delta_from_version="1.2.2",
+        )
+
+        selected = manifest["platforms"]["linux-aarch64"][
+            "layered_updates"
+        ][0]
+        self.assertEqual(selected["format"], "uos-layered-v1")
+        self.assertEqual(selected["from_version"], "1.2.2")
+        self.assertEqual(selected["source_layout_sha256"], "4" * 64)
+        self.assertEqual(selected["target_layout_sha256"], "5" * 64)
+        self.assertEqual(selected["target_sha256"], uos["sha256"])
+        self.assertEqual(selected["installer_path"], "/updates/files/client.intlayer")
+
+    def test_uos_layer_report_allows_explicit_full_fallback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = (
+                root
+                / "dist/update-release/files/IntDemo-UOS-arm64-1.2.2.deb"
+            )
+            target = root / "dist/uos-arm64/IntDemo-UOS-arm64-1.2.3.deb"
+            layer = (
+                root
+                / "dist/uos-arm64/IntDemo-UOS-arm64-Layers-"
+                "1.2.2-to-1.2.3.intlayer"
+            )
+            receipt_path = (
+                root / "dist/release-results/1.2.2/publish-receipt.json"
+            )
+            source.parent.mkdir(parents=True)
+            target.parent.mkdir(parents=True)
+            receipt_path.parent.mkdir(parents=True)
+            source.write_bytes(b"s" * 90)
+            target.write_bytes(b"t" * 100)
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "version": "1.2.2",
+                        "artifacts": {
+                            "uos_installer": {
+                                "name": source.name,
+                                "size": source.stat().st_size,
+                                "sha256": tasks.sha256(source),
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            report_path = layer.with_suffix(".intlayer.json")
+            report = {
+                "schema_version": 1,
+                "format": "uos-layered-v1",
+                "platform": "linux-aarch64",
+                "from_version": "1.2.2",
+                "target_version": "1.2.3",
+                "source_name": source.name,
+                "source_size": source.stat().st_size,
+                "source_sha256": tasks.sha256(source),
+                "target_name": target.name,
+                "target_size": target.stat().st_size,
+                "target_sha256": tasks.sha256(target),
+                "archive_name": layer.name,
+                "archive_size": 0,
+                "archive_sha256": "",
+                "source_layout_sha256": "",
+                "target_layout_sha256": "6" * 64,
+                "changed_layers": [],
+                "replay_verified": False,
+                "eligible": False,
+                "fallback_to_full": True,
+                "reason": "source_layout_missing",
+            }
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+
+            candidate, validated_report, loaded = (
+                tasks.validate_uos_layer_candidate(
+                    root,
+                    from_version="1.2.2",
+                    target_version="1.2.3",
+                    target_deb=target,
+                )
+            )
+
+            self.assertIsNone(candidate)
+            self.assertEqual(validated_report, report_path)
+            self.assertEqual(loaded["reason"], "source_layout_missing")
+
+            layer.write_bytes(b"layer" * 5)
+            report.update(
+                {
+                    "archive_size": layer.stat().st_size,
+                    "archive_sha256": tasks.sha256(layer),
+                    "source_layout_sha256": "5" * 64,
+                    "source_bootstrap_sha256": "7" * 64,
+                    "target_bootstrap_sha256": "7" * 64,
+                    "changed_layers": ["app"],
+                    "replay_verified": True,
+                    "eligible": True,
+                    "fallback_to_full": False,
+                    "reason": "",
+                }
+            )
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            with patch(
+                "integrated_client.online.uos_layers.read_layer_manifest",
+                return_value={"changed_layers": ["app"]},
+            ):
+                candidate, _validated_report, _loaded = (
+                    tasks.validate_uos_layer_candidate(
+                        root,
+                        from_version="1.2.2",
+                        target_version="1.2.3",
+                        target_deb=target,
+                    )
+                )
+            self.assertEqual(candidate, layer)
 
     def test_uos_delta_candidate_requires_real_released_base_and_replay_report(self):
         with tempfile.TemporaryDirectory() as directory:

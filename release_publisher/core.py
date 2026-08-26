@@ -207,6 +207,25 @@ class ReleaseOptions:
         )
 
     @property
+    def uos_layer_installer(self) -> Path | None:
+        if not self.uos_delta_from_version:
+            return None
+        return (
+            self.repo_root
+            / "dist"
+            / "uos-arm64"
+            / (
+                f"IntDemo-UOS-arm64-Layers-{self.uos_delta_from_version}"
+                f"-to-{self.version}.intlayer"
+            )
+        )
+
+    @property
+    def uos_layer_report(self) -> Path | None:
+        package = self.uos_layer_installer
+        return package.with_suffix(package.suffix + ".json") if package else None
+
+    @property
     def snapshot_path(self) -> Path:
         return (
             self.repo_root
@@ -1277,11 +1296,11 @@ def validate_release_options(
 
     if options.uos_delta_from_version:
         if not options.build_uos:
-            errors.append("UOS 增量更新必须选择统信 UOS ARM64")
+            errors.append("UOS 分层更新必须选择统信 UOS ARM64")
         try:
             uos_delta_key = _version_key(options.uos_delta_from_version)
             if target_key is not None and uos_delta_key >= target_key:
-                errors.append("UOS 增量来源版本必须低于目标版本")
+                errors.append("UOS 分层来源版本必须低于目标版本")
         except PublisherError as exc:
             errors.append(str(exc))
         source_receipt = (
@@ -1299,7 +1318,7 @@ def validate_release_options(
             / f"IntDemo-UOS-arm64-{options.uos_delta_from_version}.deb"
         )
         if (for_build or for_publish or for_pipeline) and not source_receipt.is_file():
-            errors.append(f"缺少 UOS 增量来源发布收据：{source_receipt}")
+            errors.append(f"缺少 UOS 分层来源发布收据：{source_receipt}")
         if (for_build or for_publish or for_pipeline) and not source_deb.is_file():
             errors.append(f"缺少真实已发布 UOS 来源 DEB：{source_deb}")
 
@@ -1363,10 +1382,10 @@ def validate_release_options(
         if options.build_uos and not options.uos_installer.is_file():
             errors.append(f"UOS ARM64 安装包不存在：{options.uos_installer}")
         if (
-            options.uos_delta_installer is not None
-            and not options.uos_delta_installer.is_file()
+            options.uos_layer_report is not None
+            and not options.uos_layer_report.is_file()
         ):
-            errors.append(f"UOS ARM64 增量包不存在：{options.uos_delta_installer}")
+            errors.append(f"UOS ARM64 分层构建报告不存在：{options.uos_layer_report}")
         if not options.windows_result_receipt.is_file():
             errors.append(
                 f"缺少已校验的 Windows 构建收据：{options.windows_result_receipt}"
@@ -1736,7 +1755,7 @@ def build_package_steps(
                         CommandStep(
                             key="build_uos_delta",
                             title=(
-                                "生成并回放验证 UOS ARM64 增量包 "
+                                "生成并回放验证 UOS ARM64 分层更新包 "
                                 f"{options.uos_delta_from_version} → "
                                 f"{options.version}"
                             ),
@@ -1744,12 +1763,18 @@ def build_package_steps(
                             arguments=(
                                 str(
                                     options.repo_root
-                                    / "scripts/uos-arm64/build-delta.sh"
+                                    / "scripts/uos-arm64/build-layers.sh"
                                 ),
                                 "--source-deb",
                                 str(source_deb),
                                 "--target-deb",
                                 str(options.uos_installer),
+                                "--target-root",
+                                str(
+                                    options.repo_root
+                                    / "dist/uos-arm64/package"
+                                    / f"IntDemo-UOS-arm64-{options.version}"
+                                ),
                                 "--from-version",
                                 options.uos_delta_from_version,
                                 "--target-version",
@@ -1757,7 +1782,9 @@ def build_package_steps(
                                 "--source-receipt",
                                 str(source_receipt),
                                 "--output",
-                                str(options.uos_delta_installer),
+                                str(options.uos_layer_installer),
+                                "--report",
+                                str(options.uos_layer_report),
                             ),
                             working_directory=options.repo_root,
                         )
@@ -1927,12 +1954,12 @@ def build_uos_delta_base_export_steps(
     output: str | Path,
 ) -> list[CommandStep]:
     if not options.uos_delta_from_version:
-        raise PublisherError("请先填写 UOS 增量来源版本")
+        raise PublisherError("请先填写 UOS 分层来源版本")
     return [
         _release_task_step(
             options,
             key="export_uos_delta_base",
-            title=f"导出 UOS {options.uos_delta_from_version} 增量基线包",
+            title=f"导出 UOS {options.uos_delta_from_version} 分层基线包",
             command="export-uos-delta-base",
             arguments=(
                 "--version",
@@ -1952,7 +1979,7 @@ def build_uos_delta_base_import_steps(
         _release_task_step(
             options,
             key="import_uos_delta_base",
-            title="导入已发布的 UOS 增量基线",
+            title="导入已发布的 UOS 分层基线",
             command="import-uos-delta-base",
             arguments=(
                 "--base-archive",

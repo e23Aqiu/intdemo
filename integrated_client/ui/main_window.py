@@ -1,6 +1,7 @@
 import os
 import threading
 from dataclasses import replace
+from pathlib import Path
 
 from PyQt5.QtCore import (
     QProcess,
@@ -1279,7 +1280,12 @@ class MainWindow(FramelessMainWindow):
             QMessageBox.warning(self, "检查更新失败", message)
         elif state == "downloading":
             self._set_update_busy(True)
-        elif state in {"reconstructing", "verifying_target"}:
+        elif state in {
+            "reconstructing",
+            "verifying_target",
+            "preparing_layers",
+            "verifying_layers",
+        }:
             self._set_update_busy(True)
             dialog = self.update_dialog
             if dialog is not None:
@@ -1322,23 +1328,40 @@ class MainWindow(FramelessMainWindow):
         self.downloaded_installer_path = installer_path
         self._set_update_busy(False)
         self._set_update_prompt_blocked(False)
+        layered = Path(installer_path).suffix.casefold() == ".intlayer"
         self.personal_center_page.set_update_state(
             "downloaded",
-            "更新包已下载并校验完成，需要重启程序并运行安装程序。",
+            (
+                "分层更新已校验并准备完成，重启后自动切换。"
+                if layered
+                else "更新包已下载并校验完成，需要重启程序并运行安装程序。"
+            ),
         )
         dialog = self.update_dialog
         if dialog is not None:
-            dialog.set_downloaded()
+            dialog.set_downloaded(layered=layered)
             return
         running = bool(getattr(self.workflow_page, "pipeline_running", False))
         reply = QMessageBox.question(
             self,
             "更新下载完成",
-            "更新包已下载并通过 SHA-256 校验。\n\n"
+            (
+                "分层更新已下载、组装并通过校验。\n\n"
+                if layered
+                else "更新包已下载并通过 SHA-256 校验。\n\n"
+            )
             + (
-                "安装需要保存已完成数据并停止当前业务。是否现在安装？"
+                (
+                    "应用更新需要保存已完成数据并停止当前业务。是否现在重启？"
+                    if layered
+                    else "安装需要保存已完成数据并停止当前业务。是否现在安装？"
+                )
                 if running
-                else "安装会关闭程序。是否现在安装？"
+                else (
+                    "应用更新会关闭并重启程序。是否现在继续？"
+                    if layered
+                    else "安装会关闭程序。是否现在安装？"
+                )
             ),
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -1350,11 +1373,13 @@ class MainWindow(FramelessMainWindow):
         if installer_path is None:
             return
         running = bool(getattr(self.workflow_page, "pipeline_running", False))
+        layered = Path(installer_path).suffix.casefold() == ".intlayer"
+        action = "应用分层更新" if layered else "安装更新"
         message = (
-            "安装更新必须停止当前业务处理并关闭程序。\n\n"
-            "确定现在保存已完成数据、停止业务并安装吗？"
+            f"{action}必须停止当前业务处理并关闭程序。\n\n"
+            f"确定现在保存已完成数据、停止业务并{action}吗？"
             if running
-            else "安装更新将关闭当前程序。\n\n确定现在安装吗？"
+            else f"{action}将关闭当前程序。\n\n确定现在继续吗？"
         )
         if not confirmed:
             reply = QMessageBox.question(

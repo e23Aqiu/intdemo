@@ -64,10 +64,13 @@ class UpdatePromptDialog(FramelessDialog):
         self.version_label.setObjectName("UpdateVersion")
         version_row.addWidget(version_caption)
         version_row.addWidget(self.version_label)
+        package_kind = (
+            "分层更新"
+            if update.is_layered
+            else ("增量更新" if update.is_delta else "完整更新")
+        )
         package_label = QLabel(
-            f"增量更新 · {update.size / 1024 / 1024:.1f} MB"
-            if update.is_delta
-            else f"完整更新 · {update.size / 1024 / 1024:.1f} MB"
+            f"{package_kind} · {update.size / 1024 / 1024:.1f} MB"
         )
         package_label.setObjectName("UpdatePackageBadge")
         version_row.addWidget(package_label)
@@ -248,18 +251,23 @@ class UpdatePromptDialog(FramelessDialog):
     def set_error(self, message: str):
         self._restore_retry_state(f"更新失败：{message}")
 
-    def set_downloaded(self):
+    def set_downloaded(self, *, layered=None):
         self._download_active = False
         self._downloaded = True
+        layered = self.update.is_layered if layered is None else bool(layered)
         self.speed_label.hide()
         self.progress.setRange(0, 100)
         self.progress.setValue(100)
         self.progress.setFormat("100% · 下载及校验完成")
         self.state_label.setText(
-            "更新包已准备完成。安装会退出程序，请先结束并保存正在处理的业务。"
+            "分层更新已准备完成。重启后自动切换，新版本启动失败会自动回退。"
+            if layered
+            else "更新包已准备完成。安装会退出程序，请先结束并保存正在处理的业务。"
         )
         self.update_button.setEnabled(True)
-        self.update_button.setText("重启并安装")
+        self.update_button.setText(
+            "重启并应用" if layered else "重启并安装"
+        )
         self.ignore_button.hide()
         self.background_button.hide()
         if not self.mandatory:

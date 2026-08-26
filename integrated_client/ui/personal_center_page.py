@@ -198,11 +198,12 @@ class PersonalCenterPage(QWidget):
         self.update_notes.setPlainText(
             update.notes or "本次更新包含功能改进和问题修复。"
         )
-        package_label = (
-            f"增量更新包 {update.size / 1024 / 1024:.1f} MB"
-            if update.is_delta
-            else f"完整更新包 {update.size / 1024 / 1024:.1f} MB"
+        package_kind = (
+            "分层更新包"
+            if update.is_layered
+            else ("增量更新包" if update.is_delta else "完整更新包")
         )
+        package_label = f"{package_kind} {update.size / 1024 / 1024:.1f} MB"
         self.update_status_label.setText(
             "发现强制更新，必须安装后才能继续使用。"
             if update.mandatory

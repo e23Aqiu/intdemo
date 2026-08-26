@@ -78,6 +78,20 @@ def update_manifest_file():
                         "target_size": 620_000_000,
                     }
                 ],
+                "layered_updates": [
+                    {
+                        "format": "uos-layered-v1",
+                        "from_version": "0.2.4",
+                        "source_layout_sha256": "f" * 64,
+                        "target_layout_sha256": "1" * 64,
+                        "installer_path": (
+                            "/updates/files/IntDemo-UOS-arm64-Layers-"
+                            "0.2.4-to-0.2.5.intlayer"
+                        ),
+                        "sha256": "2" * 64,
+                        "size": 8_000_000,
+                    }
+                ],
             },
         },
     }
@@ -136,6 +150,7 @@ def test_update_server_advertises_source_version_targeting(client):
     assert response.status_code == 200
     assert response.headers["cache-control"] == "no-store"
     assert "source-version-targeting-v1" in response.json()["capabilities"]
+    assert "uos-layered-v1" in response.json()["capabilities"]
 
 
 def test_targeted_update_only_reaches_exact_client_versions(
@@ -213,7 +228,33 @@ def test_uos_delta_requires_explicit_client_capability(client, update_manifest_f
     assert response.headers["x-intdemo-update-package"] == "delta"
 
 
-@pytest.mark.parametrize("version", ["1.1.0", "1.1.1", "1.2.0", "0.2.4"])
+def test_uos_layered_update_is_preferred_with_explicit_capability(
+    client, update_manifest_file
+):
+    _path, canonical = update_manifest_file
+    response = client.get(
+        "/updates/test.json",
+        headers={
+            "X-IntDemo-Version": "0.2.4",
+            "X-IntDemo-Platform": "linux-aarch64",
+            "X-IntDemo-Update-Capabilities": (
+                "uos-layered-v1, uos-deb-xdelta-v1"
+            ),
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    layered = canonical["platforms"]["linux-aarch64"]["layered_updates"][0]
+    assert payload["installer_path"] == layered["installer_path"]
+    assert payload["primary_kind"] == "layered"
+    assert payload["primary_from_version"] == "0.2.4"
+    assert response.headers["x-intdemo-update-package"] == "layered"
+
+
+@pytest.mark.parametrize(
+    "version", ["1.1.0", "1.1.1", "1.2.0", "1.2.1", "0.2.4"]
+)
 def test_old_uos_clients_always_receive_full_deb(
     client,
     update_manifest_file,
@@ -232,9 +273,12 @@ def test_old_uos_clients_always_receive_full_deb(
     assert payload["installer_path"].endswith(".deb")
     assert payload["primary_kind"] == "full"
     assert "deltas" not in payload
+    assert "layered_updates" not in payload
     nested = payload["platforms"]["linux-aarch64"]
     assert "delta" not in nested
     assert "deltas" not in nested
+    assert "layers" not in nested
+    assert "layered_updates" not in nested
     assert nested["full"]["installer_path"].endswith(".deb")
 
 

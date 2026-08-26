@@ -96,7 +96,11 @@ class UpdateCoordinator(QObject):
         self._busy = True
         self._download_active = True
         self._download_cancel.clear()
-        package_label = "增量更新包" if update.is_delta else "完整更新包"
+        package_label = (
+            "分层更新包"
+            if update.is_layered
+            else ("增量更新包" if update.is_delta else "完整更新包")
+        )
         self.state_changed.emit(
             "downloading",
             f"正在下载 v{update.version} {package_label}；下载期间可以继续使用程序。",

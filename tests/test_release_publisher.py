@@ -434,7 +434,14 @@ class ReleasePublisherCoreTests(unittest.TestCase):
             ["build_uos_package", "build_uos_delta", "export_uos_result"],
         )
         delta_step = build_steps[1]
+        self.assertTrue(
+            str(delta_step.arguments[0]).replace("\\", "/").endswith(
+                "scripts/uos-arm64/build-layers.sh"
+            )
+        )
         self.assertIn("--from-version", delta_step.arguments)
+        self.assertIn("--target-root", delta_step.arguments)
+        self.assertIn("--report", delta_step.arguments)
         self.assertIn("1.2.2", delta_step.arguments)
         self.assertNotIn("1.2.1", delta_step.arguments)
         self.assertIn("--uos-delta-from-version", build_steps[2].arguments)

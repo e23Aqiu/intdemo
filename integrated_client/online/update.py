@@ -24,11 +24,17 @@ from .uos_delta import (
     UosDeltaCancelled,
     UosDeltaError,
 )
+from .uos_layers import (
+    UOS_LAYER_FORMAT,
+    UosLayerCancelled,
+    UosLayerError,
+    UosLayerStore,
+)
 
 _VERSION_PATTERN = re.compile(r"^\d+(?:\.\d+){1,3}$")
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 _PACKAGE_PATH_PATTERN = re.compile(
-    r"^/updates/files/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:exe|deb|intdelta)$",
+    r"^/updates/files/[A-Za-z0-9][A-Za-z0-9._-]*\.(?:exe|deb|intdelta|intlayer)$",
     re.IGNORECASE,
 )
 _MAX_INSTALLER_BYTES = 2 * 1024 * 1024 * 1024
@@ -72,14 +78,21 @@ class UpdateInfo:
     base_size: int = 0
     target_sha256: str = ""
     target_size: int = 0
+    layer_format: str = ""
+    source_layout_sha256: str = ""
+    target_layout_sha256: str = ""
 
     @property
     def is_delta(self) -> bool:
-        return self.package_kind == "delta"
+        return self.package_kind in {"delta", "layered"}
+
+    @property
+    def is_layered(self) -> bool:
+        return self.package_kind == "layered"
 
     @property
     def is_uos_delta(self) -> bool:
-        return self.is_delta and self.platform_key == UOS_UPDATE_PLATFORM
+        return self.package_kind == "delta" and self.platform_key == UOS_UPDATE_PLATFORM
 
     def full_fallback(self) -> UpdateInfo:
         if not (
@@ -137,11 +150,19 @@ class UpdateClient:
             }
         )
         self.uos_delta_cache: UosDeltaCache | None = None
+        self.uos_layer_store: UosLayerStore | None = None
         if self.platform_key == UOS_UPDATE_PLATFORM:
             self.session.headers.update(
-                {"X-IntDemo-Update-Capabilities": UOS_DELTA_FORMAT}
+                {
+                    "X-IntDemo-Update-Capabilities": (
+                        f"{UOS_LAYER_FORMAT}, {UOS_DELTA_FORMAT}"
+                    )
+                }
             )
             self.uos_delta_cache = UosDeltaCache(
+                current_version=self.current_version
+            )
+            self.uos_layer_store = UosLayerStore(
                 current_version=self.current_version
             )
             try:
@@ -246,6 +267,31 @@ class UpdateClient:
             "target_size": target_size,
         }
 
+    def _validated_uos_layer(self, payload: dict) -> dict:
+        if str(payload.get("format") or "").strip() != UOS_LAYER_FORMAT:
+            raise UpdateError("服务器 UOS 分层更新格式不受支持")
+        package = self._validated_package(
+            payload,
+            label="UOS 分层更新包",
+            expected_suffix=".intlayer",
+        )
+        source_layout_sha256 = str(
+            payload.get("source_layout_sha256") or ""
+        ).strip().casefold()
+        target_layout_sha256 = str(
+            payload.get("target_layout_sha256") or ""
+        ).strip().casefold()
+        if not _HASH_PATTERN.fullmatch(source_layout_sha256):
+            raise UpdateError("服务器 UOS 分层来源布局校验值无效")
+        if not _HASH_PATTERN.fullmatch(target_layout_sha256):
+            raise UpdateError("服务器 UOS 分层目标布局校验值无效")
+        return {
+            **package,
+            "layer_format": UOS_LAYER_FORMAT,
+            "source_layout_sha256": source_layout_sha256,
+            "target_layout_sha256": target_layout_sha256,
+        }
+
     def _platform_manifest(self, payload: dict) -> dict:
         selected_platform = str(
             payload.get("selected_platform") or ""
@@ -266,6 +312,8 @@ class UpdateClient:
                 "full",
                 "delta",
                 "deltas",
+                "layered_updates",
+                "layers",
                 "primary_kind",
                 "primary_from_version",
             ):
@@ -288,6 +336,27 @@ class UpdateClient:
         candidates = payload.get("deltas")
         if candidates is None and isinstance(payload.get("delta"), dict):
             candidates = [payload["delta"]]
+        if not isinstance(candidates, list):
+            return None
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            from_versions = candidate.get("from_versions")
+            if from_versions is None:
+                from_versions = [candidate.get("from_version")]
+            if not isinstance(from_versions, list):
+                continue
+            if current_version in {
+                str(item or "").strip() for item in from_versions
+            }:
+                return candidate
+        return None
+
+    @staticmethod
+    def _matching_layer(payload: dict, current_version: str) -> dict | None:
+        candidates = payload.get("layered_updates")
+        if candidates is None:
+            candidates = payload.get("layers")
         if not isinstance(candidates, list):
             return None
         for candidate in candidates:
@@ -340,8 +409,28 @@ class UpdateClient:
         package = dict(full_package)
         package_kind = "full"
         from_version = None
+        layer = (
+            self._matching_layer(payload, self.current_version)
+            if self.platform_key == UOS_UPDATE_PLATFORM
+            else None
+        )
+        if layer is not None:
+            try:
+                package = self._validated_uos_layer(layer)
+                store = self.uos_layer_store
+                if store is None or store.source_root(
+                    version=self.current_version,
+                    layout_sha256=package["source_layout_sha256"],
+                ) is None:
+                    raise UpdateError("本机没有可用的 UOS 分层更新基线")
+            except UpdateError:
+                package = dict(full_package)
+            else:
+                package_kind = "layered"
+                from_version = self.current_version
+
         delta = self._matching_delta(payload, self.current_version)
-        if delta is not None:
+        if package_kind == "full" and delta is not None:
             try:
                 if self.platform_key == UOS_UPDATE_PLATFORM:
                     package = self._validated_uos_delta(
@@ -399,6 +488,14 @@ class UpdateClient:
         cancelled_callback=None,
         state_callback=None,
     ) -> Path:
+        if update.is_layered:
+            return self._download_uos_layer(
+                update,
+                progress_callback=progress_callback,
+                speed_callback=speed_callback,
+                cancelled_callback=cancelled_callback,
+                state_callback=state_callback,
+            )
         if update.is_uos_delta:
             return self._download_uos_delta(
                 update,
@@ -616,3 +713,69 @@ class UpdateClient:
             raise UpdateCancelled("更新下载已停止")
         except (UpdateError, UosDeltaError, OSError) as exc:
             return fallback(str(exc) or "UOS 增量更新不可用")
+
+    def _download_uos_layer(
+        self,
+        update: UpdateInfo,
+        *,
+        progress_callback=None,
+        speed_callback=None,
+        cancelled_callback=None,
+        state_callback=None,
+    ) -> Path:
+        store = self.uos_layer_store
+        cache = self.uos_delta_cache
+        if store is None or cache is None:
+            raise UpdateError("UOS 分层更新缓存不可用")
+
+        def fallback(reason: str) -> Path:
+            if state_callback is not None:
+                state_callback(
+                    "fallback_full",
+                    f"{reason}，已自动切换完整 UOS 更新包。",
+                )
+            full = update.full_fallback()
+            destination = self._download_destination(full)
+            result = self._download_file(
+                full,
+                destination,
+                progress_callback=progress_callback,
+                speed_callback=speed_callback,
+                cancelled_callback=cancelled_callback,
+            )
+            try:
+                return cache.register_pending(
+                    result,
+                    version=full.version,
+                    size=full.size,
+                    sha256=full.sha256,
+                )
+            except UosDeltaError as exc:
+                raise UpdateError(str(exc)) from exc
+
+        try:
+            archive_path = store.archive_path(
+                update.installer_name,
+                from_version=str(update.from_version or self.current_version),
+                target_version=update.version,
+            )
+            self._download_file(
+                update,
+                archive_path,
+                progress_callback=progress_callback,
+                speed_callback=speed_callback,
+                cancelled_callback=cancelled_callback,
+            )
+            return store.stage(
+                archive_path,
+                from_version=str(update.from_version or self.current_version),
+                target_version=update.version,
+                source_layout_sha256=update.source_layout_sha256,
+                target_layout_sha256=update.target_layout_sha256,
+                cancelled_callback=cancelled_callback,
+                state_callback=state_callback,
+            )
+        except (UpdateCancelled, UosLayerCancelled):
+            raise UpdateCancelled("更新下载已停止")
+        except (UpdateError, UosLayerError, OSError) as exc:
+            return fallback(str(exc) or "UOS 分层更新不可用")

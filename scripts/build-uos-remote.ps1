@@ -148,20 +148,26 @@ if ($UosDeltaFromVersion) {
         throw "Could not upload the UOS source publish receipt"
     }
     $remoteTargetDeb = "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-$Version.deb"
-    $remotePatch = (
-        "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-Patch-" +
-        "$UosDeltaFromVersion-to-$Version.intdelta"
+    $remoteLayer = (
+        "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-Layers-" +
+        "$UosDeltaFromVersion-to-$Version.intlayer"
+    )
+    $remoteLayerReport = "$remoteLayer.json"
+    $remoteTargetRoot = (
+        "$BuilderRepoPath/dist/uos-arm64/package/IntDemo-UOS-arm64-$Version"
     )
     $remoteDeltaCommand = (
-        " && bash scripts/uos-arm64/build-delta.sh" +
+        " && bash scripts/uos-arm64/build-layers.sh" +
         " --source-deb " + (Quote-Posix "$remoteSourceDirectory/$sourceName") +
         " --target-deb " + (Quote-Posix $remoteTargetDeb) +
+        " --target-root " + (Quote-Posix $remoteTargetRoot) +
         " --from-version " + (Quote-Posix $UosDeltaFromVersion) +
         " --target-version " + (Quote-Posix $Version) +
         " --source-receipt " + (
             Quote-Posix "$remoteReceiptDirectory/publish-receipt.json"
         ) +
-        " --output " + (Quote-Posix $remotePatch)
+        " --output " + (Quote-Posix $remoteLayer) +
+        " --report " + (Quote-Posix $remoteLayerReport)
     )
     $remoteDeltaExportArgument = (
         " --uos-delta-from-version " + (Quote-Posix $UosDeltaFromVersion)
@@ -228,30 +234,36 @@ if ($expectedHash -notmatch '^[0-9a-fA-F]{64}$' -or
 Write-Host "UOS ARM64 package downloaded: $artifact"
 Write-Host "SHA-256: $actualHash"
 if ($UosDeltaFromVersion) {
-    $patchName = (
-        "IntDemo-UOS-arm64-Patch-$UosDeltaFromVersion-to-$Version.intdelta"
+    $layerName = (
+        "IntDemo-UOS-arm64-Layers-$UosDeltaFromVersion-to-$Version.intlayer"
     )
-    $patch = Join-Path $outputRoot $patchName
-    $patchReport = "$patch.json"
-    $remotePatch = "$BuilderRepoPath/dist/uos-arm64/$patchName"
-    & scp @scpArgs "${BuilderHost}:$remotePatch" $patch
+    $layer = Join-Path $outputRoot $layerName
+    $layerReport = "$layer.json"
+    $remoteLayer = "$BuilderRepoPath/dist/uos-arm64/$layerName"
+    & scp @scpArgs "${BuilderHost}:$remoteLayer.json" $layerReport
     if ($LASTEXITCODE -ne 0) {
-        throw "Could not download the UOS ARM64 delta package"
+        throw "Could not download the UOS ARM64 layered-update report"
     }
-    & scp @scpArgs "${BuilderHost}:$remotePatch.json" $patchReport
-    if ($LASTEXITCODE -ne 0) {
-        throw "Could not download the UOS ARM64 delta report"
+    $reportPayload = Get-Content -LiteralPath $layerReport -Raw | ConvertFrom-Json
+    if ($reportPayload.eligible -eq $true) {
+        & scp @scpArgs "${BuilderHost}:$remoteLayer" $layer
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not download the UOS ARM64 layered-update package"
+        }
+        $actualLayerHash = (
+            Get-FileHash -LiteralPath $layer -Algorithm SHA256
+        ).Hash.ToLowerInvariant()
+        if ($reportPayload.replay_verified -ne $true -or
+            $actualLayerHash -ne ([string]$reportPayload.archive_sha256).ToLowerInvariant()) {
+            throw "The downloaded UOS layered-update package failed report verification"
+        }
+        Write-Host "UOS ARM64 layered update downloaded: $layer"
+    } elseif ($reportPayload.fallback_to_full -ne $true) {
+        throw "The UOS layered-update report does not declare a safe full fallback"
+    } else {
+        Remove-Item -LiteralPath $layer -Force -ErrorAction SilentlyContinue
+        Write-Host "UOS layered update is ineligible; the release will use the full DEB"
     }
-    $reportPayload = Get-Content -LiteralPath $patchReport -Raw | ConvertFrom-Json
-    $actualPatchHash = (
-        Get-FileHash -LiteralPath $patch -Algorithm SHA256
-    ).Hash.ToLowerInvariant()
-    if ($reportPayload.eligible -ne $true -or
-        $reportPayload.byte_identical -ne $true -or
-        $actualPatchHash -ne ([string]$reportPayload.patch_sha256).ToLowerInvariant()) {
-        throw "The downloaded UOS ARM64 delta package failed report verification"
-    }
-    Write-Host "UOS ARM64 delta downloaded: $patch"
 }
 if ($ExportResult) {
     $resultRoot = Join-Path $repoRoot "dist\uos-build-results\$Version"

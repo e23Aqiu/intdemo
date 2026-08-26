@@ -233,6 +233,17 @@ def update_install_command(package_path):
             "未找到 deepin-deb-installer、xdg-open 或 pkexec/dpkg，"
             "无法启动 UOS 更新安装包"
         )
+    if target == UOS_UPDATE_PLATFORM and path.suffix.casefold() == ".intlayer":
+        launcher_value = os.environ.get("INTDEMO_UOS_LAUNCHER", "").strip()
+        if not launcher_value:
+            raise RuntimeError("当前 UOS 安装缺少分层更新启动器，请改用完整 DEB")
+        try:
+            launcher = Path(launcher_value).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise RuntimeError("UOS 分层更新启动器不可用，请改用完整 DEB") from exc
+        if not launcher.is_file() or not os.access(launcher, os.X_OK):
+            raise RuntimeError("UOS 分层更新启动器不可执行，请改用完整 DEB")
+        return str(launcher), ["--intdemo-apply-layer", str(os.getpid())]
     raise RuntimeError("当前平台或更新包格式不支持自动安装")
 
 

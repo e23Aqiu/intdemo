@@ -4,7 +4,7 @@ from integrated_client.platform_support import configure_desktop_environment
 
 configure_desktop_environment()
 
-from PyQt5.QtCore import Qt, qVersion
+from PyQt5.QtCore import Qt, QTimer, qVersion
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QApplication
 
@@ -12,6 +12,7 @@ from integrated_client.app_controller import ApplicationController
 from integrated_client.config import APP_NAME, ORGANIZATION_NAME
 from integrated_client.database import Database
 from integrated_client.diagnostics import configure_diagnostics, get_logger
+from integrated_client.online.uos_layers import confirm_running_layer
 from integrated_client.ui.theme import (
     APP_STYLESHEET,
     _control_asset_path,
@@ -51,6 +52,10 @@ def main():
         database = Database()
         controller = ApplicationController(app, database)
         controller.start()
+        # Promote a UOS trial only after Qt's event loop has remained healthy
+        # long enough to display the login UI. If startup fails first, the
+        # stable launcher rolls back on the next run.
+        QTimer.singleShot(1500, confirm_running_layer)
         return app.exec_()
     except Exception:
         get_logger().exception("Fatal error while starting the application")
