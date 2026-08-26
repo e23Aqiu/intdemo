@@ -14,7 +14,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image, ImageDraw
 from playwright.sync_api import sync_playwright
-from PyQt5.QtCore import QItemSelectionModel
+from PyQt5 import sip
+from PyQt5.QtCore import QCoreApplication, QEvent, QItemSelectionModel
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from integrated_client.captcha_models import (
@@ -2109,6 +2110,30 @@ class CaptchaLearningTests(unittest.TestCase):
         dialog.reject()
         self.assertFalse(dialog.isVisible())
         dialog.deleteLater()
+
+    def test_training_terminal_destroy_is_safe_after_page_is_deleted(self):
+        session = _FakeSession()
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session)
+        page.refresh_timer.stop()
+        page._begin_training_terminal(
+            training_id="page-delete-race",
+            captcha_name="数字验证码",
+            mode_name="标准模式",
+            method_name="OpenCV HOG + 线性 SVM",
+        )
+        terminal = page._training_terminal
+        button = page.show_training_terminal_btn
+        self.assertIsNotNone(terminal)
+        self.assertTrue(button.isEnabled())
+
+        page.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        self.app.processEvents()
+
+        self.assertTrue(sip.isdeleted(page))
+        self.assertTrue(sip.isdeleted(button))
+        self.assertTrue(sip.isdeleted(terminal))
 
     def test_machine_learning_page_disables_enhanced_mode_without_component(self):
         manager = _FakeTrainerManager(available=False)

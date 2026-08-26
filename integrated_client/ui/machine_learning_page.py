@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import os
 import uuid
+import weakref
 from pathlib import Path
 
+from PyQt5 import sip
 from PyQt5.QtCore import QObject, Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -40,8 +42,8 @@ from .announcement_page import ImagePreviewDialog, start_api_task
 from .file_dialogs import SystemFileDialog as QFileDialog
 from .frameless import FramelessMessageBox as QMessageBox
 from .loading_dialog import LoadingDialog, run_with_loading
-from .training_terminal_dialog import TrainingTerminalDialog
 from .table_utils import make_table_columns_resizable
+from .training_terminal_dialog import TrainingTerminalDialog
 
 MAX_IMPORT_BYTES = 100 * 1024 * 1024
 UPLOAD_MODES = (
@@ -1748,11 +1750,15 @@ class MachineLearningPage(QWidget):
             method_name=method_name,
             parent=self.window(),
         )
-        self._training_terminal.destroyed.connect(
-            lambda _object=None, task_id=training_id: (
-                self._training_terminal_destroyed(task_id)
-            )
-        )
+        page_ref = weakref.ref(self)
+
+        def terminal_destroyed(_object=None, task_id=training_id):
+            page = page_ref()
+            if page is None or sip.isdeleted(page):
+                return
+            page._training_terminal_destroyed(task_id)
+
+        self._training_terminal.destroyed.connect(terminal_destroyed)
         self.show_training_terminal_btn.setEnabled(True)
         self._training_terminal.show()
         self._training_terminal.raise_()
@@ -1770,7 +1776,10 @@ class MachineLearningPage(QWidget):
         if training_id != self._training_id:
             return
         self._training_terminal = None
-        self.show_training_terminal_btn.setEnabled(False)
+        button = getattr(self, "show_training_terminal_btn", None)
+        if self._shutting_down or button is None or sip.isdeleted(button):
+            return
+        button.setEnabled(False)
 
     def _show_training_terminal(self):
         terminal = self._training_terminal
