@@ -830,11 +830,41 @@ class UosLayerStore:
             return False
         target_root = self.versions_dir / version
         layout = read_layout(target_root, version=version)
-        validate_package_root(target_root, layout)
+        file_layout_path = target_root / "file-layout.json"
+        if file_layout_path.is_file():
+            from .uos_file_update import (
+                UosFileUpdateError,
+                read_file_layout,
+                validate_file_package_root,
+            )
+
+            try:
+                file_layout = read_file_layout(target_root, version=version)
+                validate_file_package_root(target_root, file_layout)
+            except UosFileUpdateError as exc:
+                raise UosLayerError(f"UOS 逐文件版本校验失败：{exc}") from exc
+        else:
+            validate_package_root(target_root, layout)
         self._write_text_atomic(self.current_version_path, version)
         self.pending_version_path.unlink(missing_ok=True)
         self.pending_attempted_path.unlink(missing_ok=True)
         self.pending_pid_path.unlink(missing_ok=True)
+        retained = {version}
+        try:
+            for candidate in self.versions_dir.iterdir():
+                if candidate.name in retained:
+                    continue
+                if _VERSION_PATTERN.fullmatch(candidate.name):
+                    self._remove_version_path(candidate)
+            for candidate in self.downloads_dir.iterdir():
+                if candidate.is_file() and candidate.name.casefold().endswith(
+                    (".intlayer", ".intlayer.part")
+                ):
+                    candidate.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup is best effort and must not roll back an already
+            # validated, successfully started version.
+            pass
         return True
 
 

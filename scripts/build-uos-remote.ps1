@@ -149,7 +149,7 @@ if ($UosDeltaFromVersion) {
     }
     $remoteTargetDeb = "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-$Version.deb"
     $remoteLayer = (
-        "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-Layers-" +
+        "$BuilderRepoPath/dist/uos-arm64/IntDemo-UOS-arm64-Files-" +
         "$UosDeltaFromVersion-to-$Version.intlayer"
     )
     $remoteLayerReport = "$remoteLayer.json"
@@ -157,7 +157,7 @@ if ($UosDeltaFromVersion) {
         "$BuilderRepoPath/dist/uos-arm64/package/IntDemo-UOS-arm64-$Version"
     )
     $remoteDeltaCommand = (
-        " && bash scripts/uos-arm64/build-layers.sh" +
+        " && bash scripts/uos-arm64/build-files.sh" +
         " --source-deb " + (Quote-Posix "$remoteSourceDirectory/$sourceName") +
         " --target-deb " + (Quote-Posix $remoteTargetDeb) +
         " --target-root " + (Quote-Posix $remoteTargetRoot) +
@@ -235,34 +235,34 @@ Write-Host "UOS ARM64 package downloaded: $artifact"
 Write-Host "SHA-256: $actualHash"
 if ($UosDeltaFromVersion) {
     $layerName = (
-        "IntDemo-UOS-arm64-Layers-$UosDeltaFromVersion-to-$Version.intlayer"
+        "IntDemo-UOS-arm64-Files-$UosDeltaFromVersion-to-$Version.intlayer"
     )
     $layer = Join-Path $outputRoot $layerName
     $layerReport = "$layer.json"
     $remoteLayer = "$BuilderRepoPath/dist/uos-arm64/$layerName"
     & scp @scpArgs "${BuilderHost}:$remoteLayer.json" $layerReport
     if ($LASTEXITCODE -ne 0) {
-        throw "Could not download the UOS ARM64 layered-update report"
+        throw "Could not download the UOS ARM64 file-update report"
     }
     $reportPayload = Get-Content -LiteralPath $layerReport -Raw | ConvertFrom-Json
     if ($reportPayload.eligible -eq $true) {
         & scp @scpArgs "${BuilderHost}:$remoteLayer" $layer
         if ($LASTEXITCODE -ne 0) {
-            throw "Could not download the UOS ARM64 layered-update package"
+            throw "Could not download the UOS ARM64 file-update package"
         }
         $actualLayerHash = (
             Get-FileHash -LiteralPath $layer -Algorithm SHA256
         ).Hash.ToLowerInvariant()
         if ($reportPayload.replay_verified -ne $true -or
             $actualLayerHash -ne ([string]$reportPayload.archive_sha256).ToLowerInvariant()) {
-            throw "The downloaded UOS layered-update package failed report verification"
+            throw "The downloaded UOS file-update package failed report verification"
         }
-        Write-Host "UOS ARM64 layered update downloaded: $layer"
+        Write-Host "UOS ARM64 file update downloaded: $layer"
     } elseif ($reportPayload.fallback_to_full -ne $true) {
-        throw "The UOS layered-update report does not declare a safe full fallback"
+        throw "The UOS file-update report does not declare a safe full fallback"
     } else {
         Remove-Item -LiteralPath $layer -Force -ErrorAction SilentlyContinue
-        Write-Host "UOS layered update is ineligible; the release will use the full DEB"
+        Write-Host "UOS file update is ineligible; the release will use the full DEB"
     }
 }
 if ($ExportResult) {

@@ -73,6 +73,7 @@ required_paths=(
   "$package_root/browser/chrome"
   "$package_root/build-info.txt"
   "$package_root/layer-layout.json"
+  "$package_root/file-layout.json"
   "$package_root/client-online.json"
 )
 for required_path in "${required_paths[@]}"; do
@@ -148,6 +149,7 @@ cp "$repo_root/docs/UOS_ARM64.md" "$files_root/"
 cp "$repo_root/integrated_client/ui/assets/app-icon.png" "$files_root/"
 cp "$package_root/build-info.txt" "$files_root/"
 cp "$package_root/layer-layout.json" "$files_root/"
+cp "$package_root/file-layout.json" "$files_root/"
 cp "$repo_root/packaging/uos-arm64/deb/$desktop_file_name" \
   "$desktop_root/"
 
@@ -166,7 +168,8 @@ chmod 0644 \
   "$files_root/UOS_ARM64.md" \
   "$files_root/app-icon.png" \
   "$files_root/build-info.txt" \
-  "$files_root/layer-layout.json"
+  "$files_root/layer-layout.json" \
+  "$files_root/file-layout.json"
 find "$files_root/certs" -type f -exec chmod 0644 {} +
 find "$deb_root" -type d -exec chmod 0755 {} +
 

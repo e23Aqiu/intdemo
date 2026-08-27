@@ -41,6 +41,7 @@ UOS_RESULT_FILE = "uos-build-result.json"
 UOS_DELTA_BASE_FILE = "uos-delta-base.json"
 SOURCE_VERSION_TARGETING_CAPABILITY = "source-version-targeting-v1"
 UOS_LAYERED_UPDATE_CAPABILITY = "uos-layered-v1"
+UOS_FILE_UPDATE_CAPABILITY = "uos-file-update-v2"
 MAX_ELIGIBLE_CLIENT_VERSIONS = 32
 WINDOWS_WORKFLOW_NAME = "Windows release build"
 WINDOWS_TAG_PREFIX = "intdemo-windows/v"
@@ -1244,6 +1245,11 @@ def validate_uos_payload(
     ca_hash: str,
     label: str,
 ) -> None:
+    from integrated_client.online.uos_file_update import (
+        UosFileUpdateError,
+        read_file_layout,
+        validate_file_package_root,
+    )
     from integrated_client.online.uos_layers import (
         UosLayerError,
         read_layout,
@@ -1293,6 +1299,11 @@ def validate_uos_payload(
         validate_bootstrap(payload_root, layer_layout)
     except UosLayerError as exc:
         raise ReleaseTaskError(f"{label}UOS 分层基线无效：{exc}") from exc
+    try:
+        file_layout = read_file_layout(payload_root, version=version)
+        validate_file_package_root(payload_root, file_layout)
+    except UosFileUpdateError as exc:
+        raise ReleaseTaskError(f"{label}UOS 逐文件基线无效：{exc}") from exc
 
 
 def validate_uos_deb_payload(
@@ -1586,6 +1597,140 @@ def validate_uos_layer_candidate(
     return archive, report_path, report
 
 
+def validate_uos_file_candidate(
+    root: Path,
+    *,
+    from_version: str,
+    target_version: str,
+    target_deb: Path,
+) -> tuple[Path | None, Path, dict[str, Any]]:
+    """Validate a replayed file update or its intentional full-DEB fallback."""
+
+    version_key(from_version)
+    if version_key(from_version) >= version_key(target_version):
+        raise ReleaseTaskError("UOS 逐文件来源版本必须低于目标版本")
+    archive = (
+        root
+        / "dist"
+        / "uos-arm64"
+        / (
+            f"IntDemo-UOS-arm64-Files-{from_version}"
+            f"-to-{target_version}.intlayer"
+        )
+    )
+    report_path = archive.with_suffix(archive.suffix + ".json")
+    if not report_path.is_file():
+        raise ReleaseTaskError("缺少 UOS 逐文件构建报告")
+    report = load_json_object(report_path, "UOS 逐文件构建报告")
+    expected = {
+        "schema_version": 2,
+        "format": UOS_FILE_UPDATE_CAPABILITY,
+        "platform": "linux-aarch64",
+        "from_version": from_version,
+        "target_version": target_version,
+        "target_name": target_deb.name,
+        "target_size": target_deb.stat().st_size,
+        "target_sha256": sha256(target_deb),
+        "archive_name": archive.name,
+    }
+    for key, value in expected.items():
+        if report.get(key) != value:
+            raise ReleaseTaskError(
+                f"UOS 逐文件构建报告 {key} 不匹配："
+                f"{report.get(key)!r} != {value!r}"
+            )
+    source_deb = (
+        root
+        / "dist"
+        / "update-release"
+        / "files"
+        / f"IntDemo-UOS-arm64-{from_version}.deb"
+    )
+    source_receipt_path = (
+        root
+        / "dist"
+        / "release-results"
+        / from_version
+        / "publish-receipt.json"
+    )
+    validate_published_uos_base(
+        source_deb,
+        source_receipt_path,
+        version=from_version,
+    )
+    for key, value in {
+        "source_name": source_deb.name,
+        "source_size": source_deb.stat().st_size,
+        "source_sha256": sha256(source_deb),
+    }.items():
+        if report.get(key) != value:
+            raise ReleaseTaskError(f"UOS 逐文件报告的来源基线 {key} 不匹配")
+
+    eligible = report.get("eligible") is True
+    if not eligible:
+        if report.get("fallback_to_full") is not True:
+            raise ReleaseTaskError("UOS 逐文件包未通过时必须明确回退完整 DEB")
+        if not str(report.get("reason") or "").strip():
+            raise ReleaseTaskError("UOS 逐文件回退报告缺少原因")
+        if archive.exists():
+            raise ReleaseTaskError("UOS 逐文件报告已回退完整包，但候选包仍然存在")
+        return None, report_path, report
+
+    if report.get("fallback_to_full") is not False:
+        raise ReleaseTaskError("UOS 逐文件候选状态无效")
+    if report.get("replay_verified") is not True:
+        raise ReleaseTaskError("UOS 逐文件候选没有通过回放验证")
+    if not archive.is_file():
+        raise ReleaseTaskError("UOS 逐文件报告声明可发布，但候选包不存在")
+    for key, value in {
+        "archive_size": archive.stat().st_size,
+        "archive_sha256": sha256(archive),
+    }.items():
+        if report.get(key) != value:
+            raise ReleaseTaskError(f"UOS 逐文件报告的候选包 {key} 不匹配")
+    for key in ("source_layout_sha256", "target_layout_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(report.get(key) or "")):
+            raise ReleaseTaskError(f"UOS 逐文件报告 {key} 无效")
+    source_bootstrap = str(report.get("source_bootstrap_sha256") or "").casefold()
+    target_bootstrap = str(report.get("target_bootstrap_sha256") or "").casefold()
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", source_bootstrap)
+        or not re.fullmatch(r"[0-9a-f]{64}", target_bootstrap)
+        or source_bootstrap != target_bootstrap
+    ):
+        raise ReleaseTaskError("UOS 逐文件报告的引导文件指纹不兼容")
+    changed_paths = report.get("changed_paths")
+    deleted_paths = report.get("deleted_paths")
+    if not isinstance(changed_paths, list) or not isinstance(deleted_paths, list):
+        raise ReleaseTaskError("UOS 逐文件报告缺少变更或删除清单")
+    if changed_paths != sorted(set(changed_paths)):
+        raise ReleaseTaskError("UOS 逐文件报告的变更清单无效")
+    if deleted_paths != sorted(set(deleted_paths)):
+        raise ReleaseTaskError("UOS 逐文件报告的删除清单无效")
+    try:
+        from integrated_client.online.uos_file_update import (
+            UosFileUpdateError,
+            read_file_manifest,
+        )
+
+        file_manifest = read_file_manifest(
+            archive,
+            from_version=from_version,
+            target_version=target_version,
+            source_layout_sha256=str(report["source_layout_sha256"]),
+            target_layout_sha256=str(report["target_layout_sha256"]),
+        )
+    except UosFileUpdateError as exc:
+        raise ReleaseTaskError(f"UOS 逐文件包结构校验失败：{exc}") from exc
+    if file_manifest["changed_paths"] != changed_paths:
+        raise ReleaseTaskError("UOS 逐文件包与回放报告的变更清单不一致")
+    if file_manifest["deleted_paths"] != deleted_paths:
+        raise ReleaseTaskError("UOS 逐文件包与回放报告的删除清单不一致")
+    if archive.stat().st_size * 2 >= target_deb.stat().st_size:
+        raise ReleaseTaskError("UOS 逐文件包未达到小于完整 DEB 50% 的发布门槛")
+    return archive, report_path, report
+
+
 def record_uos_result(
     root: Path,
     *,
@@ -1634,16 +1779,16 @@ def record_uos_result(
     }
     uos_update_kind = "full"
     if uos_delta_from_version:
-        layer, report_path, _report = validate_uos_layer_candidate(
+        file_update, report_path, _report = validate_uos_file_candidate(
             root,
             from_version=uos_delta_from_version,
             target_version=version,
             target_deb=artifact,
         )
-        artifacts["uos_layer_report"] = receipt_artifact(root, report_path)
-        if layer is not None:
-            artifacts["uos_layer"] = receipt_artifact(root, layer)
-            uos_update_kind = "layered"
+        artifacts["uos_file_report"] = receipt_artifact(root, report_path)
+        if file_update is not None:
+            artifacts["uos_file"] = receipt_artifact(root, file_update)
+            uos_update_kind = "file"
     receipt = {
         "schema_version": 1,
         "platform": "linux-aarch64",
@@ -1699,11 +1844,13 @@ def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
     if not uos_update_kind:
         if "uos_delta" in artifacts:
             uos_update_kind = "delta"
+        elif "uos_file" in artifacts:
+            uos_update_kind = "file"
         elif "uos_layer" in artifacts:
             uos_update_kind = "layered"
         else:
             uos_update_kind = "full"
-    if uos_update_kind not in {"full", "layered", "delta"}:
+    if uos_update_kind not in {"full", "file", "layered", "delta"}:
         raise ReleaseTaskError("UOS 构建结果的更新类型无效")
     if uos_update_kind != "full" and not uos_delta_from_version:
         raise ReleaseTaskError("UOS 增量构建结果缺少来源版本")
@@ -1732,12 +1879,18 @@ def validate_uos_result_payload(payload: Any) -> dict[str, Any]:
 def expected_uos_result_artifacts(payload: dict[str, Any]) -> set[str]:
     kind = str(payload.get("uos_update_kind") or "full")
     source = str(payload.get("uos_delta_from_version") or "")
+    artifacts = payload.get("artifacts")
+    artifact_keys = set(artifacts) if isinstance(artifacts, dict) else set()
     if kind == "delta":
         return {"uos_installer", "uos_delta", "uos_delta_report"}
+    if kind == "file":
+        return {"uos_installer", "uos_file", "uos_file_report"}
     if kind == "layered":
         return {"uos_installer", "uos_layer", "uos_layer_report"}
     if source:
-        return {"uos_installer", "uos_layer_report"}
+        if "uos_layer_report" in artifact_keys:
+            return {"uos_installer", "uos_layer_report"}
+        return {"uos_installer", "uos_file_report"}
     return {"uos_installer"}
 
 
@@ -2005,6 +2158,8 @@ def export_uos_result(
     if not uos_update_kind:
         if "uos_delta" in artifact_paths:
             uos_update_kind = "delta"
+        elif "uos_file" in artifact_paths:
+            uos_update_kind = "file"
         elif "uos_layer" in artifact_paths:
             uos_update_kind = "layered"
         else:
@@ -2031,6 +2186,14 @@ def export_uos_result(
                         "uos_delta_report": f"{patch_name}.json",
                     }
                 )
+            elif uos_update_kind == "file" or "uos_file_report" in artifact_paths:
+                file_name = (
+                    f"IntDemo-UOS-arm64-Files-{uos_delta_from_version}"
+                    f"-to-{version}.intlayer"
+                )
+                target_names["uos_file_report"] = f"{file_name}.json"
+                if uos_update_kind == "file":
+                    target_names["uos_file"] = file_name
             else:
                 layer_name = (
                     f"IntDemo-UOS-arm64-Layers-{uos_delta_from_version}"
@@ -2158,6 +2321,36 @@ def import_uos_result(
                 target_version=version,
                 target_deb=target,
             )
+        elif uos_delta_from_version and (
+            result["uos_update_kind"] == "file" or "uos_file_report" in verified
+        ):
+            file_name = (
+                f"IntDemo-UOS-arm64-Files-{uos_delta_from_version}"
+                f"-to-{version}.intlayer"
+            )
+            report_target = root / "dist" / "uos-arm64" / f"{file_name}.json"
+            if verified["uos_file_report"].name != report_target.name:
+                raise ReleaseTaskError("UOS 逐文件报告文件名不符合约定")
+            copy_atomic(verified["uos_file_report"], report_target)
+            imported_artifacts["uos_file_report"] = report_target
+            file_target = root / "dist" / "uos-arm64" / file_name
+            if result["uos_update_kind"] == "file":
+                if verified["uos_file"].name != file_name:
+                    raise ReleaseTaskError("UOS 逐文件更新包文件名不符合约定")
+                copy_atomic(verified["uos_file"], file_target)
+                imported_artifacts["uos_file"] = file_target
+            else:
+                file_target.unlink(missing_ok=True)
+            file_update, _report_path, _report = validate_uos_file_candidate(
+                root,
+                from_version=uos_delta_from_version,
+                target_version=version,
+                target_deb=target,
+            )
+            if (file_update is not None) != (
+                result["uos_update_kind"] == "file"
+            ):
+                raise ReleaseTaskError("UOS 逐文件报告与结果包更新类型不一致")
         elif uos_delta_from_version:
             layer_name = (
                 f"IntDemo-UOS-arm64-Layers-{uos_delta_from_version}"
@@ -2365,11 +2558,17 @@ def load_release_candidates(
     required_uos = {"uos_installer"}
     if uos_update_kind == "delta":
         required_uos.update({"uos_delta", "uos_delta_report"})
+    elif uos_update_kind == "file":
+        required_uos.update({"uos_file", "uos_file_report"})
     elif uos_update_kind == "layered":
         required_uos.update({"uos_layer", "uos_layer_report"})
     elif uos_delta_from_version:
-        required_uos.add("uos_layer_report")
-    if uos_update_kind not in {"full", "layered", "delta"}:
+        required_uos.add(
+            "uos_layer_report"
+            if "uos_layer_report" in uos_paths
+            else "uos_file_report"
+        )
+    if uos_update_kind not in {"full", "file", "layered", "delta"}:
         raise ReleaseTaskError("UOS 构建收据的更新类型无效")
     if set(uos_paths) != required_uos:
         raise ReleaseTaskError("UOS 构建收据的产物集合不完整")
@@ -2388,6 +2587,7 @@ def prepare_update_manifest(
     delta: dict[str, Any] | None,
     delta_from_version: str,
     uos_delta: dict[str, Any] | None = None,
+    uos_file: dict[str, Any] | None = None,
     uos_layer: dict[str, Any] | None = None,
     uos_delta_from_version: str = "",
     eligible_client_versions: tuple[str, ...] | list[str] = (),
@@ -2474,6 +2674,45 @@ def prepare_update_manifest(
         }
         manifest["platforms"]["linux-aarch64"]["deltas"] = [
             uos_delta_payload
+        ]
+    if uos_file is not None:
+        uos_full = manifest["platforms"]["linux-aarch64"]["full"]
+        if not uos_delta_from_version:
+            raise ReleaseTaskError("UOS 逐文件更新包缺少来源版本")
+        if version_key(uos_delta_from_version) >= version_key(version):
+            raise ReleaseTaskError("UOS 逐文件来源版本必须低于目标版本")
+        file_sha256 = str(uos_file.get("sha256") or "").casefold()
+        source_layout_sha256 = str(
+            uos_file.get("source_layout_sha256") or ""
+        ).casefold()
+        target_layout_sha256 = str(
+            uos_file.get("target_layout_sha256") or ""
+        ).casefold()
+        try:
+            file_size = int(uos_file.get("size"))
+        except (TypeError, ValueError) as exc:
+            raise ReleaseTaskError("UOS 逐文件更新包大小字段无效") from exc
+        if (
+            not re.fullmatch(r"[0-9a-f]{64}", file_sha256)
+            or not re.fullmatch(r"[0-9a-f]{64}", source_layout_sha256)
+            or not re.fullmatch(r"[0-9a-f]{64}", target_layout_sha256)
+            or file_size <= 0
+        ):
+            raise ReleaseTaskError("UOS 逐文件更新包哈希或大小字段无效")
+        if file_size * 2 >= int(uos_full["size"]):
+            raise ReleaseTaskError("UOS 逐文件更新包未达到小于完整 DEB 50% 的发布门槛")
+        manifest["platforms"]["linux-aarch64"]["file_updates"] = [
+            {
+                "format": UOS_FILE_UPDATE_CAPABILITY,
+                "from_version": uos_delta_from_version,
+                "source_layout_sha256": source_layout_sha256,
+                "target_layout_sha256": target_layout_sha256,
+                "installer_path": f"/updates/files/{uos_file['name']}",
+                "sha256": file_sha256,
+                "size": file_size,
+                "target_sha256": str(uos_full["sha256"]),
+                "target_size": int(uos_full["size"]),
+            }
         ]
     if uos_layer is not None:
         uos_full = manifest["platforms"]["linux-aarch64"]["full"]
@@ -2989,8 +3228,9 @@ def assert_platform_server_support(
     *,
     require_source_version_targeting: bool = False,
     require_uos_layered: bool = False,
+    require_uos_file: bool = False,
 ) -> None:
-    if require_source_version_targeting or require_uos_layered:
+    if require_source_version_targeting or require_uos_layered or require_uos_file:
         request = urllib.request.Request(
             f"{base_url.rstrip('/')}/updates/capabilities.json",
             headers={"User-Agent": "IntDemoReleasePublisher/1"},
@@ -3040,6 +3280,11 @@ def assert_platform_server_support(
             raise ReleaseTaskError(
                 "在线 API 尚未启用 UOS 三层更新选择；"
                 "必须先升级服务器，不能发布分层更新包"
+            )
+        if require_uos_file and UOS_FILE_UPDATE_CAPABILITY not in capabilities:
+            raise ReleaseTaskError(
+                "在线 API 尚未启用 UOS 逐文件更新选择；"
+                "必须先升级服务器，不能发布逐文件更新包"
             )
     status, _payload, headers = request_manifest(
         base_url,
@@ -3258,6 +3503,10 @@ def publish_release(
             str(uos_receipt.get("uos_update_kind") or "") == "layered"
             or "uos_layer" in uos_paths
         ),
+        require_uos_file=(
+            str(uos_receipt.get("uos_update_kind") or "") == "file"
+            or "uos_file" in uos_paths
+        ),
     )
 
     files_root = root / "dist" / "update-release" / "files"
@@ -3282,10 +3531,16 @@ def publish_release(
         )
         prepared["windows_delta"] = delta
     uos_delta = None
+    uos_file = None
     uos_layer = None
     uos_update_kind = str(uos_receipt.get("uos_update_kind") or "").strip()
     if not uos_update_kind:
-        uos_update_kind = "delta" if "uos_delta" in uos_paths else "full"
+        if "uos_delta" in uos_paths:
+            uos_update_kind = "delta"
+        elif "uos_file" in uos_paths:
+            uos_update_kind = "file"
+        else:
+            uos_update_kind = "full"
     if uos_delta_from_version and uos_update_kind == "delta":
         report = load_json_object(
             uos_paths["uos_delta_report"],
@@ -3302,6 +3557,26 @@ def publish_release(
         uos_delta["base_sha256"] = str(report.get("base_sha256") or "")
         uos_delta["base_size"] = int(report.get("base_size") or 0)
         prepared["uos_delta"] = uos_delta
+    elif uos_delta_from_version and uos_update_kind == "file":
+        report = load_json_object(
+            uos_paths["uos_file_report"],
+            "UOS 逐文件构建报告",
+        )
+        uos_file = stage_release_artifact(
+            uos_paths["uos_file"],
+            files_root
+            / (
+                f"IntDemo-UOS-arm64-Files-{uos_delta_from_version}"
+                f"-to-{version}.intlayer"
+            ),
+        )
+        uos_file["source_layout_sha256"] = str(
+            report.get("source_layout_sha256") or ""
+        )
+        uos_file["target_layout_sha256"] = str(
+            report.get("target_layout_sha256") or ""
+        )
+        prepared["uos_file"] = uos_file
     elif uos_delta_from_version and uos_update_kind == "layered":
         report = load_json_object(
             uos_paths["uos_layer_report"],
@@ -3333,6 +3608,7 @@ def publish_release(
         delta=delta,
         delta_from_version=delta_from_version,
         uos_delta=uos_delta,
+        uos_file=uos_file,
         uos_layer=uos_layer,
         uos_delta_from_version=uos_delta_from_version,
         eligible_client_versions=eligible_versions,

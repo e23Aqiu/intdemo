@@ -240,9 +240,9 @@ def update_install_command(package_path):
         try:
             launcher = Path(launcher_value).expanduser().resolve(strict=True)
         except (OSError, RuntimeError) as exc:
-            raise RuntimeError("UOS 分层更新启动器不可用，请改用完整 DEB") from exc
+            raise RuntimeError("UOS 应用内更新启动器不可用，请改用完整 DEB") from exc
         if not launcher.is_file() or not os.access(launcher, os.X_OK):
-            raise RuntimeError("UOS 分层更新启动器不可执行，请改用完整 DEB")
+            raise RuntimeError("UOS 应用内更新启动器不可执行，请改用完整 DEB")
         return str(launcher), ["--intdemo-apply-layer", str(os.getpid())]
     raise RuntimeError("当前平台或更新包格式不支持自动安装")
 

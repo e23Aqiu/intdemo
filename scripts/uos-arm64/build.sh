@@ -487,6 +487,16 @@ if [[ ! -f "$package_root/layer-layout.json" ]]; then
   exit 1
 fi
 
+echo "=== 生成 UOS 逐文件更新基线 ==="
+"$conda_cmd" run --prefix "$env_prefix" \
+  python -m integrated_client.online.uos_file_update write-layout \
+  --package-root "$package_root" \
+  --version "$version"
+if [[ ! -f "$package_root/file-layout.json" ]]; then
+  echo "错误：未生成 UOS 逐文件布局基线。" >&2
+  exit 1
+fi
+
 mkdir -p "$package_parent"
 tar -C "$package_parent" -czf "$artifact" "$package_name"
 sha256sum "$artifact" > "$artifact.sha256"

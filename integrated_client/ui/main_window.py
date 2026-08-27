@@ -1339,7 +1339,7 @@ class MainWindow(FramelessMainWindow):
         self.personal_center_page.set_update_state(
             "downloaded",
             (
-                "分层更新已校验并准备完成，重启后自动切换。"
+                "应用内增量更新已校验并准备完成，重启后自动切换。"
                 if layered
                 else "更新包已下载并校验完成，需要重启程序并运行安装程序。"
             ),
@@ -1353,7 +1353,7 @@ class MainWindow(FramelessMainWindow):
             self,
             "更新下载完成",
             (
-                "分层更新已下载、组装并通过校验。\n\n"
+                "应用内增量更新已下载、组装并通过校验。\n\n"
                 if layered
                 else "更新包已下载并通过 SHA-256 校验。\n\n"
             )
@@ -1381,7 +1381,7 @@ class MainWindow(FramelessMainWindow):
             return
         running = bool(getattr(self.workflow_page, "pipeline_running", False))
         layered = Path(installer_path).suffix.casefold() == ".intlayer"
-        action = "应用分层更新" if layered else "安装更新"
+        action = "应用增量更新" if layered else "安装更新"
         message = (
             f"{action}必须停止当前业务处理并关闭程序。\n\n"
             f"确定现在保存已完成数据、停止业务并{action}吗？"

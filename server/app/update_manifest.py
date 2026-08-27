@@ -26,17 +26,21 @@ _PACKAGE_KEYS = (
     "deltas",
     "layers",
     "layered_updates",
+    "files",
+    "file_updates",
 )
 _PLATFORMS = {"windows-x86_64", "linux-aarch64"}
 _LEGACY_PLATFORM = "windows-x86_64"
 _UOS_DELTA_FORMAT = "uos-deb-xdelta-v1"
 _UOS_LAYER_FORMAT = "uos-layered-v1"
+_UOS_FILE_UPDATE_FORMAT = "uos-file-update-v2"
 _SOURCE_VERSION_TARGETING = "source-version-targeting-v1"
 _UPDATE_SERVER_CAPABILITIES = (
     "platform-selection-v1",
     _SOURCE_VERSION_TARGETING,
     _UOS_DELTA_FORMAT,
     _UOS_LAYER_FORMAT,
+    _UOS_FILE_UPDATE_FORMAT,
 )
 _CAPABILITY_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 _MAX_TARGET_CLIENT_VERSIONS = 32
@@ -165,6 +169,29 @@ def matching_layered_update(
     return None
 
 
+def matching_file_update(
+    payload: dict[str, Any], current_version: str | None
+) -> dict | None:
+    if current_version is None:
+        return None
+    candidates = payload.get("file_updates")
+    if candidates is None:
+        candidates = payload.get("files")
+    if not isinstance(candidates, list):
+        return None
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        from_versions = candidate.get("from_versions")
+        if from_versions is None:
+            from_versions = [candidate.get("from_version")]
+        if not isinstance(from_versions, list):
+            continue
+        if current_version in {str(item or "").strip() for item in from_versions}:
+            return candidate
+    return None
+
+
 def _remove_optional_uos_packages(
     selected: dict[str, Any],
     platform_key: str,
@@ -199,6 +226,20 @@ def select_manifest_package(
     full = payload.get("full") if isinstance(payload.get("full"), dict) else payload
     delta = matching_delta(payload, current_version)
     layered = matching_layered_update(payload, current_version)
+    file_update = matching_file_update(payload, current_version)
+    if platform_key != "linux-aarch64" or (
+        file_update is None
+        or str(file_update.get("format") or "").strip().casefold()
+        != _UOS_FILE_UPDATE_FORMAT
+        or _UOS_FILE_UPDATE_FORMAT not in capabilities
+    ):
+        file_update = None
+        _remove_optional_uos_packages(
+            selected,
+            platform_key,
+            "files",
+            "file_updates",
+        )
     if platform_key != "linux-aarch64" or (
         layered is None
         or str(layered.get("format") or "").strip().casefold()
@@ -223,13 +264,17 @@ def select_manifest_package(
         # v1.1.1 and v1.2.0 therefore see the same full-DEB response shape
         # they already understand even when their version matches a patch.
         _remove_optional_uos_packages(selected, platform_key, "delta", "deltas")
-    package = layered or delta or full
-    kind = "layered" if layered is not None else ("delta" if delta is not None else "full")
+    package = file_update or layered or delta or full
+    kind = (
+        "file"
+        if file_update is not None
+        else ("layered" if layered is not None else ("delta" if delta is not None else "full"))
+    )
 
     for field in _PACKAGE_FIELDS:
         selected[field] = package.get(field)
     selected["primary_kind"] = kind
-    if kind in {"delta", "layered"}:
+    if kind in {"delta", "layered", "file"}:
         selected["primary_from_version"] = current_version
     else:
         selected.pop("primary_from_version", None)

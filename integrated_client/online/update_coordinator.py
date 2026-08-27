@@ -97,7 +97,7 @@ class UpdateCoordinator(QObject):
         self._download_active = True
         self._download_cancel.clear()
         package_label = (
-            "分层更新包"
+            "应用内增量更新包"
             if update.is_layered
             else ("增量更新包" if update.is_delta else "完整更新包")
         )

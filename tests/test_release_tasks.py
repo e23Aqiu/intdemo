@@ -556,9 +556,11 @@ class ReleaseTasksTests(unittest.TestCase):
             browser = package / "browser/chrome"
             browser.write_bytes(b"chromium")
             browser.chmod(0o755)
+            from integrated_client.online.uos_file_update import write_file_layout
             from integrated_client.online.uos_layers import write_layout
 
             write_layout(package, "1.2.3")
+            write_file_layout(package, "1.2.3")
             deb = root / "dist" / "uos-arm64" / "IntDemo-UOS-arm64-1.2.3.deb"
             deb.write_bytes(b"deb package")
             with (
@@ -970,6 +972,42 @@ class ReleaseTasksTests(unittest.TestCase):
         self.assertEqual(selected["target_layout_sha256"], "5" * 64)
         self.assertEqual(selected["target_sha256"], uos["sha256"])
         self.assertEqual(selected["installer_path"], "/updates/files/client.intlayer")
+
+    def test_dual_manifest_can_publish_capability_gated_uos_files(self):
+        windows = {"name": "setup.exe", "size": 10, "sha256": "1" * 64}
+        uos = {"name": "client.deb", "size": 200, "sha256": "2" * 64}
+        file_update = {
+            "name": "client-files.intlayer",
+            "size": 30,
+            "sha256": "3" * 64,
+            "source_layout_sha256": "4" * 64,
+            "target_layout_sha256": "5" * 64,
+        }
+
+        manifest = tasks.prepare_update_manifest(
+            version="1.2.4",
+            channel="stable",
+            source_commit=COMMIT,
+            notes="file update release",
+            mandatory=False,
+            windows=windows,
+            uos=uos,
+            delta=None,
+            delta_from_version="",
+            uos_file=file_update,
+            uos_delta_from_version="1.2.3",
+        )
+
+        selected = manifest["platforms"]["linux-aarch64"]["file_updates"][0]
+        self.assertEqual(selected["format"], "uos-file-update-v2")
+        self.assertEqual(selected["from_version"], "1.2.3")
+        self.assertEqual(selected["source_layout_sha256"], "4" * 64)
+        self.assertEqual(selected["target_layout_sha256"], "5" * 64)
+        self.assertEqual(selected["target_sha256"], uos["sha256"])
+        self.assertEqual(
+            selected["installer_path"],
+            "/updates/files/client-files.intlayer",
+        )
 
     def test_uos_layer_report_allows_explicit_full_fallback(self):
         with tempfile.TemporaryDirectory() as directory:

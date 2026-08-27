@@ -436,7 +436,7 @@ class ReleasePublisherCoreTests(unittest.TestCase):
         delta_step = build_steps[1]
         self.assertTrue(
             str(delta_step.arguments[0]).replace("\\", "/").endswith(
-                "scripts/uos-arm64/build-layers.sh"
+                "scripts/uos-arm64/build-files.sh"
             )
         )
         self.assertIn("--from-version", delta_step.arguments)

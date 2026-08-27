@@ -260,7 +260,7 @@ class UpdatePromptDialog(FramelessDialog):
         self.progress.setValue(100)
         self.progress.setFormat("100% · 下载及校验完成")
         self.state_label.setText(
-            "分层更新已准备完成。重启后自动切换，新版本启动失败会自动回退。"
+            "应用内增量更新已准备完成。重启后自动切换，新版本启动失败会自动回退。"
             if layered
             else "更新包已准备完成。安装会退出程序，请先结束并保存正在处理的业务。"
         )
