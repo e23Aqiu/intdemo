@@ -791,9 +791,6 @@ class UosCompatibilityTests(unittest.TestCase):
                 browser_entry = candidate / "browser/chrome"
                 browser_entry.write_text("#!/usr/bin/env bash\n", encoding="utf-8")
                 browser_entry.chmod(0o755)
-            (package / "build-info.txt").write_text(
-                "version=1.2.2\n", encoding="ascii"
-            )
             (layer / "layer-layout.json").write_text("{}\n", encoding="ascii")
             launcher = package / "intdemo-client"
             launcher.write_bytes(
@@ -805,9 +802,6 @@ class UosCompatibilityTests(unittest.TestCase):
             launcher.chmod(0o755)
             marker_root = data / "uos-layers"
             marker_root.mkdir(parents=True, exist_ok=True)
-            (marker_root / "pending-version").write_text(
-                "1.2.3\n", encoding="ascii"
-            )
             environment = {
                 **os.environ,
                 "HOME": str(root / "home"),
@@ -815,6 +809,19 @@ class UosCompatibilityTests(unittest.TestCase):
                 "INTDEMO_TEST_OUTPUT": str(output),
             }
 
+            subprocess.run(
+                ["bash", str(launcher)],
+                check=True,
+                env=environment,
+            )
+            self.assertEqual(output.read_text(encoding="utf-8").strip(), "seed|")
+
+            (package / "build-info.txt").write_text(
+                "version=1.2.2\n", encoding="ascii"
+            )
+            (marker_root / "pending-version").write_text(
+                "1.2.3\n", encoding="ascii"
+            )
             subprocess.run(
                 ["bash", str(launcher)],
                 check=True,
@@ -986,6 +993,8 @@ class UosCompatibilityTests(unittest.TestCase):
         self.assertIn("qt_im_module", launcher)
         self.assertIn("QT_IM_MODULE=fcitx", launcher)
         self.assertIn('2>>"$launcher_log"', launcher)
+        self.assertIn('if [[ -r "$package_root/build-info.txt" ]]', launcher)
+        self.assertIn("|| true\n  )", launcher)
 
     def test_uos_build_generates_native_arm64_deb(self):
         root = Path(__file__).resolve().parents[1]

@@ -36,7 +36,15 @@ layer_candidate_is_valid() {
   [[ -f "$candidate/layer-layout.json" ]] || return 1
 }
 
-seed_version="$(sed -n 's/^version=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' "$package_root/build-info.txt" 2>/dev/null | head -n 1)"
+seed_version=""
+if [[ -r "$package_root/build-info.txt" ]]; then
+  seed_version="$(
+    sed -n 's/^version=\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)$/\1/p' \
+      "$package_root/build-info.txt" 2>/dev/null \
+      | head -n 1 \
+      || true
+  )"
+fi
 valid_version "$seed_version" || seed_version="0.0.0"
 if [[ -n "${INTDEMO_DATA_DIR:-}" && "$INTDEMO_DATA_DIR" == /* ]]; then
   layer_store="${INTDEMO_DATA_DIR%/}/uos-layers"
