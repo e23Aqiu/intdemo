@@ -1788,6 +1788,42 @@ class ReleaseTasksTests(unittest.TestCase):
                 run,
             )
 
+    def test_direct_release_task_can_import_uos_layers_in_isolated_mode(self):
+        script = REPO_ROOT / "release_publisher/release_tasks.py"
+        probe = (
+            "import runpy, sys\n"
+            "namespace = runpy.run_path(sys.argv[1])\n"
+            "namespace['validate_uos_payload'](\n"
+            "    namespace['Path'](sys.argv[2]),\n"
+            "    version='1.2.2', commit='a' * 40,\n"
+            "    base_url='https://api.example.com', channel='test',\n"
+            "    ca_hash='', label='probe ',\n"
+            ")\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    probe,
+                    str(script),
+                    str(Path(directory) / "missing-payload"),
+                ],
+                cwd=directory,
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env={**os.environ, "PYTHONUTF8": "1"},
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn("ModuleNotFoundError", result.stderr)
+        self.assertIn("ReleaseTaskError", result.stderr)
+        self.assertIn("build-info.txt", result.stderr)
+
     def test_github_fallback_exit_and_build_scripts_do_not_call_app_server(self):
         self.assertEqual(tasks.GITHUB_UNAVAILABLE_EXIT, 20)
         workflow = (REPO_ROOT / ".github/workflows/windows-release.yml").read_text(

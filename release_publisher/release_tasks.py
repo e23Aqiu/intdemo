@@ -24,6 +24,10 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.parse import urlsplit
 
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPOSITORY_ROOT))
+
 VERSION_PATTERN = re.compile(r"^\d+\.\d+\.\d+$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$", re.IGNORECASE)
 REQUEST_ID_PATTERN = re.compile(r"^[0-9A-Za-z._-]{12,80}$")
@@ -85,7 +89,7 @@ class CommandFailure(ReleaseTaskError):
 
 
 def repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return REPOSITORY_ROOT
 
 
 def utc_now() -> str:
