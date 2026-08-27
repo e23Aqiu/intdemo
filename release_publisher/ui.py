@@ -47,6 +47,8 @@ from .core import (
     build_uos_delta_base_export_steps,
     build_uos_delta_base_import_steps,
     build_uos_result_import_steps,
+    build_windows_delta_base_export_steps,
+    build_windows_delta_base_import_steps,
     build_windows_result_import_steps,
     find_inno_compiler,
     git_remote_url,
@@ -64,6 +66,7 @@ from .release_tasks import (
     ReleaseTaskError,
     detect_uos_delta_base_version,
     detect_uos_result_delta_source,
+    detect_windows_delta_base_version,
     detect_windows_result_portable,
 )
 
@@ -446,26 +449,43 @@ class ReleasePublisherWindow(QMainWindow):
         self.push_button.clicked.connect(self._push_changes)
         actions.addWidget(self.push_button, 1, 4, 1, 2)
 
-        baseline_label = QLabel("UOS 逐文件基线")
+        baseline_label = QLabel("双端增量基线")
         baseline_label.setObjectName("ActionGroupTitle")
         actions.addWidget(baseline_label, 2, 0)
-        self.import_uos_delta_base_button = QPushButton("导入已发布基线包")
+        self.import_windows_delta_base_button = QPushButton("导入 Windows 基线包")
+        self.import_windows_delta_base_button.setToolTip(
+            "在任一发布器导入真实已发布的 Windows 快照与发布收据；"
+            "用于另一台主机制作 Windows 增量更新"
+        )
+        self.import_windows_delta_base_button.clicked.connect(
+            self._import_windows_delta_base
+        )
+        actions.addWidget(self.import_windows_delta_base_button, 2, 1)
+        self.export_windows_delta_base_button = QPushButton("导出 Windows 基线包")
+        self.export_windows_delta_base_button.setToolTip(
+            "从真实已发布版本导出 Windows 快照与发布收据，带到另一台发布器"
+        )
+        self.export_windows_delta_base_button.clicked.connect(
+            self._export_windows_delta_base
+        )
+        actions.addWidget(self.export_windows_delta_base_button, 2, 2)
+        self.import_uos_delta_base_button = QPushButton("导入 UOS 基线包")
         self.import_uos_delta_base_button.setToolTip(
-            "在统信构建机导入 Windows 发布器导出的真实已发布 DEB 与发布收据；"
-            "v1.2.2 起自动用于三层更新"
+            "在任一发布器导入真实已发布的 UOS DEB 与发布收据；"
+            "用于另一台主机制作 UOS 逐文件更新"
         )
         self.import_uos_delta_base_button.clicked.connect(
             self._import_uos_delta_base
         )
-        actions.addWidget(self.import_uos_delta_base_button, 2, 1)
-        self.export_uos_delta_base_button = QPushButton("导出已发布基线包")
+        actions.addWidget(self.import_uos_delta_base_button, 2, 3)
+        self.export_uos_delta_base_button = QPushButton("导出 UOS 基线包")
         self.export_uos_delta_base_button.setToolTip(
-            "在 Windows 发布完成后导出基线包，带到统信真机构建下一版本分层更新"
+            "从真实已发布版本导出 UOS DEB 与发布收据，带到另一台发布器"
         )
         self.export_uos_delta_base_button.clicked.connect(
             self._export_uos_delta_base
         )
-        actions.addWidget(self.export_uos_delta_base_button, 2, 2)
+        actions.addWidget(self.export_uos_delta_base_button, 2, 4)
 
         publish_label = QLabel("发布控制")
         publish_label.setObjectName("ActionGroupTitle")
@@ -885,8 +905,12 @@ class ReleasePublisherWindow(QMainWindow):
         if self.process is None:
             self.import_windows_result_button.setEnabled(windows)
             self.import_uos_result_button.setEnabled(uos)
-            self.import_uos_delta_base_button.setEnabled(uos)
-            self.export_uos_delta_base_button.setEnabled(uos)
+            # Baselines are portable between the two release hosts.  Their
+            # availability must not depend on which build target is selected.
+            self.import_windows_delta_base_button.setEnabled(True)
+            self.export_windows_delta_base_button.setEnabled(True)
+            self.import_uos_delta_base_button.setEnabled(True)
+            self.export_uos_delta_base_button.setEnabled(True)
 
     def _save_settings(self) -> None:
         settings = PublisherSettings(
@@ -1129,6 +1153,55 @@ class ReleasePublisherWindow(QMainWindow):
             completion_message=f"UOS {version} 已发布增量基线已导入",
         )
 
+    def _import_windows_delta_base(self) -> None:
+        selected, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Windows 增量基线包",
+            str(self.repo_root / "dist"),
+            "Windows 增量基线 (windows-delta-base*.zip);;ZIP 文件 (*.zip)",
+        )
+        if not selected:
+            return
+        try:
+            version = detect_windows_delta_base_version(selected)
+        except ReleaseTaskError as exc:
+            QMessageBox.warning(self, "无法识别 Windows 增量基线", str(exc))
+            return
+        self.delta_edit.setText(version)
+        self._save_settings()
+        self._run_steps(
+            build_windows_delta_base_import_steps(self._options(), selected),
+            completion_message=f"Windows {version} 已发布增量基线已导入",
+        )
+
+    def _export_windows_delta_base(self) -> None:
+        options = self._options()
+        source_version = options.delta_from_version
+        if not source_version:
+            QMessageBox.warning(
+                self,
+                "缺少来源版本",
+                "请先填写“Windows 增量来源”，再导出 Windows 基线包。",
+            )
+            return
+        output = (
+            self.repo_root
+            / "dist"
+            / "windows-delta-bases"
+            / source_version
+            / f"windows-delta-base-{source_version}.zip"
+        )
+        try:
+            steps = build_windows_delta_base_export_steps(options, output)
+        except PublisherError as exc:
+            QMessageBox.warning(self, "无法导出 Windows 增量基线", str(exc))
+            return
+        self._save_settings()
+        self._run_steps(
+            steps,
+            completion_message=f"Windows 增量基线包已导出：{output}",
+        )
+
     def _export_uos_delta_base(self) -> None:
         options = self._options()
         source_version = options.uos_delta_from_version
@@ -1136,7 +1209,7 @@ class ReleasePublisherWindow(QMainWindow):
             QMessageBox.warning(
                 self,
                 "缺少来源版本",
-                "请先填写“UOS 逐文件来源”，再导出已发布基线包。",
+                "请先填写“UOS 逐文件来源”，再导出 UOS 基线包。",
             )
             return
         output = (
@@ -1623,6 +1696,8 @@ class ReleasePublisherWindow(QMainWindow):
             self.build_button,
             self.import_windows_result_button,
             self.import_uos_result_button,
+            self.import_windows_delta_base_button,
+            self.export_windows_delta_base_button,
             self.import_uos_delta_base_button,
             self.export_uos_delta_base_button,
             self.commit_changes_button,

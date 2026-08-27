@@ -101,10 +101,13 @@ class UpdateCoordinator(QObject):
             if update.is_layered
             else ("增量更新包" if update.is_delta else "完整更新包")
         )
-        self.state_changed.emit(
-            "downloading",
-            f"正在下载 v{update.version} {package_label}；下载期间可以继续使用程序。",
+        message = (
+            f"正在下载 v{update.version} {package_label}；"
+            "请等待强制更新完成。"
+            if update.mandatory
+            else f"正在下载 v{update.version} {package_label}；下载期间可以继续使用程序。"
         )
+        self.state_changed.emit("downloading", message)
         self._pool.start(_UpdateTask(self, "download", update))
         return True
 

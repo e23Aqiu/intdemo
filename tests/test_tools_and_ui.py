@@ -3479,6 +3479,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual(updates.download_calls, 1)
         self.assertTrue(window._update_busy)
+        self.assertTrue(dialog.background_button.isEnabled())
         self.assertTrue(window.sidebar.isEnabled())
         self.assertTrue(window.page_scroll_area.isEnabled())
         self.assertIsNone(QApplication.activeModalWidget())
@@ -3542,6 +3543,106 @@ class ToolAndUiTests(unittest.TestCase):
         window._prepared_to_close = True
         window.close()
 
+    def test_optional_immediate_download_can_switch_to_background_without_restart(self):
+        class FakeUpdateCoordinator(QObject):
+            update_available = pyqtSignal(object)
+            state_changed = pyqtSignal(str, str)
+            download_progress = pyqtSignal(int, int)
+            download_speed = pyqtSignal(object)
+            download_completed = pyqtSignal(object)
+
+            def __init__(self):
+                super().__init__()
+                self.download_calls = 0
+
+            def download(self, _update):
+                self.download_calls += 1
+                return True
+
+            @staticmethod
+            def cancel_download():
+                return True
+
+        updates = FakeUpdateCoordinator()
+        window = MainWindow(self.db, self.admin, update_coordinator=updates)
+        update = UpdateInfo(
+            version="0.2.8",
+            installer_url="https://example.com/update.exe",
+            installer_name="update.exe",
+            sha256="0" * 64,
+            size=100,
+            notes="test",
+            mandatory=False,
+        )
+        window.available_update = update
+        window._show_update_dialog(update)
+        dialog = window.update_dialog
+        dialog.update_button.click()
+        self.app.processEvents()
+        self.assertEqual(updates.download_calls, 1)
+        self.assertTrue(dialog.background_button.isEnabled())
+        dialog.background_button.click()
+        self.app.processEvents()
+        self.assertEqual(updates.download_calls, 1)
+        self.assertIsNone(window.update_dialog)
+        self.assertTrue(window._update_busy)
+        window._update_download_state("download_cancelled", "已停止")
+        window.workflow_page.shutdown()
+        window._prepared_to_close = True
+        window.close()
+
+    def test_mandatory_update_keeps_business_pages_locked_until_exit(self):
+        class FakeUpdateCoordinator(QObject):
+            update_available = pyqtSignal(object)
+            state_changed = pyqtSignal(str, str)
+            download_progress = pyqtSignal(int, int)
+            download_speed = pyqtSignal(object)
+            download_completed = pyqtSignal(object)
+
+            def download(self, _update):
+                return True
+
+            @staticmethod
+            def cancel_download():
+                return True
+
+        updates = FakeUpdateCoordinator()
+        window = MainWindow(self.db, self.admin, update_coordinator=updates)
+        update = UpdateInfo(
+            version="0.2.9",
+            installer_url="https://example.com/update.exe",
+            installer_name="update.exe",
+            sha256="0" * 64,
+            size=100,
+            notes="必须更新",
+            mandatory=True,
+        )
+        window.available_update = update
+        window._show_update_dialog(update)
+        dialog = window.update_dialog
+        self.assertFalse(window.workflow_page.isEnabled())
+        self.assertFalse(window.personal_center_page.isEnabled())
+        self.assertIs(QApplication.activeModalWidget(), dialog)
+        self.assertTrue(dialog.logout_button.isEnabled())
+        self.assertTrue(dialog.exit_button.isEnabled())
+
+        window._download_available_update()
+        self.assertFalse(window.workflow_page.isEnabled())
+        self.assertFalse(window.personal_center_page.isEnabled())
+        self.assertTrue(dialog.logout_button.isEnabled())
+        self.assertTrue(dialog.exit_button.isEnabled())
+        window._update_download_state("download_error", "网络错误")
+        self.assertFalse(window.workflow_page.isEnabled())
+        self.assertFalse(window.personal_center_page.isEnabled())
+        self.assertTrue(dialog.update_button.isEnabled())
+        self.assertTrue(dialog.logout_button.isEnabled())
+        self.assertTrue(dialog.exit_button.isEnabled())
+
+        window._exit_from_update()
+        self.assertFalse(window._update_prompt_blocked)
+        window._prepared_to_close = True
+        window.close()
+
     def test_update_prompt_enforces_mandatory_and_reports_progress(self):
         mandatory_update = UpdateInfo(
             version="0.2.4",
@@ -3558,6 +3659,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(dialog.ignore_button.isHidden())
         self.assertTrue(dialog.cancel_button.isHidden())
         self.assertTrue(dialog.background_button.isHidden())
+        self.assertTrue(dialog.logout_button.isVisible())
+        self.assertTrue(dialog.exit_button.isVisible())
         self.assertTrue(dialog.window_controls.close_button.isHidden())
         dialog.reject()
         self.app.processEvents()
@@ -3567,6 +3670,9 @@ class ToolAndUiTests(unittest.TestCase):
         dialog.set_progress(40, 100)
         self.assertEqual(dialog.progress.value(), 40)
         self.assertFalse(dialog.update_button.isEnabled())
+        self.assertTrue(dialog.cancel_button.isHidden())
+        self.assertTrue(dialog.logout_button.isEnabled())
+        self.assertTrue(dialog.exit_button.isEnabled())
         dialog.set_downloaded()
         self.assertEqual(dialog.update_button.text(), "重启并安装")
         dialog.allow_close()

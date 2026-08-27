@@ -800,6 +800,85 @@ class ReleaseTasksTests(unittest.TestCase):
                     {"schema_version": "invalid"}
                 )
 
+    def test_windows_published_base_round_trips_between_release_hosts(self):
+        with (
+            tempfile.TemporaryDirectory() as source_directory,
+            tempfile.TemporaryDirectory() as target_directory,
+        ):
+            source_root = Path(source_directory)
+            target_root = Path(target_directory)
+            version = "1.2.1"
+            snapshot = (
+                source_root / "dist" / "release-snapshots" / f"{version}.json"
+            )
+            receipt = (
+                source_root
+                / "dist"
+                / "release-results"
+                / version
+                / "publish-receipt.json"
+            )
+            installer = source_root / "windows-installer.exe"
+            snapshot.parent.mkdir(parents=True)
+            receipt.parent.mkdir(parents=True)
+            installer.write_bytes(b"published windows installer")
+            write_snapshot(snapshot, version)
+            tasks.write_json(
+                receipt,
+                {
+                    "schema_version": 1,
+                    "version": version,
+                    "source_commit": COMMIT,
+                    "artifacts": {
+                        "windows_installer": {
+                            "name": f"IntDemoOnline-Setup-{version}.exe",
+                            "size": installer.stat().st_size,
+                            "sha256": tasks.sha256(installer),
+                        }
+                    },
+                },
+            )
+            archive = source_root / "windows-delta-base.zip"
+
+            tasks.export_windows_delta_base(
+                source_root,
+                version=version,
+                output=archive,
+            )
+            self.assertEqual(
+                tasks.detect_windows_delta_base_version(archive),
+                version,
+            )
+            imported = tasks.import_windows_delta_base(
+                target_root,
+                base_archive=archive,
+            )
+            self.assertEqual(imported, version)
+            imported_snapshot = (
+                target_root / "dist" / "release-snapshots" / f"{version}.json"
+            )
+            imported_receipt = (
+                target_root
+                / "dist"
+                / "release-results"
+                / version
+                / "publish-receipt.json"
+            )
+            self.assertEqual(imported_snapshot.read_bytes(), snapshot.read_bytes())
+            self.assertEqual(tasks.sha256(imported_receipt), tasks.sha256(receipt))
+
+            tampered_staging = target_root / "tampered-staging"
+            tasks.extract_zip_safely(archive, tampered_staging)
+            tampered_snapshot = next((tampered_staging / "artifacts").glob("*.json"))
+            tampered_snapshot.write_bytes(b"tampered snapshot")
+            tampered_archive = target_root / "tampered-windows-delta-base.zip"
+            tasks.make_zip(tampered_staging, tampered_archive)
+            with self.assertRaisesRegex(tasks.ReleaseTaskError, "大小|SHA-256"):
+                tasks.import_windows_delta_base(
+                    target_root / "tampered-import",
+                    base_archive=tampered_archive,
+                )
+
     def test_uos_result_import_rejects_tampering_and_config_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

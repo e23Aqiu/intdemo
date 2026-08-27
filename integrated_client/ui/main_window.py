@@ -176,6 +176,8 @@ class MainWindow(FramelessMainWindow):
         self.update_dialog = None
         self._update_busy = False
         self._update_prompt_blocked = False
+        self._update_download_update = None
+        self._update_close_authorized = False
         self._prepared_to_close = False
         self._hard_exit_timer = None
         self._nav_buttons = {}
@@ -1222,12 +1224,15 @@ class MainWindow(FramelessMainWindow):
             current.raise_()
             current.activateWindow()
             return
+        self._update_close_authorized = False
         dialog = UpdatePromptDialog(update, self)
         dialog.update_requested.connect(self._download_available_update)
         dialog.background_update_requested.connect(
             lambda: self._download_available_update(background=True)
         )
         dialog.cancel_requested.connect(self._cancel_update_download)
+        dialog.logout_requested.connect(self._logout_from_update)
+        dialog.exit_requested.connect(self._exit_from_update)
         dialog.ignore_requested.connect(
             lambda version=update.version: self._ignore_update(version)
         )
@@ -1240,9 +1245,10 @@ class MainWindow(FramelessMainWindow):
 
         dialog.finished.connect(clear_dialog)
         self.update_dialog = dialog
-        # A Qt-modal dialog also blocks the custom title-bar controls. Keep
-        # this prompt modeless and emulate modality only for the application
-        # content so minimize, maximize, and close always remain available.
+        # Optional prompts stay modeless so the user can keep working. A
+        # mandatory prompt is application-modal; the content block below also
+        # keeps the main window's custom controls in a consistent disabled
+        # state while the prompt is visible.
         self._set_update_prompt_blocked(True)
         dialog.show()
         dialog.raise_()
@@ -1259,13 +1265,33 @@ class MainWindow(FramelessMainWindow):
         if update is None or self.update_coordinator is None:
             return
         dialog = self.update_dialog
+        active_update = self._update_download_update
+        coordinator_active = bool(
+            getattr(self.update_coordinator, "download_active", False)
+        )
+        if (active_update is not None and active_update == update) or (
+            coordinator_active and active_update is None
+        ):
+            # Immediate and background actions share one coordinator task. A
+            # second click only changes where the prompt is shown; it must not
+            # start a competing download.
+            if background and dialog is not None and not dialog.mandatory:
+                dialog.allow_close()
+                dialog.reject()
+            return
+        # Mark the task before invoking the coordinator because the real
+        # coordinator emits its initial state synchronously. Terminal signals
+        # can therefore clear this marker before ``download`` returns.
+        self._update_download_update = update
         if not self.update_coordinator.download(update):
+            self._update_download_update = None
             if dialog is not None:
                 dialog.set_error("更新服务正忙，请稍后重试。")
             return
         if dialog is not None and dialog.update is update:
             dialog.begin_download()
-        self._set_update_prompt_blocked(False)
+        if dialog is None or not dialog.mandatory:
+            self._set_update_prompt_blocked(False)
         self.client_preferences.clear_ignored_update()
         self._set_update_busy(True)
         if background and dialog is not None and not dialog.mandatory:
@@ -1305,14 +1331,20 @@ class MainWindow(FramelessMainWindow):
         elif state == "cancelling":
             self._set_update_busy(True)
         elif state == "download_cancelled":
+            mandatory = self._mandatory_update_active()
+            self._update_download_update = None
             self._set_update_busy(False)
-            self._set_update_prompt_blocked(False)
+            if not mandatory:
+                self._set_update_prompt_blocked(False)
             dialog = self.update_dialog
             if dialog is not None:
                 dialog.set_cancelled()
         elif state == "download_error":
+            mandatory = self._mandatory_update_active()
+            self._update_download_update = None
             self._set_update_busy(False)
-            self._set_update_prompt_blocked(False)
+            if not mandatory:
+                self._set_update_prompt_blocked(False)
             dialog = self.update_dialog
             if dialog is not None:
                 dialog.set_error(message)
@@ -1333,8 +1365,11 @@ class MainWindow(FramelessMainWindow):
 
     def _update_downloaded(self, installer_path):
         self.downloaded_installer_path = installer_path
+        mandatory = self._mandatory_update_active()
+        self._update_download_update = None
         self._set_update_busy(False)
-        self._set_update_prompt_blocked(False)
+        if not mandatory:
+            self._set_update_prompt_blocked(False)
         layered = Path(installer_path).suffix.casefold() == ".intlayer"
         self.personal_center_page.set_update_state(
             "downloaded",
@@ -1426,8 +1461,43 @@ class MainWindow(FramelessMainWindow):
             )
             return
         if self.update_dialog is not None:
+            self._update_close_authorized = True
             self.update_dialog.allow_close()
             self.update_dialog.accept()
+        self.close()
+
+    def _mandatory_update_active(self):
+        dialog = self.update_dialog
+        return bool(
+            dialog is not None
+            and dialog.mandatory
+            and not self._update_close_authorized
+        )
+
+    def _logout_from_update(self):
+        dialog = self.update_dialog
+        if dialog is None or not dialog.mandatory:
+            return
+        if not self._prepare_close():
+            return
+        self._update_close_authorized = True
+        self._cancel_update_download()
+        dialog.allow_close()
+        dialog.reject()
+        self._set_update_prompt_blocked(False)
+        self.logout_requested.emit()
+
+    def _exit_from_update(self):
+        dialog = self.update_dialog
+        if dialog is None or not dialog.mandatory:
+            return
+        if not self._prepare_close():
+            return
+        self._update_close_authorized = True
+        self._cancel_update_download()
+        dialog.allow_close()
+        dialog.reject()
+        self._set_update_prompt_blocked(False)
         self.close()
 
     def _set_settings_update_indicator(self, available):
@@ -2051,7 +2121,7 @@ class MainWindow(FramelessMainWindow):
         self.logout_requested.emit()
 
     def closeEvent(self, event):
-        if self._update_busy:
+        if self._update_busy and not self._update_close_authorized:
             reply = QMessageBox.question(
                 self,
                 "停止更新并退出",
@@ -2069,6 +2139,7 @@ class MainWindow(FramelessMainWindow):
             and self.update_dialog.mandatory
             and self.update_dialog.isVisible()
             and not self._prepared_to_close
+            and not self._update_close_authorized
         ):
             event.ignore()
             self.update_dialog.raise_()

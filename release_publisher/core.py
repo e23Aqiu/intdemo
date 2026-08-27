@@ -1937,6 +1937,53 @@ def build_windows_result_import_steps(
     ]
 
 
+def build_windows_delta_base_export_steps(
+    options: ReleaseOptions,
+    output: str | Path,
+) -> list[CommandStep]:
+    source_version = str(options.delta_from_version or "").strip()
+    if not source_version:
+        raise PublisherError("请先填写 Windows 增量来源版本")
+    return [
+        _release_task_step(
+            options,
+            key="export_windows_delta_base",
+            title=f"导出 Windows {source_version} 增量基线包",
+            command="export-windows-delta-base",
+            arguments=(
+                "--version",
+                source_version,
+                "--output",
+                str(Path(output).expanduser().resolve()),
+            ),
+        )
+    ]
+
+
+def build_windows_delta_base_import_steps(
+    options: ReleaseOptions,
+    base_archive: str | Path,
+) -> list[CommandStep]:
+    return [
+        _release_task_step(
+            options,
+            key="import_windows_delta_base",
+            title="导入已发布的 Windows 增量基线",
+            command="import-windows-delta-base",
+            arguments=(
+                "--base-archive",
+                str(Path(base_archive).expanduser().resolve()),
+            ),
+        )
+    ]
+
+
+# Short aliases keep integrations that call these operations by their
+# platform-neutral baseline name source-compatible.
+build_windows_baseline_export_steps = build_windows_delta_base_export_steps
+build_windows_baseline_import_steps = build_windows_delta_base_import_steps
+
+
 def build_uos_result_import_steps(
     options: ReleaseOptions,
     result_archive: str | Path,

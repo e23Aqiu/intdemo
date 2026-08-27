@@ -39,6 +39,7 @@ REQUEST_FILE = "windows-build-request.json"
 RESULT_FILE = "windows-build-result.json"
 UOS_RESULT_FILE = "uos-build-result.json"
 UOS_DELTA_BASE_FILE = "uos-delta-base.json"
+WINDOWS_DELTA_BASE_FILE = "windows-delta-base.json"
 SOURCE_VERSION_TARGETING_CAPABILITY = "source-version-targeting-v1"
 UOS_LAYERED_UPDATE_CAPABILITY = "uos-layered-v1"
 UOS_FILE_UPDATE_CAPABILITY = "uos-file-update-v2"
@@ -1960,6 +1961,300 @@ def _inspect_uos_delta_base_archive(
 def detect_uos_delta_base_version(base_archive: str | Path) -> str:
     _archive, payload = _inspect_uos_delta_base_archive(base_archive)
     return str(payload["version"])
+
+
+def validate_windows_delta_base_payload(payload: Any) -> dict[str, Any]:
+    """Validate metadata for a portable Windows incremental base archive.
+
+    A Windows delta only needs the published file snapshot and its publish
+    receipt.  Keeping the archive small is important because it is commonly
+    transferred from the Windows release host to a UOS build host.  The
+    receipt provides provenance while the snapshot is the input consumed by
+    ``build-delta-installer.ps1``.
+    """
+    if not isinstance(payload, dict):
+        raise ReleaseTaskError("Windows 增量基线包版本不受支持")
+    try:
+        schema_version = int(payload.get("schema_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseTaskError("Windows 增量基线包版本不受支持") from exc
+    if schema_version != 1:
+        raise ReleaseTaskError("Windows 增量基线包版本不受支持")
+    if str(payload.get("kind") or "") != "windows-delta-base":
+        raise ReleaseTaskError("所选文件不是 Windows 增量基线包")
+    version = str(payload.get("version") or "").strip()
+    version_key(version)
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict) or set(artifacts) != {
+        "windows_snapshot",
+        "publish_receipt",
+    }:
+        raise ReleaseTaskError("Windows 增量基线包的产物集合不完整")
+    for key, label in (
+        ("windows_snapshot", "Windows 发布快照"),
+        ("publish_receipt", "发布收据"),
+    ):
+        validate_descriptor(artifacts[key], label)
+    source_commit = str(payload.get("source_commit") or "").casefold()
+    if source_commit and not COMMIT_PATTERN.fullmatch(source_commit):
+        raise ReleaseTaskError("Windows 增量基线包源提交无效")
+    return {
+        **payload,
+        "schema_version": 1,
+        "version": version,
+        "source_commit": source_commit,
+        "artifacts": artifacts,
+    }
+
+
+def _validate_windows_baseline_receipt(
+    receipt: dict[str, Any],
+    *,
+    version: str,
+) -> dict[str, Any]:
+    """Check the release receipt without requiring a platform-specific shape.
+
+    Receipts created by older publisher builds contain a smaller set of fields;
+    they remain valid as long as they identify the published version.  When a
+    Windows artifact descriptor is present, it is checked as well.
+    """
+    try:
+        schema_version = int(receipt.get("schema_version") or 0)
+    except (TypeError, ValueError) as exc:
+        raise ReleaseTaskError("Windows 来源发布收据版本无效") from exc
+    if schema_version != 1:
+        raise ReleaseTaskError("Windows 来源发布收据版本无效")
+    if str(receipt.get("version") or "") != version:
+        raise ReleaseTaskError("Windows 来源发布收据版本与增量基线不一致")
+    artifacts = receipt.get("artifacts")
+    if artifacts is not None and not isinstance(artifacts, dict):
+        raise ReleaseTaskError("Windows 来源发布收据 artifacts 无效")
+    if isinstance(artifacts, dict) and "windows_installer" in artifacts:
+        descriptor = artifacts["windows_installer"]
+        if not isinstance(descriptor, dict):
+            raise ReleaseTaskError("Windows 来源发布收据缺少完整安装包")
+        name = str(descriptor.get("name") or "")
+        expected_name = f"IntDemoOnline-Setup-{version}.exe"
+        if name != expected_name:
+            raise ReleaseTaskError("Windows 来源发布收据完整包名称不一致")
+        try:
+            size = int(descriptor.get("size"))
+        except (TypeError, ValueError) as exc:
+            raise ReleaseTaskError("Windows 来源发布收据完整包大小无效") from exc
+        digest = str(descriptor.get("sha256") or "").casefold()
+        if size < 0 or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ReleaseTaskError("Windows 来源发布收据完整包校验值无效")
+    return receipt
+
+
+def _inspect_windows_delta_base_archive(
+    base_archive: str | Path,
+) -> tuple[Path, dict[str, Any]]:
+    archive_path = Path(base_archive).expanduser().resolve()
+    if not archive_path.is_file():
+        raise ReleaseTaskError(f"Windows 增量基线包不存在：{archive_path}")
+    try:
+        with zipfile.ZipFile(archive_path) as archive:
+            members = _validated_zip_members(archive)
+            metadata = members.get(WINDOWS_DELTA_BASE_FILE)
+            if metadata is None or metadata.is_dir():
+                raise ReleaseTaskError("Windows 增量基线包缺少元数据")
+            if metadata.file_size > 2 * 1024 * 1024:
+                raise ReleaseTaskError("Windows 增量基线包元数据过大")
+            payload = validate_windows_delta_base_payload(
+                json.loads(archive.read(metadata).decode("utf-8"))
+            )
+            snapshot_descriptor = validate_descriptor(
+                payload["artifacts"]["windows_snapshot"],
+                "Windows 发布快照",
+            )
+            receipt_descriptor = validate_descriptor(
+                payload["artifacts"]["publish_receipt"],
+                "发布收据",
+            )
+            snapshot_member = members.get(snapshot_descriptor["file"])
+            receipt_member = members.get(receipt_descriptor["file"])
+            if snapshot_member is None or snapshot_member.is_dir():
+                raise ReleaseTaskError("Windows 增量基线包缺少发布快照")
+            if receipt_member is None or receipt_member.is_dir():
+                raise ReleaseTaskError("Windows 增量基线包缺少发布收据")
+            if snapshot_member.file_size != snapshot_descriptor["size"]:
+                raise ReleaseTaskError("Windows 增量基线包中的发布快照大小不匹配")
+            if receipt_member.file_size != receipt_descriptor["size"]:
+                raise ReleaseTaskError("Windows 增量基线包中的发布收据大小不匹配")
+            if hashlib.sha256(archive.read(snapshot_member)).hexdigest() != snapshot_descriptor[
+                "sha256"
+            ]:
+                raise ReleaseTaskError("Windows 增量基线包中的发布快照 SHA-256 不匹配")
+            if hashlib.sha256(archive.read(receipt_member)).hexdigest() != receipt_descriptor[
+                "sha256"
+            ]:
+                raise ReleaseTaskError("Windows 增量基线包中的发布收据 SHA-256 不匹配")
+            snapshot_payload = json.loads(archive.read(snapshot_member).decode("utf-8"))
+            # Validate the snapshot directly from the archive bytes so import
+            # never needs to trust an unverified temporary path.
+            if (
+                not isinstance(snapshot_payload, dict)
+                or int(snapshot_payload.get("schema_version") or 0) != 1
+                or str(snapshot_payload.get("version") or "")
+                != payload["version"]
+                or not isinstance(snapshot_payload.get("files"), list)
+                or not snapshot_payload["files"]
+            ):
+                raise ReleaseTaskError("Windows 增量基线包中的发布快照无效")
+            receipt_payload = json.loads(archive.read(receipt_member).decode("utf-8"))
+            if not isinstance(receipt_payload, dict):
+                raise ReleaseTaskError("Windows 增量基线包中的发布收据无效")
+            _validate_windows_baseline_receipt(
+                receipt_payload,
+                version=payload["version"],
+            )
+    except ReleaseTaskError:
+        raise
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        RuntimeError,
+        ValueError,
+    ) as exc:
+        raise ReleaseTaskError(f"无法读取 Windows 增量基线包：{archive_path}") from exc
+    return archive_path, payload
+
+
+def detect_windows_delta_base_version(base_archive: str | Path) -> str:
+    _archive, payload = _inspect_windows_delta_base_archive(base_archive)
+    return str(payload["version"])
+
+
+def export_windows_delta_base(
+    root: Path,
+    *,
+    version: str,
+    output: Path | None = None,
+) -> Path:
+    """Export a real published Windows snapshot for transfer to another host."""
+    version_key(version)
+    snapshot = root / "dist" / "release-snapshots" / f"{version}.json"
+    receipt_path = (
+        root / "dist" / "release-results" / version / "publish-receipt.json"
+    )
+    if not snapshot.is_file():
+        raise ReleaseTaskError(f"缺少实际发布的 Windows 基线快照：{snapshot}")
+    if not receipt_path.is_file():
+        raise ReleaseTaskError(f"缺少 Windows 来源发布收据：{receipt_path}")
+    validate_snapshot(snapshot, version)
+    receipt = _validate_windows_baseline_receipt(
+        load_json_object(receipt_path, "Windows 来源发布收据"),
+        version=version,
+    )
+    result = (
+        output.expanduser().resolve()
+        if output is not None
+        else (
+            root
+            / "dist"
+            / "windows-delta-bases"
+            / version
+            / f"windows-delta-base-{version}.zip"
+        )
+    )
+    with tempfile.TemporaryDirectory(prefix="intdemo-windows-delta-base-") as temporary:
+        staging = Path(temporary)
+        staged_snapshot = staging / "artifacts" / f"IntDemoOnline-Snapshot-{version}.json"
+        staged_receipt = staging / "publish-receipt.json"
+        staged_snapshot.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(snapshot, staged_snapshot)
+        shutil.copy2(receipt_path, staged_receipt)
+        write_json(
+            staging / WINDOWS_DELTA_BASE_FILE,
+            {
+                "schema_version": 1,
+                "kind": "windows-delta-base",
+                "version": version,
+                "source_commit": str(receipt.get("source_commit") or "").casefold(),
+                "exported_at": utc_now(),
+                "artifacts": {
+                    "windows_snapshot": artifact_descriptor(
+                        staged_snapshot,
+                        f"artifacts/{staged_snapshot.name}",
+                    ),
+                    "publish_receipt": artifact_descriptor(
+                        staged_receipt,
+                        staged_receipt.name,
+                    ),
+                },
+            },
+        )
+        make_zip(staging, result)
+    write_bytes_atomic(
+        result.with_suffix(result.suffix + ".sha256"),
+        f"{sha256(result)}  {result.name}\n".encode("ascii"),
+    )
+    print(f"Windows 增量基线包：{result}", flush=True)
+    print(f"SHA-256：{sha256(result)}", flush=True)
+    return result
+
+
+def import_windows_delta_base(
+    root: Path,
+    *,
+    base_archive: Path,
+) -> str:
+    archive_path, inspected = _inspect_windows_delta_base_archive(base_archive)
+    version = str(inspected["version"])
+    with tempfile.TemporaryDirectory(prefix="intdemo-windows-delta-import-") as temporary:
+        extracted = Path(temporary)
+        extract_zip_safely(archive_path, extracted)
+        payload = validate_windows_delta_base_payload(
+            load_json_object(extracted / WINDOWS_DELTA_BASE_FILE, "Windows 增量基线元数据")
+        )
+        snapshot = verify_file(
+            extracted,
+            payload["artifacts"]["windows_snapshot"],
+            "Windows 发布快照",
+        )
+        receipt = verify_file(
+            extracted,
+            payload["artifacts"]["publish_receipt"],
+            "Windows 发布收据",
+        )
+        validate_snapshot(snapshot, version)
+        _validate_windows_baseline_receipt(
+            load_json_object(receipt, "Windows 来源发布收据"),
+            version=version,
+        )
+        targets = (
+            (
+                snapshot,
+                root / "dist" / "release-snapshots" / f"{version}.json",
+            ),
+            (
+                receipt,
+                root / "dist" / "release-results" / version / "publish-receipt.json",
+            ),
+        )
+        for source, target in targets:
+            if target.exists() and (
+                not target.is_file() or sha256(target) != sha256(source)
+            ):
+                raise ReleaseTaskError(
+                    f"本地已有不同的同版本 Windows 增量基线，拒绝覆盖：{target}"
+                )
+        for source, target in targets:
+            if not target.is_file():
+                copy_atomic(source, target)
+    print(f"Windows 增量基线已导入：{version}", flush=True)
+    return version
+
+
+# User-facing aliases retained for callers that use the shorter "baseline"
+# terminology.  The explicit delta names remain the canonical API.
+validate_windows_baseline_payload = validate_windows_delta_base_payload
+detect_windows_baseline_version = detect_windows_delta_base_version
+export_windows_baseline = export_windows_delta_base
+import_windows_baseline = import_windows_delta_base
 
 
 def export_uos_delta_base(
@@ -4108,6 +4403,13 @@ def build_parser() -> argparse.ArgumentParser:
     add_common_build_arguments(import_result)
     import_result.add_argument("--result-archive", required=True)
 
+    export_windows_base = commands.add_parser("export-windows-delta-base")
+    export_windows_base.add_argument("--version", required=True)
+    export_windows_base.add_argument("--output", default="")
+
+    import_windows_base = commands.add_parser("import-windows-delta-base")
+    import_windows_base.add_argument("--base-archive", required=True)
+
     record_uos = commands.add_parser("record-uos-result")
     record_uos.add_argument("--version", required=True)
     record_uos.add_argument("--base-url", required=True)
@@ -4225,6 +4527,17 @@ def main(argv: list[str] | None = None) -> int:
                 ca_bundle=args.ca_bundle,
                 delta_from_version=args.delta_from_version,
                 build_portable=args.build_portable,
+            )
+        elif args.command == "export-windows-delta-base":
+            export_windows_delta_base(
+                root,
+                version=args.version,
+                output=Path(args.output) if args.output else None,
+            )
+        elif args.command == "import-windows-delta-base":
+            import_windows_delta_base(
+                root,
+                base_archive=Path(args.base_archive),
             )
         elif args.command == "record-uos-result":
             record_uos_result(

@@ -31,6 +31,8 @@ from release_publisher.core import (
     build_release_plan,
     build_uos_delta_base_export_steps,
     build_uos_delta_base_import_steps,
+    build_windows_delta_base_export_steps,
+    build_windows_delta_base_import_steps,
     find_inno_compiler,
     git_status,
     parse_eligible_client_versions,
@@ -1526,6 +1528,8 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertTrue(window.import_uos_result_button.isEnabled())
         self.assertTrue(window.import_uos_delta_base_button.isEnabled())
         self.assertTrue(window.export_uos_delta_base_button.isEnabled())
+        self.assertTrue(window.import_windows_delta_base_button.isEnabled())
+        self.assertTrue(window.export_windows_delta_base_button.isEnabled())
         self.assertEqual(window.control_username_edit.text(), "admin")
         self.assertEqual(window.control_password_edit.text(), "")
         self.assertIn("断开全部", window.disconnect_all_button.text())
@@ -1559,6 +1563,36 @@ class ReleasePublisherUiTests(unittest.TestCase):
             "中文日志",
         )
 
+        window.deleteLater()
+
+    def test_windows_baseline_steps_and_buttons_are_platform_neutral(self):
+        options = ReleaseOptions(
+            repo_root=REPO_ROOT,
+            version="1.2.5",
+            base_url="https://api.example.com",
+            notes="test",
+            delta_from_version="1.2.1",
+        )
+        export_step = build_windows_delta_base_export_steps(
+            options,
+            REPO_ROOT / "dist" / "windows-delta-base.zip",
+        )[0]
+        import_step = build_windows_delta_base_import_steps(
+            options,
+            REPO_ROOT / "windows-delta-base.zip",
+        )[0]
+        self.assertEqual(export_step.key, "export_windows_delta_base")
+        self.assertEqual(import_step.key, "import_windows_delta_base")
+        self.assertIn("export-windows-delta-base", export_step.arguments)
+        self.assertIn("import-windows-delta-base", import_step.arguments)
+
+        window = ReleasePublisherWindow(REPO_ROOT)
+        window.windows_check.setChecked(False)
+        window.uos_check.setChecked(False)
+        self.assertTrue(window.import_windows_delta_base_button.isEnabled())
+        self.assertTrue(window.export_windows_delta_base_button.isEnabled())
+        self.assertTrue(window.import_uos_delta_base_button.isEnabled())
+        self.assertTrue(window.export_uos_delta_base_button.isEnabled())
         window.deleteLater()
 
     def test_native_uos_enables_windows_transfer_and_updates_build_text(self):

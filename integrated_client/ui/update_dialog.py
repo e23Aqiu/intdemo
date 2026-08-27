@@ -29,6 +29,8 @@ class UpdatePromptDialog(FramelessDialog):
     ignore_requested = pyqtSignal()
     cancel_requested = pyqtSignal()
     restart_requested = pyqtSignal()
+    logout_requested = pyqtSignal()
+    exit_requested = pyqtSignal()
 
     def __init__(self, update, parent=None):
         super().__init__(parent)
@@ -38,11 +40,14 @@ class UpdatePromptDialog(FramelessDialog):
         self._downloaded = False
         self._allow_close = False
         self.setWindowTitle("程序更新")
-        # MainWindow applies a soft content-only block while this prompt needs
-        # attention. Native Qt modality would also block the main window's
-        # minimize, maximize, and close buttons.
-        self.setModal(False)
-        self.setWindowModality(Qt.NonModal)
+        # Optional updates are intentionally modeless so that the user can
+        # keep working. A mandatory update is application-modal: disabling
+        # only the main content would still leave independent announcement or
+        # contact dialogs interactive while the update is being applied.
+        self.setModal(self.mandatory)
+        self.setWindowModality(
+            Qt.ApplicationModal if self.mandatory else Qt.NonModal
+        )
         self.setMinimumSize(560, 450)
         self.resize(610, 480)
 
@@ -98,7 +103,7 @@ class UpdatePromptDialog(FramelessDialog):
         layout.addWidget(notes_card, 1)
 
         self.state_label = QLabel(
-            "此版本必须更新。点击更新后，下载期间仍可处理业务。"
+            "此版本必须更新。请完成更新后继续使用程序。"
             if self.mandatory
             else "可以立即更新、转入后台下载，或稍后在“系统设置”中更新。"
         )
@@ -122,6 +127,17 @@ class UpdatePromptDialog(FramelessDialog):
 
         buttons = QHBoxLayout()
         buttons.addStretch()
+        self.logout_button = QPushButton("退出登录")
+        self.logout_button.setVisible(self.mandatory)
+        self.logout_button.setToolTip("停止更新并返回登录界面")
+        self.logout_button.clicked.connect(self._logout)
+        buttons.addWidget(self.logout_button)
+        self.exit_button = QPushButton("退出应用")
+        self.exit_button.setObjectName("DangerButton")
+        self.exit_button.setVisible(self.mandatory)
+        self.exit_button.setToolTip("停止更新并关闭程序")
+        self.exit_button.clicked.connect(self._exit)
+        buttons.addWidget(self.exit_button)
         self.ignore_button = QPushButton("不再提示")
         self.ignore_button.setVisible(not self.mandatory)
         self.ignore_button.clicked.connect(self._ignore)
@@ -158,9 +174,17 @@ class UpdatePromptDialog(FramelessDialog):
         super().reject()
 
     def _background_update(self):
-        if self._download_active or self._downloaded or self.mandatory:
+        if self._downloaded or self.mandatory:
             return
         self.background_update_requested.emit()
+
+    def _logout(self):
+        if self.mandatory:
+            self.logout_requested.emit()
+
+    def _exit(self):
+        if self.mandatory:
+            self.exit_requested.emit()
 
     def _cancel(self):
         if self._download_active:
@@ -181,13 +205,18 @@ class UpdatePromptDialog(FramelessDialog):
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
         self.state_label.setText(
-            "正在后台下载更新。可以继续查看数据和处理业务，也可随时停止下载。"
+            "正在下载必须安装的更新，请等待完成；"
+            "也可以退出登录或退出应用。"
+            if self.mandatory
+            else "正在下载更新。可以继续查看数据和处理业务，也可随时停止下载。"
         )
         self.update_button.setEnabled(False)
         self.update_button.setText("正在下载…")
         self.ignore_button.setEnabled(False)
-        self.background_button.setEnabled(False)
-        self.cancel_button.show()
+        # An ordinary immediate download can be moved to the background at
+        # any point.  The mandatory prompt never exposes this button.
+        self.background_button.setEnabled(not self.mandatory)
+        self.cancel_button.setVisible(not self.mandatory)
         self.cancel_button.setEnabled(True)
         self.cancel_button.setText("停止下载")
         self.window_controls.close_button.hide()
@@ -209,7 +238,11 @@ class UpdatePromptDialog(FramelessDialog):
 
     def set_preparing(self, message: str):
         self._download_active = True
-        self.state_label.setText(message)
+        self.state_label.setText(
+            f"{message} 请等待更新完成。"
+            if self.mandatory
+            else message
+        )
         self.speed_label.hide()
         self.progress.show()
         self.progress.setRange(0, 0)
@@ -220,7 +253,11 @@ class UpdatePromptDialog(FramelessDialog):
 
     def set_fallback_full(self, message: str):
         self._download_active = True
-        self.state_label.setText(message)
+        self.state_label.setText(
+            f"{message} 请等待更新完成。"
+            if self.mandatory
+            else message
+        )
         self.speed_label.show()
         self.progress.show()
         self.progress.setRange(0, 100)
