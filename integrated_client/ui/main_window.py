@@ -301,6 +301,10 @@ class MainWindow(FramelessMainWindow):
                 else None
             ),
         )
+        self.test_page = None
+        if not self.offline_business_mode:
+            self.test_page = QWidget()
+            self.test_page.setObjectName("TestPage")
         self.personal_center_page = None
         if not self.offline_business_mode:
             self.personal_center_page = PersonalCenterPage(
@@ -333,6 +337,8 @@ class MainWindow(FramelessMainWindow):
             self._add_page("home", self.dashboard_page)
             self._add_page("statistics", self.statistics_page)
         self._add_page("workflow", self.workflow_page)
+        if not self.offline_business_mode:
+            self._add_page("test", self.test_page)
         if account.is_admin and not self.offline_business_mode:
             if self.announcement_service_available:
                 self.announcement_admin_page = AnnouncementAdminPage(
@@ -584,6 +590,7 @@ class MainWindow(FramelessMainWindow):
         if self.account.is_account_manager and not self.offline_business_mode:
             trailing_nav_items.append(("accounts", "账号管理", "nav-accounts.svg"))
         if not self.offline_business_mode:
+            trailing_nav_items.append(("test", "测试", "nav-test.svg"))
             trailing_nav_items.append(("personal", "系统设置", "nav-user.svg"))
         for key, text, icon_name in trailing_nav_items:
             if key == "announcements_admin":

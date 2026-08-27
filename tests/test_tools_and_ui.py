@@ -1775,6 +1775,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertNotIn("aiqicha", window._pages)
         self.assertIn("statistics", window._pages)
         self.assertIn("accounts", window._pages)
+        self.assertIs(window._pages["test"], window.test_page)
+        self.assertIsNone(window.test_page.layout())
         self.assertNotIn("statistics", window._nav_buttons)
         for key in (
             "data_station",
@@ -1800,6 +1802,7 @@ class ToolAndUiTests(unittest.TestCase):
             "home": ("数据仪表盘", "nav-dashboard.svg"),
             "workflow": ("一键业务处理", "nav-workflow.svg"),
             "accounts": ("账号管理", "nav-accounts.svg"),
+            "test": ("测试", "nav-test.svg"),
             "personal": ("系统设置", "nav-user.svg"),
         }
         for key, (label, icon_name) in expected_nav.items():
@@ -1905,6 +1908,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(window.statistics_page.navigation_view, "violation")
         window.show_page("home")
         self.assertIs(window.stack.currentWidget(), window.dashboard_page)
+        window.show_page("test")
+        self.assertIs(window.stack.currentWidget(), window.test_page)
+        self.assertTrue(window._nav_buttons["test"].isChecked())
+        window.show_page("home")
         self.assertFalse(hasattr(window, "top_identity"))
         self.assertEqual(window.sidebar_user.text(), "系统管理员")
         self.assertEqual(window.personal_center_page.identity_value.text(), "管理员")
@@ -2450,6 +2457,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIsNone(window.workflow_timing)
         self.assertIn("accounts", window._pages)
         self.assertIn("accounts", window._nav_buttons)
+        self.assertIn("test", window._pages)
+        self.assertIn("test", window._nav_buttons)
         self.assertNotIn("machine_learning", window._pages)
         self.assertNotIn("announcements_admin", window._pages)
         self.assertIsNone(window.machine_learning_page)
@@ -3340,6 +3349,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(account.role_label, "测试账号")
         self.assertIn("workflow", window._pages)
         self.assertIn("statistics", window._pages)
+        self.assertIn("test", window._pages)
+        self.assertIn("test", window._nav_buttons)
         self.assertNotIn("accounts", window._pages)
         self.assertIsNone(window.workflow_timing)
         self.assertFalse(window.business_metrics_enabled)
@@ -3705,6 +3716,7 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertIsNone(window.dashboard_page)
         self.assertIsNone(window.statistics_page)
         self.assertIsNone(window.personal_center_page)
+        self.assertIsNone(window.test_page)
         self.assertEqual(set(window._pages), {"workflow"})
         self.assertEqual(set(window._nav_buttons), {"workflow"})
         self.assertIsNone(window.account_page)
@@ -3898,6 +3910,8 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertNotIn("accounts", window._pages)
         self.assertNotIn("statistics", window._nav_buttons)
         self.assertIn("statistics", window._pages)
+        self.assertIn("test", window._pages)
+        self.assertIn("test", window._nav_buttons)
         for key in (
             "data_station",
             "data_timing",

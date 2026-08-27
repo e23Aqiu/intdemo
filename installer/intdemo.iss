@@ -2,7 +2,7 @@
 #define MyAppExeName "逃费车辆信息智能查询平台.exe"
 #define MyAppId "F9B73C99-E62D-4DB4-8C5A-CE64DEB5609D"
 #ifndef MyAppVersion
-  #define MyAppVersion "1.2.2"
+  #define MyAppVersion "1.2.3"
 #endif
 #ifndef StageDir
   #define StageDir "..\dist\installer-stage"
