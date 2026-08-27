@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from hashlib import sha256 as bytes_sha256
 from pathlib import Path
@@ -275,6 +276,77 @@ class ReleaseTasksTests(unittest.TestCase):
                 None,
                 require_source_version_targeting=True,
             )
+
+    def test_server_capability_check_retries_transient_tls_eof(self):
+        class CapabilityResponse:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return json.dumps(
+                    {
+                        "schema_version": 1,
+                        "capabilities": [tasks.UOS_FILE_UPDATE_CAPABILITY],
+                    }
+                ).encode("utf-8")
+
+        transient = urllib.error.URLError(
+            tasks.ssl.SSLEOFError(8, "EOF occurred in violation of protocol")
+        )
+        with (
+            patch.object(
+                tasks.urllib.request,
+                "urlopen",
+                side_effect=[transient, CapabilityResponse()],
+            ) as urlopen,
+            patch.object(tasks.time, "sleep") as sleep,
+            patch.object(
+                tasks,
+                "request_manifest",
+                return_value=(
+                    200,
+                    {},
+                    {"x-intdemo-platform": "linux-aarch64"},
+                ),
+            ),
+        ):
+            tasks.assert_platform_server_support(
+                "https://api.example.com",
+                "test",
+                None,
+                require_uos_file=True,
+            )
+
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_server_capability_check_does_not_retry_bad_certificate(self):
+        certificate_error = urllib.error.URLError(
+            tasks.ssl.SSLCertVerificationError(1, "certificate verify failed")
+        )
+        with (
+            patch.object(
+                tasks.urllib.request,
+                "urlopen",
+                side_effect=certificate_error,
+            ) as urlopen,
+            patch.object(tasks.time, "sleep") as sleep,
+            self.assertRaisesRegex(tasks.ReleaseTaskError, "证书校验失败"),
+        ):
+            tasks.assert_platform_server_support(
+                "https://api.example.com",
+                "test",
+                None,
+                require_uos_file=True,
+            )
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
 
     def test_windows_builder_accepts_exact_detached_commit(self):
         with patch.object(

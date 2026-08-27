@@ -60,6 +60,7 @@ SFTP_UPLOAD_ATTEMPTS = 6
 SFTP_PROGRESS_INTERVAL_SECONDS = 10.0
 SFTP_STALL_TIMEOUT_SECONDS = 300.0
 SFTP_RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 30)
+UPDATE_HTTP_RETRY_DELAYS_SECONDS = (1, 2, 4)
 
 
 class ReleaseTaskError(RuntimeError):
@@ -3202,12 +3203,11 @@ def request_manifest(
         if ca_bundle is not None
         else ssl.create_default_context()
     )
-    try:
-        response = urllib.request.urlopen(request, timeout=20, context=context)
-    except urllib.error.HTTPError as exc:
-        response = exc
-    except (OSError, ssl.SSLError, urllib.error.URLError) as exc:
-        raise ReleaseTaskError(f"无法读取在线更新清单：{exc}") from exc
+    response = _urlopen_with_retry(
+        request,
+        context=context,
+        error_label="无法读取在线更新清单",
+    )
     with response:
         status = int(response.status)
         headers = {key.casefold(): value for key, value in response.headers.items()}
@@ -3219,6 +3219,37 @@ def request_manifest(
     except (UnicodeError, json.JSONDecodeError) as exc:
         raise ReleaseTaskError("在线更新清单不是有效 JSON") from exc
     return status, payload if isinstance(payload, dict) else None, headers
+
+
+def _urlopen_with_retry(
+    request: urllib.request.Request,
+    *,
+    context: ssl.SSLContext,
+    error_label: str,
+):
+    last_error: BaseException | None = None
+    for attempt in range(len(UPDATE_HTTP_RETRY_DELAYS_SECONDS) + 1):
+        try:
+            return urllib.request.urlopen(request, timeout=20, context=context)
+        except urllib.error.HTTPError as exc:
+            return exc
+        except (OSError, ssl.SSLError, urllib.error.URLError) as exc:
+            reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+            if isinstance(reason, ssl.SSLCertVerificationError):
+                raise ReleaseTaskError(
+                    f"{error_label}（TLS 证书校验失败）：{exc}"
+                ) from exc
+            last_error = exc
+            if attempt >= len(UPDATE_HTTP_RETRY_DELAYS_SECONDS):
+                break
+            delay = UPDATE_HTTP_RETRY_DELAYS_SECONDS[attempt]
+            print(
+                f"提示：{error_label}，将在 {delay} 秒后重试"
+                f"（{attempt + 2}/{len(UPDATE_HTTP_RETRY_DELAYS_SECONDS) + 1}）：{exc}",
+                flush=True,
+            )
+            time.sleep(delay)
+    raise ReleaseTaskError(f"{error_label}：{last_error}") from last_error
 
 
 def assert_platform_server_support(
@@ -3240,20 +3271,13 @@ def assert_platform_server_support(
             if ca_bundle is not None
             else ssl.create_default_context()
         )
-        try:
-            with urllib.request.urlopen(
-                request,
-                timeout=20,
-                context=context,
-            ) as response:
-                status = int(response.status)
-                body = response.read()
-        except urllib.error.HTTPError as exc:
-            with exc:
-                status = int(exc.code)
-                body = exc.read()
-        except (OSError, ssl.SSLError, urllib.error.URLError) as exc:
-            raise ReleaseTaskError(f"无法读取更新服务器能力：{exc}") from exc
+        with _urlopen_with_retry(
+            request,
+            context=context,
+            error_label="无法读取更新服务器能力",
+        ) as response:
+            status = int(response.status)
+            body = response.read()
         try:
             capability_payload = json.loads(body.decode("utf-8")) if body else {}
         except (UnicodeError, json.JSONDecodeError) as exc:
