@@ -1568,7 +1568,7 @@ class ReleasePublisherUiTests(unittest.TestCase):
     def test_windows_baseline_steps_and_buttons_are_platform_neutral(self):
         options = ReleaseOptions(
             repo_root=REPO_ROOT,
-            version="1.2.5",
+            version="1.3.0",
             base_url="https://api.example.com",
             notes="test",
             delta_from_version="1.2.1",

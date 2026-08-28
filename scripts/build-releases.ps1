@@ -9,7 +9,7 @@ param(
     [string]$Channel = "test",
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.2.5",
+    [string]$Version = "1.3.0",
     [ValidatePattern('^$|^\d+\.\d+\.\d+$')]
     [string]$DeltaFromVersion = "",
 

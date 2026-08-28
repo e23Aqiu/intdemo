@@ -50,7 +50,7 @@ class UosFileUpdateTests(unittest.TestCase):
         if include_old:
             (package / "app/_internal/old.bin").write_bytes(b"remove-me")
         if include_asset:
-            (package / "app/_internal/assets/nav-test.svg").write_text(
+            (package / "app/_internal/assets/new-feature.svg").write_text(
                 "<svg/>",
                 encoding="utf-8",
             )
@@ -89,7 +89,7 @@ class UosFileUpdateTests(unittest.TestCase):
             self.assertEqual(manifest["format"], UOS_FILE_UPDATE_FORMAT)
             self.assertEqual(
                 manifest["changed_paths"],
-                ["app/_internal/assets/nav-test.svg", "app/intdemo-client"],
+                ["app/_internal/assets/new-feature.svg", "app/intdemo-client"],
             )
             self.assertEqual(manifest["deleted_paths"], ["app/_internal/old.bin"])
             with zipfile.ZipFile(archive) as package:
@@ -97,7 +97,7 @@ class UosFileUpdateTests(unittest.TestCase):
                     set(package.namelist()),
                     {
                         "manifest.json",
-                        "payload/app/_internal/assets/nav-test.svg",
+                        "payload/app/_internal/assets/new-feature.svg",
                         "payload/app/intdemo-client",
                     },
                 )
@@ -118,7 +118,7 @@ class UosFileUpdateTests(unittest.TestCase):
             validate_file_package_root(installed, manifest["target_layout"])
             self.assertFalse((installed / "app/_internal/old.bin").exists())
             self.assertEqual(
-                (installed / "app/_internal/assets/nav-test.svg").read_text(
+                (installed / "app/_internal/assets/new-feature.svg").read_text(
                     encoding="utf-8"
                 ),
                 "<svg/>",
