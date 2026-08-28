@@ -13,7 +13,7 @@ from pathlib import Path
 
 PROTOCOL_VERSION = 1
 OUTPUT_SCHEMA_VERSION = 1
-COMPONENT_VERSION = "1.0.0"
+COMPONENT_VERSION = "1.1.0"
 ALGORITHM = "tiny-cnn-onnx-v1"
 TRAINING_MODE = "enhanced"
 

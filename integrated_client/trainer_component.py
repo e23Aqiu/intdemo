@@ -41,6 +41,9 @@ TRAINER_PACKAGE_SUFFIX = ".inttrainer"
 TRAINER_OUTPUT_MODEL_NAME = "candidate.onnx"
 TRAINER_OUTPUT_METADATA_NAME = "metadata.json"
 TRAINER_OUTPUT_METRICS_NAME = "metrics.json"
+DEFAULT_TRAINING_EPOCHS = 24
+MIN_TRAINING_EPOCHS = 1
+MAX_TRAINING_EPOCHS = 200
 SUPPORTED_TRAINER_PLATFORMS = {
     WINDOWS_UPDATE_PLATFORM,
     UOS_UPDATE_PLATFORM,
@@ -261,6 +264,9 @@ class TrainerComponentManager:
         self.versions_root = self.component_root / "versions"
         self.active_path = self.component_root / "active.json"
         self.preference_path = self.component_root / "preference.json"
+        self.training_preferences_path = (
+            self.data_dir / "captcha-training-preferences.json"
+        )
         # The lock must remain outside component_root: uninstall renames that
         # directory, which cannot safely carry an open lock file on Windows.
         self.training_lock_path = self.component_root.parent / ".trainer-operation.lock"
@@ -1146,6 +1152,43 @@ class TrainerComponentManager:
             {"schema_version": 1, "mode": normalized},
         )
         return normalized
+
+    def training_epochs(self) -> int:
+        """Return the locally persisted epoch count for enhanced training."""
+
+        try:
+            payload = _strict_json_loads(
+                self.training_preferences_path.read_bytes(),
+                label="强化训练设置",
+            )
+        except (OSError, TrainerComponentError):
+            return DEFAULT_TRAINING_EPOCHS
+        epochs = payload.get("epochs") if isinstance(payload, dict) else None
+        if (
+            set(payload) != {"schema_version", "epochs"}
+            or payload.get("schema_version") != 1
+            or type(epochs) is not int
+            or not MIN_TRAINING_EPOCHS <= epochs <= MAX_TRAINING_EPOCHS
+        ):
+            return DEFAULT_TRAINING_EPOCHS
+        return epochs
+
+    def set_training_epochs(self, epochs: int) -> int:
+        """Persist the epoch count used by the next enhanced training job."""
+
+        if (
+            type(epochs) is not int
+            or not MIN_TRAINING_EPOCHS <= epochs <= MAX_TRAINING_EPOCHS
+        ):
+            raise ValueError(
+                f"强化训练轮次必须在 {MIN_TRAINING_EPOCHS} 到 "
+                f"{MAX_TRAINING_EPOCHS} 之间"
+            )
+        self._atomic_write_json(
+            self.training_preferences_path,
+            {"schema_version": 1, "epochs": epochs},
+        )
+        return epochs
 
     @contextmanager
     def _operation_lock(

@@ -82,6 +82,7 @@ class _FakeTrainerManager:
         self.installed_sources = []
         self.self_test_count = 0
         self.uninstall_count = 0
+        self.epochs = 24
 
     def status(self, *, verify_files=True):
         return self._status
@@ -94,6 +95,15 @@ class _FakeTrainerManager:
             raise RuntimeError("强化组件不可用")
         self.mode = mode
         return mode
+
+    def training_epochs(self):
+        return self.epochs
+
+    def set_training_epochs(self, epochs):
+        if type(epochs) is not int or not 1 <= epochs <= 200:
+            raise ValueError("invalid epochs")
+        self.epochs = epochs
+        return epochs
 
     def install(self, source):
         self.installed_sources.append(Path(source))
@@ -233,9 +243,19 @@ class _FakeApi:
     def admin_update_captcha_policy(_token, _mode):
         return {}
 
-    def admin_export_captcha_dataset(self, _token, captcha_type=None):
+    def admin_export_captcha_dataset(
+        self,
+        _token,
+        captcha_type=None,
+        *,
+        progress_callback=None,
+    ):
         self.export_types.append(captcha_type)
-        return f"dataset-{captcha_type or 'mixed'}".encode("ascii")
+        result = f"dataset-{captcha_type or 'mixed'}".encode("ascii")
+        if progress_callback is not None:
+            progress_callback(0, len(result))
+            progress_callback(len(result), len(result))
+        return result
 
     @staticmethod
     def admin_import_captcha_dataset(_token, _archive):
@@ -378,6 +398,14 @@ class CaptchaLearningTests(unittest.TestCase):
             {"split", "feature", "classifier", "evaluation"}
             <= {event["event"] for event in events}
         )
+        evaluation = next(
+            event for event in events if event["event"] == "evaluation"
+        )
+        self.assertIn("识别结果", evaluation["message"])
+        self.assertIn("真实结果", evaluation["message"])
+        self.assertIn("predicted", evaluation)
+        self.assertIn("expected", evaluation)
+        self.assertIs(type(evaluation["correct"]), bool)
         self.assertEqual(
             sorted(event["progress"] for event in events),
             [event["progress"] for event in events],
@@ -2077,6 +2105,11 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertIn("tiny-cnn-onnx-v1", page.training_method_label.text())
         self.assertIn("已安装", page.trainer_status_label.text())
         self.assertIn("1.2.3", page.trainer_status_label.text())
+        self.assertEqual(page.training_epochs_spin.value(), 24)
+        self.assertTrue(page.training_epochs_spin.isEnabled())
+        page.training_epochs_spin.setValue(37)
+        self.assertEqual(manager.training_epochs(), 37)
+        self.assertIn("训练轮次：37", page.training_method_label.text())
         self.assertTrue(page.self_test_trainer_btn.isEnabled())
         self.assertTrue(page.uninstall_trainer_btn.isEnabled())
         page.deleteLater()
@@ -2150,6 +2183,8 @@ class CaptchaLearningTests(unittest.TestCase):
             page.training_mode_combo.model().item(enhanced_index).isEnabled()
         )
         self.assertIn("hog-linear-svm-v1", page.training_method_label.text())
+        self.assertIn("不使用训练轮次", page.training_method_label.text())
+        self.assertFalse(page.training_epochs_spin.isEnabled())
         self.assertIn("未安装", page.trainer_status_label.text())
         self.assertTrue(page.install_trainer_btn.isEnabled())
         self.assertFalse(page.self_test_trainer_btn.isEnabled())
@@ -2229,6 +2264,8 @@ class CaptchaLearningTests(unittest.TestCase):
 
         controls = [
             page.training_mode_combo,
+            page.training_epochs_label,
+            page.training_epochs_spin,
             page.install_trainer_btn,
             page.self_test_trainer_btn,
             page.uninstall_trainer_btn,
@@ -2257,7 +2294,12 @@ class CaptchaLearningTests(unittest.TestCase):
     def test_machine_learning_page_uses_selected_training_backend(self):
         session = _FakeSession()
         manager = _FakeTrainerManager(available=True, mode="enhanced")
-        session.api.admin_export_captcha_dataset = lambda _token, _kind: b"dataset"
+        session.api.admin_export_captcha_dataset = (
+            lambda _token, _kind, *, progress_callback=None: (
+                progress_callback(7, 7) if progress_callback else None
+            )
+            or b"dataset"
+        )
         session.api.admin_create_captcha_model = lambda _token, payload: payload
         candidate = SimpleNamespace(
             captcha_type="numeric",
@@ -2275,6 +2317,7 @@ class CaptchaLearningTests(unittest.TestCase):
         with patch.object(MachineLearningPage, "refresh"):
             page = MachineLearningPage(session, trainer_manager=manager)
         page.refresh_timer.stop()
+        page.training_epochs_spin.setValue(37)
 
         def immediate(function, completed):
             completed(function(), None)
@@ -2304,6 +2347,7 @@ class CaptchaLearningTests(unittest.TestCase):
             b"dataset",
             "numeric",
             manager,
+            epochs=37,
             progress_callback=ANY,
         )
         standard.assert_not_called()

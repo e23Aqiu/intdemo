@@ -8,6 +8,7 @@ UOS 的 PyInstaller 6 `onedir` 产物允许使用仅指向组件目录内普通�
 
 ## 模型与协议
 
+- 当前组件版本：`1.1.0`。protocol 仍为 v1，旧客户端会忽略不认识的新增进度事件。
 - 算法标识：`tiny-cnn-onnx-v1`
 - 数字验证码：完整原图输入的四位置多头 Tiny CNN，不切成四个等宽字符；输入
   `[1,1,48,112]`，输出 `[1,4,10]`。训练增强包含右边缘随机残缺。
@@ -20,6 +21,10 @@ UOS 的 PyInstaller 6 `onedir` 产物允许使用仅指向组件目录内普通�
   点选模型会分别用 1 个和 2 个候选裁图验证动态批次。
 - 训练器 protocol v1 输出目录严格只包含 `candidate.onnx`、`metadata.json`、
   `metrics.json`。JSON、文件大小及两个文件的 SHA-256 会由客户端再次校验。
+- 训练器在标准输出按 JSON Lines 发送 `started`、`epoch`、`evaluation` 和 `completed`
+  事件。每轮包含损失、训练准确率、批次数、样本数、耗时和学习率；评估事件包含
+  识别结果、真实结果和是否正确。事件只写入管理员本机训练终端，不增加服务端字段，
+  不包含验证码图片。
 
 训练命令由客户端生成，等价于：
 
@@ -31,7 +36,8 @@ intdemo-trainer train --protocol-version 1 --dataset DATASET.zip \
 可选的 CPU 参数通过环境变量设置：
 
 - `INTDEMO_TRAINER_THREADS`：CPU 线程数，默认不超过 4。
-- `INTDEMO_TRAINER_EPOCHS`：轮数，默认 24，允许 1～200。
+- `INTDEMO_TRAINER_EPOCHS`：轮数，默认 24，允许 1～200。客户端机器学习页面可
+  直接设置并持久保存该值；标准 HOG + SVM 模式不使用训练轮次。
 - `INTDEMO_TRAINER_BATCH_SIZE`：批量大小；ARM64 默认 16，其他平台默认 32。
 
 ## 本机构建
@@ -55,7 +61,7 @@ python -m pip install --no-index --find-links WHEELHOUSE \
 python scripts/package-trainer.py `
   --platform windows-x86_64 `
   all --build-root D:\trainer-build `
-  --output D:\release\IntDemo-Trainer-1.0.0-windows-x86_64.inttrainer
+  --output D:\release\IntDemo-Trainer-1.1.0-windows-x86_64.inttrainer
 ```
 
 在 UOS ARM64 上：
@@ -64,7 +70,7 @@ python scripts/package-trainer.py `
 python scripts/package-trainer.py \
   --platform linux-aarch64 \
   all --build-root /tmp/intdemo-trainer-build \
-  --output /release/IntDemo-Trainer-1.0.0-linux-aarch64.inttrainer
+  --output /release/IntDemo-Trainer-1.1.0-linux-aarch64.inttrainer
 ```
 
 外层 `.inttrainer` 是 ZIP 容器，也是管理员安装所需的唯一文件，不需要配套 JSON、

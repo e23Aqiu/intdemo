@@ -191,7 +191,12 @@ class EnhancedTrainingTests(unittest.TestCase):
             "'sample_count':30,'epochs':2,'batch_size':16,'cpu_threads':4}),"
             " flush=True)\n"
             "print(json.dumps({'event':'epoch','protocol_version':1,"
-            "'epoch':1,'epochs':2,'loss':0.25}), flush=True)\n"
+            "'epoch':1,'epochs':2,'loss':0.25,'train_accuracy':0.75,"
+            "'character_accuracy':0.9,'batches':3,'processed_samples':20,"
+            "'duration_seconds':1.25,'learning_rate':0.0015}), flush=True)\n"
+            "print(json.dumps({'event':'evaluation','protocol_version':1,"
+            "'current':1,'total':2,'predicted':'1234','expected':'1234',"
+            "'correct':True}), flush=True)\n"
         )
         with tempfile.TemporaryDirectory() as directory:
             with (Path(directory) / "stderr.log").open("w+b") as stderr_stream:
@@ -219,8 +224,14 @@ class EnhancedTrainingTests(unittest.TestCase):
                 )
 
         self.assertEqual(result.returncode, 0)
-        self.assertEqual([event["event"] for event in events], ["started", "epoch"])
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["started", "epoch", "evaluation"],
+        )
         self.assertIn("1/2", events[1]["message"])
+        self.assertIn("训练准确率 75.0%", events[1]["message"])
+        self.assertIn("识别结果：1234", events[2]["message"])
+        self.assertIn("真实结果：1234", events[2]["message"])
         self.assertEqual(events[1]["progress"], 56)
 
     def test_streaming_runner_discards_oversized_progress_line(self):
@@ -309,6 +320,42 @@ class EnhancedTrainingTests(unittest.TestCase):
         self.assertFalse(manager.locked)
         self.assertFalse(runner.dataset_path.exists())
 
+    def test_selected_epochs_are_forwarded_and_verified(self):
+        manager = _FakeComponentManager()
+        runner = _OutputRunner(
+            manager,
+            mutate_metrics=lambda value: value.update({"epochs": 37}),
+        )
+
+        with patch(
+            "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
+            return_value=object(),
+        ):
+            candidate = train_enhanced_candidate(
+                b"dataset-archive",
+                "numeric",
+                manager,
+                runner=runner,
+                epochs=37,
+            )
+
+        self.assertEqual(candidate.metrics["epochs"], 37)
+        self.assertEqual(
+            runner.calls[0][1]["env"]["INTDEMO_TRAINER_EPOCHS"],
+            "37",
+        )
+        for invalid in (True, 0, 201):
+            with self.subTest(epochs=invalid), self.assertRaises(
+                EnhancedTrainingError
+            ):
+                train_enhanced_candidate(
+                    b"dataset-archive",
+                    "numeric",
+                    manager,
+                    runner=runner,
+                    epochs=invalid,
+                )
+
     def test_click_protocol_supports_class_and_crop_metrics(self):
         manager = _FakeComponentManager()
         runner = _OutputRunner(manager)
@@ -348,8 +395,11 @@ class EnhancedTrainingTests(unittest.TestCase):
                 b'"cpu_threads":4}\n'
                 b'{"event":"epoch","protocol_version":1,'
                 b'"epoch":12,"epochs":24,"loss":0.125}\n'
+                b'{"event":"evaluation","protocol_version":1,'
+                b'"current":1,"total":5,"predicted":"4826",'
+                b'"expected":"4828","correct":false}\n'
                 b'{"event":"completed","protocol_version":1,'
-                b'"accuracy":0.8}\n'
+                b'"accuracy":0.8,"correct_count":4,"test_count":5}\n'
             )
             return result
 
@@ -368,10 +418,21 @@ class EnhancedTrainingTests(unittest.TestCase):
         event_names = [event["event"] for event in events]
         self.assertEqual(
             event_names,
-            ["preparing", "started", "epoch", "completed", "validating", "validated"],
+            [
+                "preparing",
+                "started",
+                "epoch",
+                "evaluation",
+                "completed",
+                "validating",
+                "validated",
+            ],
         )
         self.assertIn("12/24", events[2]["message"])
         self.assertIn("0.125000", events[2]["message"])
+        self.assertIn("识别结果：4826", events[3]["message"])
+        self.assertIn("真实结果：4828", events[3]["message"])
+        self.assertIn("正确 4/5", events[4]["message"])
         self.assertEqual(events[-1]["progress"], 90)
 
     def test_failure_uses_bounded_sanitized_stderr_and_ignores_stdout(self):

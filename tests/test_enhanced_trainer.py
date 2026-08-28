@@ -35,6 +35,7 @@ from integrated_client.captcha_models import _cnn_click_tensor
 from integrated_client.captcha_tensors import click_candidate_bbox
 from enhanced_trainer.protocol import (
     ALGORITHM,
+    COMPONENT_VERSION,
     METADATA_FILE_NAME,
     METRICS_FILE_NAME,
     METRICS_OPTIONAL_FIELDS,
@@ -269,7 +270,7 @@ class EnhancedProtocolTests(unittest.TestCase):
             return_value={
                 "ok": True,
                 "protocol_version": 1,
-                "component_version": "1.0.0",
+                "component_version": COMPONENT_VERSION,
             },
         ), patch("builtins.print") as output:
             code = cli.main(["self-test", "--protocol-version", "1"])
@@ -456,7 +457,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
                     {
                         "ok": True,
                         "protocol_version": 1,
-                        "component_version": "1.0.0",
+                        "component_version": COMPONENT_VERSION,
                     }
                 ),
                 stderr="",

@@ -9,6 +9,7 @@ import platform
 import random
 import shutil
 import tempfile
+import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -204,6 +205,7 @@ def _train_numeric(torch, samples, epochs, batch_size, seed):
     criterion = torch.nn.CrossEntropyLoss()
     model.train()
     for epoch in range(epochs):
+        epoch_started = time.perf_counter()
         train_dataset.epoch = epoch
         loader = _loader(
             torch,
@@ -214,6 +216,9 @@ def _train_numeric(torch, samples, epochs, batch_size, seed):
         )
         loss_total = 0.0
         item_count = 0
+        batch_count = 0
+        exact_correct = 0
+        character_correct = 0
         for images, targets in loader:
             optimizer.zero_grad(set_to_none=True)
             logits = model(images)
@@ -225,12 +230,24 @@ def _train_numeric(torch, samples, epochs, batch_size, seed):
             optimizer.step()
             loss_total += float(loss.detach()) * len(images)
             item_count += len(images)
+            batch_count += 1
+            with torch.no_grad():
+                predictions = logits.detach().argmax(dim=2)
+                matches = predictions.eq(targets)
+                exact_correct += int(matches.all(dim=1).sum().item())
+                character_correct += int(matches.sum().item())
         _emit(
             "epoch",
             captcha_type="numeric",
             epoch=epoch + 1,
             epochs=epochs,
             loss=loss_total / max(1, item_count),
+            train_accuracy=exact_correct / max(1, item_count),
+            character_accuracy=character_correct / max(1, item_count * 4),
+            batches=batch_count,
+            processed_samples=item_count,
+            duration_seconds=time.perf_counter() - epoch_started,
+            learning_rate=float(optimizer.param_groups[0]["lr"]),
         )
 
     model.eval()
@@ -248,7 +265,24 @@ def _train_numeric(torch, samples, epochs, batch_size, seed):
             predictions = model(images).argmax(dim=2)
             matches = predictions.eq(targets)
             correct += int(matches.all(dim=1).sum().item())
-            evaluated += len(images)
+            predicted_rows = predictions.tolist()
+            expected_rows = targets.tolist()
+            for predicted_row, expected_row in zip(
+                predicted_rows,
+                expected_rows,
+            ):
+                predicted_text = "".join(str(int(value)) for value in predicted_row)
+                expected_text = "".join(str(int(value)) for value in expected_row)
+                evaluated += 1
+                _emit(
+                    "evaluation",
+                    captcha_type="numeric",
+                    current=evaluated,
+                    total=len(test_samples),
+                    predicted=predicted_text,
+                    expected=expected_text,
+                    correct=predicted_text == expected_text,
+                )
             for position in range(4):
                 position_correct[position] += int(matches[:, position].sum().item())
     metrics = {
@@ -337,6 +371,7 @@ def _train_click(torch, samples, epochs, batch_size, seed):
     criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
     model.train()
     for epoch in range(epochs):
+        epoch_started = time.perf_counter()
         train_dataset.epoch = epoch
         loader = _loader(
             torch,
@@ -347,19 +382,32 @@ def _train_click(torch, samples, epochs, batch_size, seed):
         )
         loss_total = 0.0
         item_count = 0
+        batch_count = 0
+        item_correct = 0
         for images, targets in loader:
             optimizer.zero_grad(set_to_none=True)
-            loss = criterion(model(images), targets)
+            logits = model(images)
+            loss = criterion(logits, targets)
             loss.backward()
             optimizer.step()
             loss_total += float(loss.detach()) * len(images)
             item_count += len(images)
+            batch_count += 1
+            with torch.no_grad():
+                item_correct += int(
+                    logits.detach().argmax(dim=1).eq(targets).sum().item()
+                )
         _emit(
             "epoch",
             captcha_type="click",
             epoch=epoch + 1,
             epochs=epochs,
             loss=loss_total / max(1, item_count),
+            train_accuracy=item_correct / max(1, item_count),
+            batches=batch_count,
+            processed_samples=item_count,
+            duration_seconds=time.perf_counter() - epoch_started,
+            learning_rate=float(optimizer.param_groups[0]["lr"]),
         )
 
     model.eval()
@@ -385,7 +433,17 @@ def _train_click(torch, samples, epochs, batch_size, seed):
             predictions = model(tensor).argmax(dim=1).tolist()
             predicted = [labels[index] for index in predictions]
             evaluated_samples += 1
-            correct_samples += int(predicted == expected)
+            matched = predicted == expected
+            correct_samples += int(matched)
+            _emit(
+                "evaluation",
+                captcha_type="click",
+                current=evaluated_samples,
+                total=len(test_samples),
+                predicted="、".join(predicted),
+                expected="、".join(expected),
+                correct=matched,
+            )
     if not evaluated_samples:
         raise TrainingError("点选验证码测试集没有可评估的已知字符")
     metrics = {
@@ -615,6 +673,8 @@ def train(
         captcha_type=selected_type,
         version=version,
         accuracy=float(metrics["accuracy"]),
+        test_count=int(metrics["test_samples"]),
+        correct_count=int(metrics["correct_samples"]),
     )
     return result
 

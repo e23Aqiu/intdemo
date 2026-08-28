@@ -1451,14 +1451,22 @@ def _train_numeric(
         except CaptchaTrainingError:
             continue
         evaluated += 1
-        correct += int(predicted == expected)
+        matched = predicted == expected
+        correct += int(matched)
         _report_training_progress(
             progress_callback,
             "evaluation",
             progress=75 + round(11 * index / max(1, len(test))),
-            message=f"评估固定留出集 {index}/{len(test)}",
-            current=index,
+            message=(
+                f"固定留出集 {evaluated}/{len(test)} · "
+                f"识别结果：{predicted or '（空）'} · 真实结果：{expected} · "
+                f"{'正确' if matched else '错误'}"
+            ),
+            current=evaluated,
             total=len(test),
+            predicted=predicted,
+            expected=expected,
+            correct=matched,
         )
     if not evaluated:
         raise CaptchaTrainingError("数字验证码测试集没有可评估样本")
@@ -1566,14 +1574,25 @@ def _train_click(
         except (CaptchaTrainingError, KeyError, TypeError, ValueError):
             continue
         evaluated += 1
-        correct += int(predicted == [str(value) for value in prompt])
+        expected = [str(value) for value in prompt]
+        matched = predicted == expected
+        correct += int(matched)
+        predicted_text = "、".join(predicted) or "（空）"
+        expected_text = "、".join(expected)
         _report_training_progress(
             progress_callback,
             "evaluation",
             progress=75 + round(11 * index / max(1, len(test))),
-            message=f"评估固定留出集 {index}/{len(test)}",
-            current=index,
+            message=(
+                f"固定留出集 {evaluated}/{len(test)} · "
+                f"识别结果：{predicted_text} · 真实结果：{expected_text} · "
+                f"{'正确' if matched else '错误'}"
+            ),
+            current=evaluated,
             total=len(test),
+            predicted=predicted_text,
+            expected=expected_text,
+            correct=matched,
         )
     if not evaluated:
         raise CaptchaTrainingError("点选验证码测试集没有可评估样本")
@@ -1615,7 +1634,8 @@ def train_candidate(
         progress=20,
         message=(
             f"标准训练开始：有效样本 {len(samples)} 条，"
-            f"算法 hog-linear-svm-v1"
+            "算法 hog-linear-svm-v1；标准模式为一次性确定性训练，"
+            "不使用训练轮次"
         ),
         captcha_type=captcha_type,
         sample_count=len(samples),

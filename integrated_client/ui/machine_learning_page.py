@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QInputDialog,
     QLabel,
     QPushButton,
+    QSpinBox,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -32,6 +33,9 @@ from ..captcha_models import (
 from ..enhanced_training import train_enhanced_candidate
 from ..online.api import ApiResponseError
 from ..trainer_component import (
+    DEFAULT_TRAINING_EPOCHS,
+    MAX_TRAINING_EPOCHS,
+    MIN_TRAINING_EPOCHS,
     STATUS_AVAILABLE,
     STATUS_DAMAGED,
     STATUS_INCOMPATIBLE,
@@ -131,6 +135,7 @@ class MachineLearningPage(QWidget):
         self._shutting_down = False
         self._loading_policy = False
         self._loading_training_mode = False
+        self._loading_training_epochs = False
         self._component_task_running = False
         self._training_in_progress = False
         self._training_id = ""
@@ -240,6 +245,29 @@ class MachineLearningPage(QWidget):
             self._change_training_mode
         )
         trainer_controls.addWidget(self.training_mode_combo)
+        self.training_epochs_label = QLabel("强化训练轮次")
+        self.training_epochs_label.setObjectName("Muted")
+        trainer_controls.addWidget(self.training_epochs_label)
+        self.training_epochs_spin = QSpinBox()
+        self.training_epochs_spin.setRange(
+            MIN_TRAINING_EPOCHS,
+            MAX_TRAINING_EPOCHS,
+        )
+        self.training_epochs_spin.setSuffix(" 轮")
+        self.training_epochs_spin.setMinimumWidth(92)
+        self.training_epochs_spin.setKeyboardTracking(False)
+        self.training_epochs_spin.setToolTip(
+            "仅用于 Tiny CNN 强化训练；标准 HOG + SVM 为一次性训练，不使用轮次。"
+        )
+        try:
+            configured_epochs = self.trainer_manager.training_epochs()
+        except (AttributeError, OSError, TrainerComponentError, ValueError):
+            configured_epochs = DEFAULT_TRAINING_EPOCHS
+        self.training_epochs_spin.setValue(configured_epochs)
+        self.training_epochs_spin.valueChanged.connect(
+            self._change_training_epochs
+        )
+        trainer_controls.addWidget(self.training_epochs_spin)
         self.install_trainer_btn = QPushButton("安装强化组件")
         self.install_trainer_btn.clicked.connect(self._install_trainer_component)
         self.self_test_trainer_btn = QPushButton("组件自检")
@@ -491,6 +519,11 @@ class MachineLearningPage(QWidget):
     def _set_component_controls_enabled(self, enabled):
         available = bool(enabled) and not self._training_in_progress
         self.training_mode_combo.setEnabled(available)
+        enhanced_selected = (
+            str(self.training_mode_combo.currentData() or "standard")
+            == "enhanced"
+        )
+        self.training_epochs_spin.setEnabled(available and enhanced_selected)
         self.install_trainer_btn.setEnabled(available)
         status = self.trainer_manager.status(verify_files=False)
         self.self_test_trainer_btn.setEnabled(available and status.available)
@@ -516,9 +549,14 @@ class MachineLearningPage(QWidget):
             if item is not None:
                 item.setEnabled(status.available)
 
+        epoch_detail = (
+            f" · 训练轮次：{self.training_epochs_spin.value()}"
+            if mode == "enhanced"
+            else " · 标准模式不使用训练轮次"
+        )
         self.training_method_label.setText(
             f"当前模式：{'强化模式' if mode == 'enhanced' else '标准模式'} · "
-            f"当前方法：{TRAINING_METHODS[mode]}"
+            f"当前方法：{TRAINING_METHODS[mode]}{epoch_detail}"
         )
         platform_labels = {
             "windows-x86_64": "Windows x64",
@@ -575,6 +613,30 @@ class MachineLearningPage(QWidget):
         except (TrainerComponentError, OSError, ValueError) as exc:
             QMessageBox.warning(self, "无法切换训练模式", str(exc))
         self._refresh_training_component()
+
+    def _change_training_epochs(self, value):
+        if self._loading_training_epochs:
+            return
+        try:
+            self.trainer_manager.set_training_epochs(int(value))
+        except (AttributeError, OSError, TrainerComponentError, ValueError) as exc:
+            self._loading_training_epochs = True
+            try:
+                self.training_epochs_spin.setValue(
+                    self.trainer_manager.training_epochs()
+                )
+            except (AttributeError, OSError, TrainerComponentError, ValueError):
+                self.training_epochs_spin.setValue(DEFAULT_TRAINING_EPOCHS)
+            finally:
+                self._loading_training_epochs = False
+            QMessageBox.warning(self, "无法保存训练轮次", str(exc))
+            return
+        mode = str(self.training_mode_combo.currentData() or "standard")
+        if mode == "enhanced":
+            self.training_method_label.setText(
+                f"当前模式：强化模式 · 当前方法：{TRAINING_METHODS['enhanced']}"
+                f" · 训练轮次：{int(value)}"
+            )
 
     def _begin_loading(self, message):
         if self._loading_dialog is not None:
@@ -1738,6 +1800,7 @@ class MachineLearningPage(QWidget):
         captcha_name,
         mode_name,
         method_name,
+        training_epochs=None,
     ):
         previous = self._training_terminal
         if previous is not None:
@@ -1768,7 +1831,14 @@ class MachineLearningPage(QWidget):
             {
                 "event": "queued",
                 "progress": 2,
-                "message": f"训练任务已启动 · {mode_name} · {method_name}",
+                "message": (
+                    f"训练任务已启动 · {mode_name} · {method_name}"
+                    + (
+                        f" · 设置 {int(training_epochs)} 轮"
+                        if training_epochs is not None
+                        else " · 一次性训练"
+                    )
+                ),
             },
         )
 
@@ -1814,6 +1884,9 @@ class MachineLearningPage(QWidget):
         mode_name = "强化模式" if mode == "enhanced" else "标准模式"
         method_name = TRAINING_METHODS[mode]
         algorithm = TRAINING_ALGORITHM_BY_MODE[mode]
+        training_epochs = (
+            self.training_epochs_spin.value() if mode == "enhanced" else None
+        )
         if self._server_capabilities_loaded and algorithm not in (
             self._server_model_algorithms.get(captcha_type) or frozenset()
         ):
@@ -1829,7 +1902,13 @@ class MachineLearningPage(QWidget):
             "训练候选模型",
             f"将下载当前{type_name}成功样本，在本机划分训练集和固定留出集，"
             f"使用{mode_name}生成候选模型并上传模型及评估结果。\n"
-            f"当前方法：{method_name}\n\n是否继续？",
+            f"当前方法：{method_name}\n"
+            + (
+                f"训练轮次：{training_epochs}\n"
+                if training_epochs is not None
+                else "标准模式为一次性训练，不使用训练轮次。\n"
+            )
+            + "\n是否继续？",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -1851,6 +1930,7 @@ class MachineLearningPage(QWidget):
             captcha_name=type_name,
             mode_name=mode_name,
             method_name=method_name,
+            training_epochs=training_epochs,
         )
 
         def progress(payload):
@@ -1860,20 +1940,60 @@ class MachineLearningPage(QWidget):
             progress(
                 {
                     "event": "download",
-                    "progress": 5,
-                    "message": "正在从服务器下载未处理的原始成功样本",
+                    "progress": 4,
+                    "message": "正在连接服务器并准备下载原始成功样本",
                 }
             )
             token = self.session_manager.access_token()
+            last_download_percent = {"value": -1}
+            last_download_bytes = {"value": -1}
+
+            def download_progress(downloaded, total):
+                downloaded = max(0, int(downloaded or 0))
+                if total:
+                    total = max(downloaded, int(total))
+                    percent = min(100, round(downloaded * 100 / total))
+                    if percent == last_download_percent["value"]:
+                        return
+                    last_download_percent["value"] = percent
+                    message = (
+                        f"样本下载进度：{_format_size(downloaded)} / "
+                        f"{_format_size(total)}（{percent}%）"
+                    )
+                    terminal_progress = 5 + round(7 * percent / 100)
+                else:
+                    if (
+                        last_download_bytes["value"] >= 0
+                        and downloaded - last_download_bytes["value"]
+                        < 1024 * 1024
+                    ):
+                        return
+                    last_download_bytes["value"] = downloaded
+                    message = f"样本下载进度：已下载 {_format_size(downloaded)}"
+                    terminal_progress = 8
+                progress(
+                    {
+                        "event": "download_progress",
+                        "progress": terminal_progress,
+                        "message": message,
+                        "downloaded_bytes": downloaded,
+                        "total_bytes": total,
+                    }
+                )
+
             archive = self.session_manager.api.admin_export_captcha_dataset(
                 token,
                 captcha_type,
+                progress_callback=download_progress,
             )
             progress(
                 {
                     "event": "inspect",
-                    "progress": 12,
-                    "message": f"数据集下载完成 · {_format_size(len(archive))}，正在检查样本",
+                    "progress": 13,
+                    "message": (
+                        f"数据集下载完成：{_format_size(len(archive))}；"
+                        "正在校验清单、图片、答案和重复样本"
+                    ),
                 }
             )
             inspection = inspect_training_dataset(archive, captcha_type)
@@ -1890,7 +2010,7 @@ class MachineLearningPage(QWidget):
             progress(
                 {
                     "event": "inspection_complete",
-                    "progress": 18,
+                    "progress": 19,
                     "message": (
                         f"样本检查完成：服务器记录 {declared_samples} 条，"
                         f"有效且不重复 {inspection.valid_count} 条，"
@@ -1911,6 +2031,7 @@ class MachineLearningPage(QWidget):
                     archive,
                     captcha_type,
                     self.trainer_manager,
+                    epochs=training_epochs,
                     progress_callback=progress,
                 )
                 if mode == "enhanced"

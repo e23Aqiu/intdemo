@@ -188,12 +188,22 @@ class TrainerComponentTests(unittest.TestCase):
         self.assertEqual(manager.preferred_mode(), "standard")
         self.assertEqual(manager.set_preferred_mode("enhanced"), "enhanced")
         self.assertEqual(manager.preferred_mode(), "enhanced")
+        self.assertEqual(manager.training_epochs(), 24)
+        self.assertEqual(manager.set_training_epochs(37), 37)
+        self.assertEqual(self.manager().training_epochs(), 37)
+        with self.assertRaises(ValueError):
+            manager.set_training_epochs(0)
+        with self.assertRaises(ValueError):
+            manager.set_training_epochs(True)
+        with self.assertRaises(ValueError):
+            manager.set_training_epochs(201)
         self.assertEqual(manager.self_test().code, STATUS_AVAILABLE)
 
         released = manager.uninstall()
         self.assertGreater(released, 0)
         self.assertEqual(manager.status().code, STATUS_NOT_INSTALLED)
         self.assertEqual(manager.preferred_mode(), "standard")
+        self.assertEqual(manager.training_epochs(), 37)
         self.assertTrue((self.root / "samples.zip").parent.exists())
 
     def test_training_output_cannot_overwrite_component(self):

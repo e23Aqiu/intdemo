@@ -21,7 +21,12 @@ from .captcha_models import (
     TinyCnnOnnxCaptchaModel,
 )
 from .platform_support import system_application_launch_context
-from .trainer_component import TRAINER_PROTOCOL_VERSION, TrainerComponentManager
+from .trainer_component import (
+    MAX_TRAINING_EPOCHS,
+    MIN_TRAINING_EPOCHS,
+    TRAINER_PROTOCOL_VERSION,
+    TrainerComponentManager,
+)
 
 ENHANCED_TRAINING_TIMEOUT_SECONDS = 3_600
 MAX_OUTPUT_JSON_BYTES = 256 * 1024
@@ -101,17 +106,21 @@ def _component_progress_event(
     if not isinstance(event, dict) or event.get("protocol_version") != 1:
         return
     name = str(event.get("event") or "")
-    try:
-        epochs = int(event.get("epochs") or 0)
-        epoch = int(event.get("epoch") or 0)
-        samples = int(event.get("sample_count") or 0)
-        batch_size = int(event.get("batch_size") or 0)
-        threads = int(event.get("cpu_threads") or 0)
-        loss = float(event.get("loss") or 0.0)
-        accuracy = float(event.get("accuracy") or 0.0)
-    except (TypeError, ValueError, OverflowError):
-        return
     if name == "started":
+        try:
+            epochs = int(event.get("epochs") or 0)
+            samples = int(event.get("sample_count") or 0)
+            batch_size = int(event.get("batch_size") or 0)
+            threads = int(event.get("cpu_threads") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (
+            not 1 <= epochs <= 200
+            or not 1 <= samples <= MAX_COUNT
+            or not 1 <= batch_size <= MAX_COUNT
+            or not 1 <= threads <= 64
+        ):
+            return
         _emit_progress(
             callback,
             {
@@ -128,26 +137,153 @@ def _component_progress_event(
             },
         )
     elif name == "epoch":
-        epochs = max(1, epochs)
+        try:
+            epochs = int(event.get("epochs") or 0)
+            epoch = int(event.get("epoch") or 0)
+            loss = float(event.get("loss"))
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (
+            not 1 <= epochs <= 200
+            or not 1 <= epoch <= epochs
+            or not math.isfinite(loss)
+            or loss < 0
+        ):
+            return
+
+        def optional_number(key, *, minimum=0.0, maximum=None):
+            value = event.get(key)
+            if value is None:
+                return None
+            try:
+                result = float(value)
+            except (TypeError, ValueError, OverflowError):
+                return None
+            if not math.isfinite(result) or result < minimum:
+                return None
+            if maximum is not None and result > maximum:
+                return None
+            return result
+
+        def optional_integer(key, *, minimum=1, maximum=MAX_COUNT):
+            value = event.get(key)
+            if type(value) is not int or not minimum <= value <= maximum:
+                return None
+            return value
+
+        train_accuracy = optional_number("train_accuracy", maximum=1.0)
+        character_accuracy = optional_number(
+            "character_accuracy",
+            maximum=1.0,
+        )
+        duration_seconds = optional_number(
+            "duration_seconds",
+            maximum=86_400.0,
+        )
+        learning_rate = optional_number(
+            "learning_rate",
+            maximum=1_000.0,
+        )
+        batches = optional_integer("batches")
+        processed_samples = optional_integer("processed_samples")
+        parts = [f"训练轮次 {epoch}/{epochs}", f"损失 {loss:.6f}"]
+        if train_accuracy is not None:
+            parts.append(f"训练准确率 {train_accuracy * 100:.1f}%")
+        if character_accuracy is not None:
+            parts.append(f"单字符准确率 {character_accuracy * 100:.1f}%")
+        if batches is not None and processed_samples is not None:
+            parts.append(f"{batches} 批 / {processed_samples} 条")
+        if duration_seconds is not None:
+            parts.append(f"耗时 {duration_seconds:.2f} 秒")
+        if learning_rate is not None:
+            parts.append(f"学习率 {learning_rate:.6g}")
+        payload = {
+            "event": name,
+            "progress": 32 + round(48 * epoch / epochs),
+            "message": " · ".join(parts),
+            "epoch": epoch,
+            "epochs": epochs,
+            "loss": loss,
+        }
+        for key, value in (
+            ("train_accuracy", train_accuracy),
+            ("character_accuracy", character_accuracy),
+            ("duration_seconds", duration_seconds),
+            ("learning_rate", learning_rate),
+            ("batches", batches),
+            ("processed_samples", processed_samples),
+        ):
+            if value is not None:
+                payload[key] = value
+        _emit_progress(
+            callback,
+            payload,
+        )
+    elif name == "evaluation":
+        try:
+            current = int(event.get("current") or 0)
+            total = int(event.get("total") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        correct = event.get("correct")
+        expected = " ".join(
+            str(event.get("expected") or "").replace("\x00", "").split()
+        )[:64]
+        predicted = " ".join(
+            str(event.get("predicted") or "").replace("\x00", "").split()
+        )[:64]
+        if (
+            not 1 <= current <= total <= MAX_COUNT
+            or type(correct) is not bool
+            or not expected
+        ):
+            return
         _emit_progress(
             callback,
             {
                 "event": name,
-                "progress": 32 + round(48 * epoch / epochs),
-                "message": f"训练轮次 {epoch}/{epochs} · 损失 {loss:.6f}",
-                "epoch": epoch,
-                "epochs": epochs,
-                "loss": loss,
+                "progress": 80 + round(4 * current / total),
+                "message": (
+                    f"固定留出集 {current}/{total} · "
+                    f"识别结果：{predicted or '（空）'} · "
+                    f"真实结果：{expected} · {'正确' if correct else '错误'}"
+                ),
+                "current": current,
+                "total": total,
+                "predicted": predicted,
+                "expected": expected,
+                "correct": correct,
             },
         )
     elif name == "completed":
+        try:
+            accuracy = float(event.get("accuracy"))
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not math.isfinite(accuracy) or not 0 <= accuracy <= 1:
+            return
+        test_count = event.get("test_count")
+        correct_count = event.get("correct_count")
+        count_detail = ""
+        if (
+            type(test_count) is int
+            and type(correct_count) is int
+            and 1 <= test_count <= MAX_COUNT
+            and 0 <= correct_count <= test_count
+        ):
+            count_detail = f" · 正确 {correct_count}/{test_count}"
         _emit_progress(
             callback,
             {
                 "event": name,
                 "progress": 84,
-                "message": f"强化训练完成 · 固定留出集准确率 {accuracy * 100:.1f}%",
+                "message": (
+                    f"强化训练完成 · 固定留出集准确率 {accuracy * 100:.1f}%"
+                    f"{count_detail}"
+                ),
                 "accuracy": accuracy,
+                "test_count": test_count,
+                "correct_count": correct_count,
             },
         )
 
@@ -494,6 +630,7 @@ def train_enhanced_candidate(
     *,
     runner=None,
     timeout_seconds: float = ENHANCED_TRAINING_TIMEOUT_SECONDS,
+    epochs: int | None = None,
     progress_callback: EnhancedProgressCallback | None = None,
 ) -> CaptchaCandidate:
     """Train through the installed component and return a verified candidate."""
@@ -509,6 +646,14 @@ def train_enhanced_candidate(
     timeout = float(timeout_seconds)
     if not math.isfinite(timeout) or timeout <= 0 or timeout > 86_400:
         raise EnhancedTrainingError("强化训练超时时间无效")
+    if epochs is not None and (
+        type(epochs) is not int
+        or not MIN_TRAINING_EPOCHS <= epochs <= MAX_TRAINING_EPOCHS
+    ):
+        raise EnhancedTrainingError(
+            f"强化训练轮次必须在 {MIN_TRAINING_EPOCHS} 到 "
+            f"{MAX_TRAINING_EPOCHS} 之间"
+        )
     process_runner = runner or subprocess.run
 
     try:
@@ -523,7 +668,10 @@ def train_enhanced_candidate(
                 {
                     "event": "preparing",
                     "progress": 26,
-                    "message": "正在准备强化训练工作区并校验本机组件",
+                    "message": (
+                        "正在准备强化训练工作区并校验本机组件"
+                        + (f" · 已设置 {epochs} 轮" if epochs is not None else "")
+                    ),
                 },
             )
             with (workspace / "trainer.stderr").open("w+b") as stderr_stream:
@@ -564,6 +712,8 @@ def train_enhanced_candidate(
                         raise EnhancedTrainingError("强化训练器启动命令无效")
                     command = list(command)
                     environment = component_manager.training_environment()
+                    if epochs is not None:
+                        environment["INTDEMO_TRAINER_EPOCHS"] = str(epochs)
                     run_options["env"] = environment
                     try:
                         with system_application_launch_context():
@@ -616,6 +766,13 @@ def train_enhanced_candidate(
                         captcha_type,
                         component_manager,
                     )
+                    if (
+                        epochs is not None
+                        and candidate.metrics.get("epochs") != epochs
+                    ):
+                        raise EnhancedTrainingError(
+                            "强化训练器未按所选轮次生成模型"
+                        )
                     _emit_progress(
                         progress_callback,
                         {

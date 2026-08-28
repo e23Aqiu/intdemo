@@ -15,7 +15,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from integrated_client.config import APP_VERSION
 from integrated_client.database import AuthenticationError, Database, DatabaseError
-from integrated_client.online.api import ApiResponseError, NetworkUnavailable
+from integrated_client.online.api import ApiClient, ApiResponseError, NetworkUnavailable
 from integrated_client.online.config import OnlineConfig, OnlineConfigurationError
 from integrated_client.online.coordinator import load_websocket_ca_certificates
 from integrated_client.online.secure import DpapiProtector, Protector
@@ -547,6 +547,33 @@ class OnlineClientTests(unittest.TestCase):
             ca_bundle=str(self.database.path),
         ).validate()
         self.assertEqual(config.ca_bundle, str(self.database.path))
+
+    def test_captcha_dataset_download_streams_byte_progress(self):
+        response = Mock()
+        response.status_code = 200
+        response.headers = {"Content-Length": "6"}
+        response.iter_content.return_value = [b"abc", b"", b"def"]
+        session = Mock()
+        session.headers = {}
+        session.request.return_value = response
+        client = ApiClient(
+            OnlineConfig(base_url="https://api.example.com"),
+            session=session,
+        )
+        progress = []
+
+        result = client.admin_export_captcha_dataset(
+            "token",
+            "numeric",
+            progress_callback=lambda downloaded, total: progress.append(
+                (downloaded, total)
+            ),
+        )
+
+        self.assertEqual(result, b"abcdef")
+        self.assertEqual(progress, [(0, 6), (3, 6), (6, 6)])
+        self.assertTrue(session.request.call_args.kwargs["stream"])
+        response.close.assert_called_once_with()
 
     def test_websocket_ca_loads_from_unicode_windows_path(self):
         source = (

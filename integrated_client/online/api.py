@@ -1,11 +1,19 @@
 from __future__ import annotations
 
-from typing import Any
+from collections.abc import Callable
+from typing import Any, Optional
 
 import requests
 
 from ..config import APP_VERSION
 from .config import OnlineConfig
+
+DATASET_DOWNLOAD_CHUNK_SIZE = 256 * 1024
+MAX_DATASET_DOWNLOAD_BYTES = 100 * 1024 * 1024
+DownloadProgressCallback = Callable[
+    [int, Optional[int]],  # noqa: UP045 - Python 3.9 runtime alias
+    None,
+]
 
 
 class OnlineApiError(RuntimeError):
@@ -62,6 +70,7 @@ class ApiClient:
         content_type: str | None = None,
         params: dict | None = None,
         raw_response: bool = False,
+        stream: bool = False,
     ) -> Any:
         headers = {}
         if token:
@@ -78,6 +87,7 @@ class ApiClient:
                 params=params,
                 timeout=(self.config.connect_timeout, self.config.read_timeout),
                 verify=self.config.ca_bundle or True,
+                stream=stream,
             )
         except requests.exceptions.SSLError as exc:
             raise TlsVerificationError(f"TLS 证书验证失败：{exc}") from exc
@@ -251,6 +261,8 @@ class ApiClient:
         self,
         access_token: str,
         captcha_type: str | None = None,
+        *,
+        progress_callback: DownloadProgressCallback | None = None,
     ) -> bytes:
         response = self._request(
             "GET",
@@ -258,8 +270,48 @@ class ApiClient:
             token=access_token,
             params={"captcha_type": captcha_type} if captcha_type else None,
             raw_response=True,
+            stream=True,
         )
-        return bytes(response.content)
+        raw_total = str(response.headers.get("Content-Length") or "").strip()
+        try:
+            total = int(raw_total) if raw_total else None
+        except ValueError:
+            total = None
+        if total is not None and not 0 <= total <= MAX_DATASET_DOWNLOAD_BYTES:
+            response.close()
+            raise OnlineApiError("验证码数据集下载大小超过 100 MB 限制")
+
+        def report(downloaded: int) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(downloaded, total)
+            except Exception:  # noqa: BLE001,S110 - display callback is optional
+                pass
+
+        blocks = []
+        downloaded = 0
+        report(0)
+        try:
+            for block in response.iter_content(
+                chunk_size=DATASET_DOWNLOAD_CHUNK_SIZE
+            ):
+                if not block:
+                    continue
+                downloaded += len(block)
+                if downloaded > MAX_DATASET_DOWNLOAD_BYTES:
+                    raise OnlineApiError(
+                        "验证码数据集下载大小超过 100 MB 限制"
+                    )
+                blocks.append(bytes(block))
+                report(downloaded)
+        except requests.exceptions.SSLError as exc:
+            raise TlsVerificationError(f"TLS 证书验证失败：{exc}") from exc
+        except requests.RequestException as exc:
+            raise NetworkUnavailable(f"验证码数据集下载中断：{exc}") from exc
+        finally:
+            response.close()
+        return b"".join(blocks)
 
     def admin_import_captcha_dataset(
         self,
