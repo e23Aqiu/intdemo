@@ -11,12 +11,14 @@ from pathlib import Path
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
 
 from ..captcha_models import (
+    CAPTCHA_ENGINE_ALGORITHM,
     ENHANCED_ONNX_ALGORITHM,
     HOG_SVM_ALGORITHM,
     CaptchaModelManager,
 )
 from ..config import get_data_dir
 from ..diagnostics import get_logger
+from ..trainer_component import TrainerComponentManager
 
 MAX_MODEL_CACHE_BYTES = 20 * 1024 * 1024
 MAX_SAMPLE_UPLOAD_BYTES = 1 * 1024 * 1024
@@ -32,6 +34,7 @@ UPLOAD_MODES = {
     UPLOAD_MODE_SAMPLES_AND_METRICS,
 }
 SUPPORTED_REMOTE_MODEL_ALGORITHMS = {
+    CAPTCHA_ENGINE_ALGORITHM,
     HOG_SVM_ALGORITHM,
     ENHANCED_ONNX_ALGORITHM,
 }
@@ -69,12 +72,16 @@ class CaptchaLearningService(QObject):
         session_manager,
         parent=None,
         model_manager=None,
+        component_manager=None,
         database=None,
         server_account_id=None,
     ):
         super().__init__(parent)
         self.session_manager = session_manager
-        self.model_manager = model_manager or CaptchaModelManager()
+        self.component_manager = component_manager or TrainerComponentManager()
+        self.model_manager = model_manager or CaptchaModelManager(
+            component_manager=self.component_manager
+        )
         self.database = database
         self.server_account_id = str(server_account_id or "").strip()
         self.policy = {
@@ -112,6 +119,9 @@ class CaptchaLearningService(QObject):
         self._refresh_pending = False
         self._downloading_models.clear()
         self._uploading_outbox_ids.clear()
+        stop_models = getattr(self.model_manager, "stop", None)
+        if callable(stop_models):
+            stop_models()
 
     def upload_mode(self) -> str:
         mode = str(self.policy.get("upload_mode") or "")
@@ -221,6 +231,14 @@ class CaptchaLearningService(QObject):
                 algorithm,
             ):
                 continue
+            if (
+                algorithm == CAPTCHA_ENGINE_ALGORITHM
+                and self._model_cache_matches(captcha_type, version, digest)
+            ):
+                # The data-only model is validly cached but this device has no
+                # compatible local component yet.  Retry the cache on each
+                # policy refresh without downloading or deleting it.
+                continue
             self._downloading_models[captcha_type] = identity
 
             def download(kind=captcha_type):
@@ -274,6 +292,20 @@ class CaptchaLearningService(QObject):
             )
         except Exception as exc:  # noqa: BLE001 - invalid remote artifact
             get_logger().exception("Could not install CAPTCHA model: %s", exc)
+            if algorithm == CAPTCHA_ENGINE_ALGORITHM:
+                try:
+                    self._save_model_cache(
+                        captcha_type,
+                        version,
+                        artifact,
+                        algorithm=algorithm,
+                    )
+                except (OSError, ValueError) as cache_exc:
+                    get_logger().warning(
+                        "Could not cache pending component CAPTCHA model: %s",
+                        cache_exc,
+                    )
+                return
             self._reject_model_artifact(captcha_type, version)
             return
         self._active_model_identities[captcha_type] = requested_identity
@@ -299,6 +331,16 @@ class CaptchaLearningService(QObject):
         if not safe_version:
             safe_version = hashlib.sha256(str(version).encode("utf-8")).hexdigest()[:16]
         return directory / f"{safe_version}.npz"
+
+    @classmethod
+    def _model_cache_matches(cls, captcha_type, version, expected_digest):
+        target = cls._model_cache_path(captcha_type, version)
+        try:
+            if not 0 < target.stat().st_size <= MAX_MODEL_CACHE_BYTES:
+                return False
+            return hashlib.sha256(target.read_bytes()).hexdigest() == expected_digest
+        except OSError:
+            return False
 
     def _load_model_cache(
         self,
@@ -370,6 +412,10 @@ class CaptchaLearningService(QObject):
         self._active_model_identities.pop(captcha_type, None)
         self._clear_active_model_marker(captcha_type)
         self._prune_model_cache(captcha_type)
+
+    def _clear_runtime_model(self, captcha_type):
+        self.model_manager.clear(captcha_type)
+        self._active_model_identities.pop(captcha_type, None)
 
     def _reject_model_artifact(self, captcha_type, version):
         self._clear_installed_model(captcha_type)
@@ -460,6 +506,8 @@ class CaptchaLearningService(QObject):
     def _load_last_active_models(self):
         for captcha_type in ("numeric", "click"):
             marker = self._active_model_marker_path(captcha_type)
+            version = ""
+            algorithm = ""
             try:
                 if marker.stat().st_size > 4096:
                     continue
@@ -505,6 +553,13 @@ class CaptchaLearningService(QObject):
                     "Could not restore cached CAPTCHA model: %s",
                     exc,
                 )
+                if algorithm == CAPTCHA_ENGINE_ALGORITHM:
+                    # A locally imported component may simply be absent or too
+                    # old for this private model family.  Keep the verified
+                    # opaque artifact so a later local component upgrade can
+                    # load it without another server download.
+                    self._clear_runtime_model(captcha_type)
+                    continue
                 self._reject_model_artifact(captcha_type, version)
 
     @classmethod

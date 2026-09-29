@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
@@ -17,6 +18,7 @@ from enhanced_trainer.protocol import (
 )
 from integrated_client.captcha_models import CaptchaTrainingError
 from integrated_client.enhanced_training import (
+    EnhancedTrainingCancelled,
     EnhancedTrainingError,
     _run_component_streaming,
     train_enhanced_candidate,
@@ -47,7 +49,7 @@ class _FakeComponentManager:
             "intdemo-trainer",
             "train",
             "--protocol-version",
-            "1",
+            "2",
             "--dataset",
             str(dataset_path),
             "--captcha-type",
@@ -62,14 +64,14 @@ class _FakeComponentManager:
         if not self.locked:
             raise AssertionError("environment must be resolved while training is locked")
         self.environment_calls += 1
-        return {"INTDEMO_TRAINER_PROTOCOL_VERSION": "1", "PATH": "safe"}
+        return {"INTDEMO_TRAINER_PROTOCOL_VERSION": "2", "PATH": "safe"}
 
     def training_output_paths(self, output_dir):
         if not self.locked:
             raise AssertionError("outputs must be validated while training is locked")
         root = Path(output_dir)
         return {
-            "model": root / "candidate.onnx",
+            "model": root / "candidate.intmodel",
             "metadata": root / "metadata.json",
             "metrics": root / "metrics.json",
         }
@@ -120,10 +122,10 @@ class _OutputRunner:
                 stderr=None,
             )
 
-        artifact = b"portable-onnx-artifact"
+        artifact = b"portable-engine-model-bundle"
         metrics = {
             "schema_version": 1,
-            "protocol_version": 1,
+            "protocol_version": 2,
             "evaluation": "held_out_exact_code_accuracy",
             "train_samples": 20,
             "test_samples": 5,
@@ -138,9 +140,15 @@ class _OutputRunner:
         if captcha_type == "click":
             metrics.update(
                 {
-                    "evaluation": "held_out_target_crop_sequence_accuracy",
+                    "evaluation": "held_out_ordered_click_accuracy",
                     "class_count": 12,
                     "crop_count": 50,
+                    "feature_schema": "click-pair-features-v1",
+                    "feature_count": 33,
+                    "pair_count": 120,
+                    "proposal_recall": 0.9,
+                    "target_accuracy": 0.85,
+                    "baseline_accuracy": 0.75,
                 }
             )
             metrics.pop("per_position_accuracy")
@@ -169,7 +177,7 @@ class _OutputRunner:
         )
         if self.mutate_metadata:
             self.mutate_metadata(metadata)
-        (output_dir / "candidate.onnx").write_bytes(artifact)
+        (output_dir / "candidate.intmodel").write_bytes(artifact)
         (output_dir / "metadata.json").write_bytes(canonical_json_bytes(metadata))
         (output_dir / "metrics.json").write_bytes(metrics_raw)
         if self.extra_file:
@@ -187,14 +195,14 @@ class EnhancedTrainingTests(unittest.TestCase):
         events = []
         script = (
             "import json\n"
-            "print(json.dumps({'event':'started','protocol_version':1,"
+            "print(json.dumps({'event':'started','protocol_version':2,"
             "'sample_count':30,'epochs':2,'batch_size':16,'cpu_threads':4}),"
             " flush=True)\n"
-            "print(json.dumps({'event':'epoch','protocol_version':1,"
+            "print(json.dumps({'event':'epoch','protocol_version':2,"
             "'epoch':1,'epochs':2,'loss':0.25,'train_accuracy':0.75,"
             "'character_accuracy':0.9,'batches':3,'processed_samples':20,"
             "'duration_seconds':1.25,'learning_rate':0.0015}), flush=True)\n"
-            "print(json.dumps({'event':'evaluation','protocol_version':1,"
+            "print(json.dumps({'event':'evaluation','protocol_version':2,"
             "'current':1,'total':2,'predicted':'1234','expected':'1234',"
             "'correct':True}), flush=True)\n"
         )
@@ -219,7 +227,6 @@ class EnhancedTrainingTests(unittest.TestCase):
                 result = _run_component_streaming(
                     [sys.executable, "-c", script],
                     options,
-                    timeout=10.0,
                     progress_callback=events.append,
                 )
 
@@ -239,7 +246,7 @@ class EnhancedTrainingTests(unittest.TestCase):
         script = (
             "import json\n"
             "print('x' * 20000, flush=True)\n"
-            "print(json.dumps({'event':'epoch','protocol_version':1,"
+            "print(json.dumps({'event':'epoch','protocol_version':2,"
             "'epoch':2,'epochs':2,'loss':0.125}), flush=True)\n"
         )
         with tempfile.TemporaryDirectory() as directory:
@@ -263,7 +270,6 @@ class EnhancedTrainingTests(unittest.TestCase):
                 result = _run_component_streaming(
                     [sys.executable, "-c", script],
                     options,
-                    timeout=10.0,
                     progress_callback=events.append,
                 )
 
@@ -272,44 +278,80 @@ class EnhancedTrainingTests(unittest.TestCase):
         self.assertEqual(events[0]["event"], "epoch")
         self.assertEqual(events[0]["progress"], 80)
 
+    def test_streaming_runner_terminates_process_when_cancelled(self):
+        cancel_event = threading.Event()
+        timer = threading.Timer(0.2, cancel_event.set)
+        script = "import time\ntime.sleep(30)\n"
+        with tempfile.TemporaryDirectory() as directory:
+            with (Path(directory) / "stderr.log").open("w+b") as stderr_stream:
+                options = {
+                    "cwd": directory,
+                    "stdin": subprocess.DEVNULL,
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": stderr_stream,
+                    "text": False,
+                    "check": False,
+                    "shell": False,
+                }
+                if os.name == "nt":
+                    options["creationflags"] = getattr(
+                        subprocess,
+                        "CREATE_NO_WINDOW",
+                        0,
+                    )
+                timer.start()
+                try:
+                    with self.assertRaisesRegex(
+                        EnhancedTrainingCancelled,
+                        "用户中止",
+                    ):
+                        _run_component_streaming(
+                            [sys.executable, "-c", script],
+                            options,
+                            progress_callback=lambda _event: None,
+                            cancel_event=cancel_event,
+                        )
+                finally:
+                    timer.cancel()
+
     def test_success_runs_locked_without_shell_and_returns_verified_candidate(self):
         manager = _FakeComponentManager()
         runner = _OutputRunner(manager)
 
         with patch(
-            "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
-            return_value=object(),
-        ) as validate_onnx:
+            "integrated_client.enhanced_training.LocalCaptchaEngineClient",
+        ) as engine_client:
             candidate = train_enhanced_candidate(
                 b"dataset-archive",
                 "numeric",
                 manager,
                 runner=runner,
-                timeout_seconds=321,
             )
 
-        self.assertEqual(candidate.algorithm, "tiny-cnn-onnx-v1")
+        self.assertEqual(candidate.algorithm, "captcha-engine-v1")
         self.assertEqual(candidate.version, "numeric-enhanced-test")
         self.assertEqual(candidate.sample_count, 25)
         self.assertEqual(candidate.test_count, 5)
         self.assertEqual(candidate.correct_count, 4)
         self.assertEqual(candidate.metrics["training_mode"], "enhanced")
         self.assertEqual(candidate.metrics["trainer_version"], COMPONENT_VERSION)
-        validate_onnx.assert_called_once_with(
+        engine_client.assert_called_once_with(manager)
+        engine_client.return_value.load_model.assert_called_once_with(
             "numeric",
             "numeric-enhanced-test",
-            b"portable-onnx-artifact",
+            b"portable-engine-model-bundle",
         )
+        engine_client.return_value.stop.assert_called_once_with()
         command, options = runner.calls[0]
-        self.assertEqual(command[1:4], ["train", "--protocol-version", "1"])
+        self.assertEqual(command[1:4], ["train", "--protocol-version", "2"])
         self.assertIs(options["stdin"], subprocess.DEVNULL)
         self.assertIs(options["stdout"], subprocess.DEVNULL)
         self.assertTrue(hasattr(options["stderr"], "write"))
         self.assertIs(options["text"], False)
         self.assertIs(options["check"], False)
         self.assertIs(options["shell"], False)
-        self.assertEqual(options["timeout"], 321.0)
-        self.assertEqual(options["env"]["INTDEMO_TRAINER_PROTOCOL_VERSION"], "1")
+        self.assertNotIn("timeout", options)
+        self.assertEqual(options["env"]["INTDEMO_TRAINER_PROTOCOL_VERSION"], "2")
         if os.name == "nt":
             self.assertEqual(
                 options["creationflags"],
@@ -328,8 +370,7 @@ class EnhancedTrainingTests(unittest.TestCase):
         )
 
         with patch(
-            "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
-            return_value=object(),
+            "integrated_client.enhanced_training.LocalCaptchaEngineClient",
         ):
             candidate = train_enhanced_candidate(
                 b"dataset-archive",
@@ -361,9 +402,8 @@ class EnhancedTrainingTests(unittest.TestCase):
         runner = _OutputRunner(manager)
 
         with patch(
-            "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
-            return_value=object(),
-        ) as validate_onnx:
+            "integrated_client.enhanced_training.LocalCaptchaEngineClient",
+        ) as engine_client:
             candidate = train_enhanced_candidate(
                 b"dataset-archive",
                 "click",
@@ -374,11 +414,12 @@ class EnhancedTrainingTests(unittest.TestCase):
         self.assertEqual(candidate.captcha_type, "click")
         self.assertEqual(candidate.metrics["class_count"], 12)
         self.assertEqual(candidate.metrics["crop_count"], 50)
+        self.assertEqual(candidate.metrics["feature_count"], 33)
         self.assertNotIn("per_position_accuracy", candidate.metrics)
-        validate_onnx.assert_called_once_with(
+        engine_client.return_value.load_model.assert_called_once_with(
             "click",
             "click-enhanced-test",
-            b"portable-onnx-artifact",
+            b"portable-engine-model-bundle",
         )
 
     def test_progress_callback_translates_component_json_lines(self):
@@ -390,22 +431,21 @@ class EnhancedTrainingTests(unittest.TestCase):
         def event_runner(command, **kwargs):
             result = original_call(command, **kwargs)
             result.stdout = (
-                b'{"event":"started","protocol_version":1,'
+                b'{"event":"started","protocol_version":2,'
                 b'"sample_count":25,"epochs":24,"batch_size":16,'
                 b'"cpu_threads":4}\n'
-                b'{"event":"epoch","protocol_version":1,'
+                b'{"event":"epoch","protocol_version":2,'
                 b'"epoch":12,"epochs":24,"loss":0.125}\n'
-                b'{"event":"evaluation","protocol_version":1,'
+                b'{"event":"evaluation","protocol_version":2,'
                 b'"current":1,"total":5,"predicted":"4826",'
                 b'"expected":"4828","correct":false}\n'
-                b'{"event":"completed","protocol_version":1,'
+                b'{"event":"completed","protocol_version":2,'
                 b'"accuracy":0.8,"correct_count":4,"test_count":5}\n'
             )
             return result
 
         with patch(
-            "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
-            return_value=object(),
+            "integrated_client.enhanced_training.LocalCaptchaEngineClient",
         ):
             train_enhanced_candidate(
                 b"dataset-archive",
@@ -457,25 +497,21 @@ class EnhancedTrainingTests(unittest.TestCase):
         self.assertLessEqual(len(message), 1_050)
         self.assertFalse(manager.locked)
 
-    def test_timeout_is_normalized_and_releases_training_lock(self):
+    def test_cancelled_before_start_does_not_run_or_hold_training_lock(self):
         manager = _FakeComponentManager()
+        cancel_event = threading.Event()
+        cancel_event.set()
 
-        def timeout_runner(command, **_kwargs):
-            self.assertTrue(manager.locked)
-            _kwargs["stderr"].write(b"training took too long")
-            _kwargs["stderr"].flush()
-            raise subprocess.TimeoutExpired(
-                command,
-                5,
-            )
+        def unexpected_runner(*_args, **_kwargs):
+            raise AssertionError("cancelled training must not start")
 
-        with self.assertRaisesRegex(EnhancedTrainingError, "training took too long"):
+        with self.assertRaisesRegex(EnhancedTrainingCancelled, "用户中止"):
             train_enhanced_candidate(
                 b"dataset-archive",
                 "numeric",
                 manager,
-                runner=timeout_runner,
-                timeout_seconds=5,
+                runner=unexpected_runner,
+                cancel_event=cancel_event,
             )
         self.assertFalse(manager.locked)
 
@@ -489,8 +525,7 @@ class EnhancedTrainingTests(unittest.TestCase):
         ]
         for runner in cases:
             with self.subTest(extra=runner.extra_file), patch(
-                "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
-                return_value=object(),
+                "integrated_client.enhanced_training.LocalCaptchaEngineClient",
             ), self.assertRaises(EnhancedTrainingError):
                 train_enhanced_candidate(
                     b"dataset-archive",
@@ -529,8 +564,7 @@ class EnhancedTrainingTests(unittest.TestCase):
                 metadata=metadata_mutation is not None,
                 metrics=metrics_mutation is not None,
             ), patch(
-                "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
-                return_value=object(),
+                "integrated_client.enhanced_training.LocalCaptchaEngineClient",
             ), self.assertRaises(EnhancedTrainingError):
                 train_enhanced_candidate(
                     b"dataset-archive",
@@ -539,7 +573,7 @@ class EnhancedTrainingTests(unittest.TestCase):
                     runner=runner,
                 )
 
-    def test_rejects_component_version_mismatch_and_invalid_onnx(self):
+    def test_rejects_component_version_mismatch_and_invalid_model_bundle(self):
         manager = _FakeComponentManager()
         mismatch = _OutputRunner(
             manager,
@@ -555,9 +589,14 @@ class EnhancedTrainingTests(unittest.TestCase):
 
         runner = _OutputRunner(manager)
         with patch(
-            "integrated_client.enhanced_training.TinyCnnOnnxCaptchaModel.from_bytes",
-            side_effect=CaptchaTrainingError("invalid ONNX"),
-        ), self.assertRaisesRegex(EnhancedTrainingError, "ONNX"):
+            "integrated_client.enhanced_training.LocalCaptchaEngineClient",
+        ) as engine_client, self.assertRaisesRegex(
+            EnhancedTrainingError,
+            "模型加载验证失败",
+        ):
+            engine_client.return_value.load_model.side_effect = CaptchaTrainingError(
+                "invalid model bundle"
+            )
             train_enhanced_candidate(
                 b"dataset-archive",
                 "numeric",
@@ -569,22 +608,22 @@ class EnhancedTrainingTests(unittest.TestCase):
         manager = _FakeComponentManager()
         runner = _OutputRunner(manager)
         cases = [
-            (b"", "numeric", 5),
-            (b"dataset-archive", "unknown", 5),
+            (b"", "numeric", None),
+            (b"dataset-archive", "unknown", None),
             (b"dataset-archive", "numeric", 0),
             (b"dataset-archive", "numeric", float("inf")),
         ]
-        for archive, captcha_type, timeout in cases:
+        for archive, captcha_type, epochs in cases:
             with self.subTest(
                 captcha_type=captcha_type,
-                timeout=timeout,
+                epochs=epochs,
             ), self.assertRaises(EnhancedTrainingError):
                 train_enhanced_candidate(
                     archive,
                     captcha_type,
                     manager,
                     runner=runner,
-                    timeout_seconds=timeout,
+                    epochs=epochs,
                 )
         self.assertFalse(runner.calls)
 

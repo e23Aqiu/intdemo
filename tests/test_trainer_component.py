@@ -16,7 +16,6 @@ from unittest.mock import patch
 from integrated_client.trainer_component import (
     STATUS_AVAILABLE,
     STATUS_DAMAGED,
-    STATUS_INCOMPATIBLE,
     STATUS_NOT_INSTALLED,
     TRAINER_COMPONENT_ID,
     TrainerBusyError,
@@ -26,7 +25,6 @@ from integrated_client.trainer_component import (
     TrainerPackageError,
     TrainerSelfTestError,
 )
-
 
 _LOCK_HOLDER_SCRIPT = """
 import os
@@ -81,12 +79,13 @@ class TrainerPackageFactory:
             "component_id": TRAINER_COMPONENT_ID,
             "version": version,
             "platform": platform,
-            "protocol_version": 1,
+            "protocol_version": 2,
+            "engine_api_version": 1,
             "min_client_version": "1.1.0",
             "entrypoint": entrypoint,
             "capabilities": {
                 "numeric": "tiny-cnn-four-head-v1",
-                "click": "tiny-cnn-character-v1",
+                "click": "prompt-conditioned-ranker-v1",
             },
             "files": entries,
         }
@@ -131,7 +130,8 @@ class TrainerComponentTests(unittest.TestCase):
             stdout=json.dumps(
                 {
                     "ok": True,
-                    "protocol_version": 1,
+                    "protocol_version": 2,
+                    "engine_api_version": 1,
                     "component_version": manifest["version"],
                 }
             ),
@@ -173,17 +173,21 @@ class TrainerComponentTests(unittest.TestCase):
             "numeric",
             self.root / "output",
         )
-        self.assertEqual(command[1:4], ["train", "--protocol-version", "1"])
+        self.assertEqual(command[1:4], ["train", "--protocol-version", "2"])
         self.assertIn("--dataset", command)
         with patch.dict(
             os.environ,
             {"INTDEMO_TRAINER_SIGNING_PRIVATE_KEY": "never-forward"},
         ):
             environment = manager.training_environment()
-        self.assertEqual(environment["INTDEMO_TRAINER_PROTOCOL_VERSION"], "1")
+        self.assertEqual(environment["INTDEMO_TRAINER_PROTOCOL_VERSION"], "2")
         self.assertNotIn("INTDEMO_TRAINER_SIGNING_PRIVATE_KEY", environment)
         outputs = manager.training_output_paths(self.root / "output")
-        self.assertEqual(outputs["model"].name, "candidate.onnx")
+        self.assertEqual(outputs["model"].name, "candidate.intmodel")
+        self.assertEqual(
+            manager.build_engine_command()[1:],
+            ["serve", "--engine-api-version", "1"],
+        )
 
         self.assertEqual(manager.preferred_mode(), "standard")
         self.assertEqual(manager.set_preferred_mode("enhanced"), "enhanced")

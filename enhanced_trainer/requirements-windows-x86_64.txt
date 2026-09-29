@@ -3,6 +3,7 @@
 torch==2.7.0+cpu
 onnx==1.18.0
 onnxruntime==1.19.2
+ddddocr==1.5.6
 numpy==2.0.2
 Pillow==11.3.0
 cryptography==45.0.7

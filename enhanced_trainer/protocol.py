@@ -11,20 +11,26 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
-PROTOCOL_VERSION = 1
+from .model_bundle import (
+    ENGINE_API_VERSION,
+    MAX_MODEL_BUNDLE_BYTES,
+    load_model_bundle,
+)
+
+PROTOCOL_VERSION = 2
 OUTPUT_SCHEMA_VERSION = 1
-COMPONENT_VERSION = "1.1.0"
-ALGORITHM = "tiny-cnn-onnx-v1"
+COMPONENT_VERSION = "2.0.0"
+ALGORITHM = "captcha-engine-v1"
 TRAINING_MODE = "enhanced"
 
-MODEL_FILE_NAME = "candidate.onnx"
+MODEL_FILE_NAME = "candidate.intmodel"
 METADATA_FILE_NAME = "metadata.json"
 METRICS_FILE_NAME = "metrics.json"
 
 NUMERIC_INPUT_SHAPE = (1, 1, 48, 112)
 NUMERIC_OUTPUT_SHAPE = (1, 4, 10)
-CLICK_INPUT_SHAPE = ("N", 3, 64, 64)
-MAX_MODEL_BYTES = 20 * 1024 * 1024
+CLICK_INPUT_SHAPE = ("N", 33)
+MAX_MODEL_BYTES = MAX_MODEL_BUNDLE_BYTES
 
 _VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -68,12 +74,42 @@ METRICS_OPTIONAL_FIELDS = frozenset(
         "crop_count",
         "per_position_accuracy",
         "right_edge_augmentation",
+        "feature_schema",
+        "feature_count",
+        "pair_count",
+        "proposal_recall",
+        "target_accuracy",
+        "baseline_accuracy",
+        "ranker_weight",
+        "confidence_threshold",
+        "accepted_samples",
+        "accepted_accuracy",
+        "accepted_coverage",
     }
 )
 
 
 class TrainerProtocolError(RuntimeError):
     """A protocol request or generated output is invalid."""
+
+
+def _strict_json_bytes(payload: bytes) -> object:
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if not isinstance(key, str) or key in result:
+                raise ValueError("duplicate or invalid key")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"non-finite number: {value}")
+
+    return json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=object_pairs,
+        parse_constant=reject_constant,
+    )
 
 
 def canonical_json_bytes(payload: Mapping[str, object]) -> bytes:
@@ -127,38 +163,26 @@ def model_metadata(
     *,
     captcha_type: str,
     version: str,
-    labels: list[str] | None = None,
+    model_family: str,
+    feature_count: int | None = None,
 ) -> dict[str, str]:
-    """Return ONNX custom metadata consumed by TinyCnnOnnxCaptchaModel."""
+    """Return private ONNX metadata consumed by the imported engine."""
 
     if captcha_type not in {"numeric", "click"}:
         raise TrainerProtocolError("验证码类型必须是 numeric 或 click")
     if not _VERSION_PATTERN.fullmatch(str(version or "")):
         raise TrainerProtocolError("模型版本号格式无效")
     metadata = {
-        "algorithm": ALGORITHM,
+        "engine_api_version": str(ENGINE_API_VERSION),
         "captcha_type": captcha_type,
         "version": version,
-        "training_mode": TRAINING_MODE,
+        "model_family": str(model_family),
         "trainer_version": COMPONENT_VERSION,
     }
-    if captcha_type == "click":
-        if (
-            not isinstance(labels, list)
-            or len(labels) < 2
-            or len(labels) > 1024
-            or len(set(labels)) != len(labels)
-            or any(
-                not isinstance(label, str) or not label or len(label) > 4
-                for label in labels
-            )
-        ):
-            raise TrainerProtocolError("点选模型标签列表无效")
-        metadata["labels_json"] = json.dumps(
-            labels,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+    if feature_count is not None:
+        if type(feature_count) is not int or feature_count < 1:
+            raise TrainerProtocolError("点选模型特征数量无效")
+        metadata["feature_count"] = str(feature_count)
     return metadata
 
 
@@ -181,10 +205,13 @@ def output_metadata(
         raise TrainerProtocolError("模型 SHA-256 无效")
     if not _HASH_PATTERN.fullmatch(metrics_sha256):
         raise TrainerProtocolError("指标 SHA-256 无效")
-    if not 0 < artifact_size <= MAX_MODEL_BYTES:
+    if type(artifact_size) is not int or not 0 < artifact_size <= MAX_MODEL_BYTES:
         raise TrainerProtocolError("模型大小无效")
     if (
-        sample_count < 1
+        type(sample_count) is not int
+        or type(test_count) is not int
+        or type(correct_count) is not int
+        or sample_count < 1
         or test_count < 1
         or correct_count < 0
         or correct_count > test_count
@@ -210,7 +237,7 @@ def output_metadata(
 
 
 def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
-    """Strictly validate the trainer's three protocol-v1 output files."""
+    """Strictly validate the engine's three protocol-v2 output files."""
 
     root = Path(output_dir).resolve()
     model_path = root / MODEL_FILE_NAME
@@ -223,18 +250,25 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
     except OSError as exc:
         raise TrainerProtocolError(f"强化训练输出文件不完整：{exc}") from exc
     if not 0 < model_size <= MAX_MODEL_BYTES:
-        raise TrainerProtocolError("强化 ONNX 模型大小无效")
+        raise TrainerProtocolError("验证码引擎模型包大小无效")
     try:
-        metadata = json.loads(metadata_bytes.decode("utf-8"))
-        metrics = json.loads(metrics_bytes.decode("utf-8"))
-    except (UnicodeError, json.JSONDecodeError) as exc:
+        metadata = _strict_json_bytes(metadata_bytes)
+        metrics = _strict_json_bytes(metrics_bytes)
+    except (
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        RecursionError,
+    ) as exc:
         raise TrainerProtocolError("强化训练元数据不是有效 JSON") from exc
     if not isinstance(metadata, dict) or not isinstance(metrics, dict):
         raise TrainerProtocolError("强化训练元数据必须是 JSON 对象")
     if set(metadata) != OUTPUT_METADATA_FIELDS:
         raise TrainerProtocolError("强化训练 metadata.json 字段集合无效")
     if (
-        metadata.get("schema_version") != OUTPUT_SCHEMA_VERSION
+        type(metadata.get("schema_version")) is not int
+        or metadata.get("schema_version") != OUTPUT_SCHEMA_VERSION
+        or type(metadata.get("protocol_version")) is not int
         or metadata.get("protocol_version") != PROTOCOL_VERSION
         or metadata.get("algorithm") != ALGORITHM
         or metadata.get("training_mode") != TRAINING_MODE
@@ -246,9 +280,9 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
     ):
         raise TrainerProtocolError("强化训练 metadata.json 契约不兼容")
     if sha256_file(model_path) != metadata.get("artifact_sha256"):
-        raise TrainerProtocolError("强化 ONNX 模型 SHA-256 不一致")
+        raise TrainerProtocolError("验证码引擎模型包 SHA-256 不一致")
     if model_size != metadata.get("artifact_size"):
-        raise TrainerProtocolError("强化 ONNX 模型大小不一致")
+        raise TrainerProtocolError("验证码引擎模型包大小不一致")
     if sha256_bytes(metrics_bytes) != metadata.get("metrics_sha256"):
         raise TrainerProtocolError("强化训练 metrics.json SHA-256 不一致")
     if (
@@ -265,8 +299,14 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
         METRICS_REQUIRED_FIELDS | METRICS_OPTIONAL_FIELDS
     ):
         raise TrainerProtocolError("强化训练 metrics.json 字段集合无效")
+    for field in ("train_samples", "test_samples", "correct_samples"):
+        value = metrics.get(field)
+        if type(value) is not int or value < 0 or value > 10_000_000:
+            raise TrainerProtocolError(f"强化训练指标 {field} 无效")
     if (
-        metrics.get("schema_version") != OUTPUT_SCHEMA_VERSION
+        type(metrics.get("schema_version")) is not int
+        or metrics.get("schema_version") != OUTPUT_SCHEMA_VERSION
+        or type(metrics.get("protocol_version")) is not int
         or metrics.get("protocol_version") != PROTOCOL_VERSION
         or metrics.get("test_samples") != metadata["test_count"]
         or metrics.get("correct_samples") != metadata["correct_count"]
@@ -285,10 +325,6 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
     expected_accuracy = metadata["correct_count"] / metadata["test_count"]
     if abs(float(accuracy) - expected_accuracy) > 1e-9:
         raise TrainerProtocolError("强化训练准确率与计数不一致")
-    for field in ("train_samples", "test_samples", "correct_samples"):
-        value = metrics.get(field)
-        if type(value) is not int or value < 0 or value > 10_000_000:
-            raise TrainerProtocolError(f"强化训练指标 {field} 无效")
     seed = metrics.get("seed")
     if type(seed) is not int or not 0 <= seed <= 2_147_483_647:
         raise TrainerProtocolError("强化训练指标 seed 无效")
@@ -297,8 +333,30 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
         if type(value) is not int or not 1 <= value <= 10_000_000:
             raise TrainerProtocolError(f"强化训练指标 {field} 无效")
     captcha_type = metadata["captcha_type"]
+    try:
+        bundle = load_model_bundle(
+            model_path.read_bytes(),
+            expected_captcha_type=captcha_type,
+            expected_version=metadata["version"],
+        )
+    except ValueError as exc:
+        raise TrainerProtocolError(f"验证码引擎模型包无效：{exc}") from exc
     if captcha_type == "numeric":
-        if fields & {"class_count", "crop_count"}:
+        if fields & {
+            "class_count",
+            "crop_count",
+            "feature_schema",
+            "feature_count",
+            "pair_count",
+            "proposal_recall",
+            "target_accuracy",
+            "baseline_accuracy",
+            "ranker_weight",
+            "confidence_threshold",
+            "accepted_samples",
+            "accepted_accuracy",
+            "accepted_coverage",
+        }:
             raise TrainerProtocolError("数字模型包含点选专用训练指标")
         positions = metrics.get("per_position_accuracy")
         if positions is not None and (
@@ -321,9 +379,37 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
     else:
         if fields & {"per_position_accuracy", "right_edge_augmentation"}:
             raise TrainerProtocolError("点选模型包含数字专用训练指标")
-        for field in ("class_count", "crop_count"):
+        for field in ("class_count", "crop_count", "feature_count", "pair_count"):
             if field in metrics and (
                 type(metrics[field]) is not int or metrics[field] < 1
             ):
                 raise TrainerProtocolError(f"点选训练指标 {field} 无效")
-    return {"metadata": metadata, "metrics": metrics, "model_path": model_path}
+        if "accepted_samples" in metrics and (
+            type(metrics["accepted_samples"]) is not int
+            or not 0 <= metrics["accepted_samples"] <= metrics["test_samples"]
+        ):
+            raise TrainerProtocolError("点选训练指标 accepted_samples 无效")
+        for field in (
+            "proposal_recall",
+            "target_accuracy",
+            "baseline_accuracy",
+            "ranker_weight",
+            "confidence_threshold",
+            "accepted_accuracy",
+            "accepted_coverage",
+        ):
+            if field in metrics and (
+                isinstance(metrics[field], bool)
+                or not isinstance(metrics[field], (int, float))
+                or not math.isfinite(float(metrics[field]))
+                or not 0 <= float(metrics[field]) <= 1
+            ):
+                raise TrainerProtocolError(f"点选训练指标 {field} 无效")
+        if metrics.get("feature_schema") not in {None, "click-pair-features-v1"}:
+            raise TrainerProtocolError("点选训练特征协议无效")
+    return {
+        "metadata": metadata,
+        "metrics": metrics,
+        "model_path": model_path,
+        "bundle": bundle,
+    }

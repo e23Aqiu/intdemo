@@ -1,4 +1,4 @@
-"""Command-line interface implementing TrainerComponentManager protocol v1."""
+"""Command-line interface for the local train-and-infer CAPTCHA engine."""
 
 from __future__ import annotations
 
@@ -7,6 +7,8 @@ import json
 import sys
 
 from .dataset import DatasetError
+from .engine import EngineError, serve
+from .model_bundle import ENGINE_API_VERSION
 from .protocol import PROTOCOL_VERSION, TrainerProtocolError
 from .training import TrainingError, self_test, train
 
@@ -27,14 +29,21 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("numeric", "click"),
     )
     training.add_argument("--output", required=True)
+
+    engine = subparsers.add_parser("serve")
+    engine.add_argument("--engine-api-version", required=True, type=int)
     return parser
 
 
 def main(arguments=None) -> int:
     parser = build_parser()
     options = parser.parse_args(arguments)
-    if options.protocol_version != PROTOCOL_VERSION:
-        parser.error(f"仅支持协议版本 {PROTOCOL_VERSION}")
+    if options.command in {"self-test", "train"} and (
+        options.protocol_version != PROTOCOL_VERSION
+    ):
+        parser.error(f"仅支持训练协议版本 {PROTOCOL_VERSION}")
+    if options.command == "serve" and options.engine_api_version != ENGINE_API_VERSION:
+        parser.error(f"仅支持推理引擎 API {ENGINE_API_VERSION}")
     try:
         if options.command == "self-test":
             print(
@@ -45,10 +54,12 @@ def main(arguments=None) -> int:
                 ),
                 flush=True,
             )
-        else:
+        elif options.command == "train":
             train(options.dataset, options.captcha_type, options.output)
+        else:
+            return serve()
         return 0
-    except (TrainingError, TrainerProtocolError, DatasetError) as exc:
+    except (TrainingError, TrainerProtocolError, DatasetError, EngineError) as exc:
         print(
             json.dumps(
                 {

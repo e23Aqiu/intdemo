@@ -1,4 +1,4 @@
-"""Run an installed enhanced trainer and validate its protocol-v1 outputs."""
+"""Run an imported CAPTCHA engine and validate its protocol-v2 outputs."""
 
 from __future__ import annotations
 
@@ -13,12 +13,14 @@ import threading
 from collections.abc import Callable
 from pathlib import Path
 
+from .captcha_engine import LocalCaptchaEngineClient
 from .captcha_models import (
+    CAPTCHA_ENGINE_ALGORITHM,
     MAX_DATASET_BYTES,
     MAX_MODEL_ARTIFACT_BYTES,
     CaptchaCandidate,
+    CaptchaTrainingCancelled,
     CaptchaTrainingError,
-    TinyCnnOnnxCaptchaModel,
 )
 from .platform_support import system_application_launch_context
 from .trainer_component import (
@@ -28,10 +30,9 @@ from .trainer_component import (
     TrainerComponentManager,
 )
 
-ENHANCED_TRAINING_TIMEOUT_SECONDS = 3_600
 MAX_OUTPUT_JSON_BYTES = 256 * 1024
 MAX_COUNT = 10_000_000
-_ALGORITHM = "tiny-cnn-onnx-v1"
+_ALGORITHM = CAPTCHA_ENGINE_ALGORITHM
 _VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _TRAINER_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,79}$")
 _HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -70,11 +71,26 @@ _METRICS_OPTIONAL_FIELDS = {
     "crop_count",
     "per_position_accuracy",
     "right_edge_augmentation",
+    "feature_schema",
+    "feature_count",
+    "pair_count",
+    "proposal_recall",
+    "target_accuracy",
+    "baseline_accuracy",
+    "ranker_weight",
+    "confidence_threshold",
+    "accepted_samples",
+    "accepted_accuracy",
+    "accepted_coverage",
 }
 
 
 class EnhancedTrainingError(CaptchaTrainingError):
-    """The local enhanced trainer or its output violated protocol v1."""
+    """The local CAPTCHA engine or its output violated protocol v2."""
+
+
+class EnhancedTrainingCancelled(EnhancedTrainingError, CaptchaTrainingCancelled):
+    """The user explicitly stopped the local training process."""
 
 
 EnhancedProgressCallback = Callable[[dict[str, object]], None]
@@ -103,7 +119,10 @@ def _component_progress_event(
         event = json.loads(raw_line)
     except (TypeError, ValueError, json.JSONDecodeError):
         return
-    if not isinstance(event, dict) or event.get("protocol_version") != 1:
+    if (
+        not isinstance(event, dict)
+        or event.get("protocol_version") != TRAINER_PROTOCOL_VERSION
+    ):
         return
     name = str(event.get("event") or "")
     if name == "started":
@@ -134,6 +153,29 @@ def _component_progress_event(
                 "sample_count": samples,
                 "batch_size": batch_size,
                 "cpu_threads": threads,
+            },
+        )
+    elif name == "feature":
+        try:
+            current = int(event.get("current") or 0)
+            total = int(event.get("total") or 0)
+            usable = int(event.get("usable") or 0)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if not 1 <= current <= total <= MAX_COUNT or not 0 <= usable <= current:
+            return
+        _emit_progress(
+            callback,
+            {
+                "event": name,
+                "progress": 32,
+                "message": (
+                    f"正在提取点选候选框和 OCR 概率特征 {current}/{total}"
+                    f" · 可用 {usable} 条"
+                ),
+                "current": current,
+                "total": total,
+                "usable": usable,
             },
         )
     elif name == "epoch":
@@ -292,8 +334,8 @@ def _run_component_streaming(
     command: list[str],
     run_options: dict[str, object],
     *,
-    timeout: float,
     progress_callback: EnhancedProgressCallback,
+    cancel_event: threading.Event | None = None,
 ) -> subprocess.CompletedProcess:
     popen_options = dict(run_options)
     popen_options.pop("timeout", None)
@@ -334,11 +376,21 @@ def _run_component_streaming(
     )
     reader.start()
     try:
-        return_code = process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-        raise
+        while True:
+            return_code = process.poll()
+            if return_code is not None:
+                break
+            if cancel_event is not None and cancel_event.wait(0.1):
+                try:
+                    process.terminate()
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise EnhancedTrainingCancelled("训练已由用户中止")
+            if cancel_event is None:
+                return_code = process.wait()
+                break
     finally:
         reader.join(timeout=5)
     return subprocess.CompletedProcess(command, return_code, stdout=None, stderr=None)
@@ -419,6 +471,17 @@ def _validate_metrics(payload: dict, *, captcha_type: str) -> dict:
     click_optional = {
         "class_count",
         "crop_count",
+        "feature_schema",
+        "feature_count",
+        "pair_count",
+        "proposal_recall",
+        "target_accuracy",
+        "baseline_accuracy",
+        "ranker_weight",
+        "confidence_threshold",
+        "accepted_samples",
+        "accepted_accuracy",
+        "accepted_coverage",
     }
     allowed_optional = numeric_optional if captcha_type == "numeric" else click_optional
     if not _METRICS_REQUIRED_FIELDS <= fields or fields - (
@@ -448,13 +511,30 @@ def _validate_metrics(payload: dict, *, captcha_type: str) -> dict:
     _bounded_integer(payload.get("epochs"), label="epochs", minimum=1)
     _bounded_integer(payload.get("batch_size"), label="batch_size", minimum=1)
 
-    for field in ("class_count", "crop_count"):
+    for field in ("class_count", "crop_count", "feature_count", "pair_count"):
         if field in payload:
             _bounded_integer(payload[field], label=field, minimum=1)
+    if "accepted_samples" in payload:
+        _bounded_integer(payload["accepted_samples"], label="accepted_samples")
+        if payload["accepted_samples"] > test_samples:
+            raise EnhancedTrainingError("accepted_samples 超过测试样本数")
     if "class_count" in payload and payload["class_count"] < 2:
         raise EnhancedTrainingError("class_count 至少为 2")
     if "crop_count" in payload and payload["crop_count"] < train_samples:
         raise EnhancedTrainingError("crop_count 小于训练样本数")
+    for field in (
+        "proposal_recall",
+        "target_accuracy",
+        "baseline_accuracy",
+        "ranker_weight",
+        "confidence_threshold",
+        "accepted_accuracy",
+        "accepted_coverage",
+    ):
+        if field in payload:
+            _finite_number(payload[field], label=field, minimum=0, maximum=1)
+    if "feature_schema" in payload and payload["feature_schema"] != "click-pair-features-v1":
+        raise EnhancedTrainingError("feature_schema 无效")
     if "per_position_accuracy" in payload:
         values = payload["per_position_accuracy"]
         if captcha_type != "numeric" or not isinstance(values, list) or len(values) != 4:
@@ -485,7 +565,7 @@ def _validate_outputs(
         entries = list(output_dir.iterdir())
     except (OSError, ValueError) as exc:
         raise EnhancedTrainingError(f"无法读取强化训练输出目录：{exc}") from exc
-    expected_names = {"candidate.onnx", "metadata.json", "metrics.json"}
+    expected_names = {"candidate.intmodel", "metadata.json", "metrics.json"}
     if {entry.name for entry in entries} != expected_names:
         raise EnhancedTrainingError("强化训练输出目录缺少文件或包含未声明文件")
     if any(entry.is_symlink() or not entry.is_file() for entry in entries):
@@ -493,7 +573,7 @@ def _validate_outputs(
 
     paths = component_manager.training_output_paths(output_dir)
     for key, expected_name in {
-        "model": "candidate.onnx",
+        "model": "candidate.intmodel",
         "metadata": "metadata.json",
         "metrics": "metrics.json",
     }.items():
@@ -521,7 +601,7 @@ def _validate_outputs(
         raise EnhancedTrainingError("强化训练模型验证码类型不一致")
     if metadata.get("training_mode") != "enhanced":
         raise EnhancedTrainingError("强化训练模型的训练模式无效")
-    if metadata.get("artifact_file") != "candidate.onnx":
+    if metadata.get("artifact_file") != "candidate.intmodel":
         raise EnhancedTrainingError("强化训练模型文件名无效")
     if metadata.get("metrics_file") != "metrics.json":
         raise EnhancedTrainingError("强化训练指标文件名无效")
@@ -562,7 +642,9 @@ def _validate_outputs(
         if len(artifact) != model_size or len(artifact) > MAX_MODEL_ARTIFACT_BYTES:
             raise ValueError("size changed while reading")
     except (OSError, ValueError) as exc:
-        raise EnhancedTrainingError(f"强化训练器输出的 candidate.onnx 无效：{exc}") from exc
+        raise EnhancedTrainingError(
+            f"验证码组件输出的 candidate.intmodel 无效：{exc}"
+        ) from exc
     artifact_size = _bounded_integer(
         metadata.get("artifact_size"),
         label="artifact_size",
@@ -586,12 +668,15 @@ def _validate_outputs(
     ):
         raise EnhancedTrainingError("强化训练指标 SHA-256 校验失败")
 
-    # Parsing metadata is not enough: instantiate the production inference
-    # adapter to enforce ONNX metadata, input/output shapes and supported ops.
+    # Let the imported component validate its private model family.  The host
+    # and server intentionally understand only the stable bundle envelope.
+    validator = LocalCaptchaEngineClient(component_manager)
     try:
-        TinyCnnOnnxCaptchaModel.from_bytes(captcha_type, version, artifact)
-    except CaptchaTrainingError as exc:
-        raise EnhancedTrainingError(f"强化 ONNX 模型加载验证失败：{exc}") from exc
+        validator.load_model(captcha_type, version, artifact)
+    except Exception as exc:
+        raise EnhancedTrainingError(f"验证码组件模型加载验证失败：{exc}") from exc
+    finally:
+        validator.stop()
     validated_metrics["trainer_version"] = trainer_version
     return CaptchaCandidate(
         captcha_type=captcha_type,
@@ -629,9 +714,9 @@ def train_enhanced_candidate(
     component_manager: TrainerComponentManager,
     *,
     runner=None,
-    timeout_seconds: float = ENHANCED_TRAINING_TIMEOUT_SECONDS,
     epochs: int | None = None,
     progress_callback: EnhancedProgressCallback | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> CaptchaCandidate:
     """Train through the installed component and return a verified candidate."""
     if captcha_type not in {"numeric", "click"}:
@@ -641,11 +726,6 @@ def train_enhanced_candidate(
     archive_bytes = bytes(archive_bytes)
     if not archive_bytes or len(archive_bytes) > MAX_DATASET_BYTES:
         raise EnhancedTrainingError("强化训练数据集为空或大小超过限制")
-    if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, (int, float)):
-        raise EnhancedTrainingError("强化训练超时时间无效")
-    timeout = float(timeout_seconds)
-    if not math.isfinite(timeout) or timeout <= 0 or timeout > 86_400:
-        raise EnhancedTrainingError("强化训练超时时间无效")
     if epochs is not None and (
         type(epochs) is not int
         or not MIN_TRAINING_EPOCHS <= epochs <= MAX_TRAINING_EPOCHS
@@ -656,7 +736,12 @@ def train_enhanced_candidate(
         )
     process_runner = runner or subprocess.run
 
+    def ensure_not_cancelled() -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            raise EnhancedTrainingCancelled("训练已由用户中止")
+
     try:
+        ensure_not_cancelled()
         with tempfile.TemporaryDirectory(prefix="intdemo-enhanced-training-") as temporary:
             workspace = Path(temporary).resolve()
             dataset_path = workspace / "dataset.zip"
@@ -681,7 +766,6 @@ def train_enhanced_candidate(
                     "stdout": subprocess.DEVNULL,
                     "stderr": stderr_stream,
                     "text": False,
-                    "timeout": timeout,
                     "check": False,
                     "shell": False,
                 }
@@ -715,35 +799,29 @@ def train_enhanced_candidate(
                     if epochs is not None:
                         environment["INTDEMO_TRAINER_EPOCHS"] = str(epochs)
                     run_options["env"] = environment
-                    try:
-                        with system_application_launch_context():
-                            if runner is None and progress_callback is not None:
-                                result = _run_component_streaming(
-                                    command,
-                                    run_options,
-                                    timeout=timeout,
-                                    progress_callback=progress_callback,
-                                )
-                            else:
-                                if progress_callback is not None:
-                                    run_options["stdout"] = subprocess.PIPE
-                                result = process_runner(command, **run_options)
-                                if progress_callback is not None:
-                                    stdout = getattr(result, "stdout", b"")
-                                    if isinstance(stdout, bytes):
-                                        stdout = stdout.decode("utf-8", errors="replace")
-                                    for line in str(stdout or "").splitlines():
-                                        _component_progress_event(
-                                            line.strip(),
-                                            progress_callback,
-                                        )
-                    except subprocess.TimeoutExpired as exc:
-                        detail = _stderr_file_detail(stderr_stream) or _stderr_detail(
-                            exc.stderr
-                        )
-                        raise EnhancedTrainingError(
-                            "强化训练超时" + (f"：{detail}" if detail else "")
-                        ) from exc
+                    ensure_not_cancelled()
+                    with system_application_launch_context():
+                        if runner is None and progress_callback is not None:
+                            result = _run_component_streaming(
+                                command,
+                                run_options,
+                                progress_callback=progress_callback,
+                                cancel_event=cancel_event,
+                            )
+                        else:
+                            if progress_callback is not None:
+                                run_options["stdout"] = subprocess.PIPE
+                            result = process_runner(command, **run_options)
+                            if progress_callback is not None:
+                                stdout = getattr(result, "stdout", b"")
+                                if isinstance(stdout, bytes):
+                                    stdout = stdout.decode("utf-8", errors="replace")
+                                for line in str(stdout or "").splitlines():
+                                    _component_progress_event(
+                                        line.strip(),
+                                        progress_callback,
+                                    )
+                    ensure_not_cancelled()
                     if int(getattr(result, "returncode", -1)) != 0:
                         detail = _stderr_file_detail(stderr_stream) or _stderr_detail(
                             getattr(result, "stderr", b"")
@@ -758,7 +836,7 @@ def train_enhanced_candidate(
                         {
                             "event": "validating",
                             "progress": 86,
-                            "message": "正在校验 ONNX 模型、训练指标和文件完整性",
+                            "message": "正在校验组件模型包、训练指标和文件完整性",
                         },
                     )
                     candidate = _validate_outputs(
@@ -789,7 +867,7 @@ def train_enhanced_candidate(
 
 
 __all__ = [
-    "ENHANCED_TRAINING_TIMEOUT_SECONDS",
+    "EnhancedTrainingCancelled",
     "EnhancedTrainingError",
     "train_enhanced_candidate",
 ]

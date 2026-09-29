@@ -20,10 +20,11 @@ from enhanced_trainer.dataset import (
     load_dataset,
     numeric_array,
 )
+from enhanced_trainer.model_bundle import build_model_bundle
 from enhanced_trainer.package_tool import (
     LINUX_ARM64_PLATFORM,
-    WINDOWS_RUNTIME_FILES,
     WINDOWS_PLATFORM,
+    WINDOWS_RUNTIME_FILES,
     PackageToolError,
     _synchronize_windows_runtime,
     build_native_bundle,
@@ -31,8 +32,6 @@ from enhanced_trainer.package_tool import (
     require_native_platform,
     self_test_bundle,
 )
-from integrated_client.captcha_models import _cnn_click_tensor
-from integrated_client.captcha_tensors import click_candidate_bbox
 from enhanced_trainer.protocol import (
     ALGORITHM,
     COMPONENT_VERSION,
@@ -52,6 +51,8 @@ from enhanced_trainer.protocol import (
     validate_generated_outputs,
 )
 from integrated_client import enhanced_training
+from integrated_client.captcha_models import _cnn_click_tensor
+from integrated_client.captcha_tensors import click_candidate_bbox
 from integrated_client.trainer_component import (
     STATUS_AVAILABLE,
     TrainerComponentManager,
@@ -189,7 +190,7 @@ class EnhancedProtocolTests(unittest.TestCase):
 
         self.assertEqual(NUMERIC_INPUT_SHAPE, (1, 1, 48, 112))
         self.assertEqual(NUMERIC_OUTPUT_SHAPE, (1, 4, 10))
-        self.assertEqual(CLICK_INPUT_SHAPE, ("N", 3, 64, 64))
+        self.assertEqual(CLICK_INPUT_SHAPE, ("N", 33))
 
     def test_protocol_rejects_client_unknown_metric_fields(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -197,7 +198,7 @@ class EnhancedProtocolTests(unittest.TestCase):
             model = b"fake-onnx"
             metrics = {
                 "schema_version": 1,
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "evaluation": "held_out_exact_code_accuracy",
                 "train_samples": 16,
                 "test_samples": 4,
@@ -237,7 +238,7 @@ class EnhancedProtocolTests(unittest.TestCase):
         ):
             self.assertNotIn(retired_field, source)
 
-    def test_click_split_keeps_evaluation_labels_known(self):
+    def test_click_split_keeps_whole_captchas_for_end_to_end_evaluation(self):
         from enhanced_trainer.dataset import CaptchaSample
 
         samples = []
@@ -253,49 +254,65 @@ class EnhancedProtocolTests(unittest.TestCase):
                     fingerprint=f"{index:064x}",
                 )
             )
-        train_samples, test_samples = training._split_click_samples(samples)
-        known = {
-            label
-            for sample in train_samples
-            for label in sample.answer["prompt"]
-        }
+        train_samples, test_samples = training.split_samples(samples)
         self.assertTrue(test_samples)
+        self.assertEqual(len(train_samples) + len(test_samples), len(samples))
+        self.assertFalse(
+            {sample.fingerprint for sample in train_samples}
+            & {sample.fingerprint for sample in test_samples}
+        )
         self.assertTrue(
-            all(set(sample.answer["prompt"]) <= known for sample in test_samples)
+            all(
+                len(sample.answer["prompt"]) == len(sample.answer["points"])
+                for sample in test_samples
+            )
         )
 
-    def test_cli_self_test_uses_protocol_v1_json(self):
+    def test_cli_self_test_uses_protocol_v2_json(self):
         with patch(
             "enhanced_trainer.cli.self_test",
             return_value={
                 "ok": True,
-                "protocol_version": 1,
+                "protocol_version": 2,
+                "engine_api_version": 1,
                 "component_version": COMPONENT_VERSION,
             },
         ), patch("builtins.print") as output:
-            code = cli.main(["self-test", "--protocol-version", "1"])
+            code = cli.main(["self-test", "--protocol-version", "2"])
         self.assertEqual(code, 0)
         payload = json.loads(output.call_args.args[0])
         self.assertTrue(payload["ok"])
 
     def test_model_metadata_matches_desktop_inference_adapter(self):
-        numeric = model_metadata(captcha_type="numeric", version="numeric-v1")
+        numeric = model_metadata(
+            captcha_type="numeric",
+            version="numeric-v1",
+            model_family="tiny-cnn-four-head-v1",
+        )
         click = model_metadata(
             captcha_type="click",
             version="click-v1",
-            labels=["深", "比"],
+            model_family="prompt-conditioned-ranker-v1",
+            feature_count=33,
         )
-        self.assertEqual(numeric["algorithm"], ALGORITHM)
+        self.assertEqual(ALGORITHM, "captcha-engine-v1")
         self.assertEqual(numeric["captcha_type"], "numeric")
-        self.assertEqual(json.loads(click["labels_json"]), ["深", "比"])
+        self.assertEqual(click["model_family"], "prompt-conditioned-ranker-v1")
+        self.assertEqual(click["feature_count"], "33")
 
     def test_output_hash_chain_is_strictly_validated(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            model = b"fake-onnx-for-contract-test"
+            model = build_model_bundle(
+                captcha_type="numeric",
+                version="numeric-v1",
+                model_family="tiny-cnn-four-head-v1",
+                min_component_version=COMPONENT_VERSION,
+                files={"model.onnx": b"fake-onnx-for-contract-test"},
+            )
             metrics = {
                 "schema_version": 1,
-                "protocol_version": 1,
+                "protocol_version": 2,
                 "evaluation": "held_out_exact_code_accuracy",
                 "train_samples": 16,
                 "test_samples": 4,
@@ -369,7 +386,8 @@ class EnhancedPackageToolTests(unittest.TestCase):
                 stdout=json.dumps(
                     {
                         "ok": True,
-                        "protocol_version": 1,
+                        "protocol_version": 2,
+                        "engine_api_version": 1,
                         "component_version": manifest["version"],
                     }
                 ),
@@ -379,7 +397,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
         manager = TrainerComponentManager(
             data_dir=self.root / "data",
             platform_key=WINDOWS_PLATFORM,
-            current_version="1.1.0",
+            current_version="1.4.0",
             runner=runner,
         )
         self.assertEqual(manager.install(package).status.code, STATUS_AVAILABLE)
@@ -456,7 +474,8 @@ class EnhancedPackageToolTests(unittest.TestCase):
                 stdout=json.dumps(
                     {
                         "ok": True,
-                        "protocol_version": 1,
+                        "protocol_version": 2,
+                        "engine_api_version": 1,
                         "component_version": COMPONENT_VERSION,
                     }
                 ),
@@ -474,7 +493,7 @@ class EnhancedPackageToolTests(unittest.TestCase):
             )
         self.assertTrue(result["ok"])
 
-    def test_native_build_uses_package_hooks_without_collect_all(self):
+    def test_native_build_collects_ocr_runtime(self):
         commands = []
 
         def runner(command, **_options):
@@ -507,13 +526,14 @@ class EnhancedPackageToolTests(unittest.TestCase):
         )
         synchronize_runtime.assert_called_once_with(bundle)
         command = commands[0]
-        self.assertNotIn("--collect-all", command)
         hidden = [
             command[index + 1]
             for index, value in enumerate(command)
             if value == "--hidden-import"
         ]
-        self.assertEqual(hidden, ["torch", "onnx", "onnxruntime"])
+        self.assertEqual(hidden, ["torch", "onnx", "onnxruntime", "ddddocr"])
+        collect_index = command.index("--collect-all")
+        self.assertEqual(command[collect_index + 1], "ddddocr")
 
     def test_windows_runtime_set_is_copied_and_hash_verified(self):
         system_root = self.root / "Windows"

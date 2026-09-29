@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import importlib.util
 import io
 import json
@@ -25,6 +26,43 @@ def _npz_artifact() -> bytes:
     output = io.BytesIO()
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("schema.npy", b"\x93NUMPYtest-model")
+    return output.getvalue()
+
+
+def _engine_model_artifact(*, captcha_type: str, version: str) -> bytes:
+    files = {
+        "private/model.bin": b"future-component-private-model",
+        "private/settings.json": b'{"private_schema":99}',
+    }
+    descriptors = [
+        {
+            "path": name,
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+        for name, payload in sorted(files.items())
+    ]
+    manifest = {
+        "schema_version": 1,
+        "engine_id": "intdemo-captcha-engine",
+        "engine_api_version": 1,
+        "captcha_type": captcha_type,
+        "version": version,
+        "model_family": "future-private-family-v99",
+        "min_component_version": "2.0.0",
+        "files": descriptors,
+    }
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
+        manifest_info = zipfile.ZipInfo("manifest.json", (1980, 1, 1, 0, 0, 0))
+        manifest_info.compress_type = zipfile.ZIP_DEFLATED
+        manifest_info.external_attr = (0o100000 | 0o644) << 16
+        archive.writestr(manifest_info, json.dumps(manifest, separators=(",", ":")))
+        for name, payload in files.items():
+            info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            info.compress_type = zipfile.ZIP_DEFLATED
+            info.external_attr = (0o100000 | 0o644) << 16
+            archive.writestr(info, payload)
     return output.getvalue()
 
 
@@ -484,8 +522,16 @@ def test_authorized_sample_collection_policy_metrics_and_deduplication(client):
     assert overview.status_code == 200
     body = overview.json()
     assert body["supported_model_algorithms"] == {
-        "click": ["hog-linear-svm-v1", "tiny-cnn-onnx-v1"],
-        "numeric": ["hog-linear-svm-v1", "tiny-cnn-onnx-v1"],
+        "click": [
+            "captcha-engine-v1",
+            "hog-linear-svm-v1",
+            "tiny-cnn-onnx-v1",
+        ],
+        "numeric": [
+            "captcha-engine-v1",
+            "hog-linear-svm-v1",
+            "tiny-cnn-onnx-v1",
+        ],
     }
     assert body["dataset"]["total_count"] == 1
     assert body["dataset"]["numeric_count"] == 1
@@ -888,6 +934,43 @@ def test_captcha_model_upload_accepts_enhanced_onnx_and_validates_metadata(clien
     )
     assert response.status_code == 422
     assert response.json()["code"] == "invalid_captcha_model_metadata"
+
+
+def test_server_stores_component_engine_models_without_knowing_private_family(client):
+    admin = changed_admin(client)
+    version = "click-engine-v1"
+    artifact = _engine_model_artifact(captcha_type="click", version=version)
+    payload = {
+        "captcha_type": "click",
+        "version": version,
+        "algorithm": "captcha-engine-v1",
+        "artifact_base64": base64.b64encode(artifact).decode("ascii"),
+        "sample_count": 100,
+        "test_count": 20,
+        "correct_count": 16,
+        "metrics": {
+            "training_mode": "enhanced",
+            "trainer_version": "2.0.0",
+        },
+    }
+
+    created = client.post(
+        "/api/v1/admin/ml/models",
+        headers=auth_header(admin),
+        json=payload,
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["algorithm"] == "captcha-engine-v1"
+
+    mismatched = dict(payload)
+    mismatched["version"] = "click-engine-other"
+    rejected = client.post(
+        "/api/v1/admin/ml/models",
+        headers=auth_header(admin),
+        json=mismatched,
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["code"] == "invalid_captcha_model"
 
 
 def test_captcha_model_upload_rejects_onnx_that_cannot_run_client_contract(client):

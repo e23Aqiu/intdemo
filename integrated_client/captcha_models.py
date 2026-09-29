@@ -38,6 +38,15 @@ class CaptchaTrainingError(RuntimeError):
     pass
 
 
+class CaptchaTrainingCancelled(CaptchaTrainingError):
+    """The user explicitly stopped a local training operation."""
+
+
+def _raise_if_training_cancelled(cancel_event) -> None:
+    if cancel_event is not None and cancel_event.is_set():
+        raise CaptchaTrainingCancelled("训练已由用户中止")
+
+
 TrainingProgressCallback = Callable[[dict[str, object]], None]
 
 
@@ -136,6 +145,7 @@ def _feature_from_image(image: Image.Image, width=24, height=32) -> np.ndarray:
 
 HOG_SVM_ALGORITHM = "hog-linear-svm-v1"
 ENHANCED_ONNX_ALGORITHM = "tiny-cnn-onnx-v1"
+CAPTCHA_ENGINE_ALGORITHM = "captcha-engine-v1"
 _HOG_WINDOW = (64, 64)
 _HOG_BLOCK = (16, 16)
 _HOG_STRIDE = (8, 8)
@@ -813,6 +823,8 @@ def _train_binary_linear_svm(features: np.ndarray, positive: np.ndarray):
 def _train_ovr_linear_svm(
     features: np.ndarray,
     labels,
+    *,
+    cancel_event=None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     features = np.asarray(features, dtype=np.float32)
     labels = np.asarray(labels).astype(str)
@@ -828,9 +840,10 @@ def _train_ovr_linear_svm(
     classes = np.asarray(sorted(set(labels.tolist())))
     if len(classes) < 2 or len(classes) > _MAX_SVM_CLASSES:
         raise CaptchaTrainingError("线性 SVM 标签种类数量无效")
-    parameters = [
-        _train_binary_linear_svm(features, labels == label) for label in classes
-    ]
+    parameters = []
+    for label in classes:
+        _raise_if_training_cancelled(cancel_event)
+        parameters.append(_train_binary_linear_svm(features, labels == label))
     return (
         classes.astype(str),
         np.stack([item[0] for item in parameters]).astype(np.float32),
@@ -1251,7 +1264,7 @@ class TinyCnnOnnxCaptchaModel:
                 raise CaptchaTrainingError("强化点选模型输出无效")
         except (CaptchaTrainingError, TypeError, ValueError, OverflowError):
             return {}
-        except Exception:
+        except Exception:  # noqa: BLE001 - component failure uses legacy fallback
             return {}
         positions = {}
         for bbox, class_index in zip(boxes, np.argmax(logits, axis=1)):
@@ -1261,6 +1274,81 @@ class TinyCnnOnnxCaptchaModel:
                 ((x1 + x2) // 2, (y1 + y2) // 2),
             )
         return positions
+
+
+class ComponentCaptchaModel:
+    """Opaque model executed by the locally imported CAPTCHA engine."""
+
+    ALGORITHM = CAPTCHA_ENGINE_ALGORITHM
+
+    def __init__(self, captcha_type: str, version: str, artifact: bytes, engine):
+        self.captcha_type = str(captcha_type)
+        self.version = str(version)
+        self.artifact = bytes(artifact)
+        self.engine = engine
+
+    @classmethod
+    def from_bytes(cls, captcha_type: str, version: str, artifact: bytes, engine):
+        data = bytes(artifact or b"")
+        if not data or len(data) > MAX_MODEL_ARTIFACT_BYTES:
+            raise CaptchaTrainingError("验证码组件模型包大小无效")
+        try:
+            engine.load_model(captcha_type, version, data)
+        except Exception as exc:
+            raise CaptchaTrainingError(f"本机验证码组件拒绝了模型包：{exc}") from exc
+        return cls(captcha_type, version, data, engine)
+
+    def predict_numeric(self, image_bytes: bytes) -> str:
+        if self.captcha_type != "numeric":
+            return ""
+        try:
+            result = self.engine.predict_numeric(image_bytes)
+        except Exception as exc:
+            raise CaptchaTrainingError(f"验证码组件数字识别失败：{exc}") from exc
+        if result.get("status") != "ok" or result.get("version") != self.version:
+            return ""
+        value = str(result.get("value") or "")
+        return value if re.fullmatch(r"[0-9]{4}", value) else ""
+
+    def predict_click_points(self, image_bytes: bytes, target_chars) -> dict:
+        if self.captcha_type != "click":
+            return {}
+        try:
+            result = self.engine.predict_click(image_bytes, target_chars)
+        except Exception:  # noqa: BLE001 - component failure uses legacy fallback
+            return {}
+        if result.get("status") != "ok" or result.get("version") != self.version:
+            return {}
+        points = result.get("points")
+        if not isinstance(points, list) or len(points) != len(target_chars):
+            return {}
+        normalized = []
+        for point in points:
+            if not isinstance(point, dict):
+                return {}
+            try:
+                x = float(point["x"])
+                y = float(point["y"])
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return {}
+            if (
+                not math.isfinite(x)
+                or not math.isfinite(y)
+                or not 0 <= x <= 1
+                or not 0 <= y <= 1
+            ):
+                return {}
+            normalized.append((x, y))
+        try:
+            confidence = float(result.get("confidence") or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            return {}
+        if not math.isfinite(confidence) or not 0 <= confidence <= 1:
+            return {}
+        return {
+            "points": normalized,
+            "confidence": confidence,
+        }
 
 
 def _npz_algorithm(artifact: bytes) -> str:
@@ -1281,9 +1369,14 @@ def _npz_algorithm(artifact: bytes) -> str:
 
 
 class CaptchaModelManager:
-    def __init__(self):
+    def __init__(self, *, engine_client=None, component_manager=None):
         self._models = {}
         self._lock = threading.RLock()
+        if engine_client is None:
+            from .captcha_engine import LocalCaptchaEngineClient
+
+            engine_client = LocalCaptchaEngineClient(component_manager)
+        self.engine_client = engine_client
 
     def install(
         self,
@@ -1297,10 +1390,21 @@ class CaptchaModelManager:
         if (
             expected_algorithm is not None
             and expected_algorithm
-            not in {HOG_SVM_ALGORITHM, ENHANCED_ONNX_ALGORITHM}
+            not in {
+                HOG_SVM_ALGORITHM,
+                ENHANCED_ONNX_ALGORITHM,
+                CAPTCHA_ENGINE_ALGORITHM,
+            }
         ):
             raise CaptchaTrainingError("不支持服务端清单声明的模型算法")
-        if artifact.startswith(b"PK"):
+        if expected_algorithm == CAPTCHA_ENGINE_ALGORITHM:
+            model = ComponentCaptchaModel.from_bytes(
+                captcha_type,
+                version,
+                artifact,
+                self.engine_client,
+            )
+        elif artifact.startswith(b"PK"):
             algorithm = _npz_algorithm(artifact)
             if expected_algorithm is not None and algorithm != expected_algorithm:
                 raise CaptchaTrainingError("模型算法与服务端清单不一致")
@@ -1331,6 +1435,22 @@ class CaptchaModelManager:
     def clear(self, captcha_type: str) -> None:
         with self._lock:
             self._models.pop(captcha_type, None)
+        try:
+            self.engine_client.unload_model(captcha_type)
+        except Exception:  # noqa: BLE001,S110 - fallback cleanup is best effort
+            pass
+
+    def component_changed(self) -> None:
+        try:
+            self.engine_client.component_changed()
+        except Exception:  # noqa: BLE001,S110 - next prediction retries lazily
+            pass
+
+    def stop(self) -> None:
+        try:
+            self.engine_client.stop()
+        except Exception:  # noqa: BLE001,S110 - shutdown cleanup is best effort
+            pass
 
     def get(self, captcha_type: str):
         with self._lock:
@@ -1356,6 +1476,7 @@ def _candidate_version(captcha_type: str, samples: list[dict]) -> str:
 def _train_numeric(
     samples: list[dict],
     progress_callback: TrainingProgressCallback | None = None,
+    cancel_event=None,
 ) -> CaptchaCandidate:
     if len(samples) < MIN_NUMERIC_SAMPLES:
         raise CaptchaTrainingError(
@@ -1374,6 +1495,7 @@ def _train_numeric(
     values = []
     valid_train = 0
     for index, item in enumerate(train, start=1):
+        _raise_if_training_cancelled(cancel_event)
         value = str(item["answer"].get("value") or "")
         if len(value) != 4 or any(character not in "0123456789" for character in value):
             continue
@@ -1412,6 +1534,7 @@ def _train_numeric(
             _train_ovr_linear_svm(
                 feature_matrix,
                 [value[position] for value in values],
+                cancel_event=cancel_event,
             )
         )
     maximum_classes = max(len(item[0]) for item in classifiers)
@@ -1441,6 +1564,7 @@ def _train_numeric(
     correct = 0
     evaluated = 0
     for index, item in enumerate(test, start=1):
+        _raise_if_training_cancelled(cancel_event)
         expected = str(item["answer"].get("value") or "")
         if len(expected) != 4 or any(
             character not in "0123456789" for character in expected
@@ -1491,6 +1615,7 @@ def _train_numeric(
 def _train_click(
     samples: list[dict],
     progress_callback: TrainingProgressCallback | None = None,
+    cancel_event=None,
 ) -> CaptchaCandidate:
     if len(samples) < MIN_CLICK_SAMPLES:
         raise CaptchaTrainingError(
@@ -1509,6 +1634,7 @@ def _train_click(
     labels = []
     valid_train = 0
     for index, item in enumerate(train, start=1):
+        _raise_if_training_cancelled(cancel_event)
         prompt = item["answer"].get("prompt")
         points = item["answer"].get("points")
         if not isinstance(prompt, list) or not isinstance(points, list):
@@ -1547,6 +1673,7 @@ def _train_click(
     click_labels, click_weights, click_biases = _train_ovr_linear_svm(
         np.stack(features),
         np.asarray(labels),
+        cancel_event=cancel_event,
     )
     model = HogLinearSvmCaptchaModel(
         "click",
@@ -1559,6 +1686,7 @@ def _train_click(
     correct = 0
     evaluated = 0
     for index, item in enumerate(test, start=1):
+        _raise_if_training_cancelled(cancel_event)
         prompt = item["answer"].get("prompt")
         points = item["answer"].get("points")
         if not isinstance(prompt, list) or not isinstance(points, list):
@@ -1621,12 +1749,15 @@ def train_candidate(
     mode: str = "standard",
     *,
     progress_callback: TrainingProgressCallback | None = None,
+    cancel_event=None,
 ) -> CaptchaCandidate:
+    _raise_if_training_cancelled(cancel_event)
     if captcha_type not in {"numeric", "click"}:
         raise CaptchaTrainingError("验证码类型无效")
     if str(mode).strip().lower() != "standard":
         raise CaptchaTrainingError("强化模式训练必须由本机强化训练组件执行")
     inspection = inspect_training_dataset(archive_bytes, captcha_type)
+    _raise_if_training_cancelled(cancel_event)
     samples = list(inspection.valid_samples)
     _report_training_progress(
         progress_callback,
@@ -1657,9 +1788,18 @@ def train_candidate(
             key=lambda item: item["fingerprint"],
         )[:MAX_TRAINING_SAMPLES]
     if captcha_type == "numeric":
-        candidate = _train_numeric(samples, progress_callback)
+        candidate = _train_numeric(
+            samples,
+            progress_callback,
+            cancel_event=cancel_event,
+        )
     else:
-        candidate = _train_click(samples, progress_callback)
+        candidate = _train_click(
+            samples,
+            progress_callback,
+            cancel_event=cancel_event,
+        )
+    _raise_if_training_cancelled(cancel_event)
     candidate.metrics.update(
         {
             "available_samples": available_samples,

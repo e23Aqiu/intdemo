@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtGui import QFontDatabase
 from PyQt5.QtWidgets import (
     QApplication,
@@ -18,6 +19,8 @@ from .frameless import FramelessDialog
 
 class TrainingTerminalDialog(FramelessDialog):
     """Non-modal training progress window shared by both training modes."""
+
+    cancel_requested = pyqtSignal()
 
     def __init__(
         self,
@@ -78,9 +81,13 @@ class TrainingTerminalDialog(FramelessDialog):
         actions.addStretch()
         self.copy_btn = QPushButton("复制日志")
         self.copy_btn.clicked.connect(self._copy_log)
+        self.cancel_btn = QPushButton("中止训练")
+        self.cancel_btn.setObjectName("DangerButton")
+        self.cancel_btn.clicked.connect(self._request_cancel)
         self.close_btn = QPushButton("隐藏")
         self.close_btn.clicked.connect(self._close_or_hide)
         actions.addWidget(self.copy_btn)
+        actions.addWidget(self.cancel_btn)
         actions.addWidget(self.close_btn)
         root.addLayout(actions)
 
@@ -101,9 +108,19 @@ class TrainingTerminalDialog(FramelessDialog):
         scrollbar = self.log.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def finish(self, *, error: Exception | None = None) -> None:
+    def finish(
+        self,
+        *,
+        error: Exception | None = None,
+        cancelled: bool = False,
+    ) -> None:
         self._running = False
-        if error is None:
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.hide()
+        if cancelled:
+            self.progress_bar.setFormat("训练已中止")
+            self.append_event({"message": "训练已由用户中止，未上传候选模型"})
+        elif error is None:
             self.progress_bar.setValue(100)
             self.progress_bar.setFormat("训练已完成 100%")
             self.append_event(
@@ -116,6 +133,14 @@ class TrainingTerminalDialog(FramelessDialog):
             self.progress_bar.setFormat("训练未完成")
             self.append_event({"message": f"训练失败：{error}"})
         self.close_btn.setText("关闭")
+
+    def _request_cancel(self) -> None:
+        if not self._running or not self.cancel_btn.isEnabled():
+            return
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setText("正在中止…")
+        self.status_label.setText("正在中止本机训练进程")
+        self.cancel_requested.emit()
 
     def _copy_log(self) -> None:
         QApplication.clipboard().setText(self.log.toPlainText())

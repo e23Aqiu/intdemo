@@ -36,9 +36,10 @@ from .platform_support import (
 
 TRAINER_COMPONENT_ID = "intdemo-enhanced-trainer"
 TRAINER_COMPONENT_SCHEMA_VERSION = 1
-TRAINER_PROTOCOL_VERSION = 1
+TRAINER_PROTOCOL_VERSION = 2
+CAPTCHA_ENGINE_API_VERSION = 1
 TRAINER_PACKAGE_SUFFIX = ".inttrainer"
-TRAINER_OUTPUT_MODEL_NAME = "candidate.onnx"
+TRAINER_OUTPUT_MODEL_NAME = "candidate.intmodel"
 TRAINER_OUTPUT_METADATA_NAME = "metadata.json"
 TRAINER_OUTPUT_METRICS_NAME = "metrics.json"
 DEFAULT_TRAINING_EPOCHS = 24
@@ -239,14 +240,15 @@ def _regular_zip_member(info: zipfile.ZipInfo) -> tuple[bool, bool]:
 class TrainerComponentManager:
     """Install and manage one platform-specific enhanced trainer component.
 
-    Protocol v1 has two subcommands::
+    Protocol v2 has two training subcommands and one inference service::
 
-        intdemo-trainer self-test --protocol-version 1
-        intdemo-trainer train --protocol-version 1 --dataset DATASET \
+        intdemo-trainer self-test --protocol-version 2
+        intdemo-trainer train --protocol-version 2 --dataset DATASET \
             --captcha-type {numeric,click} --output DIRECTORY
+        intdemo-trainer serve --engine-api-version 1
 
     A successful training invocation exits with code zero and writes
-    ``candidate.onnx``, ``metadata.json`` and ``metrics.json`` in DIRECTORY.
+    ``candidate.intmodel``, ``metadata.json`` and ``metrics.json`` in DIRECTORY.
     Runtime progress may be emitted as UTF-8 JSON Lines on stdout; launchers
     must treat unknown event fields as forward-compatible.
     """
@@ -288,6 +290,7 @@ class TrainerComponentManager:
             "version",
             "platform",
             "protocol_version",
+            "engine_api_version",
             "min_client_version",
             "entrypoint",
             "capabilities",
@@ -322,6 +325,10 @@ class TrainerComponentManager:
             manifest["protocol_version"] != TRAINER_PROTOCOL_VERSION
         ):
             raise TrainerCompatibilityError("强化组件命令行协议版本不兼容")
+        if type(manifest.get("engine_api_version")) is not int or (
+            manifest["engine_api_version"] != CAPTCHA_ENGINE_API_VERSION
+        ):
+            raise TrainerCompatibilityError("验证码组件推理协议版本不兼容")
         min_client_version = str(manifest.get("min_client_version") or "").strip()
         _version_key(min_client_version)
         max_client_version = manifest.get("max_client_version")
@@ -636,6 +643,8 @@ class TrainerComponentManager:
             raise TrainerSelfTestError("强化组件自检未返回成功状态")
         if payload.get("protocol_version") != TRAINER_PROTOCOL_VERSION:
             raise TrainerSelfTestError("强化组件自检协议版本不一致")
+        if payload.get("engine_api_version") != CAPTCHA_ENGINE_API_VERSION:
+            raise TrainerSelfTestError("验证码组件自检推理协议不一致")
         if str(payload.get("component_version") or "") != manifest["version"]:
             raise TrainerSelfTestError("强化组件自检版本与清单不一致")
 
@@ -1435,7 +1444,7 @@ class TrainerComponentManager:
         self,
         output_dir: Path | str,
     ) -> dict[str, Path]:
-        """Return the three protocol-v1 result paths expected from a trainer."""
+        """Return the three protocol-v2 result paths expected from the engine."""
 
         root = Path(output_dir).expanduser().resolve()
         return {
@@ -1461,6 +1470,16 @@ class TrainerComponentManager:
     def active_executable(self) -> Path:
         _active, manifest, directory = self._load_installed(verify_files=True)
         return self._safe_output_path(directory, manifest["entrypoint"])
+
+    def build_engine_command(self) -> list[str]:
+        """Return the stable local inference service command."""
+
+        return [
+            str(self.active_executable()),
+            "serve",
+            "--engine-api-version",
+            str(CAPTCHA_ENGINE_API_VERSION),
+        ]
 
     @contextmanager
     def training_lock(self) -> Iterator[None]:
@@ -1525,6 +1544,7 @@ class TrainerComponentManager:
 
 
 __all__ = [
+    "CAPTCHA_ENGINE_API_VERSION",
     "STATUS_AVAILABLE",
     "STATUS_DAMAGED",
     "STATUS_INCOMPATIBLE",

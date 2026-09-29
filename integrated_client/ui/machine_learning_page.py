@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import os
+import threading
 import uuid
 import weakref
 from pathlib import Path
@@ -26,11 +27,12 @@ from PyQt5.QtWidgets import (
 
 from ..captcha_models import (
     BUILTIN_MODEL_VERSION,
+    CaptchaTrainingCancelled,
     CaptchaTrainingError,
     inspect_training_dataset,
     train_candidate,
 )
-from ..enhanced_training import train_enhanced_candidate
+from ..enhanced_training import EnhancedTrainingCancelled, train_enhanced_candidate
 from ..online.api import ApiResponseError
 from ..trainer_component import (
     DEFAULT_TRAINING_EPOCHS,
@@ -62,15 +64,15 @@ TRAINING_MODES = (
 )
 TRAINING_METHODS = {
     "standard": "OpenCV HOG + 线性 SVM（hog-linear-svm-v1）",
-    "enhanced": "Tiny CNN + ONNX（tiny-cnn-onnx-v1）",
+    "enhanced": "本机验证码引擎组件（captcha-engine-v1）",
 }
 ACTIVATABLE_MODEL_ALGORITHMS = frozenset(
-    {"hog-linear-svm-v1", "tiny-cnn-onnx-v1"}
+    {"hog-linear-svm-v1", "tiny-cnn-onnx-v1", "captcha-engine-v1"}
 )
 RETIRED_KNN_ALGORITHM = "knn-pixels-v1"
 TRAINING_ALGORITHM_BY_MODE = {
     "standard": "hog-linear-svm-v1",
-    "enhanced": "tiny-cnn-onnx-v1",
+    "enhanced": "captcha-engine-v1",
 }
 
 
@@ -124,6 +126,12 @@ class MachineLearningPage(QWidget):
         self.learning_service = learning_service
         if trainer_manager is not None:
             self.trainer_manager = trainer_manager
+        elif learning_service is not None and getattr(
+            learning_service,
+            "component_manager",
+            None,
+        ) is not None:
+            self.trainer_manager = learning_service.component_manager
         else:
             self.trainer_manager = TrainerComponentManager()
         self._tasks = []
@@ -140,6 +148,7 @@ class MachineLearningPage(QWidget):
         self._training_in_progress = False
         self._training_id = ""
         self._training_terminal = None
+        self._training_cancel_event = None
         self._loading_dialog = None
         self._overview_loading_visible = False
         self._sample_loading_visible = False
@@ -668,6 +677,8 @@ class MachineLearningPage(QWidget):
         self._set_component_controls_enabled(False)
 
         def install():
+            if self.learning_service is not None:
+                self.learning_service.model_manager.component_changed()
             return self.trainer_manager.install(Path(source))
 
         task = self._start(install, self._trainer_component_installed)
@@ -692,6 +703,8 @@ class MachineLearningPage(QWidget):
             "强化组件安装完成",
             f"已安装版本 {status.version}{replaced}。组件自检已通过。",
         )
+        if self.learning_service is not None:
+            self.learning_service.refresh_policy()
 
     def _self_test_trainer_component(self):
         self._component_task_running = True
@@ -734,12 +747,17 @@ class MachineLearningPage(QWidget):
         self._component_task_running = True
         self._set_component_controls_enabled(False)
         task = self._start(
-            self.trainer_manager.uninstall,
+            self._uninstall_component_and_stop_engine,
             self._trainer_component_uninstalled,
         )
         if task is None:
             self._component_task_running = False
             self._refresh_training_component()
+
+    def _uninstall_component_and_stop_engine(self):
+        if self.learning_service is not None:
+            self.learning_service.model_manager.component_changed()
+        return self.trainer_manager.uninstall()
 
     def _trainer_component_uninstalled(self, result, error):
         self._component_task_running = False
@@ -785,6 +803,10 @@ class MachineLearningPage(QWidget):
         self._training_id = ""
         self._finish_loading()
         terminal = self._training_terminal
+        cancel_event = self._training_cancel_event
+        if cancel_event is not None:
+            cancel_event.set()
+        self._training_cancel_event = None
         if terminal is not None:
             terminal.hide()
             terminal.deleteLater()
@@ -1050,6 +1072,7 @@ class MachineLearningPage(QWidget):
                 "ddddocr": "ddddocr（内置）",
                 "hog-linear-svm-v1": "HOG + 线性 SVM",
                 "tiny-cnn-onnx-v1": "Tiny CNN + ONNX",
+                "captcha-engine-v1": "本机验证码引擎组件",
                 "knn-pixels-v1": "KNN（旧版）",
             }
             for row, model in enumerate(self._model_rows):
@@ -1822,6 +1845,9 @@ class MachineLearningPage(QWidget):
             page._training_terminal_destroyed(task_id)
 
         self._training_terminal.destroyed.connect(terminal_destroyed)
+        self._training_terminal.cancel_requested.connect(
+            lambda task_id=training_id: self._cancel_training(task_id)
+        )
         self.show_training_terminal_btn.setEnabled(True)
         self._training_terminal.show()
         self._training_terminal.raise_()
@@ -1859,6 +1885,20 @@ class MachineLearningPage(QWidget):
         terminal.raise_()
         terminal.activateWindow()
 
+    def _cancel_training(self, training_id):
+        if training_id != self._training_id or not self._training_in_progress:
+            return
+        event = self._training_cancel_event
+        if event is not None:
+            event.set()
+        self._emit_training_progress(
+            training_id,
+            {
+                "event": "cancelling",
+                "message": "正在中止训练；本机训练进程退出后将自动清理临时文件",
+            },
+        )
+
     def _emit_training_progress(self, training_id, payload):
         if self._shutting_down:
             return
@@ -1893,8 +1933,8 @@ class MachineLearningPage(QWidget):
             QMessageBox.warning(
                 self,
                 "服务器版本不兼容",
-                "当前在线服务器尚不支持 v1.1.0 的验证码训练模型。\n\n"
-                "请先将服务器升级到 v1.1.0，再开始训练。",
+                "当前在线服务器尚不支持验证码引擎模型。\n\n"
+                "请先将服务器升级到 v1.4.0，再开始训练。",
             )
             return
         reply = QMessageBox.question(
@@ -1925,6 +1965,8 @@ class MachineLearningPage(QWidget):
         self.train_click_btn.setEnabled(False)
         self._set_component_controls_enabled(False)
         training_id = uuid.uuid4().hex
+        cancel_event = threading.Event()
+        self._training_cancel_event = cancel_event
         self._begin_training_terminal(
             training_id=training_id,
             captcha_name=type_name,
@@ -1949,6 +1991,8 @@ class MachineLearningPage(QWidget):
             last_download_bytes = {"value": -1}
 
             def download_progress(downloaded, total):
+                if cancel_event.is_set():
+                    raise EnhancedTrainingCancelled("训练已由用户中止")
                 downloaded = max(0, int(downloaded or 0))
                 if total:
                     total = max(downloaded, int(total))
@@ -1986,6 +2030,8 @@ class MachineLearningPage(QWidget):
                 captcha_type,
                 progress_callback=download_progress,
             )
+            if cancel_event.is_set():
+                raise EnhancedTrainingCancelled("训练已由用户中止")
             progress(
                 {
                     "event": "inspect",
@@ -2033,6 +2079,7 @@ class MachineLearningPage(QWidget):
                     self.trainer_manager,
                     epochs=training_epochs,
                     progress_callback=progress,
+                    cancel_event=cancel_event,
                 )
                 if mode == "enhanced"
                 else train_candidate(
@@ -2040,8 +2087,11 @@ class MachineLearningPage(QWidget):
                     captcha_type,
                     mode="standard",
                     progress_callback=progress,
+                    cancel_event=cancel_event,
                 )
             )
+            if cancel_event.is_set():
+                raise EnhancedTrainingCancelled("训练已由用户中止")
             progress(
                 {
                     "event": "upload",
@@ -2102,6 +2152,7 @@ class MachineLearningPage(QWidget):
             else self.train_click_btn
         )
         self._training_in_progress = False
+        self._training_cancel_event = None
         self.train_numeric_btn.setEnabled(True)
         self.train_click_btn.setEnabled(True)
         self._refresh_training_component()
@@ -2115,9 +2166,12 @@ class MachineLearningPage(QWidget):
             if training_id is None or training_id == self._training_id
             else None
         )
+        cancelled = isinstance(error, CaptchaTrainingCancelled)
         if terminal is not None:
-            terminal.finish(error=error)
+            terminal.finish(error=error, cancelled=cancelled)
         if error is not None:
+            if cancelled:
+                return
             if (
                 isinstance(error, ApiResponseError)
                 and error.code == "validation_error"
@@ -2125,8 +2179,8 @@ class MachineLearningPage(QWidget):
                 QMessageBox.warning(
                     self,
                     "服务器版本不兼容",
-                    "服务器拒绝了 v1.1.0 模型参数。请先将在线服务器升级到 "
-                    "v1.1.0，再重新训练。",
+                    "服务器拒绝了验证码引擎模型参数。请先将在线服务器升级到 "
+                    "v1.4.0，再重新训练。",
                 )
                 return
             title = (

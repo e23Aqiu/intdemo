@@ -18,7 +18,8 @@ import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
 
-from .protocol import COMPONENT_VERSION
+from .model_bundle import ENGINE_API_VERSION
+from .protocol import COMPONENT_VERSION, PROTOCOL_VERSION
 
 WINDOWS_PLATFORM = "windows-x86_64"
 LINUX_ARM64_PLATFORM = "linux-aarch64"
@@ -173,12 +174,13 @@ def package_bundle(
         "component_id": "intdemo-enhanced-trainer",
         "version": component_version,
         "platform": platform_key,
-        "protocol_version": 1,
-        "min_client_version": "1.1.0",
+        "protocol_version": PROTOCOL_VERSION,
+        "engine_api_version": ENGINE_API_VERSION,
+        "min_client_version": "1.4.0",
         "entrypoint": f"bin/{expected_executable}",
         "capabilities": {
             "numeric": "tiny-cnn-four-head-v1",
-            "click": "tiny-cnn-character-v1",
+            "click": "prompt-conditioned-ranker-v1",
         },
         "files": [
             {"path": name, "size": size, "sha256": digest}
@@ -235,7 +237,14 @@ def package_bundle(
 def _require_build_dependencies() -> None:
     missing = [
         name
-        for name in ("torch", "onnx", "onnxruntime", "PIL", "PyInstaller")
+        for name in (
+            "torch",
+            "onnx",
+            "onnxruntime",
+            "ddddocr",
+            "PIL",
+            "PyInstaller",
+        )
         if importlib.util.find_spec(name) is None
     ]
     if missing:
@@ -338,7 +347,12 @@ def self_test_bundle(
         raise PackageToolError("强化训练器入口不存在或类型无效")
     if platform_key == LINUX_ARM64_PLATFORM:
         executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
-    command = [str(executable), "self-test", "--protocol-version", "1"]
+    command = [
+        str(executable),
+        "self-test",
+        "--protocol-version",
+        str(PROTOCOL_VERSION),
+    ]
     try:
         result = runner(
             command,
@@ -366,7 +380,8 @@ def self_test_bundle(
     if (
         not isinstance(payload, dict)
         or payload.get("ok") is not True
-        or payload.get("protocol_version") != 1
+        or payload.get("protocol_version") != PROTOCOL_VERSION
+        or payload.get("engine_api_version") != ENGINE_API_VERSION
         or payload.get("component_version") != COMPONENT_VERSION
     ):
         raise PackageToolError("强化训练器自检结果与组件协议不一致")
@@ -421,6 +436,10 @@ def build_native_bundle(
         "onnx",
         "--hidden-import",
         "onnxruntime",
+        "--hidden-import",
+        "ddddocr",
+        "--collect-all",
+        "ddddocr",
         str(entrypoint),
     ]
     try:

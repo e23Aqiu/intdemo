@@ -12,6 +12,7 @@ from collections.abc import Collection
 LEGACY_KNN_PIXELS_ALGORITHM = "knn-pixels-v1"
 HOG_LINEAR_SVM_ALGORITHM = "hog-linear-svm-v1"
 TINY_CNN_ONNX_ALGORITHM = "tiny-cnn-onnx-v1"
+CAPTCHA_ENGINE_ALGORITHM = "captcha-engine-v1"
 
 STANDARD_TRAINING_MODE = "standard"
 ENHANCED_TRAINING_MODE = "enhanced"
@@ -23,12 +24,14 @@ SUPPORTED_CAPTCHA_MODEL_ALGORITHMS: dict[str, frozenset[str]] = {
         {
             HOG_LINEAR_SVM_ALGORITHM,
             TINY_CNN_ONNX_ALGORITHM,
+            CAPTCHA_ENGINE_ALGORITHM,
         }
     ),
     "click": frozenset(
         {
             HOG_LINEAR_SVM_ALGORITHM,
             TINY_CNN_ONNX_ALGORITHM,
+            CAPTCHA_ENGINE_ALGORITHM,
         }
     ),
 }
@@ -36,16 +39,19 @@ SUPPORTED_CAPTCHA_MODEL_ALGORITHMS: dict[str, frozenset[str]] = {
 TRAINING_MODE_BY_ALGORITHM = {
     HOG_LINEAR_SVM_ALGORITHM: STANDARD_TRAINING_MODE,
     TINY_CNN_ONNX_ALGORITHM: ENHANCED_TRAINING_MODE,
+    CAPTCHA_ENGINE_ALGORITHM: ENHANCED_TRAINING_MODE,
 }
 
 ARTIFACT_FORMAT_BY_ALGORITHM = {
     HOG_LINEAR_SVM_ALGORITHM: "npz",
     TINY_CNN_ONNX_ALGORITHM: "onnx",
+    CAPTCHA_ENGINE_ALGORITHM: "intmodel",
 }
 
 MAX_ARTIFACT_BYTES_BY_ALGORITHM = {
     HOG_LINEAR_SVM_ALGORITHM: MAX_CAPTCHA_MODEL_BYTES,
     TINY_CNN_ONNX_ALGORITHM: MAX_CAPTCHA_MODEL_BYTES,
+    CAPTCHA_ENGINE_ALGORITHM: MAX_CAPTCHA_MODEL_BYTES,
 }
 
 
@@ -59,4 +65,3 @@ def is_supported_model(captcha_type: str, algorithm: str) -> bool:
     """Return whether this category/algorithm combination may be used."""
 
     return algorithm in supported_algorithms(captcha_type)
-

@@ -90,5 +90,35 @@ def build_click_model(class_count: int, torch_module=None):
     return ClickTinyCnn()
 
 
+def build_click_ranker(feature_count: int, torch_module=None):
+    """Return a class-independent scorer for one target/candidate pair."""
+
+    if not isinstance(feature_count, int) or feature_count < 1:
+        raise ValueError("feature_count must be positive")
+    torch = _torch(torch_module)
+    nn = torch.nn
+
+    class ClickPromptRanker(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.network = nn.Sequential(
+                nn.Linear(feature_count, 32),
+                nn.ReLU(inplace=True),
+                nn.Dropout(0.1),
+                nn.Linear(32, 16),
+                nn.ReLU(inplace=True),
+                nn.Linear(16, 1),
+            )
+            nn.init.zeros_(self.network[-1].weight)
+            nn.init.zeros_(self.network[-1].bias)
+
+        def forward(self, features):
+            # Feature 20 is the proven four-view OCR fusion baseline.  The
+            # tiny network learns a bounded residual instead of discarding it.
+            return features[:, 20:21] + 0.25 * self.network(features)
+
+    return ClickPromptRanker()
+
+
 def parameter_count(model) -> int:
     return sum(int(parameter.numel()) for parameter in model.parameters())

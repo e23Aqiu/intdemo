@@ -4,6 +4,7 @@ import io
 import json
 import os
 import tempfile
+import threading
 import unittest
 import zipfile
 from pathlib import Path
@@ -19,7 +20,9 @@ from PyQt5.QtCore import QCoreApplication, QEvent, QItemSelectionModel
 from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from integrated_client.captcha_models import (
+    CAPTCHA_ENGINE_ALGORITHM,
     CaptchaModelManager,
+    CaptchaTrainingCancelled,
     CaptchaTrainingError,
     HogLinearSvmCaptchaModel,
     KnnCaptchaModel,
@@ -411,6 +414,16 @@ class CaptchaLearningTests(unittest.TestCase):
             [event["progress"] for event in events],
         )
 
+    def test_standard_training_honors_the_shared_cancel_event(self):
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with self.assertRaisesRegex(CaptchaTrainingCancelled, "用户中止"):
+            train_candidate(
+                self.archive,
+                "numeric",
+                cancel_event=cancel_event,
+            )
+
     def test_training_rejects_unsafe_or_insufficient_archives(self):
         output = io.BytesIO()
         with zipfile.ZipFile(output, "w") as archive:
@@ -655,6 +668,87 @@ class CaptchaLearningTests(unittest.TestCase):
                 CaptchaLearningService._active_model_marker_path(
                     "numeric"
                 ).exists()
+            )
+
+    def test_component_model_waits_in_cache_until_local_component_is_available(self):
+        class MissingComponentModels:
+            def __init__(self):
+                self.available = False
+                self.installed = {}
+
+            def install(
+                self,
+                captcha_type,
+                version,
+                _artifact,
+                *,
+                expected_algorithm=None,
+            ):
+                if not self.available:
+                    raise CaptchaTrainingError("本机验证码组件不可用")
+                self.installed[captcha_type] = (version, expected_algorithm)
+
+            def version(self, captcha_type):
+                return self.installed.get(
+                    captcha_type,
+                    ("ddddocr-builtin", "ddddocr-builtin"),
+                )[0]
+
+            def algorithm(self, captcha_type):
+                return self.installed.get(
+                    captcha_type,
+                    ("ddddocr-builtin", "ddddocr-builtin"),
+                )[1]
+
+            def clear(self, captcha_type):
+                self.installed.pop(captcha_type, None)
+
+            @staticmethod
+            def stop():
+                return None
+
+        artifact = b"opaque-component-model"
+        metadata = {
+            "version": "click-engine-v1",
+            "algorithm": CAPTCHA_ENGINE_ALGORITHM,
+            "artifact_sha256": hashlib.sha256(artifact).hexdigest(),
+        }
+        with tempfile.TemporaryDirectory() as temp_dir, patch(
+            "integrated_client.online.captcha_learning.get_data_dir",
+            return_value=Path(temp_dir),
+        ):
+            service = CaptchaLearningService(
+                _FakeSession(),
+                model_manager=MissingComponentModels(),
+            )
+            service._stopped = False
+            service.policy = {"active_models": {"click": metadata}}
+
+            service._model_downloaded("click", metadata, artifact, None)
+
+            cache = CaptchaLearningService._model_cache_path(
+                "click",
+                metadata["version"],
+            )
+            self.assertEqual(cache.read_bytes(), artifact)
+            restored_models = MissingComponentModels()
+            restored = CaptchaLearningService(
+                _FakeSession(),
+                model_manager=restored_models,
+            )
+            self.assertEqual(cache.read_bytes(), artifact)
+            started = []
+            service._start_task = lambda function, completed: started.append(
+                (function, completed)
+            )
+            service._sync_active_models()
+            self.assertEqual(started, [])
+            restored_models.available = True
+            restored.policy = {"active_models": {"click": metadata}}
+            restored._sync_active_models()
+            self.assertEqual(
+                restored_models.version("click"),
+                metadata["version"],
             )
 
     def test_saving_model_cache_rejects_oversized_artifact(self):
@@ -2102,7 +2196,7 @@ class CaptchaLearningTests(unittest.TestCase):
 
         self.assertEqual(page.training_mode_combo.currentData(), "enhanced")
         self.assertIn("强化模式", page.training_method_label.text())
-        self.assertIn("tiny-cnn-onnx-v1", page.training_method_label.text())
+        self.assertIn("captcha-engine-v1", page.training_method_label.text())
         self.assertIn("已安装", page.trainer_status_label.text())
         self.assertIn("1.2.3", page.trainer_status_label.text())
         self.assertEqual(page.training_epochs_spin.value(), 24)
@@ -2142,6 +2236,25 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertEqual(dialog.close_btn.text(), "关闭")
         dialog.reject()
         self.assertFalse(dialog.isVisible())
+        dialog.deleteLater()
+
+    def test_training_terminal_stop_button_emits_once_and_marks_cancelled(self):
+        dialog = TrainingTerminalDialog(
+            captcha_name="点选验证码",
+            mode_name="强化模式",
+            method_name="本机验证码引擎组件",
+        )
+        requests = []
+        dialog.cancel_requested.connect(lambda: requests.append(True))
+
+        dialog.cancel_btn.click()
+        dialog.cancel_btn.click()
+
+        self.assertEqual(requests, [True])
+        self.assertFalse(dialog.cancel_btn.isEnabled())
+        self.assertEqual(dialog.cancel_btn.text(), "正在中止…")
+        dialog.finish(cancelled=True)
+        self.assertIn("未上传候选模型", dialog.log.toPlainText())
         dialog.deleteLater()
 
     def test_training_terminal_destroy_is_safe_after_page_is_deleted(self):
@@ -2313,8 +2426,8 @@ class CaptchaLearningTests(unittest.TestCase):
         candidate = SimpleNamespace(
             captcha_type="numeric",
             version="numeric-enhanced-test",
-            algorithm="tiny-cnn-onnx-v1",
-            artifact=b"onnx",
+            algorithm="captcha-engine-v1",
+            artifact=b"intmodel",
             sample_count=25,
             test_count=5,
             correct_count=4,
@@ -2358,6 +2471,7 @@ class CaptchaLearningTests(unittest.TestCase):
             manager,
             epochs=37,
             progress_callback=ANY,
+            cancel_event=ANY,
         )
         standard.assert_not_called()
         self.assertEqual(download_tokens, ["download-token"])
@@ -2448,7 +2562,7 @@ class CaptchaLearningTests(unittest.TestCase):
             page._train_model("numeric")
 
         self.assertEqual(warning.call_args.args[1], "服务器版本不兼容")
-        self.assertIn("升级到 v1.1.0", warning.call_args.args[2])
+        self.assertIn("升级到 v1.4.0", warning.call_args.args[2])
         question.assert_not_called()
         start.assert_not_called()
         page.deleteLater()
@@ -2470,7 +2584,7 @@ class CaptchaLearningTests(unittest.TestCase):
             page._model_trained("numeric", None, error)
 
         self.assertEqual(warning.call_args.args[1], "服务器版本不兼容")
-        self.assertIn("升级到 v1.1.0", warning.call_args.args[2])
+        self.assertIn("升级到 v1.4.0", warning.call_args.args[2])
         page.deleteLater()
 
     def test_workers_emit_success_metrics_without_sample_data(self):
@@ -2764,6 +2878,99 @@ class CaptchaLearningTests(unittest.TestCase):
             click_model.calls[0][1],
             [[12, 12, 48, 48], [72, 12, 108, 48]],
         )
+
+    def test_component_click_inference_runs_before_client_ddddocr(self):
+        original_image = _click_image(7)
+
+        class ClickModel:
+            version = "click-component-v1"
+
+            def __init__(self):
+                self.calls = []
+
+            def predict_click_points(self, image, targets):
+                self.calls.append((image, list(targets)))
+                return {
+                    "points": [(0.25, 0.5), (0.75, 0.5)],
+                    "confidence": 0.9,
+                }
+
+        click_model = ClickModel()
+
+        class Manager:
+            @staticmethod
+            def get(captcha_type):
+                return click_model if captcha_type == "click" else None
+
+        class Prompt:
+            @staticmethod
+            def count():
+                return 1
+
+            @staticmethod
+            def inner_text():
+                return "请依次点击【甲,乙】"
+
+            @staticmethod
+            def is_visible():
+                return False
+
+        class CaptchaImage:
+            first = None
+
+            def __init__(self):
+                self.first = self
+                self.clicks = []
+
+            @staticmethod
+            def screenshot():
+                return original_image
+
+            def click(self, *, position, timeout):
+                self.clicks.append((position, timeout))
+
+        captcha_image = CaptchaImage()
+
+        class Page:
+            @staticmethod
+            def locator(selector):
+                if selector == ".verify-msg":
+                    return Prompt()
+                if selector == ".back-img":
+                    return captcha_image
+                raise AssertionError(f"unexpected selector: {selector}")
+
+            @staticmethod
+            def wait_for_timeout(_milliseconds):
+                return None
+
+        worker = BusinessBackfillWorker(
+            "unused.xlsx",
+            True,
+            True,
+            1,
+            False,
+            captcha_collection_enabled=lambda: True,
+            captcha_model_manager=Manager(),
+        )
+        worker.page = Page()
+        events = []
+        worker.captcha_attempt_signal.connect(events.append)
+
+        with patch(
+            "integrated_client.tools.transport_tool.DdddOcr",
+            None,
+        ), patch("integrated_client.tools.transport_tool.time.sleep"):
+            self.assertTrue(worker.solve_captcha())
+
+        self.assertEqual(click_model.calls, [(original_image, ["甲", "乙"])])
+        self.assertEqual(
+            [item[0] for item in captcha_image.clicks],
+            [{"x": 30, "y": 30}, {"x": 90, "y": 30}],
+        )
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["success"])
+        self.assertEqual(events[0]["answer"]["prompt"], ["甲", "乙"])
 
     def test_numeric_custom_model_failure_is_counted_before_builtin_fallback(self):
         class Locator:

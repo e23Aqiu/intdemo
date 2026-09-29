@@ -9,7 +9,7 @@ param(
     [string]$Channel = "test",
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = "1.3.0",
+    [string]$Version = "1.4.0",
     [switch]$SkipPyInstaller
 )
 

@@ -8,11 +8,13 @@ import io
 import json
 import math
 import re
+import stat
 import struct
 import unicodedata
 import uuid
 import zipfile
 from datetime import UTC, datetime
+from pathlib import PurePosixPath
 from typing import Any
 
 from fastapi import APIRouter, Query, Request, Response
@@ -21,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 
 from ..captcha_model_algorithms import (
     ARTIFACT_FORMAT_BY_ALGORITHM,
+    CAPTCHA_ENGINE_ALGORITHM,
     HOG_LINEAR_SVM_ALGORITHM,
     LEGACY_KNN_PIXELS_ALGORITHM,
     MAX_ARTIFACT_BYTES_BY_ALGORITHM,
@@ -943,6 +946,167 @@ def _is_safe_hog_npz_model(
         return False
 
 
+def _safe_engine_member_name(value: Any, *, allow_manifest: bool = False) -> str | None:
+    if not isinstance(value, str):
+        return None
+    name = value.replace("\\", "/")
+    path = PurePosixPath(name)
+    normalized = str(path)
+    if (
+        not name
+        or name.startswith("/")
+        or "//" in name
+        or name.endswith("/")
+        or path.is_absolute()
+        or not path.parts
+        or normalized != name
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or ":" in path.parts[0]
+        or any(
+            part.endswith((" ", "."))
+            or any(ord(character) < 32 for character in part)
+            for part in path.parts
+        )
+        or (normalized == "manifest.json" and not allow_manifest)
+    ):
+        return None
+    return normalized
+
+
+def _strict_engine_manifest(payload: bytes) -> dict[str, Any] | None:
+    def object_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if not isinstance(key, str) or key in result:
+                raise ValueError("duplicate or invalid key")
+            result[key] = value
+        return result
+
+    def reject_constant(value):
+        raise ValueError(f"non-finite number: {value}")
+
+    value = json.loads(
+        payload.decode("utf-8"),
+        object_pairs_hook=object_pairs,
+        parse_constant=reject_constant,
+    )
+    return value if isinstance(value, dict) else None
+
+
+def _is_safe_engine_model(
+    data: bytes,
+    *,
+    captcha_type: str,
+    version: str,
+) -> bool:
+    """Validate the stable data-only component model envelope."""
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as archive:
+            infos = archive.infolist()
+            if not infos or len(infos) > 65:
+                return False
+            members = {}
+            expanded = 0
+            for info in infos:
+                name = _safe_engine_member_name(
+                    info.filename,
+                    allow_manifest=True,
+                )
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if (
+                    name is None
+                    or info.is_dir()
+                    or (mode and not stat.S_ISREG(mode))
+                    or info.flag_bits & 0x1
+                    or info.compress_type
+                    not in {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+                    or info.file_size <= 0
+                    or info.file_size > MAX_MODEL_BYTES
+                ):
+                    return False
+                identity = name.casefold()
+                if identity in members:
+                    return False
+                members[identity] = info
+                expanded += info.file_size
+                if expanded > MAX_MODEL_EXPANDED_BYTES:
+                    return False
+            manifest_info = members.get("manifest.json")
+            if manifest_info is None or manifest_info.file_size > 64 * 1024:
+                return False
+            manifest = _strict_engine_manifest(archive.read(manifest_info))
+            required = {
+                "schema_version",
+                "engine_id",
+                "engine_api_version",
+                "captcha_type",
+                "version",
+                "model_family",
+                "min_component_version",
+                "files",
+            }
+            if (
+                not isinstance(manifest, dict)
+                or set(manifest) != required
+                or type(manifest.get("schema_version")) is not int
+                or manifest.get("schema_version") != 1
+                or manifest.get("engine_id") != "intdemo-captcha-engine"
+                or type(manifest.get("engine_api_version")) is not int
+                or manifest.get("engine_api_version") != 1
+                or manifest.get("captcha_type") != captcha_type
+                or manifest.get("version") != version
+                or not isinstance(manifest.get("model_family"), str)
+                or re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", manifest["model_family"])
+                is None
+                or not isinstance(manifest.get("min_component_version"), str)
+                or TRAINER_VERSION_PATTERN.fullmatch(manifest["min_component_version"])
+                is None
+            ):
+                return False
+            descriptors = manifest.get("files")
+            if not isinstance(descriptors, list) or not descriptors:
+                return False
+            declared = set()
+            for item in descriptors:
+                if not isinstance(item, dict) or set(item) != {"path", "size", "sha256"}:
+                    return False
+                name = _safe_engine_member_name(item.get("path"))
+                if name is None:
+                    return False
+                identity = name.casefold()
+                size = item.get("size")
+                digest = str(item.get("sha256") or "").casefold()
+                if (
+                    identity in declared
+                    or identity not in members
+                    or type(size) is not int
+                    or size <= 0
+                    or size != members[identity].file_size
+                    or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+                ):
+                    return False
+                payload = archive.read(members[identity])
+                if len(payload) != size or hashlib.sha256(payload).hexdigest() != digest:
+                    return False
+                declared.add(identity)
+            return (
+                set(members) == {"manifest.json", *declared}
+                and archive.testzip() is None
+            )
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        json.JSONDecodeError,
+        zipfile.BadZipFile,
+        zipfile.LargeZipFile,
+        RecursionError,
+        RuntimeError,
+    ):
+        return False
+
+
 def _validate_model_contract(
     captcha_type: str,
     version: str,
@@ -975,6 +1139,14 @@ def _validate_model_contract(
             )
         )
         if algorithm == TINY_CNN_ONNX_ALGORITHM
+        else (
+            _is_safe_engine_model(
+                artifact,
+                captcha_type=captcha_type,
+                version=version,
+            )
+        )
+        if algorithm == CAPTCHA_ENGINE_ALGORITHM
         else False
     )
     if not valid_artifact:

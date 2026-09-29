@@ -1490,20 +1490,58 @@ class BusinessBackfillWorker(QThread):
         self,
         image_bytes,
         bboxes,
-        expected_count,
+        target_chars,
     ):
         """使用管理员当前应用的点选模型，失败时交回内置识别结果。"""
         custom_model = self._active_model("click")
         if custom_model is None:
             return None
+        if type(target_chars) is int:
+            target_count = target_chars
+            prompt_chars = None
+        else:
+            try:
+                prompt_chars = [str(value) for value in target_chars]
+            except TypeError:
+                prompt_chars = None
+            target_count = len(prompt_chars) if prompt_chars is not None else 0
+        if target_count < 1:
+            return None
         try:
-            positions = custom_model.predict_click_regions(
-                image_bytes,
-                bboxes,
-            )
-        except Exception:
+            predictor = getattr(custom_model, "predict_click_points", None)
+            if callable(predictor) and prompt_chars is not None:
+                result = predictor(image_bytes, prompt_chars)
+                normalized = result.get("points") if isinstance(result, dict) else None
+                if isinstance(normalized, list) and len(normalized) == target_count:
+                    with Image.open(io.BytesIO(image_bytes)) as opened:
+                        width, height = opened.size
+                    ordered = [
+                        (
+                            max(0, min(width - 1, round(float(point[0]) * width))),
+                            max(0, min(height - 1, round(float(point[1]) * height))),
+                        )
+                        for point in normalized
+                    ]
+                    positions = {"ordered_points": ordered}
+                else:
+                    positions = {}
+            elif bboxes is None:
+                return None
+            else:
+                positions = custom_model.predict_click_regions(
+                    image_bytes,
+                    bboxes,
+                )
+        except Exception:  # noqa: BLE001 - custom model failures use fallback
             positions = {}
-        if len(positions) >= int(expected_count):
+        if not isinstance(positions, dict):
+            positions = {}
+        usable = (
+            len(positions.get("ordered_points") or []) == target_count
+            if "ordered_points" in positions
+            else len(positions) >= target_count
+        )
+        if usable:
             version = str(custom_model.version)
             self.log.emit(f"✅ 已使用当前点选验证码模型：{version}")
             return positions, version
@@ -1542,6 +1580,64 @@ class BusinessBackfillWorker(QThread):
                 }
             )
         self.captcha_attempt_signal.emit(event)
+
+    def _submit_automatic_clicks(
+        self,
+        *,
+        image_element,
+        prompt_element,
+        image_bytes,
+        target_chars,
+        click_list,
+        model_version,
+    ):
+        """Click one ordered prediction and keep the existing sample format."""
+
+        for x, y, target_char, matched_char in click_list:
+            self._check_stopped()
+            self.log.emit(
+                f"✅ 按题目顺序点击：{target_char}→{matched_char}，坐标({x},{y})"
+            )
+            try:
+                image_element.click(position={"x": x, "y": y}, timeout=2000)
+            except Exception:  # noqa: BLE001 - browser click failure is recoverable
+                self.log.emit("⚠️ 点击验证码超时，跳过本次")
+                break
+            self._check_stopped()
+            time.sleep(0.4)
+
+        self.log.emit("⏳ 等待页面响应，校验验证码结果...")
+        self._check_stopped()
+        self.page.wait_for_timeout(2000)
+        if prompt_element.is_visible():
+            self._emit_captcha_attempt(
+                success=False,
+                model_version=model_version,
+                assisted=False,
+            )
+            self.log.emit("⚠️ 验证码未消失，点击错误，自动重试...")
+            return False
+
+        with Image.open(io.BytesIO(image_bytes)) as captured:
+            width, height = captured.size
+        normalized_points = [
+            {
+                "x": round(x / max(1, width), 6),
+                "y": round(y / max(1, height), 6),
+            }
+            for x, y, _target, _matched in click_list
+        ]
+        self._report_successful_click_captcha(
+            {
+                "image_bytes": image_bytes,
+                "prompt": target_chars,
+            },
+            normalized_points,
+            model_version=model_version,
+            assisted=False,
+        )
+        self.log.emit("🎉 验证码验证通过！")
+        return True
 
     def stop(self):
         self._running = False
@@ -2877,21 +2973,11 @@ class BusinessBackfillWorker(QThread):
     # 封装：你的专属验证码识别逻辑（完全未修改，原样封装）
     # ======================
     def solve_captcha(self):
-        if DdddOcr is None:
-            custom_model = self._active_model("click")
-            if custom_model is not None:
-                self._emit_captcha_attempt(
-                    success=False,
-                    model_version=custom_model.version,
-                    assisted=False,
-                )
-            self.log.emit(f"❌ ddddocr 不可用，无法自动识别验证码：{DDDDOCR_IMPORT_ERROR}")
-            return False
         try:
             self.log.emit("🤖 开始处理中文点选验证码")
             success = False
-            det_ocr = DdddOcr(det=True, ocr=False, show_ad=False)
-            rec_ocr = DdddOcr(det=False, ocr=True, show_ad=False)
+            det_ocr = None
+            rec_ocr = None
 
             # 读取界面设置的重试次数
             captcha_max_retry = self.captcha_retry
@@ -2923,6 +3009,56 @@ class BusinessBackfillWorker(QThread):
                     # recognition use a sharpened copy below, while a
                     # successful sample must remain untouched.
                     original_img_bytes = img_el.screenshot()
+
+                    # The imported local component owns the new click algorithm,
+                    # including detection, OCR features, ranking and confidence
+                    # gating.  Only abstention/failure reaches the legacy path.
+                    component_model = self._active_model("click")
+                    component_predictor = getattr(
+                        component_model,
+                        "predict_click_points",
+                        None,
+                    )
+                    if callable(component_predictor):
+                        component_prediction = self._predict_with_active_click_model(
+                            original_img_bytes,
+                            None,
+                            target_chars,
+                        )
+                        if component_prediction is not None:
+                            component_result, attempt_model_version = (
+                                component_prediction
+                            )
+                            ordered_points = component_result.get("ordered_points")
+                            if ordered_points is not None:
+                                click_list = [
+                                    (x, y, target, target)
+                                    for (x, y), target in zip(
+                                        ordered_points,
+                                        target_chars,
+                                    )
+                                ]
+                                if self._submit_automatic_clicks(
+                                    image_element=img_el,
+                                    prompt_element=prompt_el,
+                                    image_bytes=original_img_bytes,
+                                    target_chars=target_chars,
+                                    click_list=click_list,
+                                    model_version=attempt_model_version,
+                                ):
+                                    return True
+                                self.page.locator(".verify-refresh").click()
+                                time.sleep(2)
+                                continue
+
+                    if DdddOcr is None:
+                        raise RuntimeError(
+                            "本机组件未给出可用结果，且客户端 ddddocr 不可用："
+                            f"{DDDDOCR_IMPORT_ERROR}"
+                        )
+                    if det_ocr is None or rec_ocr is None:
+                        det_ocr = DdddOcr(det=True, ocr=False, show_ad=False)
+                        rec_ocr = DdddOcr(det=False, ocr=True, show_ad=False)
 
                     # 整图锐化
                     pil_img_original = Image.open(
@@ -3044,94 +3180,73 @@ class BusinessBackfillWorker(QThread):
 
                     self.log.emit(f"✅ 文字识别完成：{char_position_map}")
 
-                    custom_prediction = self._predict_with_active_click_model(
-                        original_img_bytes,
-                        bboxes,
-                        len(target_chars),
-                    )
-                    if custom_prediction is not None:
-                        char_position_map, attempt_model_version = (
-                            custom_prediction
+                    custom_prediction = None
+                    if not callable(component_predictor):
+                        custom_prediction = self._predict_with_active_click_model(
+                            original_img_bytes,
+                            bboxes,
+                            target_chars,
                         )
+                    ordered_component_points = None
+                    if custom_prediction is not None:
+                        component_result, attempt_model_version = custom_prediction
+                        ordered_component_points = component_result.get("ordered_points")
+                        if ordered_component_points is None:
+                            char_position_map = component_result
 
                     # 全局匹配+点击
                     self.log.emit("🖱️ 第三步：全局两两对比相似度，开始最优匹配")
-                    recog_chars = list(char_position_map.keys())
-                    target_list = target_chars.copy()
-                    final_match = {}
-                    used_recog = set()
-                    match_pool = []
-                    for t_char in target_list:
-                        for r_char in recog_chars:
-                            if r_char not in used_recog:
-                                py_target = get_pinyin(t_char)
-                                py_recog = get_pinyin(r_char)
-                                py_score = difflib.SequenceMatcher(None, py_target, py_recog).ratio()
-                                char_score = difflib.SequenceMatcher(None, t_char, r_char).ratio()
-                                score = py_score * 0.6 + char_score * 0.4
-                                match_pool.append((-score, t_char, r_char))
-                    self.log.emit("=" * 50)
+                    if ordered_component_points is not None:
+                        click_list = [
+                            (x, y, target, target)
+                            for (x, y), target in zip(
+                                ordered_component_points,
+                                target_chars,
+                            )
+                        ]
+                    else:
+                        recog_chars = list(char_position_map.keys())
+                        target_list = target_chars.copy()
+                        final_match = {}
+                        used_recog = set()
+                        match_pool = []
+                        for t_char in target_list:
+                            for r_char in recog_chars:
+                                if r_char not in used_recog:
+                                    py_target = get_pinyin(t_char)
+                                    py_recog = get_pinyin(r_char)
+                                    py_score = difflib.SequenceMatcher(None, py_target, py_recog).ratio()
+                                    char_score = difflib.SequenceMatcher(None, t_char, r_char).ratio()
+                                    score = py_score * 0.6 + char_score * 0.4
+                                    match_pool.append((-score, t_char, r_char))
+                        self.log.emit("=" * 50)
 
-                    match_pool.sort()
-                    for score_neg, t_char, r_char in match_pool:
-                        if t_char not in final_match and r_char not in used_recog:
-                            final_match[t_char] = r_char
-                            used_recog.add(r_char)
-                        if len(final_match) == len(target_list):
-                            break
+                        match_pool.sort()
+                        for score_neg, t_char, r_char in match_pool:
+                            if t_char not in final_match and r_char not in used_recog:
+                                final_match[t_char] = r_char
+                                used_recog.add(r_char)
+                            if len(final_match) == len(target_list):
+                                break
 
-                    click_list = []
-                    for t in target_chars:
-                        matched_char = final_match[t]
-                        x, y = char_position_map[matched_char]
-                        click_list.append((x, y, t, matched_char))
+                        click_list = []
+                        for t in target_chars:
+                            matched_char = final_match[t]
+                            x, y = char_position_map[matched_char]
+                            click_list.append((x, y, t, matched_char))
 
                     # 必须严格按照题目给出的文字顺序点击，不能按页面横坐标重排。
-                    for x, y, target_char, matched_char in click_list:
-                        self._check_stopped()
-                        self.log.emit(f"✅ 按题目顺序点击：{target_char}→{matched_char}，坐标({x},{y})")
-
-                        try:
-                            img_el.click(position={"x": x, "y": y}, timeout=2000)
-                        except:
-                            self.log.emit("⚠️ 点击验证码超时，跳过本次")
-                            break
-
-                        self._check_stopped()
-                        time.sleep(0.4)
-
-                    self.log.emit("⏳ 等待页面响应，校验验证码结果...")
-                    self._check_stopped()
-                    self.page.wait_for_timeout(2000)
-
-                    if not prompt_el.is_visible():
-                        normalized_points = [
-                            {
-                                "x": round(x / pil_img_sharpen.width, 6),
-                                "y": round(y / pil_img_sharpen.height, 6),
-                            }
-                            for x, y, _target, _matched in click_list
-                        ]
-                        self._report_successful_click_captcha(
-                            {
-                                "image_bytes": original_img_bytes,
-                                "prompt": target_chars,
-                            },
-                            normalized_points,
-                            model_version=attempt_model_version,
-                            assisted=False,
-                        )
-                        self.log.emit("🎉 验证码验证通过！")
+                    if self._submit_automatic_clicks(
+                        image_element=img_el,
+                        prompt_element=prompt_el,
+                        image_bytes=original_img_bytes,
+                        target_chars=target_chars,
+                        click_list=click_list,
+                        model_version=attempt_model_version,
+                    ):
                         return True
-                    else:
-                        self._emit_captcha_attempt(
-                            success=False,
-                            model_version=attempt_model_version,
-                            assisted=False,
-                        )
-                        self.log.emit("⚠️ 验证码未消失，点击错误，自动重试...")
-                        self.page.locator(".verify-refresh").click()
-                        time.sleep(2)
+                    self.page.locator(".verify-refresh").click()
+                    time.sleep(2)
 
                 except Exception as e:
                     self._emit_captcha_attempt(
