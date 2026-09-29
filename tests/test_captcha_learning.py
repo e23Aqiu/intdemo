@@ -2294,13 +2294,22 @@ class CaptchaLearningTests(unittest.TestCase):
     def test_machine_learning_page_uses_selected_training_backend(self):
         session = _FakeSession()
         manager = _FakeTrainerManager(available=True, mode="enhanced")
+        issued_tokens = iter(["download-token", "upload-token"])
+        session.access_token = lambda: next(issued_tokens)
+        download_tokens = []
+        upload_tokens = []
         session.api.admin_export_captcha_dataset = (
-            lambda _token, _kind, *, progress_callback=None: (
+            lambda token, _kind, *, progress_callback=None: download_tokens.append(
+                token
+            )
+            or (
                 progress_callback(7, 7) if progress_callback else None
             )
             or b"dataset"
         )
-        session.api.admin_create_captcha_model = lambda _token, payload: payload
+        session.api.admin_create_captcha_model = (
+            lambda token, payload: upload_tokens.append(token) or payload
+        )
         candidate = SimpleNamespace(
             captcha_type="numeric",
             version="numeric-enhanced-test",
@@ -2323,7 +2332,7 @@ class CaptchaLearningTests(unittest.TestCase):
             completed(function(), None)
             return object()
 
-        with patch.object(
+        with patch.object(page, "refresh"), patch.object(
             page,
             "_start",
             side_effect=immediate,
@@ -2351,8 +2360,75 @@ class CaptchaLearningTests(unittest.TestCase):
             progress_callback=ANY,
         )
         standard.assert_not_called()
+        self.assertEqual(download_tokens, ["download-token"])
+        self.assertEqual(upload_tokens, ["upload-token"])
         self.assertTrue(page.train_numeric_btn.isEnabled())
         self.assertTrue(page.train_click_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_refreshes_expired_upload_token_once(self):
+        session = _FakeSession()
+        manager = _FakeTrainerManager(available=True, mode="enhanced")
+        issued_tokens = iter(
+            ["download-token", "expired-upload-token", "refreshed-upload-token"]
+        )
+        session.access_token = lambda: next(issued_tokens)
+        upload_tokens = []
+        session.api.admin_export_captcha_dataset = (
+            lambda _token, _kind, *, progress_callback=None: b"dataset"
+        )
+
+        def upload(token, payload):
+            upload_tokens.append(token)
+            if token == "expired-upload-token":
+                raise ApiResponseError(
+                    "access_token_expired",
+                    "访问令牌已过期",
+                    status_code=401,
+                )
+            return payload
+
+        session.api.admin_create_captcha_model = upload
+        candidate = SimpleNamespace(
+            captcha_type="numeric",
+            version="numeric-enhanced-test",
+            algorithm="tiny-cnn-onnx-v1",
+            artifact=b"onnx",
+            sample_count=25,
+            test_count=5,
+            correct_count=4,
+            metrics={"training_mode": "enhanced"},
+        )
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session, trainer_manager=manager)
+        page.refresh_timer.stop()
+
+        def immediate(function, completed):
+            completed(function(), None)
+            return object()
+
+        with patch.object(page, "refresh"), patch.object(
+            page,
+            "_start",
+            side_effect=immediate,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.question",
+            return_value=QMessageBox.Yes,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.information",
+        ), patch(
+            "integrated_client.ui.machine_learning_page.train_enhanced_candidate",
+            return_value=candidate,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.inspect_training_dataset",
+            return_value=SimpleNamespace(valid_count=25),
+        ):
+            page._train_model("numeric")
+
+        self.assertEqual(
+            upload_tokens,
+            ["expired-upload-token", "refreshed-upload-token"],
+        )
         page.deleteLater()
 
     def test_machine_learning_page_blocks_training_against_old_server(self):

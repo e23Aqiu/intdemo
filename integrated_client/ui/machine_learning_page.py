@@ -2052,21 +2052,40 @@ class MachineLearningPage(QWidget):
                     ),
                 }
             )
-            model = self.session_manager.api.admin_create_captcha_model(
-                token,
-                {
-                    "captcha_type": candidate.captcha_type,
-                    "version": candidate.version,
-                    "algorithm": candidate.algorithm,
-                    "artifact_base64": base64.b64encode(
-                        candidate.artifact
-                    ).decode("ascii"),
-                    "sample_count": candidate.sample_count,
-                    "test_count": candidate.test_count,
-                    "correct_count": candidate.correct_count,
-                    "metrics": candidate.metrics,
-                },
-            )
+            payload = {
+                "captcha_type": candidate.captcha_type,
+                "version": candidate.version,
+                "algorithm": candidate.algorithm,
+                "artifact_base64": base64.b64encode(candidate.artifact).decode(
+                    "ascii"
+                ),
+                "sample_count": candidate.sample_count,
+                "test_count": candidate.test_count,
+                "correct_count": candidate.correct_count,
+                "metrics": candidate.metrics,
+            }
+
+            def upload_candidate():
+                # Training can outlive the token used to download the dataset.
+                upload_token = self.session_manager.access_token()
+                return self.session_manager.api.admin_create_captcha_model(
+                    upload_token,
+                    payload,
+                )
+
+            try:
+                model = upload_candidate()
+            except ApiResponseError as exc:
+                if exc.code != "access_token_expired":
+                    raise
+                progress(
+                    {
+                        "event": "upload_auth_refresh",
+                        "progress": 95,
+                        "message": "上传令牌已过期，正在刷新登录会话并重试",
+                    }
+                )
+                model = upload_candidate()
             return model
 
         self._start(
