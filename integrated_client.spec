@@ -31,6 +31,8 @@ hiddenimports = [
     'DrissionPage', 'DataRecorder', 'DownloadKit', 'DrissionGet', 'DrissionRecord',
     'playwright', 'playwright.sync_api',
     'ddddocr', 'onnxruntime', 'cv2', 'PIL', 'pinyin',
+    'enhanced_trainer.engine', 'enhanced_trainer.click_engine',
+    'enhanced_trainer.model_bundle',
     'cryptography', 'cryptography.hazmat.bindings._rust',
 ]
 

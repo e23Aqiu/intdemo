@@ -392,6 +392,9 @@ class MainWindow(FramelessMainWindow):
             self.captcha_learning_service.policy_changed.connect(
                 self._update_captcha_sync_policy
             )
+            self.captcha_learning_service.model_changed.connect(
+                self.workflow_page.refresh_captcha_model_status
+            )
             self.captcha_learning_service.pending_count_changed.connect(
                 self._update_captcha_pending_count
             )
@@ -1551,6 +1554,9 @@ class MainWindow(FramelessMainWindow):
         )
 
     def _update_captcha_sync_policy(self, policy):
+        workflow_page = getattr(self, "workflow_page", None)
+        if workflow_page is not None:
+            workflow_page.set_captcha_model_policy(policy)
         if not hasattr(self, "captcha_sync_retry_button"):
             return
         policy = policy or {}

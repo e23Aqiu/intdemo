@@ -936,7 +936,7 @@ def test_captcha_model_upload_accepts_enhanced_onnx_and_validates_metadata(clien
     assert response.json()["code"] == "invalid_captcha_model_metadata"
 
 
-def test_server_stores_component_engine_models_without_knowing_private_family(client):
+def test_server_stores_runtime_models_without_knowing_internal_family(client):
     admin = changed_admin(client)
     version = "click-engine-v1"
     artifact = _engine_model_artifact(captcha_type="click", version=version)

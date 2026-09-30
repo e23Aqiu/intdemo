@@ -11,6 +11,7 @@ from pathlib import Path
 from PyQt5.QtCore import QObject, QRunnable, QThreadPool, QTimer, pyqtSignal
 
 from ..captcha_models import (
+    BUILTIN_MODEL_VERSION,
     CAPTCHA_ENGINE_ALGORITHM,
     ENHANCED_ONNX_ALGORITHM,
     HOG_SVM_ALGORITHM,
@@ -235,9 +236,9 @@ class CaptchaLearningService(QObject):
                 algorithm == CAPTCHA_ENGINE_ALGORITHM
                 and self._model_cache_matches(captcha_type, version, digest)
             ):
-                # The data-only model is validly cached but this device has no
-                # compatible local component yet.  Retry the cache on each
-                # policy refresh without downloading or deleting it.
+                # The data-only model is validly cached but this client build
+                # does not support its inference contract yet.  Keep it for a
+                # later client update without downloading it repeatedly.
                 continue
             self._downloading_models[captcha_type] = identity
 
@@ -302,9 +303,10 @@ class CaptchaLearningService(QObject):
                     )
                 except (OSError, ValueError) as cache_exc:
                     get_logger().warning(
-                        "Could not cache pending component CAPTCHA model: %s",
+                        "Could not cache pending CAPTCHA runtime model: %s",
                         cache_exc,
                     )
+                self._clear_runtime_model(captcha_type)
                 return
             self._reject_model_artifact(captcha_type, version)
             return
@@ -366,6 +368,8 @@ class CaptchaLearningService(QObject):
             return False
         except Exception as exc:  # noqa: BLE001 - invalid local cache
             get_logger().warning("Could not load cached CAPTCHA model: %s", exc)
+            if expected_algorithm == CAPTCHA_ENGINE_ALGORITHM:
+                self._clear_runtime_model(captcha_type)
             return False
         identity = (
             captcha_type,
@@ -408,14 +412,19 @@ class CaptchaLearningService(QObject):
         return captcha_type, version, algorithm, digest
 
     def _clear_installed_model(self, captcha_type):
-        self.model_manager.clear(captcha_type)
-        self._active_model_identities.pop(captcha_type, None)
+        self._clear_runtime_model(captcha_type)
         self._clear_active_model_marker(captcha_type)
         self._prune_model_cache(captcha_type)
 
     def _clear_runtime_model(self, captcha_type):
+        try:
+            previous_version = self.model_manager.version(captcha_type)
+        except Exception:  # noqa: BLE001 - cleanup must remain best effort
+            previous_version = BUILTIN_MODEL_VERSION
         self.model_manager.clear(captcha_type)
         self._active_model_identities.pop(captcha_type, None)
+        if previous_version != BUILTIN_MODEL_VERSION:
+            self.model_changed.emit(captcha_type, BUILTIN_MODEL_VERSION)
 
     def _reject_model_artifact(self, captcha_type, version):
         self._clear_installed_model(captcha_type)
@@ -554,9 +563,8 @@ class CaptchaLearningService(QObject):
                     exc,
                 )
                 if algorithm == CAPTCHA_ENGINE_ALGORITHM:
-                    # A locally imported component may simply be absent or too
-                    # old for this private model family.  Keep the verified
-                    # opaque artifact so a later local component upgrade can
+                    # A newer client may add this inference contract.  Keep the
+                    # verified data-only artifact so an application update can
                     # load it without another server download.
                     self._clear_runtime_model(captcha_type)
                     continue

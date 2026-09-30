@@ -31,7 +31,11 @@ from .dataset import (
     numeric_array,
     split_samples,
 )
-from .model_bundle import ENGINE_API_VERSION, build_model_bundle
+from .model_bundle import (
+    ENGINE_API_VERSION,
+    ENGINE_RUNTIME_VERSION,
+    build_model_bundle,
+)
 from .models import build_click_ranker, build_numeric_model
 from .protocol import (
     ALGORITHM,
@@ -776,7 +780,10 @@ def train(
             captcha_type=selected_type,
             version=version,
             model_family=model_family,
-            min_component_version=COMPONENT_VERSION,
+            # The historical manifest field name is retained for wire
+            # compatibility.  It now describes the minimum client inference
+            # runtime, not the version of the component that trained it.
+            min_component_version=ENGINE_RUNTIME_VERSION,
             files={
                 "model.onnx": raw_onnx_path.read_bytes(),
                 "config.json": canonical_json_bytes(config),

@@ -1,4 +1,8 @@
-"""Thread-safe host for the locally imported CAPTCHA engine component."""
+"""Thread-safe CAPTCHA inference adapters.
+
+The built-in adapter is used by normal business clients.  The subprocess
+adapter remains available only for administrator-side trainer validation.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +31,91 @@ MAX_ENGINE_IMAGE_BYTES = 1024 * 1024
 
 class CaptchaEngineClientError(RuntimeError):
     pass
+
+
+class BuiltInCaptchaEngineClient:
+    """Execute synchronized data-only models with the client runtime."""
+
+    def __init__(self, *, engine=None):
+        if engine is None:
+            from enhanced_trainer.engine import CaptchaEngine
+
+            engine = CaptchaEngine()
+        self._engine = engine
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _captcha_type(value: str) -> str:
+        captcha = str(value or "").strip().casefold()
+        if captcha not in {"numeric", "click"}:
+            raise CaptchaEngineClientError("验证码类型无效")
+        return captcha
+
+    @staticmethod
+    def _artifact(value: bytes) -> bytes:
+        artifact = bytes(value or b"")
+        if not 0 < len(artifact) <= MAX_ENGINE_ARTIFACT_BYTES:
+            raise CaptchaEngineClientError("验证码模型包大小无效")
+        return artifact
+
+    @staticmethod
+    def _version(value: str) -> str:
+        version = str(value or "").strip()
+        if not version or len(version) > 80:
+            raise CaptchaEngineClientError("验证码模型版本无效")
+        return version
+
+    def load_model(self, captcha_type: str, version: str, artifact: bytes):
+        captcha = self._captcha_type(captcha_type)
+        model_version = self._version(version)
+        data = self._artifact(artifact)
+        try:
+            with self._lock:
+                return self._engine.load_model(
+                    data,
+                    expected_type=captcha,
+                    expected_version=model_version,
+                )
+        except Exception as exc:
+            raise CaptchaEngineClientError(
+                f"客户端内置推理运行时拒绝了模型包：{exc}"
+            ) from exc
+
+    def unload_model(self, captcha_type: str) -> None:
+        captcha = self._captcha_type(captcha_type)
+        with self._lock:
+            self._engine.unload_model(captcha)
+
+    def predict_numeric(self, image_bytes: bytes) -> dict:
+        image = bytes(image_bytes or b"")
+        if not 0 < len(image) <= MAX_ENGINE_IMAGE_BYTES:
+            raise CaptchaEngineClientError("验证码图片大小无效")
+        try:
+            with self._lock:
+                return dict(self._engine.predict_numeric(image) or {})
+        except Exception as exc:
+            raise CaptchaEngineClientError(f"数字验证码推理失败：{exc}") from exc
+
+    def predict_click(self, image_bytes: bytes, targets) -> dict:
+        image = bytes(image_bytes or b"")
+        target_list = [str(value or "").strip() for value in (targets or [])]
+        if not 0 < len(image) <= MAX_ENGINE_IMAGE_BYTES:
+            raise CaptchaEngineClientError("验证码图片大小无效")
+        if not 1 <= len(target_list) <= 8 or any(not value for value in target_list):
+            raise CaptchaEngineClientError("点选验证码目标文字无效")
+        try:
+            with self._lock:
+                return dict(self._engine.predict_click(image, target_list) or {})
+        except Exception as exc:
+            raise CaptchaEngineClientError(f"点选验证码推理失败：{exc}") from exc
+
+    @staticmethod
+    def component_changed() -> None:
+        """Trainer installation does not affect the built-in runtime."""
+
+    @staticmethod
+    def stop() -> None:
+        """The in-process runtime owns no subprocess to stop."""
 
 
 class LocalCaptchaEngineClient:
@@ -225,7 +314,7 @@ class LocalCaptchaEngineClient:
             },
         )
 
-    def load_model(self, captcha_type: str, version: str, artifact: bytes) -> None:
+    def load_model(self, captcha_type: str, version: str, artifact: bytes):
         captcha = str(captcha_type or "").strip().casefold()
         if captcha not in {"numeric", "click"}:
             raise CaptchaEngineClientError("验证码类型无效")
@@ -236,8 +325,9 @@ class LocalCaptchaEngineClient:
         if not model_version or len(model_version) > 80:
             raise CaptchaEngineClientError("验证码组件模型版本无效")
         with self._lock:
-            self._load_locked(captcha, model_version, data)
+            result = self._load_locked(captcha, model_version, data)
             self._artifacts[captcha] = (model_version, data)
+            return result
 
     def unload_model(self, captcha_type: str) -> None:
         captcha = str(captcha_type or "").strip().casefold()
@@ -288,6 +378,7 @@ __all__ = [
     "ENGINE_REQUEST_TIMEOUT_SECONDS",
     "MAX_ENGINE_ARTIFACT_BYTES",
     "MAX_ENGINE_IMAGE_BYTES",
+    "BuiltInCaptchaEngineClient",
     "CaptchaEngineClientError",
     "LocalCaptchaEngineClient",
 ]

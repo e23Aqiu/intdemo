@@ -999,7 +999,7 @@ def _is_safe_engine_model(
     captcha_type: str,
     version: str,
 ) -> bool:
-    """Validate the stable data-only component model envelope."""
+    """Validate the stable data-only inference model envelope."""
 
     try:
         with zipfile.ZipFile(io.BytesIO(data), "r") as archive:

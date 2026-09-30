@@ -22,7 +22,10 @@ from enhanced_trainer.model_bundle import (
     build_model_bundle,
     load_model_bundle,
 )
-from integrated_client.captcha_engine import LocalCaptchaEngineClient
+from integrated_client.captcha_engine import (
+    BuiltInCaptchaEngineClient,
+    LocalCaptchaEngineClient,
+)
 from integrated_client.captcha_models import (
     CAPTCHA_ENGINE_ALGORITHM,
     CaptchaModelManager,
@@ -288,13 +291,46 @@ class EngineTests(unittest.TestCase):
 
 
 class ClientAdapterTests(unittest.TestCase):
+    def test_default_model_manager_uses_client_runtime_not_local_component(self):
+        manager = CaptchaModelManager(component_manager=object())
+        self.assertIsInstance(manager.engine_client, BuiltInCaptchaEngineClient)
+
+    def test_client_runtime_loads_and_executes_synchronized_bundle(self):
+        config = {
+            "schema_version": 1,
+            "engine_api_version": 1,
+            "captcha_type": "numeric",
+            "version": "numeric-v1",
+            "model_family": "numeric-tiny-cnn-v1",
+        }
+        logits = np.full((1, 4, 10), -10.0, dtype=np.float32)
+        for position, digit in enumerate((9, 8, 7, 6)):
+            logits[0, position, digit] = 10.0
+        runtime = CaptchaEngine()
+        client = BuiltInCaptchaEngineClient(engine=runtime)
+        manager = CaptchaModelManager(engine_client=client)
+        with patch.object(
+            runtime,
+            "_session",
+            return_value=_Session([1, 1, 48, 112], [1, 4, 10], logits),
+        ):
+            manager.install(
+                "numeric",
+                "numeric-v1",
+                _bundle("numeric", "numeric-v1", config),
+                expected_algorithm=CAPTCHA_ENGINE_ALGORITHM,
+            )
+
+        self.assertEqual(manager.family("numeric"), "numeric-tiny-cnn-v1")
+        self.assertEqual(manager.get("numeric").predict_numeric(_png()), "9876")
+
     def test_engine_client_sends_outer_model_version(self):
         client = LocalCaptchaEngineClient(component_manager=object())
         with patch.object(client, "_load_locked", return_value={}) as load:
             client.load_model("click", "click-v1", b"bundle")
         load.assert_called_once_with("click", "click-v1", b"bundle")
 
-    def test_model_manager_treats_component_artifact_as_opaque(self):
+    def test_model_manager_accepts_runtime_artifact_through_engine_contract(self):
         class Engine:
             def __init__(self):
                 self.loaded = []

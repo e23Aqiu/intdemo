@@ -1276,27 +1276,39 @@ class TinyCnnOnnxCaptchaModel:
         return positions
 
 
-class ComponentCaptchaModel:
-    """Opaque model executed by the locally imported CAPTCHA engine."""
+class RuntimeCaptchaModel:
+    """Data-only model executed by the inference runtime built into the client."""
 
     ALGORITHM = CAPTCHA_ENGINE_ALGORITHM
 
-    def __init__(self, captcha_type: str, version: str, artifact: bytes, engine):
+    def __init__(
+        self,
+        captcha_type: str,
+        version: str,
+        artifact: bytes,
+        engine,
+        *,
+        family: str = "",
+    ):
         self.captcha_type = str(captcha_type)
         self.version = str(version)
         self.artifact = bytes(artifact)
         self.engine = engine
+        self.family = str(family or "")
 
     @classmethod
     def from_bytes(cls, captcha_type: str, version: str, artifact: bytes, engine):
         data = bytes(artifact or b"")
         if not data or len(data) > MAX_MODEL_ARTIFACT_BYTES:
-            raise CaptchaTrainingError("验证码组件模型包大小无效")
+            raise CaptchaTrainingError("验证码强化模型包大小无效")
         try:
-            engine.load_model(captcha_type, version, data)
+            loaded = engine.load_model(captcha_type, version, data)
         except Exception as exc:
-            raise CaptchaTrainingError(f"本机验证码组件拒绝了模型包：{exc}") from exc
-        return cls(captcha_type, version, data, engine)
+            raise CaptchaTrainingError(
+                f"客户端内置推理运行时拒绝了模型包：{exc}"
+            ) from exc
+        family = loaded.get("model_family", "") if isinstance(loaded, dict) else ""
+        return cls(captcha_type, version, data, engine, family=family)
 
     def predict_numeric(self, image_bytes: bytes) -> str:
         if self.captcha_type != "numeric":
@@ -1304,7 +1316,7 @@ class ComponentCaptchaModel:
         try:
             result = self.engine.predict_numeric(image_bytes)
         except Exception as exc:
-            raise CaptchaTrainingError(f"验证码组件数字识别失败：{exc}") from exc
+            raise CaptchaTrainingError(f"客户端数字模型识别失败：{exc}") from exc
         if result.get("status") != "ok" or result.get("version") != self.version:
             return ""
         value = str(result.get("value") or "")
@@ -1351,6 +1363,11 @@ class ComponentCaptchaModel:
         }
 
 
+# Compatibility name for extensions written before business inference moved
+# from the locally imported trainer into the desktop client.
+ComponentCaptchaModel = RuntimeCaptchaModel
+
+
 def _npz_algorithm(artifact: bytes) -> str:
     _validate_npz_container(artifact, maximum_members=16)
     try:
@@ -1373,9 +1390,13 @@ class CaptchaModelManager:
         self._models = {}
         self._lock = threading.RLock()
         if engine_client is None:
-            from .captcha_engine import LocalCaptchaEngineClient
+            from .captcha_engine import BuiltInCaptchaEngineClient
 
-            engine_client = LocalCaptchaEngineClient(component_manager)
+            # component_manager remains accepted for source compatibility with
+            # existing callers.  Business inference never executes the locally
+            # imported administrator training component.
+            _ = component_manager
+            engine_client = BuiltInCaptchaEngineClient()
         self.engine_client = engine_client
 
     def install(
@@ -1398,7 +1419,7 @@ class CaptchaModelManager:
         ):
             raise CaptchaTrainingError("不支持服务端清单声明的模型算法")
         if expected_algorithm == CAPTCHA_ENGINE_ALGORITHM:
-            model = ComponentCaptchaModel.from_bytes(
+            model = RuntimeCaptchaModel.from_bytes(
                 captcha_type,
                 version,
                 artifact,
@@ -1463,6 +1484,10 @@ class CaptchaModelManager:
     def algorithm(self, captcha_type: str) -> str:
         model = self.get(captcha_type)
         return model.ALGORITHM if model is not None else BUILTIN_MODEL_VERSION
+
+    def family(self, captcha_type: str) -> str:
+        model = self.get(captcha_type)
+        return str(getattr(model, "family", "") or "") if model is not None else ""
 
 
 def _candidate_version(captcha_type: str, samples: list[dict]) -> str:

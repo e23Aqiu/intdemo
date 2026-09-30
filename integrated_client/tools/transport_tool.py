@@ -3010,26 +3010,26 @@ class BusinessBackfillWorker(QThread):
                     # successful sample must remain untouched.
                     original_img_bytes = img_el.screenshot()
 
-                    # The imported local component owns the new click algorithm,
+                    # The client runtime owns the synchronized click model,
                     # including detection, OCR features, ranking and confidence
                     # gating.  Only abstention/failure reaches the legacy path.
-                    component_model = self._active_model("click")
-                    component_predictor = getattr(
-                        component_model,
+                    active_model = self._active_model("click")
+                    model_predictor = getattr(
+                        active_model,
                         "predict_click_points",
                         None,
                     )
-                    if callable(component_predictor):
-                        component_prediction = self._predict_with_active_click_model(
+                    if callable(model_predictor):
+                        model_prediction = self._predict_with_active_click_model(
                             original_img_bytes,
                             None,
                             target_chars,
                         )
-                        if component_prediction is not None:
-                            component_result, attempt_model_version = (
-                                component_prediction
+                        if model_prediction is not None:
+                            model_result, attempt_model_version = (
+                                model_prediction
                             )
-                            ordered_points = component_result.get("ordered_points")
+                            ordered_points = model_result.get("ordered_points")
                             if ordered_points is not None:
                                 click_list = [
                                     (x, y, target, target)
@@ -3053,7 +3053,7 @@ class BusinessBackfillWorker(QThread):
 
                     if DdddOcr is None:
                         raise RuntimeError(
-                            "本机组件未给出可用结果，且客户端 ddddocr 不可用："
+                            "当前同步模型未给出可用结果，且客户端 ddddocr 不可用："
                             f"{DDDDOCR_IMPORT_ERROR}"
                         )
                     if det_ocr is None or rec_ocr is None:
@@ -3181,26 +3181,26 @@ class BusinessBackfillWorker(QThread):
                     self.log.emit(f"✅ 文字识别完成：{char_position_map}")
 
                     custom_prediction = None
-                    if not callable(component_predictor):
+                    if not callable(model_predictor):
                         custom_prediction = self._predict_with_active_click_model(
                             original_img_bytes,
                             bboxes,
                             target_chars,
                         )
-                    ordered_component_points = None
+                    ordered_model_points = None
                     if custom_prediction is not None:
-                        component_result, attempt_model_version = custom_prediction
-                        ordered_component_points = component_result.get("ordered_points")
-                        if ordered_component_points is None:
-                            char_position_map = component_result
+                        model_result, attempt_model_version = custom_prediction
+                        ordered_model_points = model_result.get("ordered_points")
+                        if ordered_model_points is None:
+                            char_position_map = model_result
 
                     # 全局匹配+点击
                     self.log.emit("🖱️ 第三步：全局两两对比相似度，开始最优匹配")
-                    if ordered_component_points is not None:
+                    if ordered_model_points is not None:
                         click_list = [
                             (x, y, target, target)
                             for (x, y), target in zip(
-                                ordered_component_points,
+                                ordered_model_points,
                                 target_chars,
                             )
                         ]

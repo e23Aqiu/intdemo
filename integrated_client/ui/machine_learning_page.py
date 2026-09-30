@@ -64,7 +64,7 @@ TRAINING_MODES = (
 )
 TRAINING_METHODS = {
     "standard": "OpenCV HOG + 线性 SVM（hog-linear-svm-v1）",
-    "enhanced": "本机验证码引擎组件（captcha-engine-v1）",
+    "enhanced": "本机强化训练组件（captcha-engine-v1，客户端内置推理）",
 }
 ACTIVATABLE_MODEL_ALGORITHMS = frozenset(
     {"hog-linear-svm-v1", "tiny-cnn-onnx-v1", "captcha-engine-v1"}
@@ -486,7 +486,8 @@ class MachineLearningPage(QWidget):
 
         model_actions = QHBoxLayout()
         self.model_hint = QLabel(
-            "候选模型先在固定留出集评估；激活后客户端会校验 SHA-256 并应用。"
+            "候选模型先在固定留出集评估；应用后所有在线客户端会校验 SHA-256、"
+            "同步模型并用内置运行时识别，无需安装训练组件。"
         )
         self.model_hint.setObjectName("Muted")
         self.model_hint.setWordWrap(True)
@@ -573,7 +574,7 @@ class MachineLearningPage(QWidget):
         }
         if status.code == STATUS_AVAILABLE:
             details = [
-                "强化组件：已安装",
+                "强化训练组件：已安装（仅管理员本机训练需要）",
                 f"版本 {status.version or '-'}",
                 platform_labels.get(status.platform, status.platform or "未知平台"),
                 f"占用 {_format_size(status.installed_size)}",
@@ -589,16 +590,16 @@ class MachineLearningPage(QWidget):
             self.trainer_status_label.setText(" · ".join(details))
         elif status.code == STATUS_DAMAGED:
             self.trainer_status_label.setText(
-                f"强化组件：已损坏或不完整 · {status.detail}"
+                f"强化训练组件：已损坏或不完整 · {status.detail}"
             )
         elif status.code == STATUS_INCOMPATIBLE:
             self.trainer_status_label.setText(
-                f"强化组件：不兼容 · {status.detail}"
+                f"强化训练组件：不兼容 · {status.detail}"
             )
         else:
             message = (
-                "强化组件：未安装；可由管理员选择本机对应平台的 "
-                ".inttrainer 文件安装"
+                "强化训练组件：未安装；仅需管理员在执行强化训练的电脑上选择本平台 "
+                ".inttrainer 文件安装，普通客户端不需要安装"
             )
             if getattr(status, "maintenance_required", False):
                 message += (
@@ -737,7 +738,7 @@ class MachineLearningPage(QWidget):
                 "只会清理程序可确认的强化组件残留，不会删除验证码样本或模型。"
                 if cleanup_only
                 else "只会删除本机强化训练组件，不会删除验证码样本、候选模型或已训练的 "
-                "ONNX 模型。卸载后训练模式自动回落为标准模式。"
+                "ONNX 模型，也不影响业务客户端使用已同步模型。卸载后训练模式自动回落为标准模式。"
             )
             + "\n\n是否继续？",
             QMessageBox.Yes | QMessageBox.No,
@@ -768,7 +769,7 @@ class MachineLearningPage(QWidget):
         QMessageBox.information(
             self,
             "强化组件已卸载",
-            f"已释放 {_format_size(result)}；验证码样本和模型未受影响。",
+            f"已释放 {_format_size(result)}；验证码样本、模型和业务识别未受影响。",
         )
 
     def _start(self, function, completed):
@@ -1072,7 +1073,7 @@ class MachineLearningPage(QWidget):
                 "ddddocr": "ddddocr（内置）",
                 "hog-linear-svm-v1": "HOG + 线性 SVM",
                 "tiny-cnn-onnx-v1": "Tiny CNN + ONNX",
-                "captcha-engine-v1": "本机验证码引擎组件",
+                "captcha-engine-v1": "组件训练模型（客户端内置推理）",
                 "knn-pixels-v1": "KNN（旧版）",
             }
             for row, model in enumerate(self._model_rows):
@@ -2305,7 +2306,7 @@ class MachineLearningPage(QWidget):
             self,
             "应用候选模型",
             f"确定把 {model.get('version')} 设置为当前应用模型吗？\n\n"
-            "客户端将在下次策略刷新后下载并校验模型。",
+            "所有在线客户端将在策略刷新后下载并校验模型；普通客户端无需导入训练组件。",
             QMessageBox.Yes | QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
@@ -2330,7 +2331,8 @@ class MachineLearningPage(QWidget):
             self,
             "模型已应用",
             f"服务端当前模型已切换为 {(result or {}).get('version')}。\n"
-            "本客户端正在立即下载并校验，完成后业务自动识别会使用该模型。",
+            "本客户端正在立即下载并校验；其他在线客户端也会自动同步并使用，"
+            "无需安装训练组件。",
         )
         self.refresh()
 
@@ -2342,7 +2344,7 @@ class MachineLearningPage(QWidget):
         )
         self.model_hint.setText(
             f"{type_name}当前模型 {version} 已下载并校验，"
-            "后续业务自动识别将使用该模型。"
+            "后续业务自动识别将使用该模型；其他在线客户端会按策略自动同步。"
         )
         self.refresh()
 

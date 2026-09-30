@@ -260,7 +260,7 @@ class ClickFeatureExtractor:
             try:
                 from ddddocr import DdddOcr
             except ImportError as exc:
-                raise ClickEngineError("验证码组件缺少 ddddocr 运行库") from exc
+                raise ClickEngineError("验证码推理运行时缺少 ddddocr 运行库") from exc
             detector = detector or DdddOcr(det=True, ocr=False, show_ad=False)
             recognizer = recognizer or DdddOcr(det=False, ocr=True, show_ad=False)
         self.detector = detector

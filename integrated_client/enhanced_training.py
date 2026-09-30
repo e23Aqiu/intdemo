@@ -668,8 +668,9 @@ def _validate_outputs(
     ):
         raise EnhancedTrainingError("强化训练指标 SHA-256 校验失败")
 
-    # Let the imported component validate its private model family.  The host
-    # and server intentionally understand only the stable bundle envelope.
+    # Validate the generated model inside the imported trainer before upload.
+    # Business clients independently validate it again with their built-in
+    # inference runtime after synchronization.
     validator = LocalCaptchaEngineClient(component_manager)
     try:
         validator.load_model(captcha_type, version, artifact)

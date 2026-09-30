@@ -1,4 +1,4 @@
-"""Long-lived local inference service for imported CAPTCHA components."""
+"""Shared CAPTCHA inference runtime for desktop clients and trainer self-tests."""
 
 from __future__ import annotations
 
@@ -21,6 +21,7 @@ from .click_engine import (
 )
 from .model_bundle import (
     ENGINE_API_VERSION,
+    ENGINE_RUNTIME_VERSION,
     MAX_MODEL_BUNDLE_BYTES,
     ModelBundleError,
     load_model_bundle,
@@ -38,7 +39,7 @@ class EngineError(RuntimeError):
 
 def _version_key(value: str) -> tuple[int, int, int, int]:
     if not _VERSION_PATTERN.fullmatch(str(value or "")):
-        raise EngineError("模型要求的组件版本号无效")
+        raise EngineError("模型要求的推理运行时版本号无效")
     values = [int(item) for item in str(value).split(".")]
     return tuple((values + [0, 0, 0, 0])[:4])
 
@@ -119,7 +120,7 @@ class CaptchaEngine:
                 providers=["CPUExecutionProvider"],
             )
         except Exception as exc:
-            raise EngineError(f"无法加载组件模型：{exc}") from exc
+            raise EngineError(f"无法加载 ONNX 模型：{exc}") from exc
 
     def load_model(
         self,
@@ -136,9 +137,11 @@ class CaptchaEngine:
             )
         except ModelBundleError as exc:
             raise EngineError(str(exc)) from exc
-        if _version_key(bundle.min_component_version) > _version_key(COMPONENT_VERSION):
+        if _version_key(bundle.min_component_version) > _version_key(
+            ENGINE_RUNTIME_VERSION
+        ):
             raise EngineError(
-                f"模型需要验证码组件 {bundle.min_component_version} 或更高版本"
+                f"模型需要客户端推理运行时 {bundle.min_component_version} 或更高版本"
             )
         if set(bundle.files) != {"model.onnx", "config.json"}:
             raise EngineError("当前组件不支持该模型包文件布局")
@@ -175,7 +178,7 @@ class CaptchaEngine:
         inputs = session.get_inputs()
         outputs = session.get_outputs()
         if len(inputs) != 1 or len(outputs) != 1:
-            raise EngineError("组件模型输入输出数量无效")
+            raise EngineError("模型输入输出数量无效")
         if bundle.captcha_type == "numeric":
             if (
                 bundle.model_family != "numeric-tiny-cnn-v1"

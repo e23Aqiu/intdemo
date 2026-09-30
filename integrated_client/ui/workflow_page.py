@@ -43,6 +43,12 @@ from ..browser import (
     get_builtin_chromium_path,
     get_compatible_browser_path,
 )
+from ..captcha_models import (
+    BUILTIN_MODEL_VERSION,
+    CAPTCHA_ENGINE_ALGORITHM,
+    ENHANCED_ONNX_ALGORITHM,
+    HOG_SVM_ALGORITHM,
+)
 from .file_dialogs import SystemFileDialog as QFileDialog
 from ..database import (
     WORKFLOW_EMPTY_METRIC,
@@ -308,6 +314,7 @@ class WorkflowPage(QWidget):
         self.account_key = str(account_key or "").strip().lower()
         self.captcha_reporter = captcha_reporter
         self.captcha_model_manager = captcha_model_manager
+        self._captcha_model_policy = None
         self.captcha_collection_enabled = captcha_collection_enabled
         self.captcha_sample_collection_enabled = (
             captcha_sample_collection_enabled
@@ -342,6 +349,7 @@ class WorkflowPage(QWidget):
         self._restore_run_settings()
         self._connect_run_settings_persistence()
         self._sync_mode_controls()
+        self.refresh_captcha_model_status()
 
         self.preview_timer = QTimer(self)
         self.preview_timer.timeout.connect(self._poll_file_preview)
@@ -523,6 +531,32 @@ class WorkflowPage(QWidget):
         captcha_retry_row.addWidget(self.captcha_retry)
         captcha_layout.addLayout(captcha_retry_row)
         captcha_layout.addWidget(self.infinite_captcha)
+        captcha_model_title = QLabel("当前自动识别模型")
+        captcha_model_title.setObjectName("SettingFieldLabel")
+        captcha_layout.addWidget(captcha_model_title)
+        captcha_model_grid = QGridLayout()
+        captcha_model_grid.setContentsMargins(0, 0, 0, 0)
+        captcha_model_grid.setHorizontalSpacing(8)
+        captcha_model_grid.setVerticalSpacing(4)
+        numeric_model_label = QLabel("数字")
+        numeric_model_label.setObjectName("SettingCardDescription")
+        click_model_label = QLabel("点选")
+        click_model_label.setObjectName("SettingCardDescription")
+        self.numeric_captcha_model_value = QLabel("ddddocr（内置）")
+        self.click_captcha_model_value = QLabel("ddddocr（内置）")
+        for value_label in (
+            self.numeric_captcha_model_value,
+            self.click_captcha_model_value,
+        ):
+            value_label.setObjectName("ModelStatusValue")
+            value_label.setWordWrap(True)
+            value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        captcha_model_grid.addWidget(numeric_model_label, 0, 0, Qt.AlignTop)
+        captcha_model_grid.addWidget(self.numeric_captcha_model_value, 0, 1)
+        captcha_model_grid.addWidget(click_model_label, 1, 0, Qt.AlignTop)
+        captcha_model_grid.addWidget(self.click_captcha_model_value, 1, 1)
+        captcha_model_grid.setColumnStretch(1, 1)
+        captcha_layout.addLayout(captcha_model_grid)
         captcha_layout.addStretch()
         cards_layout.addWidget(self.captcha_card, 1)
 
@@ -892,6 +926,89 @@ class WorkflowPage(QWidget):
         retry_enabled = auto_mode or not self.manual_captcha.isChecked()
         self.infinite_captcha.setEnabled(retry_enabled)
         self.captcha_retry.setEnabled(retry_enabled and not self.infinite_captcha.isChecked())
+
+    @staticmethod
+    def _captcha_model_display_name(captcha_type, algorithm, family=""):
+        algorithm = str(algorithm or "").strip()
+        family = str(family or "").strip()
+        if algorithm in {"", BUILTIN_MODEL_VERSION, "ddddocr"}:
+            return "ddddocr（内置）"
+        if algorithm == HOG_SVM_ALGORITHM:
+            return "HOG + 线性 SVM"
+        if algorithm == ENHANCED_ONNX_ALGORITHM:
+            return "Tiny CNN + ONNX"
+        if algorithm == CAPTCHA_ENGINE_ALGORITHM:
+            if family == "numeric-tiny-cnn-v1" or captcha_type == "numeric":
+                return "Tiny CNN + ONNX（客户端内置推理）"
+            if family == "click-prompt-ranker-v1" or captcha_type == "click":
+                return "点选提示排序 + ONNX（客户端内置推理）"
+            return "强化模型（客户端内置推理）"
+        return algorithm or "未知模型"
+
+    def set_captcha_model_policy(self, policy):
+        policy = dict(policy or {})
+        active = policy.get("active_models")
+        authoritative = bool(active) or int(policy.get("revision") or 0) > 0
+        self._captcha_model_policy = policy if authoritative else None
+        self.refresh_captcha_model_status()
+
+    def refresh_captcha_model_status(self, *_args):
+        manager = self.captcha_model_manager
+        active_models = (
+            (self._captcha_model_policy or {}).get("active_models") or {}
+        )
+        labels = {
+            "numeric": getattr(self, "numeric_captcha_model_value", None),
+            "click": getattr(self, "click_captcha_model_value", None),
+        }
+        for captcha_type, label in labels.items():
+            if label is None:
+                continue
+            version = BUILTIN_MODEL_VERSION
+            algorithm = BUILTIN_MODEL_VERSION
+            family = ""
+            if manager is not None:
+                try:
+                    version = str(manager.version(captcha_type) or BUILTIN_MODEL_VERSION)
+                    algorithm = str(
+                        manager.algorithm(captcha_type) or BUILTIN_MODEL_VERSION
+                    )
+                    family_getter = getattr(manager, "family", None)
+                    if callable(family_getter):
+                        family = str(family_getter(captcha_type) or "")
+                except Exception:  # noqa: BLE001 - status must not break settings UI
+                    version = BUILTIN_MODEL_VERSION
+                    algorithm = BUILTIN_MODEL_VERSION
+                    family = ""
+            display_name = self._captcha_model_display_name(
+                captcha_type,
+                algorithm,
+                family,
+            )
+            custom = version != BUILTIN_MODEL_VERSION
+            text = f"{display_name} · {version}" if custom else display_name
+            desired = active_models.get(captcha_type)
+            if isinstance(desired, dict):
+                desired_version = str(desired.get("version") or "")
+                desired_algorithm = str(desired.get("algorithm") or "")
+                if desired_version and (
+                    desired_version != version or desired_algorithm != algorithm
+                ):
+                    desired_name = self._captcha_model_display_name(
+                        captcha_type,
+                        desired_algorithm,
+                    )
+                    text = (
+                        f"当前：{text}\n服务器目标：{desired_name} · "
+                        f"{desired_version}（等待同步或客户端升级）"
+                    )
+            elif self._captcha_model_policy is not None and custom:
+                text = f"当前：{text}\n服务器目标：ddddocr（正在切换）"
+            label.setText(text)
+            label.setToolTip(
+                f"当前实际使用\n版本：{version}\n算法：{algorithm}"
+                + (f"\n模型系列：{family}" if family else "")
+            )
 
     def _run_settings_snapshot(self):
         return {

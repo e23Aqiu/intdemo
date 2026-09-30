@@ -670,10 +670,10 @@ class CaptchaLearningTests(unittest.TestCase):
                 ).exists()
             )
 
-    def test_component_model_waits_in_cache_until_local_component_is_available(self):
-        class MissingComponentModels:
+    def test_future_runtime_model_waits_in_cache_until_client_is_compatible(self):
+        class IncompatibleRuntimeModels:
             def __init__(self):
-                self.available = False
+                self.compatible = False
                 self.installed = {}
 
             def install(
@@ -684,8 +684,8 @@ class CaptchaLearningTests(unittest.TestCase):
                 *,
                 expected_algorithm=None,
             ):
-                if not self.available:
-                    raise CaptchaTrainingError("本机验证码组件不可用")
+                if not self.compatible:
+                    raise CaptchaTrainingError("客户端推理运行时版本过低")
                 self.installed[captcha_type] = (version, expected_algorithm)
 
             def version(self, captcha_type):
@@ -707,7 +707,7 @@ class CaptchaLearningTests(unittest.TestCase):
             def stop():
                 return None
 
-        artifact = b"opaque-component-model"
+        artifact = b"future-runtime-model"
         metadata = {
             "version": "click-engine-v1",
             "algorithm": CAPTCHA_ENGINE_ALGORITHM,
@@ -719,7 +719,7 @@ class CaptchaLearningTests(unittest.TestCase):
         ):
             service = CaptchaLearningService(
                 _FakeSession(),
-                model_manager=MissingComponentModels(),
+                model_manager=IncompatibleRuntimeModels(),
             )
             service._stopped = False
             service.policy = {"active_models": {"click": metadata}}
@@ -731,7 +731,7 @@ class CaptchaLearningTests(unittest.TestCase):
                 metadata["version"],
             )
             self.assertEqual(cache.read_bytes(), artifact)
-            restored_models = MissingComponentModels()
+            restored_models = IncompatibleRuntimeModels()
             restored = CaptchaLearningService(
                 _FakeSession(),
                 model_manager=restored_models,
@@ -743,7 +743,7 @@ class CaptchaLearningTests(unittest.TestCase):
             )
             service._sync_active_models()
             self.assertEqual(started, [])
-            restored_models.available = True
+            restored_models.compatible = True
             restored.policy = {"active_models": {"click": metadata}}
             restored._sync_active_models()
             self.assertEqual(

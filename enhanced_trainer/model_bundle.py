@@ -1,7 +1,8 @@
-"""Portable model bundles consumed only by the local CAPTCHA engine.
+"""Portable model bundles shared by the trainer and the client runtime.
 
-The server and client host validate this stable envelope, while the imported
-component owns the model-family-specific validation and inference behavior.
+The server validates the stable envelope.  Training components create bundles,
+while every supported desktop client contains the runtime that validates and
+executes the model family inside the bundle.
 """
 
 from __future__ import annotations
@@ -19,6 +20,10 @@ from pathlib import PurePosixPath
 MODEL_BUNDLE_SCHEMA_VERSION = 1
 ENGINE_API_VERSION = 1
 ENGINE_ID = "intdemo-captcha-engine"
+# This is intentionally independent from the trainer component version.  A
+# trainer-only update must keep emitting models for this runtime version unless
+# it introduces a genuinely new inference contract.
+ENGINE_RUNTIME_VERSION = "2.0.0"
 MAX_MODEL_BUNDLE_BYTES = 20 * 1024 * 1024
 MAX_MODEL_BUNDLE_FILES = 64
 MAX_MODEL_BUNDLE_MEMBER_BYTES = 16 * 1024 * 1024
@@ -127,7 +132,7 @@ def build_model_bundle(
     if not _FAMILY_PATTERN.fullmatch(family):
         raise ModelBundleError("模型系列编号无效")
     if not _VERSION_PATTERN.fullmatch(minimum):
-        raise ModelBundleError("最低组件版本号无效")
+        raise ModelBundleError("最低推理运行时版本号无效")
     if not isinstance(files, Mapping) or not files or len(files) > MAX_MODEL_BUNDLE_FILES:
         raise ModelBundleError("模型包文件列表无效")
 
@@ -306,6 +311,7 @@ def load_model_bundle(
 __all__ = [
     "ENGINE_API_VERSION",
     "ENGINE_ID",
+    "ENGINE_RUNTIME_VERSION",
     "MAX_MODEL_BUNDLE_BYTES",
     "MAX_MODEL_BUNDLE_EXPANDED_BYTES",
     "MODEL_BUNDLE_SCHEMA_VERSION",

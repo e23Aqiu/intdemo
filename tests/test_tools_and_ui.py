@@ -5116,6 +5116,59 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertTrue(page.shutdown())
         page.close()
 
+    def test_workflow_settings_show_actual_numeric_and_click_models(self):
+        class Models:
+            state = {
+                "numeric": (
+                    "numeric-trained-v1",
+                    "captcha-engine-v1",
+                    "numeric-tiny-cnn-v1",
+                ),
+                "click": ("ddddocr-builtin", "ddddocr-builtin", ""),
+            }
+
+            def version(self, captcha_type):
+                return self.state[captcha_type][0]
+
+            def algorithm(self, captcha_type):
+                return self.state[captcha_type][1]
+
+            def family(self, captcha_type):
+                return self.state[captcha_type][2]
+
+        models = Models()
+        page = WorkflowPage(captcha_model_manager=models)
+
+        self.assertIn("Tiny CNN + ONNX", page.numeric_captcha_model_value.text())
+        self.assertIn("numeric-trained-v1", page.numeric_captcha_model_value.text())
+        self.assertEqual(page.click_captcha_model_value.text(), "ddddocr（内置）")
+
+        page.set_captcha_model_policy(
+            {
+                "revision": 5,
+                "active_models": {
+                    "click": {
+                        "version": "click-trained-v1",
+                        "algorithm": "captcha-engine-v1",
+                    }
+                },
+            }
+        )
+        self.assertIn("当前：ddddocr（内置）", page.click_captcha_model_value.text())
+        self.assertIn("服务器目标", page.click_captcha_model_value.text())
+
+        models.state["click"] = (
+            "click-trained-v1",
+            "captcha-engine-v1",
+            "click-prompt-ranker-v1",
+        )
+        page.refresh_captcha_model_status("click", "click-trained-v1")
+        self.assertIn("点选提示排序 + ONNX", page.click_captcha_model_value.text())
+        self.assertNotIn("等待同步", page.click_captcha_model_value.text())
+
+        self.assertTrue(page.shutdown())
+        page.close()
+
     def test_tencent_docs_dialog_displays_percentage_progress(self):
         dialog = TencentDocsProgressDialog()
         self.assertEqual(dialog.progress.minimum(), 0)
