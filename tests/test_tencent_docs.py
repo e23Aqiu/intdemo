@@ -215,6 +215,28 @@ class TencentDocsImportTests(unittest.TestCase):
             (("粤A1_黄色", "2026-09-30", "南头", ""),),
         )
 
+    def test_generation_time_is_accepted_as_issued_date_alias(self):
+        selection = select_pending_tencent_rows(
+            self._clipboard(
+                ("车牌", "生成时间", "车辆所有人/企业"),
+                (
+                    ("粤A1_黄色", "2026-10-08 09:30:00", ""),
+                    ("粤A2_黄色", "2026-10-07 09:30:00", ""),
+                ),
+            ),
+            options=TencentDocsImportOptions(
+                date_start=date(2026, 10, 8),
+                date_end=date(2026, 10, 8),
+                only_unfilled=True,
+            ),
+        )
+
+        self.assertEqual(selection.date_header, "生成时间")
+        self.assertEqual(
+            selection.rows,
+            (("粤A1_黄色", "2026-10-08 09:30:00", ""),),
+        )
+
     def test_legacy_sheet_ignores_station_but_keeps_other_filters(self):
         selection = select_pending_tencent_rows(
             self._clipboard(
@@ -311,6 +333,66 @@ class TencentDocsImportTests(unittest.TestCase):
                 call(runtime, headless=False, allow_login=True),
             ],
         )
+
+    def test_loaded_workbook_model_is_read_before_clipboard_fallback(self):
+        statuses = []
+        progress = []
+        capture = _TencentDocsBrowserCapture(
+            "https://docs.qq.com/sheet/example",
+            Path(self.temp_dir.name) / "profile",
+            statuses.append,
+            lambda: False,
+            progress.append,
+        )
+        page = MagicMock()
+        page.evaluate.side_effect = [
+            {
+                "available": True,
+                "initialized": True,
+                "allChunksLoaded": False,
+                "rowCount": 10_000,
+                "colCount": 30,
+                "usedEndRow": 4_999,
+                "usedEndCol": 29,
+                "loadedRows": 5_000,
+            },
+            {
+                "available": True,
+                "initialized": True,
+                "allChunksLoaded": True,
+                "rowCount": 10_000,
+                "colCount": 30,
+                "usedEndRow": 9_999,
+                "usedEndCol": 29,
+                "loadedRows": 10_000,
+            },
+            {
+                "text": "车牌\t生成时间\t车辆所有人/企业\n粤A1\t2026-10-08\t",
+                "rowCount": 2,
+                "colCount": 3,
+            },
+        ]
+
+        copied = capture._capture_loaded_sheet_model(page)
+
+        self.assertIn("粤A1", copied)
+        self.assertEqual(page.wait_for_timeout.call_args_list, [call(250)])
+        self.assertIn("等待全部分片加载", statuses[0])
+        self.assertEqual(statuses[-1], "表格数据已加载，正在读取已使用区域…")
+        self.assertEqual(progress, [58, 70])
+
+    def test_loaded_workbook_model_absence_uses_existing_copy_path(self):
+        capture = _TencentDocsBrowserCapture(
+            "https://docs.qq.com/sheet/example",
+            Path(self.temp_dir.name) / "profile",
+            lambda _message: None,
+            lambda: False,
+        )
+        page = MagicMock()
+        page.evaluate.return_value = {"available": False}
+
+        self.assertIsNone(capture._capture_loaded_sheet_model(page))
+        page.wait_for_timeout.assert_not_called()
 
     def test_import_worker_emits_determinate_progress_stages(self):
         worker = TencentDocsImportWorker(

@@ -1,8 +1,7 @@
-from PyQt5.QtCore import QDate, pyqtSignal
+from PyQt5.QtCore import QDate, QLocale, Qt, pyqtSignal
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QDateEdit,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -13,6 +12,7 @@ from PyQt5.QtWidgets import (
 )
 
 from ..tencent_docs import TencentDocsImportOptions
+from .date_range import DateRangeSelector, StableDateEdit
 from .frameless import FramelessDialog
 
 
@@ -51,6 +51,10 @@ class TencentDocsLinkDialog(FramelessDialog):
         filters = QGridLayout()
         filters.setHorizontalSpacing(12)
         filters.setVerticalSpacing(10)
+        filters.setColumnMinimumWidth(1, 160)
+        filters.setColumnMinimumWidth(3, 160)
+        filters.setColumnStretch(1, 1)
+        filters.setColumnStretch(3, 1)
         filters.addWidget(QLabel("跟进中心站"), 0, 0)
         self.station_combo = QComboBox()
         self.station_combo.addItem("全部中心站", "")
@@ -68,14 +72,10 @@ class TencentDocsLinkDialog(FramelessDialog):
         filters.addWidget(self.station_combo, 0, 1, 1, 3)
 
         filters.addWidget(QLabel("下发日期"), 1, 0)
-        self.date_start_edit = QDateEdit(QDate.currentDate())
-        self.date_start_edit.setCalendarPopup(True)
-        self.date_start_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_start_edit = self._date_edit("TencentDocsStartDate")
         filters.addWidget(self.date_start_edit, 1, 1)
         filters.addWidget(QLabel("至"), 1, 2)
-        self.date_end_edit = QDateEdit(QDate.currentDate())
-        self.date_end_edit.setCalendarPopup(True)
-        self.date_end_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_end_edit = self._date_edit("TencentDocsEndDate")
         filters.addWidget(self.date_end_edit, 1, 3)
 
         self.only_unfilled_check = QCheckBox("仅导入“车辆所有人/企业”未填写的行")
@@ -102,6 +102,20 @@ class TencentDocsLinkDialog(FramelessDialog):
 
         self.url_edit.setFocus()
         self.url_edit.selectAll()
+
+    @staticmethod
+    def _date_edit(object_name):
+        editor = StableDateEdit(QDate.currentDate())
+        editor.setObjectName(object_name)
+        editor.setCalendarPopup(True)
+        editor.setDisplayFormat("yyyy-MM-dd")
+        editor.setLocale(QLocale(QLocale.Chinese, QLocale.China))
+        editor.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        editor.setFixedWidth(160)
+        editor._calendar_hover_delegate = DateRangeSelector._polish_calendar(
+            editor.calendarWidget()
+        )
+        return editor
 
     def _accept_if_valid(self):
         if self.url_edit.text().strip():

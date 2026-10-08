@@ -121,7 +121,10 @@ from integrated_client.ui.statistics_page import (
     ViolationReasonChart,
     WorkflowDistributionChart,
 )
-from integrated_client.ui.tencent_docs_dialog import TencentDocsProgressDialog
+from integrated_client.ui.tencent_docs_dialog import (
+    TencentDocsLinkDialog,
+    TencentDocsProgressDialog,
+)
 from integrated_client.ui.theme import APP_STYLESHEET, _control_asset_path
 from integrated_client.ui.update_dialog import UpdatePromptDialog
 from integrated_client.ui.workflow_page import DataFrameTableModel, WorkflowPage
@@ -5200,6 +5203,31 @@ class ToolAndUiTests(unittest.TestCase):
         dialog.set_progress(150)
         self.assertEqual(dialog.progress.value(), 100)
         dialog.finish()
+        dialog.close()
+
+    def test_tencent_docs_dates_are_full_width_and_open_without_stepping(self):
+        dialog = TencentDocsLinkDialog(
+            "https://docs.qq.com/sheet/example",
+        )
+        dialog.show()
+        self.app.processEvents()
+
+        for editor in (dialog.date_start_edit, dialog.date_end_edit):
+            stable_date = QDate(2026, 10, 8)
+            editor.setDate(stable_date)
+            self.assertEqual(editor.lineEdit().text(), "2026-10-08")
+            self.assertGreaterEqual(editor.width(), 160)
+            self.assertTrue(editor.lineEdit().isReadOnly())
+            QTest.mouseClick(
+                editor.lineEdit(),
+                Qt.LeftButton,
+                pos=editor.lineEdit().rect().center(),
+            )
+            self.app.processEvents()
+            self.assertTrue(editor.calendarWidget().isVisible())
+            self.assertEqual(editor.date(), stable_date)
+            QTest.keyClick(editor.calendarWidget(), Qt.Key_Escape)
+
         dialog.close()
 
     def test_workflow_run_settings_are_persisted_per_program_account(self):

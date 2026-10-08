@@ -29,13 +29,21 @@ COMPANY_HEADER_ALIASES = (
     "公司/所有人名称",
 )
 PLATE_HEADER_ALIASES = ("车牌", "车辆标识")
-ISSUED_AT_HEADER_ALIASES = ("下发时间", "下发日期", "下发日期时间")
+ISSUED_AT_HEADER_ALIASES = (
+    "下发时间",
+    "下发日期",
+    "下发日期时间",
+    "生成时间",
+)
 CENTER_STATION_HEADER_ALIASES = ("跟进中心站",)
 TENCENT_HEADER_ROW_CANDIDATES = (0, 1)
 TENCENT_DOCS_HOST = "docs.qq.com"
 TENCENT_DOCS_PUBLIC_WAIT_SECONDS = 60
 TENCENT_DOCS_LOGIN_WAIT_SECONDS = 10 * 60
 TENCENT_DOCS_COPY_WAIT_SECONDS = 12
+TENCENT_DOCS_MODEL_WAIT_SECONDS = 30
+TENCENT_DOCS_MODEL_POLL_MILLISECONDS = 250
+TENCENT_DOCS_MAX_MODEL_CELLS = 2_000_000
 _LOGIN_PROMPT_MARKERS = (
     "微信扫码登录",
     "qq扫码登录",
@@ -643,6 +651,157 @@ class _TencentDocsBrowserCapture:
         )
 
     @staticmethod
+    def _sheet_model_state(page):
+        return page.evaluate(
+            """() => {
+                const app = window.SpreadsheetApp;
+                const sheet = app?.workbook?.activeSheet;
+                if (
+                    !sheet ||
+                    typeof sheet.getRowCount !== "function" ||
+                    typeof sheet.getColCount !== "function" ||
+                    typeof sheet.getCellDataAtPosition !== "function"
+                ) {
+                    return { available: false };
+                }
+                const usedRange = sheet.cellDataGrid?.usedRange;
+                const rowCount = Math.max(0, Number(sheet.getRowCount()) || 0);
+                const colCount = Math.max(0, Number(sheet.getColCount()) || 0);
+                const usedEndRow = Number(usedRange?.endRowIndex ?? -1);
+                const usedEndCol = Number(usedRange?.endColIndex ?? -1);
+                const loadedRows = Math.max(0, usedEndRow + 1);
+                let allChunksLoaded = false;
+                try {
+                    if (
+                        typeof sheet.highWaterMark?.isAllChunkLoaded ===
+                        "function"
+                    ) {
+                        allChunksLoaded = Boolean(
+                            sheet.highWaterMark.isAllChunkLoaded()
+                        );
+                    } else {
+                        allChunksLoaded =
+                            Boolean(sheet.getIsInitialized?.()) &&
+                            loadedRows >= rowCount;
+                    }
+                } catch (_) {}
+                return {
+                    available: true,
+                    initialized: Boolean(sheet.getIsInitialized?.()),
+                    allChunksLoaded,
+                    rowCount,
+                    colCount,
+                    usedEndRow,
+                    usedEndCol,
+                    loadedRows
+                };
+            }"""
+        )
+
+    @staticmethod
+    def _sheet_model_tsv(page):
+        return page.evaluate(
+            r"""() => {
+                const app = window.SpreadsheetApp;
+                const sheet = app?.workbook?.activeSheet;
+                const tools = app?.e2eTools;
+                const usedRange = sheet?.cellDataGrid?.usedRange;
+                if (!sheet || !usedRange) return null;
+                const endRow = Math.min(
+                    Number(sheet.getRowCount()) - 1,
+                    Number(usedRange.endRowIndex ?? -1)
+                );
+                const endCol = Math.min(
+                    Number(sheet.getColCount()) - 1,
+                    Number(usedRange.endColIndex ?? -1)
+                );
+                if (endRow < 0 || endCol < 0) return null;
+
+                const escapeCell = value => {
+                    const text = String(value ?? "").replace(/\r\n?/g, "\n");
+                    if (!/[\t\n"]/.test(text)) return text;
+                    return `"${text.replace(/"/g, '""')}"`;
+                };
+                const rows = [];
+                for (let row = 0; row <= endRow; row += 1) {
+                    const values = [];
+                    for (let col = 0; col <= endCol; col += 1) {
+                        const cell = sheet.getCellDataAtPosition(
+                            row,
+                            col,
+                            { isIgnoreCustomSheetView: true }
+                        );
+                        let value = "";
+                        if (cell) {
+                            const formatted = cell.getFormattedValue?.();
+                            if (formatted?.value != null) {
+                                value = formatted.value;
+                            } else {
+                                try {
+                                    const raw =
+                                        tools?.getValueAndTypeFromCell?.(cell);
+                                    if (raw?.value != null) value = raw.value;
+                                } catch (_) {}
+                            }
+                        }
+                        values.push(escapeCell(value));
+                    }
+                    rows.push(values.join("\t"));
+                }
+                return {
+                    text: rows.join("\n"),
+                    rowCount: endRow + 1,
+                    colCount: endCol + 1
+                };
+            }"""
+        )
+
+    def _capture_loaded_sheet_model(self, page) -> str | None:
+        """Read Tencent's loaded workbook when clipboard copying is unavailable."""
+
+        deadline = time.monotonic() + TENCENT_DOCS_MODEL_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            self._check_cancelled()
+            try:
+                state = self._sheet_model_state(page)
+            except PlaywrightError:
+                return None
+            if not isinstance(state, dict) or not state.get("available"):
+                return None
+
+            row_count = max(0, int(state.get("rowCount") or 0))
+            col_count = max(0, int(state.get("colCount") or 0))
+            loaded_rows = max(0, int(state.get("loadedRows") or 0))
+            if row_count and col_count:
+                cell_count = row_count * col_count
+                if cell_count > TENCENT_DOCS_MAX_MODEL_CELLS:
+                    raise TencentDocsImportError(
+                        "腾讯文档已使用区域过大，当前最多支持读取 "
+                        f"{TENCENT_DOCS_MAX_MODEL_CELLS:,} 个单元格；"
+                        f"当前约 {cell_count:,} 个"
+                    )
+                self._status(
+                    "正在读取在线表格数据，等待全部分片加载…"
+                )
+                loaded_ratio = min(1.0, loaded_rows / row_count)
+                self._progress(46 + round(loaded_ratio * 24))
+
+            if state.get("allChunksLoaded"):
+                self._status("表格数据已加载，正在读取已使用区域…")
+                try:
+                    payload = self._sheet_model_tsv(page)
+                except PlaywrightError:
+                    return None
+                if not isinstance(payload, dict):
+                    return None
+                copied = str(payload.get("text") or "")
+                if copied.strip():
+                    return copied
+                return None
+            page.wait_for_timeout(TENCENT_DOCS_MODEL_POLL_MILLISECONDS)
+        return None
+
+    @staticmethod
     def _prepare_copy_capture(page) -> None:
         script = """() => {
             window.__INTDEMO_COPY_CAPTURE__ = {
@@ -893,6 +1052,11 @@ class _TencentDocsBrowserCapture:
                     )
                 except PlaywrightError:
                     pass
+            copied = self._capture_loaded_sheet_model(page)
+            if copied:
+                select_pending_tencent_rows(copied)
+                self._progress(78)
+                return copied
             last_copy_error = None
             for attempt in range(1, 5):
                 self._status(
