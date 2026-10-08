@@ -199,6 +199,32 @@ class ClientPreferences:
         payload["tencent_document_urls"] = links
         self._save(payload)
 
+    def tencent_document_only_unfilled(self, username: str) -> bool:
+        account_key = self._account_key(username)
+        if not account_key:
+            return True
+        settings = self._load().get("tencent_document_only_unfilled")
+        if not isinstance(settings, dict):
+            return True
+        value = settings.get(account_key)
+        return value if type(value) is bool else True
+
+    def set_tencent_document_only_unfilled(
+        self,
+        username: str,
+        enabled: bool,
+    ) -> None:
+        account_key = self._account_key(username)
+        if not account_key:
+            raise ValueError("无法识别当前登录账号")
+        payload = self._load()
+        settings = payload.get("tencent_document_only_unfilled")
+        if not isinstance(settings, dict):
+            settings = {}
+        settings[account_key] = bool(enabled)
+        payload["tencent_document_only_unfilled"] = settings
+        self._save(payload)
+
     def dashboard_station_view(self, username: str) -> str:
         account_key = self._account_key(username)
         if not account_key:

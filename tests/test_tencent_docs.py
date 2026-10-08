@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
@@ -8,6 +9,7 @@ import openpyxl
 from integrated_client.preferences import ClientPreferences
 from integrated_client.tencent_docs import (
     TencentDocsImportError,
+    TencentDocsImportOptions,
     TencentDocsImportWorker,
     _clipboard_html_to_tsv,
     _TencentDocsBrowserCapture,
@@ -184,6 +186,74 @@ class TencentDocsImportTests(unittest.TestCase):
             (("车2", "萝岗", ""),),
         )
 
+    def test_new_sheet_filters_date_station_and_unfilled_rows(self):
+        selection = select_pending_tencent_rows(
+            self._clipboard(
+                ("稽查名单跟进表", "", "", ""),
+                (
+                    ("车牌", "下发时间", "跟进中心站", "车辆所有人/企业"),
+                    ("粤A1_黄色", "2026-09-30", "南头", ""),
+                    ("粤A2_黄色", "2026-09-30 08:30:00", "宝安", ""),
+                    ("粤A3_黄色", "2026/09/29", "南头", ""),
+                    ("粤A4_黄色", "2026年9月30日", "南头中心站", "已填写"),
+                ),
+            ),
+            options=TencentDocsImportOptions(
+                date_start=date(2026, 9, 30),
+                date_end=date(2026, 9, 30),
+                center_station="南头",
+                only_unfilled=True,
+            ),
+        )
+
+        self.assertEqual(selection.source_header_row, 2)
+        self.assertEqual(selection.date_header, "下发时间")
+        self.assertEqual(selection.center_header, "跟进中心站")
+        self.assertEqual(selection.source_row_count, 4)
+        self.assertEqual(
+            selection.rows,
+            (("粤A1_黄色", "2026-09-30", "南头", ""),),
+        )
+
+    def test_legacy_sheet_ignores_station_but_keeps_other_filters(self):
+        selection = select_pending_tencent_rows(
+            self._clipboard(
+                ("车辆标识", "下发日期", "公司名称"),
+                (
+                    ("车1", "2026-09-30", ""),
+                    ("车2", "2026-09-30", "已填写"),
+                    ("车3", "2026-10-01", ""),
+                ),
+            ),
+            options=TencentDocsImportOptions(
+                date_start=date(2026, 9, 30),
+                date_end=date(2026, 9, 30),
+                center_station="不存在的中心站",
+                only_unfilled=True,
+            ),
+        )
+
+        self.assertEqual(selection.center_header, "")
+        self.assertEqual(selection.rows, (("车1", "2026-09-30", ""),))
+
+    def test_unfilled_filter_can_be_disabled(self):
+        selection = select_pending_tencent_rows(
+            self._clipboard(
+                ("车辆标识", "下发时间", "公司名称"),
+                (
+                    ("车1", "2026-09-30", ""),
+                    ("车2", "2026-09-30", "已填写"),
+                ),
+            ),
+            options=TencentDocsImportOptions(
+                date_start=date(2026, 9, 30),
+                date_end=date(2026, 9, 30),
+                only_unfilled=False,
+            ),
+        )
+
+        self.assertEqual(len(selection.rows), 2)
+
     def test_public_login_button_is_not_treated_as_login_prompt(self):
         class Frame:
             def __init__(self, text):
@@ -298,6 +368,16 @@ class TencentDocsImportTests(unittest.TestCase):
         reloaded = ClientPreferences(self.temp_dir.name)
         self.assertEqual(reloaded.tencent_document_url("admin"), first)
         self.assertEqual(reloaded.tencent_document_url("STATION"), second)
+
+    def test_unfilled_preference_is_persisted_per_program_account(self):
+        preferences = ClientPreferences(self.temp_dir.name)
+        self.assertTrue(preferences.tencent_document_only_unfilled("admin"))
+
+        preferences.set_tencent_document_only_unfilled("Admin", False)
+
+        reloaded = ClientPreferences(self.temp_dir.name)
+        self.assertFalse(reloaded.tencent_document_only_unfilled("admin"))
+        self.assertTrue(reloaded.tencent_document_only_unfilled("station"))
 
     def test_only_https_tencent_docs_links_are_accepted(self):
         valid = "https://docs.qq.com/sheet/example?tab=one"

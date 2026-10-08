@@ -276,6 +276,8 @@ class MainWindow(FramelessMainWindow):
             timing_service=self.workflow_timing,
             client_preferences=self.client_preferences,
             account_key=account.username,
+            account_name=account.name_label,
+            account_type=account.resolved_account_type,
             untracked_mode=not self.business_metrics_enabled,
             untracked_label=(
                 "游客模式"
@@ -1861,6 +1863,11 @@ class MainWindow(FramelessMainWindow):
 
     def _apply_current_account(self, account):
         self.account = account
+        self.workflow_page.set_account_context(
+            account.username,
+            account.name_label,
+            account.resolved_account_type,
+        )
         self.business_metrics_enabled = (
             self._business_metrics_requested and account.statistics_enabled
         )

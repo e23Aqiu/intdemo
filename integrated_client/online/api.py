@@ -10,6 +10,7 @@ from .config import OnlineConfig
 
 DATASET_DOWNLOAD_CHUNK_SIZE = 256 * 1024
 MAX_DATASET_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_CAPTCHA_MODEL_DOWNLOAD_BYTES = 20 * 1024 * 1024
 DownloadProgressCallback = Callable[
     [int, Optional[int]],  # noqa: UP045 - Python 3.9 runtime alias
     None,
@@ -397,6 +398,22 @@ class ApiClient:
             f"/admin/ml/models/{model_id}/activate",
             token=access_token,
         )
+
+    def admin_download_captcha_model(
+        self,
+        access_token: str,
+        model_id: str,
+    ) -> bytes:
+        response = self._request(
+            "GET",
+            f"/admin/ml/models/{model_id}/artifact",
+            token=access_token,
+            raw_response=True,
+        )
+        artifact = bytes(response.content)
+        if not 0 < len(artifact) <= MAX_CAPTCHA_MODEL_DOWNLOAD_BYTES:
+            raise OnlineApiError("验证码模型下载大小无效")
+        return artifact
 
     def admin_rename_captcha_model(
         self,

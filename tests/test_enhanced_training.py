@@ -42,7 +42,13 @@ class _FakeComponentManager:
         finally:
             self.locked = False
 
-    def command_for(self, dataset_path, captcha_type, output_dir):
+    def command_for(
+        self,
+        dataset_path,
+        captcha_type,
+        output_dir,
+        base_model_path=None,
+    ):
         if not self.locked:
             raise AssertionError("command must be resolved while training is locked")
         command = [
@@ -57,6 +63,8 @@ class _FakeComponentManager:
             "--output",
             str(output_dir),
         ]
+        if base_model_path is not None:
+            command.extend(["--base-model", str(base_model_path)])
         self.command_calls.append(command)
         return command
 
@@ -101,6 +109,7 @@ class _OutputRunner:
         self.stderr = stderr
         self.calls = []
         self.dataset_path = None
+        self.base_model_path = None
 
     def __call__(self, command, **kwargs):
         self.calls.append((list(command), dict(kwargs)))
@@ -112,6 +121,12 @@ class _OutputRunner:
         self.dataset_path = dataset_path
         if dataset_path.read_bytes() != b"dataset-archive":
             raise AssertionError("dataset bytes changed")
+        if "--base-model" in command:
+            self.base_model_path = Path(
+                command[command.index("--base-model") + 1]
+            )
+            if self.base_model_path.read_bytes() != b"base-artifact":
+                raise AssertionError("base model bytes changed")
         if self.returncode:
             kwargs["stderr"].write(self.stderr)
             kwargs["stderr"].flush()
@@ -137,6 +152,13 @@ class _OutputRunner:
             "per_position_accuracy": [1.0, 0.8, 0.8, 0.6],
             "right_edge_augmentation": True,
         }
+        if self.base_model_path is not None:
+            metrics.update(
+                {
+                    "training_strategy": "continued",
+                    "base_model_version": "numeric-base-test",
+                }
+            )
         if captcha_type == "click":
             metrics.update(
                 {
@@ -396,6 +418,30 @@ class EnhancedTrainingTests(unittest.TestCase):
                     runner=runner,
                     epochs=invalid,
                 )
+
+    def test_base_model_is_passed_to_component_for_continued_training(self):
+        manager = _FakeComponentManager()
+        runner = _OutputRunner(manager)
+
+        with patch(
+            "integrated_client.enhanced_training.LocalCaptchaEngineClient",
+        ):
+            candidate = train_enhanced_candidate(
+                b"dataset-archive",
+                "numeric",
+                manager,
+                runner=runner,
+                base_artifact=b"base-artifact",
+            )
+
+        self.assertIn("--base-model", runner.calls[0][0])
+        self.assertEqual(candidate.metrics["training_strategy"], "continued")
+        self.assertEqual(
+            candidate.metrics["base_model_version"],
+            "numeric-base-test",
+        )
+        self.assertIsNotNone(runner.base_model_path)
+        self.assertFalse(runner.base_model_path.exists())
 
     def test_click_protocol_supports_class_and_crop_metrics(self):
         manager = _FakeComponentManager()

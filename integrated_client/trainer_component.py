@@ -1399,6 +1399,7 @@ class TrainerComponentManager:
         dataset_path: Path | str,
         captcha_type: str,
         output_dir: Path | str,
+        base_model_path: Path | str | None = None,
     ) -> list[str]:
         captcha = str(captcha_type or "").strip().casefold()
         if captcha not in {"numeric", "click"}:
@@ -1413,7 +1414,7 @@ class TrainerComponentManager:
             pass
         else:
             raise ValueError("强化训练输出目录不能位于强化组件安装目录内")
-        return [
+        command = [
             str(entrypoint),
             "train",
             "--protocol-version",
@@ -1425,6 +1426,12 @@ class TrainerComponentManager:
             "--output",
             str(output),
         ]
+        if base_model_path is not None:
+            base_model = Path(base_model_path).expanduser().resolve()
+            if not base_model.is_file():
+                raise ValueError("续训基础模型文件不存在")
+            command.extend(["--base-model", str(base_model)])
+        return command
 
     def training_environment(self) -> dict[str, str]:
         """Return a child-process environment safe for either supported OS."""
@@ -1458,6 +1465,7 @@ class TrainerComponentManager:
         dataset_path: Path | str,
         captcha_type: str,
         output_dir: Path | str,
+        base_model_path: Path | str | None = None,
     ) -> list[str]:
         """Compatibility alias used by orchestration/UI code."""
 
@@ -1465,6 +1473,7 @@ class TrainerComponentManager:
             dataset_path=dataset_path,
             captcha_type=captcha_type,
             output_dir=output_dir,
+            base_model_path=base_model_path,
         )
 
     def active_executable(self) -> Path:

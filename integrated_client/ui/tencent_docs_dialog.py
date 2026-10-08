@@ -1,5 +1,9 @@
-from PyQt5.QtCore import pyqtSignal
+from PyQt5.QtCore import QDate, pyqtSignal
 from PyQt5.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDateEdit,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -8,15 +12,24 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
 )
 
+from ..tencent_docs import TencentDocsImportOptions
 from .frameless import FramelessDialog
 
 
 class TencentDocsLinkDialog(FramelessDialog):
-    def __init__(self, current_url="", parent=None):
+    def __init__(
+        self,
+        current_url="",
+        parent=None,
+        *,
+        current_station="",
+        available_stations=(),
+        only_unfilled=True,
+    ):
         super().__init__(parent)
         self.setWindowTitle("导入腾讯文档")
         self.setModal(True)
-        self.setFixedSize(590, 255)
+        self.setFixedSize(640, 405)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 26, 28, 24)
@@ -34,6 +47,41 @@ class TencentDocsLinkDialog(FramelessDialog):
         )
         self.url_edit.returnPressed.connect(self._accept_if_valid)
         layout.addWidget(self.url_edit)
+
+        filters = QGridLayout()
+        filters.setHorizontalSpacing(12)
+        filters.setVerticalSpacing(10)
+        filters.addWidget(QLabel("跟进中心站"), 0, 0)
+        self.station_combo = QComboBox()
+        self.station_combo.addItem("全部中心站", "")
+        station_names = []
+        for value in (current_station, *tuple(available_stations or ())):
+            name = str(value or "").strip()
+            if name and name not in station_names:
+                station_names.append(name)
+                self.station_combo.addItem(name, name)
+        selected_index = self.station_combo.findData(str(current_station or "").strip())
+        self.station_combo.setCurrentIndex(max(0, selected_index))
+        self.station_combo.setToolTip(
+            "仅新格式表格的“跟进中心站”列参与筛选；旧格式表格会忽略此项"
+        )
+        filters.addWidget(self.station_combo, 0, 1, 1, 3)
+
+        filters.addWidget(QLabel("下发日期"), 1, 0)
+        self.date_start_edit = QDateEdit(QDate.currentDate())
+        self.date_start_edit.setCalendarPopup(True)
+        self.date_start_edit.setDisplayFormat("yyyy-MM-dd")
+        filters.addWidget(self.date_start_edit, 1, 1)
+        filters.addWidget(QLabel("至"), 1, 2)
+        self.date_end_edit = QDateEdit(QDate.currentDate())
+        self.date_end_edit.setCalendarPopup(True)
+        self.date_end_edit.setDisplayFormat("yyyy-MM-dd")
+        filters.addWidget(self.date_end_edit, 1, 3)
+
+        self.only_unfilled_check = QCheckBox("仅导入“车辆所有人/企业”未填写的行")
+        self.only_unfilled_check.setChecked(bool(only_unfilled))
+        filters.addWidget(self.only_unfilled_check, 2, 0, 1, 4)
+        layout.addLayout(filters)
         hint = QLabel(
             "链接和腾讯文档登录状态会按当前程序账号保存在本机。"
         )
@@ -61,6 +109,14 @@ class TencentDocsLinkDialog(FramelessDialog):
 
     def value(self):
         return self.url_edit.text().strip()
+
+    def import_options(self):
+        return TencentDocsImportOptions(
+            date_start=self.date_start_edit.date().toPyDate(),
+            date_end=self.date_end_edit.date().toPyDate(),
+            center_station=str(self.station_combo.currentData() or "").strip(),
+            only_unfilled=self.only_unfilled_check.isChecked(),
+        )
 
 
 class TencentDocsProgressDialog(FramelessDialog):

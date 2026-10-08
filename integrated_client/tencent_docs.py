@@ -7,7 +7,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urlparse
@@ -29,6 +29,8 @@ COMPANY_HEADER_ALIASES = (
     "公司/所有人名称",
 )
 PLATE_HEADER_ALIASES = ("车牌", "车辆标识")
+ISSUED_AT_HEADER_ALIASES = ("下发时间", "下发日期", "下发日期时间")
+CENTER_STATION_HEADER_ALIASES = ("跟进中心站",)
 TENCENT_HEADER_ROW_CANDIDATES = (0, 1)
 TENCENT_DOCS_HOST = "docs.qq.com"
 TENCENT_DOCS_PUBLIC_WAIT_SECONDS = 60
@@ -56,6 +58,23 @@ class _TencentDocsLoginRequired(TencentDocsImportError):
 
 
 @dataclass(frozen=True)
+class TencentDocsImportOptions:
+    date_start: date
+    date_end: date
+    center_station: str = ""
+    only_unfilled: bool = True
+
+    def __post_init__(self):
+        if not isinstance(self.date_start, date) or not isinstance(
+            self.date_end,
+            date,
+        ):
+            raise TypeError("腾讯文档下发日期范围无效")
+        if self.date_start > self.date_end:
+            raise ValueError("腾讯文档下发日期开始时间不能晚于结束时间")
+
+
+@dataclass(frozen=True)
 class TencentSheetSelection:
     headers: tuple[str, ...]
     rows: tuple[tuple[str, ...], ...]
@@ -63,6 +82,12 @@ class TencentSheetSelection:
     source_start_row: int
     source_row_count: int
     source_header_row: int = 1
+    date_header: str = ""
+    center_header: str = ""
+    selected_center: str = ""
+    date_start: date | None = None
+    date_end: date | None = None
+    only_unfilled: bool = True
 
 
 @dataclass(frozen=True)
@@ -73,6 +98,12 @@ class TencentDocsImportResult:
     source_row_count: int
     company_header: str
     source_header_row: int = 1
+    date_header: str = ""
+    center_header: str = ""
+    selected_center: str = ""
+    date_start: date | None = None
+    date_end: date | None = None
+    only_unfilled: bool = True
 
 
 def validate_tencent_docs_url(value: str) -> str:
@@ -233,6 +264,52 @@ def _company_column_index(headers: list[str]) -> int:
     )
 
 
+def _header_column_index(headers: list[str], aliases: tuple[str, ...]):
+    normalized = [_normalized_header(header) for header in headers]
+    for alias in aliases:
+        candidate = _normalized_header(alias)
+        if candidate in normalized:
+            return normalized.index(candidate)
+    return None
+
+
+def _parse_issued_date(value: str, *, source_row: int) -> date | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    normalized = (
+        text.replace("年", "-")
+        .replace("月", "-")
+        .replace("日", "")
+        .replace("/", "-")
+        .replace(".", "-")
+    )
+    match = re.match(
+        r"^\s*(\d{4})-(\d{1,2})-(\d{1,2})(?:\D.*)?$",
+        normalized,
+    )
+    if match is None:
+        raise TencentDocsImportError(
+            f"原表第 {source_row} 行的下发日期无法识别：{text}"
+        )
+    try:
+        return date(*(int(part) for part in match.groups()))
+    except ValueError as exc:
+        raise TencentDocsImportError(
+            f"原表第 {source_row} 行的下发日期无效：{text}"
+        ) from exc
+
+
+def _normalized_station(value: str) -> str:
+    station = _normalized_header(value)
+    for suffix in ("中心站账号", "中心站"):
+        normalized_suffix = _normalized_header(suffix)
+        if station.endswith(normalized_suffix):
+            station = station[: -len(normalized_suffix)]
+            break
+    return station
+
+
 def _tencent_header_row(rows: list[list[str]]):
     candidates = []
     normalized_plate_aliases = {
@@ -280,8 +357,12 @@ def _tencent_header_row(rows: list[list[str]]):
     )
 
 
-def select_pending_tencent_rows(clipboard_text: str) -> TencentSheetSelection:
-    """Select every row after the final non-empty company-name cell."""
+def select_pending_tencent_rows(
+    clipboard_text: str,
+    *,
+    options: TencentDocsImportOptions | None = None,
+) -> TencentSheetSelection:
+    """Select legacy pending rows or rows matching explicit import filters."""
 
     rows = _clipboard_rows(clipboard_text)
     width = max(len(row) for row in rows)
@@ -292,27 +373,84 @@ def select_pending_tencent_rows(clipboard_text: str) -> TencentSheetSelection:
     header_row_index, company_column = _tencent_header_row(normalized_rows)
     headers = normalized_rows[header_row_index]
 
-    last_company_row_index = header_row_index
+    source_rows = list(normalized_rows[header_row_index + 1 :])
+    while source_rows and not any(value.strip() for value in source_rows[-1]):
+        source_rows.pop()
+
+    if options is None:
+        # Preserve the original import behavior for callers that do not opt in
+        # to the new date/station filter contract.
+        last_company_row_index = header_row_index
+        for row_index, row in enumerate(
+            source_rows,
+            start=header_row_index + 1,
+        ):
+            if row[company_column].strip():
+                last_company_row_index = row_index
+        pending_rows = normalized_rows[last_company_row_index + 1 :]
+        while pending_rows and not any(value.strip() for value in pending_rows[-1]):
+            pending_rows.pop()
+        return TencentSheetSelection(
+            headers=tuple(headers),
+            rows=tuple(tuple(row) for row in pending_rows),
+            company_header=headers[company_column],
+            source_start_row=last_company_row_index + 2,
+            source_row_count=len(source_rows),
+            source_header_row=header_row_index + 1,
+        )
+
+    date_column = _header_column_index(headers, ISSUED_AT_HEADER_ALIASES)
+    if date_column is None:
+        available = "、".join(header for header in headers if header.strip()) or "（空）"
+        raise TencentDocsImportError(
+            "未找到下发日期列。支持的列名包括："
+            f"{'、'.join(ISSUED_AT_HEADER_ALIASES)}；当前表头：{available}"
+        )
+    center_column = _header_column_index(headers, CENTER_STATION_HEADER_ALIASES)
+    selected_station = _normalized_station(options.center_station)
+    pending_rows = []
+    selected_source_rows = []
     for row_index, row in enumerate(
-        normalized_rows[header_row_index + 1 :],
+        source_rows,
         start=header_row_index + 1,
     ):
-        if row[company_column].strip():
-            last_company_row_index = row_index
-
-    pending_rows = normalized_rows[last_company_row_index + 1 :]
-    # Clipboard APIs sometimes append empty rows even though they are outside
-    # the sheet's used range. Preserve internal empty rows, but not that tail.
-    while pending_rows and not any(value.strip() for value in pending_rows[-1]):
-        pending_rows.pop()
+        if not any(value.strip() for value in row):
+            continue
+        source_row = row_index + 1
+        issued_at = _parse_issued_date(row[date_column], source_row=source_row)
+        if issued_at is None or not options.date_start <= issued_at <= options.date_end:
+            continue
+        # The legacy sheet has no 跟进中心站 column.  In that case the chosen
+        # station is deliberately ignored, while date and unfilled filters
+        # still apply.
+        if (
+            center_column is not None
+            and selected_station
+            and _normalized_station(row[center_column]) != selected_station
+        ):
+            continue
+        if options.only_unfilled and row[company_column].strip():
+            continue
+        pending_rows.append(row)
+        selected_source_rows.append(source_row)
 
     return TencentSheetSelection(
         headers=tuple(headers),
         rows=tuple(tuple(row) for row in pending_rows),
         company_header=headers[company_column],
-        source_start_row=last_company_row_index + 2,
-        source_row_count=max(0, len(normalized_rows) - header_row_index - 1),
+        source_start_row=(
+            min(selected_source_rows)
+            if selected_source_rows
+            else header_row_index + 2
+        ),
+        source_row_count=len(source_rows),
         source_header_row=header_row_index + 1,
+        date_header=headers[date_column],
+        center_header=(headers[center_column] if center_column is not None else ""),
+        selected_center=str(options.center_station or "").strip(),
+        date_start=options.date_start,
+        date_end=options.date_end,
+        only_unfilled=bool(options.only_unfilled),
     )
 
 
@@ -834,12 +972,14 @@ class TencentDocsImportWorker(QThread):
         url: str,
         account_key: str,
         data_directory: str | Path | None = None,
+        options: TencentDocsImportOptions | None = None,
         parent=None,
     ):
         super().__init__(parent)
         self.url = validate_tencent_docs_url(url)
         self.account_key = str(account_key or "").strip().lower()
         self.data_directory = Path(data_directory or get_data_dir())
+        self.options = options
 
     def stop(self) -> None:
         self.requestInterruption()
@@ -865,7 +1005,10 @@ class TencentDocsImportWorker(QThread):
             clipboard_text = capture.capture()
             self.status_changed.emit("正在筛选待处理行并生成新 Excel 表格…")
             self.progress_changed.emit(84)
-            selection = select_pending_tencent_rows(clipboard_text)
+            selection = select_pending_tencent_rows(
+                clipboard_text,
+                options=self.options,
+            )
             timestamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
             destination = (
                 tencent_docs_import_directory(
@@ -889,6 +1032,12 @@ class TencentDocsImportWorker(QThread):
                     source_row_count=selection.source_row_count,
                     company_header=selection.company_header,
                     source_header_row=selection.source_header_row,
+                    date_header=selection.date_header,
+                    center_header=selection.center_header,
+                    selected_center=selection.selected_center,
+                    date_start=selection.date_start,
+                    date_end=selection.date_end,
+                    only_unfilled=selection.only_unfilled,
                 )
             )
         except TencentDocsImportCancelled:

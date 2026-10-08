@@ -35,6 +35,7 @@ from .model_bundle import (
     ENGINE_API_VERSION,
     ENGINE_RUNTIME_VERSION,
     build_model_bundle,
+    load_model_bundle,
 )
 from .models import build_click_ranker, build_numeric_model
 from .protocol import (
@@ -173,7 +174,7 @@ def _loader(torch, dataset, *, batch_size, shuffle, seed):
     )
 
 
-def _train_numeric(torch, samples, epochs, batch_size, seed):
+def _train_numeric(torch, samples, epochs, batch_size, seed, base_model=None):
     train_samples, test_samples = split_samples(samples)
     train_dataset = _NumericDataset(
         train_samples,
@@ -187,7 +188,7 @@ def _train_numeric(torch, samples, epochs, batch_size, seed):
         seed=seed,
         torch=torch,
     )
-    model = build_numeric_model(torch)
+    model = base_model if base_model is not None else build_numeric_model(torch)
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.5e-3, weight_decay=1e-4)
     criterion = torch.nn.CrossEntropyLoss()
     model.train()
@@ -366,7 +367,7 @@ def _prepare_click_groups(samples, *, include_teacher):
     return groups, covered_targets, all_targets
 
 
-def _train_click(torch, samples, epochs, batch_size, seed):
+def _train_click(torch, samples, epochs, batch_size, seed, base_model=None):
     train_samples, test_samples = split_samples(samples)
     train_groups, _train_covered, _train_targets = _prepare_click_groups(
         train_samples,
@@ -378,7 +379,11 @@ def _train_click(torch, samples, epochs, batch_size, seed):
     )
     if not train_groups:
         raise TrainingError("点选验证码没有可用于排序训练的候选框")
-    model = build_click_ranker(CLICK_FEATURE_COUNT, torch)
+    model = (
+        base_model
+        if base_model is not None
+        else build_click_ranker(CLICK_FEATURE_COUNT, torch)
+    )
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=2e-4)
     criterion = torch.nn.CrossEntropyLoss()
     model.train()
@@ -680,10 +685,143 @@ def _verify_onnx_runtime_contract(
         raise TrainingError(f"导出的强化 ONNX 模型运行时自检失败：{exc}") from exc
 
 
+def _copy_parameter(torch, target, value, *, label):
+    array = np.asarray(value)
+    if tuple(array.shape) != tuple(target.shape) or not np.isfinite(array).all():
+        raise TrainingError(f"基础模型参数形状或数值无效：{label}")
+    with torch.no_grad():
+        target.copy_(
+            torch.from_numpy(np.array(array, dtype=np.float32, copy=True)).to(
+                dtype=target.dtype
+            )
+        )
+
+
+def _load_continuation_model(torch, base_model_path, captcha_type):
+    """Rehydrate trainable weights from a verified inference-only ONNX bundle."""
+
+    path = Path(base_model_path).expanduser().resolve()
+    try:
+        bundle = load_model_bundle(
+            path.read_bytes(),
+            expected_captcha_type=captcha_type,
+        )
+    except (OSError, ValueError) as exc:
+        raise TrainingError(f"续训基础模型包无效：{exc}") from exc
+    expected_family = (
+        "numeric-tiny-cnn-v1"
+        if captcha_type == "numeric"
+        else "click-prompt-ranker-v1"
+    )
+    if (
+        bundle.model_family != expected_family
+        or set(bundle.files) != {"model.onnx", "config.json"}
+    ):
+        raise TrainingError("续训基础模型系列或文件布局不兼容")
+    try:
+        config = json.loads(bundle.files["config.json"].decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, TypeError) as exc:
+        raise TrainingError("续训基础模型配置无效") from exc
+    if (
+        not isinstance(config, dict)
+        or config.get("captcha_type") != captcha_type
+        or config.get("version") != bundle.version
+        or config.get("model_family") != expected_family
+    ):
+        raise TrainingError("续训基础模型配置与清单不一致")
+
+    onnx = _dependency("onnx")
+    try:
+        graph = onnx.load_model_from_string(bundle.files["model.onnx"])
+        onnx.checker.check_model(graph)
+        initializers = {
+            initializer.name: np.array(
+                onnx.numpy_helper.to_array(initializer),
+                copy=True,
+            )
+            for initializer in graph.graph.initializer
+        }
+    except Exception as exc:
+        raise TrainingError(f"续训基础 ONNX 权重无法读取：{exc}") from exc
+
+    if captcha_type == "click":
+        model = build_click_ranker(CLICK_FEATURE_COUNT, torch)
+        for name, parameter in model.named_parameters():
+            if name not in initializers:
+                raise TrainingError(f"续训基础模型缺少参数：{name}")
+            _copy_parameter(
+                torch,
+                parameter,
+                initializers[name],
+                label=name,
+            )
+        return model, bundle.version
+
+    model = build_numeric_model(torch)
+    convolution_nodes = [
+        node for node in graph.graph.node if node.op_type == "Conv"
+    ]
+    convolution_modules = [
+        model.features[index]
+        for index in (0, 3, 4, 8, 9, 13)
+    ]
+    if len(convolution_nodes) != len(convolution_modules):
+        raise TrainingError("续训数字模型卷积结构不兼容")
+    for position, (node, module) in enumerate(
+        zip(convolution_nodes, convolution_modules),
+        1,
+    ):
+        if len(node.input) < 3:
+            raise TrainingError("续训数字模型卷积参数不完整")
+        weight = initializers.get(node.input[1])
+        bias = initializers.get(node.input[2])
+        if weight is None or bias is None:
+            raise TrainingError("续训数字模型卷积权重缺失")
+        _copy_parameter(
+            torch,
+            module.weight,
+            weight,
+            label=f"conv-{position}.weight",
+        )
+        _copy_parameter(
+            torch,
+            module.bias,
+            bias,
+            label=f"conv-{position}.bias",
+        )
+
+    # Export folds each BatchNorm into its preceding convolution.  Restoring
+    # the folded convolution followed by an identity BatchNorm preserves the
+    # old inference function before optimization resumes.
+    for index in (1, 5, 10):
+        layer = model.features[index]
+        with torch.no_grad():
+            layer.weight.fill_(math.sqrt(1.0 + float(layer.eps)))
+            layer.bias.zero_()
+            layer.running_mean.zero_()
+            layer.running_var.fill_(1.0)
+            layer.num_batches_tracked.zero_()
+
+    parameters = dict(model.named_parameters())
+    for name in (
+        "classifier.1.weight",
+        "classifier.1.bias",
+        "classifier.4.weight",
+        "classifier.4.bias",
+    ):
+        value = initializers.get(name)
+        if value is None:
+            raise TrainingError(f"续训基础模型缺少参数：{name}")
+        _copy_parameter(torch, parameters[name], value, label=name)
+    return model, bundle.version
+
+
 def train(
     dataset_path: Path | str,
     captcha_type: str,
     output_dir: Path | str,
+    *,
+    base_model_path: Path | str | None = None,
 ) -> dict[str, object]:
     """Train one model and atomically publish protocol-v2 output files."""
 
@@ -696,6 +834,19 @@ def train(
         )
     seed = _dataset_seed(samples, selected_type)
     torch, threads = _prepare_torch(seed)
+    base_model = None
+    base_model_version = ""
+    if base_model_path is not None:
+        base_model, base_model_version = _load_continuation_model(
+            torch,
+            base_model_path,
+            selected_type,
+        )
+        _emit(
+            "base_model_loaded",
+            captcha_type=selected_type,
+            base_model_version=base_model_version,
+        )
     epochs = _bounded_environment_integer(
         "INTDEMO_TRAINER_EPOCHS",
         DEFAULT_EPOCHS,
@@ -724,6 +875,7 @@ def train(
             epochs,
             batch_size,
             seed,
+            base_model,
         )
     else:
         model, private_config, metrics = _train_click(
@@ -732,7 +884,13 @@ def train(
             epochs,
             batch_size,
             seed,
+            base_model,
         )
+    metrics["training_strategy"] = (
+        "continued" if base_model_version else "from_scratch"
+    )
+    if base_model_version:
+        metrics["base_model_version"] = base_model_version
     version = _model_version(samples, selected_type)
 
     output = Path(output_dir).expanduser().resolve()

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import os
 import threading
 import uuid
@@ -74,6 +75,17 @@ TRAINING_ALGORITHM_BY_MODE = {
     "standard": "hog-linear-svm-v1",
     "enhanced": "captcha-engine-v1",
 }
+CONTINUATION_COMPONENT_VERSION = "2.1.0"
+
+
+def _version_key(value):
+    parts = []
+    for piece in str(value or "").split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple((parts + [0, 0, 0, 0])[:4])
 
 
 class TrainingProgressSignals(QObject):
@@ -500,12 +512,16 @@ class MachineLearningPage(QWidget):
         self.rename_model_btn = QPushButton("重命名所选模型")
         self.rename_model_btn.setEnabled(False)
         self.rename_model_btn.clicked.connect(self._rename_selected_model)
+        self.continue_model_btn = QPushButton("继续训练所选模型")
+        self.continue_model_btn.setEnabled(False)
+        self.continue_model_btn.clicked.connect(self._continue_selected_model)
         self.activate_model_btn = QPushButton("应用所选模型")
         self.activate_model_btn.setObjectName("PrimaryButton")
         self.activate_model_btn.setEnabled(False)
         self.activate_model_btn.clicked.connect(self._activate_selected_model)
         model_actions.addWidget(self.use_builtin_btn)
         model_actions.addWidget(self.rename_model_btn)
+        model_actions.addWidget(self.continue_model_btn)
         model_actions.addWidget(self.delete_model_btn)
         model_actions.addWidget(self.activate_model_btn)
         root.addLayout(model_actions)
@@ -544,6 +560,7 @@ class MachineLearningPage(QWidget):
                 or bool(getattr(status, "cleanup_available", False))
             )
         )
+        self._update_continue_model_button()
 
     def _refresh_training_component(self):
         status = self.trainer_manager.status(verify_files=False)
@@ -1177,6 +1194,7 @@ class MachineLearningPage(QWidget):
         self.recalculate_model_btn.setEnabled(False)
         self.rename_model_btn.setEnabled(False)
         self.activate_model_btn.setEnabled(False)
+        self.continue_model_btn.setEnabled(False)
         self._restore_active_accuracy_values()
         self._render_models()
 
@@ -1215,6 +1233,44 @@ class MachineLearningPage(QWidget):
             return "该模型缺少有效标识，不能应用。"
         return ""
 
+    def _model_continuation_block_reason(self, model):
+        if not model:
+            return "请先选择一个组件训练模型。"
+        if model.get("is_builtin"):
+            return "内置 ddddocr 不能作为续训基础模型。"
+        if str(model.get("algorithm") or "") != "captcha-engine-v1":
+            return "只有组件训练生成的 captcha-engine-v1 模型支持继续训练。"
+        if not model.get("id"):
+            return "该模型缺少有效标识，不能继续训练。"
+        api_method = getattr(
+            getattr(self.session_manager, "api", None),
+            "admin_download_captcha_model",
+            None,
+        )
+        if not callable(api_method):
+            return "当前客户端接口不支持下载续训基础模型。"
+        status = self.trainer_manager.status(verify_files=False)
+        if not status.available:
+            return "请先安装并启用强化训练组件。"
+        if _version_key(status.version) < _version_key(
+            CONTINUATION_COMPONENT_VERSION
+        ):
+            return (
+                "继续训练需要强化组件 "
+                f"{CONTINUATION_COMPONENT_VERSION} 或更高版本。"
+            )
+        if self._training_in_progress or self._component_task_running:
+            return "当前已有训练或组件维护任务正在运行。"
+        return ""
+
+    def _update_continue_model_button(self):
+        button = getattr(self, "continue_model_btn", None)
+        if button is None:
+            return
+        reason = self._model_continuation_block_reason(self._current_model())
+        button.setEnabled(not reason)
+        button.setToolTip(reason)
+
     def _model_selection_changed(self):
         self._restore_active_accuracy_values()
         model = self._current_model()
@@ -1224,6 +1280,7 @@ class MachineLearningPage(QWidget):
             self.rename_model_btn.setEnabled(False)
             self.activate_model_btn.setEnabled(False)
             self.activate_model_btn.setToolTip("请先选择一个模型版本")
+            self._update_continue_model_button()
             return
         version = str(model.get("version") or "")
         captcha_type = str(model.get("captcha_type") or "")
@@ -1245,6 +1302,7 @@ class MachineLearningPage(QWidget):
         activation_block_reason = self._model_activation_block_reason(model)
         self.activate_model_btn.setEnabled(not activation_block_reason)
         self.activate_model_btn.setToolTip(activation_block_reason)
+        self._update_continue_model_button()
         self._show_selected_model_metric(model)
 
     def _show_selected_model_metric(self, model):
@@ -1919,9 +1977,26 @@ class MachineLearningPage(QWidget):
         if terminal is not None:
             terminal.append_event(dict(payload or {}))
 
-    def _train_model(self, captcha_type):
+    def _continue_selected_model(self):
+        model = self._selected_model()
+        if not model:
+            return
+        reason = self._model_continuation_block_reason(model)
+        if reason:
+            QMessageBox.warning(self, "不能继续训练", reason)
+            return
+        self._train_model(
+            str(model.get("captcha_type") or ""),
+            base_model=dict(model),
+        )
+
+    def _train_model(self, captcha_type, base_model=None):
         type_name = "数字验证码" if captcha_type == "numeric" else "文字点选验证码"
-        mode = self.trainer_manager.preferred_mode()
+        mode = (
+            "enhanced"
+            if base_model is not None
+            else self.trainer_manager.preferred_mode()
+        )
         mode_name = "强化模式" if mode == "enhanced" else "标准模式"
         method_name = TRAINING_METHODS[mode]
         algorithm = TRAINING_ALGORITHM_BY_MODE[mode]
@@ -1938,12 +2013,21 @@ class MachineLearningPage(QWidget):
                 "请先将服务器升级到 v1.4.0，再开始训练。",
             )
             return
+        continuation_text = ""
+        if base_model is not None:
+            continuation_text = (
+                "\n基础模型："
+                f"{base_model.get('display_name') or base_model.get('version')}"
+                f"（{base_model.get('version')}）\n"
+                "原模型不会被覆盖；训练完成后会生成新的候选版本。\n"
+            )
         reply = QMessageBox.question(
             self,
             "训练候选模型",
             f"将下载当前{type_name}成功样本，在本机划分训练集和固定留出集，"
             f"使用{mode_name}生成候选模型并上传模型及评估结果。\n"
             f"当前方法：{method_name}\n"
+            + continuation_text
             + (
                 f"训练轮次：{training_epochs}\n"
                 if training_epochs is not None
@@ -1964,6 +2048,7 @@ class MachineLearningPage(QWidget):
         self._training_in_progress = True
         self.train_numeric_btn.setEnabled(False)
         self.train_click_btn.setEnabled(False)
+        self.continue_model_btn.setEnabled(False)
         self._set_component_controls_enabled(False)
         training_id = uuid.uuid4().hex
         cancel_event = threading.Event()
@@ -1988,6 +2073,36 @@ class MachineLearningPage(QWidget):
                 }
             )
             token = self.session_manager.access_token()
+            base_artifact = None
+            if base_model is not None:
+                progress(
+                    {
+                        "event": "base_model_download",
+                        "progress": 4,
+                        "message": (
+                            "正在下载并校验续训基础模型："
+                            f"{base_model.get('version')}"
+                        ),
+                    }
+                )
+                base_artifact = (
+                    self.session_manager.api.admin_download_captcha_model(
+                        token,
+                        str(base_model["id"]),
+                    )
+                )
+                expected_size = int(base_model.get("artifact_size") or 0)
+                expected_sha256 = str(
+                    base_model.get("artifact_sha256") or ""
+                ).casefold()
+                if (
+                    len(base_artifact) != expected_size
+                    or hashlib.sha256(base_artifact).hexdigest()
+                    != expected_sha256
+                ):
+                    raise CaptchaTrainingError(
+                        "续训基础模型的大小或 SHA-256 校验失败"
+                    )
             last_download_percent = {"value": -1}
             last_download_bytes = {"value": -1}
 
@@ -2073,24 +2188,28 @@ class MachineLearningPage(QWidget):
                     f"至少需要 {minimum} 条。\n"
                     f"过滤原因：{rejection_text}"
                 )
-            candidate = (
-                train_enhanced_candidate(
+            if mode == "enhanced":
+                enhanced_options = {
+                    "epochs": training_epochs,
+                    "progress_callback": progress,
+                    "cancel_event": cancel_event,
+                }
+                if base_artifact is not None:
+                    enhanced_options["base_artifact"] = base_artifact
+                candidate = train_enhanced_candidate(
                     archive,
                     captcha_type,
                     self.trainer_manager,
-                    epochs=training_epochs,
-                    progress_callback=progress,
-                    cancel_event=cancel_event,
+                    **enhanced_options,
                 )
-                if mode == "enhanced"
-                else train_candidate(
+            else:
+                candidate = train_candidate(
                     archive,
                     captcha_type,
                     mode="standard",
                     progress_callback=progress,
                     cancel_event=cancel_event,
                 )
-            )
             if cancel_event.is_set():
                 raise EnhancedTrainingCancelled("训练已由用户中止")
             progress(

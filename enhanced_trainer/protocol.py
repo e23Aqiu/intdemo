@@ -19,7 +19,7 @@ from .model_bundle import (
 
 PROTOCOL_VERSION = 2
 OUTPUT_SCHEMA_VERSION = 1
-COMPONENT_VERSION = "2.0.0"
+COMPONENT_VERSION = "2.1.0"
 ALGORITHM = "captcha-engine-v1"
 TRAINING_MODE = "enhanced"
 
@@ -85,6 +85,8 @@ METRICS_OPTIONAL_FIELDS = frozenset(
         "accepted_samples",
         "accepted_accuracy",
         "accepted_coverage",
+        "training_strategy",
+        "base_model_version",
     }
 )
 
@@ -332,6 +334,18 @@ def validate_generated_outputs(output_dir: Path | str) -> dict[str, object]:
         value = metrics.get(field)
         if type(value) is not int or not 1 <= value <= 10_000_000:
             raise TrainerProtocolError(f"强化训练指标 {field} 无效")
+    strategy = metrics.get("training_strategy")
+    if strategy not in {None, "from_scratch", "continued"}:
+        raise TrainerProtocolError("强化训练策略字段无效")
+    base_model_version = metrics.get("base_model_version")
+    if strategy == "continued":
+        if (
+            not isinstance(base_model_version, str)
+            or not _VERSION_PATTERN.fullmatch(base_model_version)
+        ):
+            raise TrainerProtocolError("续训基础模型版本无效")
+    elif base_model_version is not None:
+        raise TrainerProtocolError("非续训模型不能声明基础模型版本")
     captcha_type = metadata["captcha_type"]
     try:
         bundle = load_model_bundle(

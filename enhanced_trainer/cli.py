@@ -29,6 +29,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("numeric", "click"),
     )
     training.add_argument("--output", required=True)
+    training.add_argument("--base-model")
 
     engine = subparsers.add_parser("serve")
     engine.add_argument("--engine-api-version", required=True, type=int)
@@ -55,7 +56,12 @@ def main(arguments=None) -> int:
                 flush=True,
             )
         elif options.command == "train":
-            train(options.dataset, options.captcha_type, options.output)
+            train(
+                options.dataset,
+                options.captcha_type,
+                options.output,
+                base_model_path=options.base_model,
+            )
         else:
             return serve()
         return 0

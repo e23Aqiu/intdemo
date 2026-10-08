@@ -2213,6 +2213,39 @@ def rename_captcha_model(
     return _model_view(model)
 
 
+@router.get("/admin/ml/models/{model_id}/artifact")
+def download_captcha_model_artifact(
+    model_id: uuid.UUID,
+    context: AdminContext,
+    db: Db,
+) -> Response:
+    """Return one verified managed model for administrator-side continuation."""
+
+    del context
+    model = db.get(CaptchaModel, model_id)
+    if model is None:
+        raise ApiError("captcha_model_not_found", "模型不存在", status_code=404)
+    if (
+        not is_supported_model(model.captcha_type, model.algorithm)
+        or not _stored_model_contract_is_valid(model)
+    ):
+        raise ApiError(
+            "invalid_captcha_model",
+            "模型文件校验失败，不能用于继续训练",
+            status_code=409,
+        )
+    return Response(
+        content=model.artifact,
+        media_type="application/octet-stream",
+        headers={
+            "X-Captcha-Model-Version": model.version,
+            "X-Captcha-Model-Algorithm": model.algorithm,
+            "X-Content-SHA256": model.artifact_sha256,
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @router.post(
     "/admin/ml/models/{model_id}/activate",
     response_model=CaptchaModelView,

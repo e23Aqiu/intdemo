@@ -762,10 +762,12 @@ class Worker(QThread):
                 df["运输证号_纯数字"] = ""
             if "查询状态" not in df.columns:
                 df["查询状态"] = ""
+            if "车辆所有人/企业" not in df.columns:
+                df["车辆所有人/企业"] = ""
 
             workbook_writer = TargetedWorkbookWriter(
                 self.src,
-                ("运输证号_纯数字", "查询状态"),
+                ("运输证号_纯数字", "查询状态", "车辆所有人/企业"),
                 header_row=header_row,
             )
 
@@ -781,6 +783,10 @@ class Worker(QThread):
                         {
                             "运输证号_纯数字": df.at[row_index, "运输证号_纯数字"],
                             "查询状态": df.at[row_index, "查询状态"],
+                            "车辆所有人/企业": df.at[
+                                row_index,
+                                "车辆所有人/企业",
+                            ],
                         },
                     )
                     workbook_writer.save()
@@ -1377,6 +1383,14 @@ class Worker(QThread):
                 if not query_success and tr_clean == "":
                     if df.at[idx, "查询状态"] == "":
                         df.at[idx, "查询状态"] = error_msg or "失败"
+                    if (
+                        df.at[idx, "查询状态"] == "查询无结果"
+                        and not has_nonempty_cell_value(
+                            df.at[idx, "车辆所有人/企业"]
+                        )
+                    ):
+                        df.at[idx, "车辆所有人/企业"] = "无运输证号"
+                        self.log.emit("ℹ️ 已在公司列填写：无运输证号")
                 elif query_success:
                     df.at[idx, "查询状态"] = "查询成功"
                 save_results(idx)

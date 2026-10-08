@@ -51,6 +51,7 @@ from ..captcha_models import (
 )
 from .file_dialogs import SystemFileDialog as QFileDialog
 from ..database import (
+    DEFAULT_STATION_USERS,
     WORKFLOW_EMPTY_METRIC,
     WORKFLOW_HAS_PHONE_METRIC,
     WORKFLOW_INDIVIDUAL_METRIC,
@@ -298,6 +299,8 @@ class WorkflowPage(QWidget):
         *,
         client_preferences=None,
         account_key="",
+        account_name="",
+        account_type="",
         untracked_mode=False,
         untracked_label="游客模式",
         captcha_reporter=None,
@@ -312,6 +315,8 @@ class WorkflowPage(QWidget):
         self._untracked_label = str(untracked_label or "当前模式")
         self.client_preferences = client_preferences
         self.account_key = str(account_key or "").strip().lower()
+        self.account_name = str(account_name or "").strip()
+        self.account_type = str(account_type or "").strip().casefold()
         self.captcha_reporter = captcha_reporter
         self.captcha_model_manager = captcha_model_manager
         self._captcha_model_policy = None
@@ -1248,6 +1253,41 @@ class WorkflowPage(QWidget):
             return ""
         return self.client_preferences.tencent_document_url(self.account_key)
 
+    def _saved_tencent_only_unfilled(self):
+        if self.client_preferences is None:
+            return True
+        return self.client_preferences.tencent_document_only_unfilled(
+            self.account_key
+        )
+
+    @staticmethod
+    def _station_label(value):
+        label = str(value or "").strip()
+        for suffix in ("中心站账号", "中心站"):
+            if label.endswith(suffix):
+                return label[: -len(suffix)].strip()
+        return label
+
+    def _current_account_station(self):
+        if self.account_type != "station":
+            return ""
+        return self._station_label(self.account_name)
+
+    def _available_station_labels(self):
+        labels = [
+            self._station_label(display_name)
+            for display_name, _username in DEFAULT_STATION_USERS
+        ]
+        current = self._current_account_station()
+        if current and current not in labels:
+            labels.insert(0, current)
+        return tuple(label for label in labels if label)
+
+    def set_account_context(self, account_key, account_name, account_type):
+        self.account_key = str(account_key or "").strip().lower()
+        self.account_name = str(account_name or "").strip()
+        self.account_type = str(account_type or "").strip().casefold()
+
     def _tencent_docs_data_directory(self):
         if self.client_preferences is None:
             return None
@@ -1300,28 +1340,37 @@ class WorkflowPage(QWidget):
         dialog = TencentDocsLinkDialog(
             self._saved_tencent_document_url(),
             self,
+            current_station=self._current_account_station(),
+            available_stations=self._available_station_labels(),
+            only_unfilled=self._saved_tencent_only_unfilled(),
         )
         if dialog.exec_() != dialog.Accepted:
             return
         url = dialog.value()
         try:
             url = validate_tencent_docs_url(url)
+            options = dialog.import_options()
             get_builtin_chromium_path()
             if self.client_preferences is not None:
                 self.client_preferences.set_tencent_document_url(
                     self.account_key,
                     url,
                 )
-        except (OSError, RuntimeError, ValueError) as exc:
+                self.client_preferences.set_tencent_document_only_unfilled(
+                    self.account_key,
+                    options.only_unfilled,
+                )
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
             QMessageBox.warning(self, "无法导入腾讯文档", str(exc))
             return
-        self._start_tencent_docs_import(url)
+        self._start_tencent_docs_import(url, options)
 
-    def _start_tencent_docs_import(self, url):
+    def _start_tencent_docs_import(self, url, options=None):
         worker = TencentDocsImportWorker(
             url,
             self.account_key,
             data_directory=self._tencent_docs_data_directory(),
+            options=options,
             parent=self,
         )
         dialog = TencentDocsProgressDialog(self)
@@ -1384,18 +1433,29 @@ class WorkflowPage(QWidget):
         self._update_workbook_action_buttons()
         self._log(
             f"腾讯文档导入完成：已识别第 {result.source_header_row} 行为表头，"
-            "从原表第 "
-            f"{result.source_start_row} 行开始复制 {result.copied_rows} 行，"
+            f"从 {result.source_row_count} 条数据中筛选出 {result.copied_rows} 条，"
             f"新表位于 {result.path}"
         )
         if loaded:
+            date_range = (
+                f"{result.date_start:%Y-%m-%d} 至 {result.date_end:%Y-%m-%d}"
+                if result.date_start is not None and result.date_end is not None
+                else "未限定"
+            )
+            if result.center_header:
+                center_filter = result.selected_center or "全部中心站"
+            else:
+                center_filter = "旧格式表格，不按中心站筛选"
+            unfilled_filter = "是" if result.only_unfilled else "否"
             QMessageBox.information(
                 self,
                 "腾讯文档导入完成",
                 f"已识别原表第 {result.source_header_row} 行为表头，"
-                f"并按“{result.company_header}”列筛选：\n"
-                f"从原表第 {result.source_start_row} 行开始，"
-                f"复制 {result.copied_rows} 行。\n\n"
+                f"从 {result.source_row_count} 条数据中复制 {result.copied_rows} 行"
+                f"（首条来自原表第 {result.source_start_row} 行）。\n"
+                f"下发日期：{date_range}\n"
+                f"中心站：{center_filter}\n"
+                f"仅筛选“{result.company_header}”未填写行：{unfilled_filter}\n\n"
                 "新 Excel 已自动导入程序，且本次导入不计入业务时间。\n"
                 f"文件位置：\n{result.path}",
             )

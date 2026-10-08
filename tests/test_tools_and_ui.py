@@ -66,7 +66,10 @@ from integrated_client.online.coordinator import SyncCoordinator
 from integrated_client.online.sync import SyncStatus
 from integrated_client.online.update import UpdateInfo
 from integrated_client.preferences import ClientPreferences
-from integrated_client.tencent_docs import TencentDocsImportResult
+from integrated_client.tencent_docs import (
+    TencentDocsImportOptions,
+    TencentDocsImportResult,
+)
 from integrated_client.timing import WorkflowTimingService
 from integrated_client.tools.aiqicha_tool import (
     ADDR_COL_NAME,
@@ -576,7 +579,7 @@ class ToolAndUiTests(unittest.TestCase):
             [
                 "冀TJ2892_黄色",
                 "",
-                "无运输证号",
+                "",
                 "Page.goto: Target page, context or browser has bee",
             ]
         )
@@ -716,6 +719,10 @@ class ToolAndUiTests(unittest.TestCase):
         self.assertEqual(
             saved.active.cell(2, headers["查询状态"]).value,
             "查询无结果",
+        )
+        self.assertEqual(
+            saved.active.cell(2, headers["车辆所有人/企业"]).value,
+            "无运输证号",
         )
         saved.close()
 
@@ -5102,10 +5109,23 @@ class ToolAndUiTests(unittest.TestCase):
             dialog.Accepted = 1
             dialog.exec_.return_value = 1
             dialog.value.return_value = new_url
+            options = TencentDocsImportOptions(
+                date_start=date.today(),
+                date_end=date.today(),
+                center_station="",
+                only_unfilled=True,
+            )
+            dialog.import_options.return_value = options
             page.tencent_docs_btn.click()
 
-        dialog_type.assert_called_once_with(old_url, page)
-        start_import.assert_called_once_with(new_url)
+        dialog_type.assert_called_once_with(
+            old_url,
+            page,
+            current_station="",
+            available_stations=page._available_station_labels(),
+            only_unfilled=True,
+        )
+        start_import.assert_called_once_with(new_url, options)
         self.assertEqual(
             ClientPreferences(self.temp_dir.name).tencent_document_url(
                 "ADMIN"

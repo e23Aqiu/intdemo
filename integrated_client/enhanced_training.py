@@ -82,6 +82,8 @@ _METRICS_OPTIONAL_FIELDS = {
     "accepted_samples",
     "accepted_accuracy",
     "accepted_coverage",
+    "training_strategy",
+    "base_model_version",
 }
 
 
@@ -483,7 +485,10 @@ def _validate_metrics(payload: dict, *, captcha_type: str) -> dict:
         "accepted_accuracy",
         "accepted_coverage",
     }
-    allowed_optional = numeric_optional if captcha_type == "numeric" else click_optional
+    common_optional = {"training_strategy", "base_model_version"}
+    allowed_optional = common_optional | (
+        numeric_optional if captcha_type == "numeric" else click_optional
+    )
     if not _METRICS_REQUIRED_FIELDS <= fields or fields - (
         _METRICS_REQUIRED_FIELDS | allowed_optional
     ):
@@ -510,6 +515,18 @@ def _validate_metrics(payload: dict, *, captcha_type: str) -> dict:
     _bounded_integer(payload.get("seed"), label="seed", maximum=2_147_483_647)
     _bounded_integer(payload.get("epochs"), label="epochs", minimum=1)
     _bounded_integer(payload.get("batch_size"), label="batch_size", minimum=1)
+    strategy = payload.get("training_strategy")
+    if strategy not in {None, "from_scratch", "continued"}:
+        raise EnhancedTrainingError("training_strategy 无效")
+    base_model_version = payload.get("base_model_version")
+    if strategy == "continued":
+        if (
+            not isinstance(base_model_version, str)
+            or not _VERSION_PATTERN.fullmatch(base_model_version)
+        ):
+            raise EnhancedTrainingError("base_model_version 无效")
+    elif base_model_version is not None:
+        raise EnhancedTrainingError("非续训模型不能包含 base_model_version")
 
     for field in ("class_count", "crop_count", "feature_count", "pair_count"):
         if field in payload:
@@ -718,6 +735,7 @@ def train_enhanced_candidate(
     epochs: int | None = None,
     progress_callback: EnhancedProgressCallback | None = None,
     cancel_event: threading.Event | None = None,
+    base_artifact: bytes | None = None,
 ) -> CaptchaCandidate:
     """Train through the installed component and return a verified candidate."""
     if captcha_type not in {"numeric", "click"}:
@@ -727,6 +745,12 @@ def train_enhanced_candidate(
     archive_bytes = bytes(archive_bytes)
     if not archive_bytes or len(archive_bytes) > MAX_DATASET_BYTES:
         raise EnhancedTrainingError("强化训练数据集为空或大小超过限制")
+    if base_artifact is not None:
+        if not isinstance(base_artifact, (bytes, bytearray, memoryview)):
+            raise EnhancedTrainingError("续训基础模型必须是字节数据")
+        base_artifact = bytes(base_artifact)
+        if not 0 < len(base_artifact) <= MAX_MODEL_ARTIFACT_BYTES:
+            raise EnhancedTrainingError("续训基础模型大小无效")
     if epochs is not None and (
         type(epochs) is not int
         or not MIN_TRAINING_EPOCHS <= epochs <= MAX_TRAINING_EPOCHS
@@ -749,6 +773,10 @@ def train_enhanced_candidate(
             output_dir = workspace / "output"
             output_dir.mkdir()
             dataset_path.write_bytes(archive_bytes)
+            base_model_path = None
+            if base_artifact is not None:
+                base_model_path = workspace / "base-model.intmodel"
+                base_model_path.write_bytes(base_artifact)
             _emit_progress(
                 progress_callback,
                 {
@@ -777,11 +805,19 @@ def train_enhanced_candidate(
                         0,
                     )
                 with component_manager.training_lock():
-                    command = component_manager.command_for(
-                        dataset_path,
-                        captcha_type,
-                        output_dir,
-                    )
+                    if base_model_path is None:
+                        command = component_manager.command_for(
+                            dataset_path,
+                            captcha_type,
+                            output_dir,
+                        )
+                    else:
+                        command = component_manager.command_for(
+                            dataset_path,
+                            captcha_type,
+                            output_dir,
+                            base_model_path,
+                        )
                     if (
                         not isinstance(command, (list, tuple))
                         or not command

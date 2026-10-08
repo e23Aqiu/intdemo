@@ -2480,6 +2480,79 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertTrue(page.train_click_btn.isEnabled())
         page.deleteLater()
 
+    def test_machine_learning_page_continues_from_verified_selected_model(self):
+        session = _FakeSession()
+        manager = _FakeTrainerManager(available=True, mode="standard")
+        manager._status.version = "2.1.0"
+        issued_tokens = iter(["download-token", "upload-token"])
+        session.access_token = lambda: next(issued_tokens)
+        base_artifact = b"verified-base-model"
+        downloaded = []
+        session.api.admin_download_captcha_model = (
+            lambda token, model_id: downloaded.append((token, model_id))
+            or base_artifact
+        )
+        session.api.admin_export_captcha_dataset = (
+            lambda _token, _kind, *, progress_callback=None: b"dataset"
+        )
+        session.api.admin_create_captcha_model = lambda _token, payload: payload
+        candidate = SimpleNamespace(
+            captcha_type="numeric",
+            version="numeric-continued-test",
+            algorithm="captcha-engine-v1",
+            artifact=b"continued-model",
+            sample_count=25,
+            test_count=5,
+            correct_count=4,
+            metrics={"training_mode": "enhanced"},
+        )
+        base_model = {
+            "id": "model-id",
+            "captcha_type": "numeric",
+            "version": "numeric-base-test",
+            "display_name": "数字基础模型",
+            "algorithm": "captcha-engine-v1",
+            "artifact_size": len(base_artifact),
+            "artifact_sha256": hashlib.sha256(base_artifact).hexdigest(),
+        }
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(session, trainer_manager=manager)
+        page.refresh_timer.stop()
+
+        def immediate(function, completed):
+            completed(function(), None)
+            return object()
+
+        with patch.object(page, "refresh"), patch.object(
+            page,
+            "_start",
+            side_effect=immediate,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.question",
+            return_value=QMessageBox.Yes,
+        ), patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.information",
+        ), patch(
+            "integrated_client.ui.machine_learning_page.train_enhanced_candidate",
+            return_value=candidate,
+        ) as enhanced, patch(
+            "integrated_client.ui.machine_learning_page.inspect_training_dataset",
+            return_value=SimpleNamespace(valid_count=25),
+        ):
+            page._train_model("numeric", base_model=base_model)
+
+        enhanced.assert_called_once_with(
+            b"dataset",
+            "numeric",
+            manager,
+            epochs=24,
+            progress_callback=ANY,
+            cancel_event=ANY,
+            base_artifact=base_artifact,
+        )
+        self.assertEqual(downloaded, [("download-token", "model-id")])
+        page.deleteLater()
+
     def test_machine_learning_page_refreshes_expired_upload_token_once(self):
         session = _FakeSession()
         manager = _FakeTrainerManager(available=True, mode="enhanced")

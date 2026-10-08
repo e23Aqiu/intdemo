@@ -803,6 +803,21 @@ def test_dataset_export_import_and_model_activation(client):
     assert renamed_model["artifact_sha256"] == model["artifact_sha256"]
     assert renamed_model["artifact_size"] == model["artifact_size"]
 
+    admin_download = client.get(
+        f"/api/v1/admin/ml/models/{model['id']}/artifact",
+        headers=auth_header(admin),
+    )
+    assert admin_download.status_code == 200
+    assert admin_download.content == artifact
+    assert admin_download.headers["x-captcha-model-version"] == "numeric-test-1"
+    assert admin_download.headers["x-content-sha256"] == model["artifact_sha256"]
+
+    forbidden_download = client.get(
+        f"/api/v1/admin/ml/models/{model['id']}/artifact",
+        headers=auth_header(user),
+    )
+    assert forbidden_download.status_code == 403
+
     blank_name = client.patch(
         f"/api/v1/admin/ml/models/{model['id']}",
         headers=auth_header(admin),
