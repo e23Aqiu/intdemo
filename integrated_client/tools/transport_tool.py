@@ -1618,7 +1618,7 @@ class BusinessBackfillWorker(QThread):
                 self.log.emit("⚠️ 点击验证码超时，跳过本次")
                 break
             self._check_stopped()
-            time.sleep(0.4)
+            time.sleep(0.1)
 
         self.log.emit("⏳ 等待页面响应，校验验证码结果...")
         self._check_stopped()
