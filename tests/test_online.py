@@ -565,6 +565,7 @@ class OnlineClientTests(unittest.TestCase):
         result = client.admin_export_captcha_dataset(
             "token",
             "numeric",
+            sample_limit=321,
             progress_callback=lambda downloaded, total: progress.append(
                 (downloaded, total)
             ),
@@ -573,6 +574,10 @@ class OnlineClientTests(unittest.TestCase):
         self.assertEqual(result, b"abcdef")
         self.assertEqual(progress, [(0, 6), (3, 6), (6, 6)])
         self.assertTrue(session.request.call_args.kwargs["stream"])
+        self.assertEqual(
+            session.request.call_args.kwargs["params"],
+            {"captcha_type": "numeric", "sample_limit": 321},
+        )
         response.close.assert_called_once_with()
 
     def test_websocket_ca_loads_from_unicode_windows_path(self):

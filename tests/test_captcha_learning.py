@@ -26,6 +26,7 @@ from integrated_client.captcha_models import (
     CaptchaTrainingError,
     HogLinearSvmCaptchaModel,
     KnnCaptchaModel,
+    inspect_training_dataset,
     train_candidate,
 )
 from integrated_client.config import DEFAULT_ADMIN_PASSWORD, DEFAULT_ADMIN_USERNAME
@@ -215,6 +216,7 @@ class _FakeApi:
     def __init__(self):
         self.attempts = []
         self.export_types = []
+        self.export_sample_limits = []
         self.sample_rows = []
         self.deleted_sample_ids = []
         self.downloaded_sample_ids = []
@@ -251,9 +253,11 @@ class _FakeApi:
         _token,
         captcha_type=None,
         *,
+        sample_limit=None,
         progress_callback=None,
     ):
         self.export_types.append(captcha_type)
+        self.export_sample_limits.append(sample_limit)
         result = f"dataset-{captcha_type or 'mixed'}".encode("ascii")
         if progress_callback is not None:
             progress_callback(0, len(result))
@@ -437,6 +441,39 @@ class CaptchaLearningTests(unittest.TestCase):
 
         with self.assertRaises(CaptchaTrainingError):
             train_candidate(_dataset_archive(numeric_count=5, click_count=0), "numeric")
+
+    def test_random_training_export_does_not_report_unselected_rows_as_missing(self):
+        source = _dataset_archive(numeric_count=25, click_count=0)
+        output = io.BytesIO()
+        with zipfile.ZipFile(io.BytesIO(source), "r") as existing, zipfile.ZipFile(
+            output,
+            "w",
+            zipfile.ZIP_STORED,
+        ) as rebuilt:
+            manifest = json.loads(existing.read("manifest.json"))
+            manifest.update(
+                {
+                    "captcha_type": "numeric",
+                    "source_sample_count": 2_000,
+                    "selection_mode": "random",
+                    "requested_sample_count": 25,
+                    "size_limited": True,
+                }
+            )
+            for info in existing.infolist():
+                if info.filename != "manifest.json":
+                    rebuilt.writestr(info, existing.read(info))
+            rebuilt.writestr("manifest.json", json.dumps(manifest))
+
+        inspection = inspect_training_dataset(output.getvalue(), "numeric")
+
+        self.assertEqual(inspection.declared_samples, 25)
+        self.assertEqual(inspection.source_samples, 2_000)
+        self.assertEqual(inspection.valid_count, 25)
+        self.assertEqual(inspection.missing_images, 0)
+        self.assertEqual(inspection.selection_mode, "random")
+        self.assertEqual(inspection.requested_samples, 25)
+        self.assertTrue(inspection.size_limited)
 
     def test_service_honors_all_upload_modes(self):
         session = _FakeSession()
@@ -2201,6 +2238,8 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertIn("1.2.3", page.trainer_status_label.text())
         self.assertEqual(page.training_epochs_spin.value(), 24)
         self.assertTrue(page.training_epochs_spin.isEnabled())
+        self.assertEqual(page.training_sample_spin.value(), 0)
+        self.assertTrue(page.training_sample_spin.isEnabled())
         page.training_epochs_spin.setValue(37)
         self.assertEqual(manager.training_epochs(), 37)
         self.assertIn("训练轮次：37", page.training_method_label.text())
@@ -2377,6 +2416,8 @@ class CaptchaLearningTests(unittest.TestCase):
 
         controls = [
             page.training_mode_combo,
+            page.training_sample_label,
+            page.training_sample_spin,
             page.training_epochs_label,
             page.training_epochs_spin,
             page.install_trainer_btn,
@@ -2412,8 +2453,8 @@ class CaptchaLearningTests(unittest.TestCase):
         download_tokens = []
         upload_tokens = []
         session.api.admin_export_captcha_dataset = (
-            lambda token, _kind, *, progress_callback=None: download_tokens.append(
-                token
+            lambda token, _kind, *, sample_limit=None, progress_callback=None: (
+                download_tokens.append((token, sample_limit))
             )
             or (
                 progress_callback(7, 7) if progress_callback else None
@@ -2440,6 +2481,7 @@ class CaptchaLearningTests(unittest.TestCase):
             page = MachineLearningPage(session, trainer_manager=manager)
         page.refresh_timer.stop()
         page.training_epochs_spin.setValue(37)
+        page.training_sample_spin.setValue(25)
 
         def immediate(function, completed):
             completed(function(), None)
@@ -2461,7 +2503,13 @@ class CaptchaLearningTests(unittest.TestCase):
             "integrated_client.ui.machine_learning_page.train_candidate",
         ) as standard, patch(
             "integrated_client.ui.machine_learning_page.inspect_training_dataset",
-            return_value=SimpleNamespace(valid_count=25),
+            return_value=SimpleNamespace(
+                valid_count=25,
+                declared_samples=25,
+                source_samples=25,
+                selection_mode="random",
+                size_limited=False,
+            ),
         ):
             page._train_model("numeric")
 
@@ -2474,10 +2522,29 @@ class CaptchaLearningTests(unittest.TestCase):
             cancel_event=ANY,
         )
         standard.assert_not_called()
-        self.assertEqual(download_tokens, ["download-token"])
+        self.assertEqual(download_tokens, [("download-token", 25)])
         self.assertEqual(upload_tokens, ["upload-token"])
         self.assertTrue(page.train_numeric_btn.isEnabled())
         self.assertTrue(page.train_click_btn.isEnabled())
+        page.deleteLater()
+
+    def test_machine_learning_page_rejects_too_small_manual_sample_count(self):
+        manager = _FakeTrainerManager(available=True, mode="enhanced")
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(_FakeSession(), trainer_manager=manager)
+        page.refresh_timer.stop()
+        page.training_sample_spin.setValue(19)
+
+        with patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.warning"
+        ) as warning, patch(
+            "integrated_client.ui.machine_learning_page.QMessageBox.question"
+        ) as question:
+            page._train_model("numeric")
+
+        warning.assert_called_once()
+        question.assert_not_called()
+        self.assertFalse(page._training_in_progress)
         page.deleteLater()
 
     def test_machine_learning_page_continues_from_verified_selected_model(self):
@@ -2493,7 +2560,9 @@ class CaptchaLearningTests(unittest.TestCase):
             or base_artifact
         )
         session.api.admin_export_captcha_dataset = (
-            lambda _token, _kind, *, progress_callback=None: b"dataset"
+            lambda _token, _kind, *, sample_limit=None, progress_callback=None: (
+                b"dataset"
+            )
         )
         session.api.admin_create_captcha_model = lambda _token, payload: payload
         candidate = SimpleNamespace(
@@ -2537,7 +2606,13 @@ class CaptchaLearningTests(unittest.TestCase):
             return_value=candidate,
         ) as enhanced, patch(
             "integrated_client.ui.machine_learning_page.inspect_training_dataset",
-            return_value=SimpleNamespace(valid_count=25),
+            return_value=SimpleNamespace(
+                valid_count=25,
+                declared_samples=25,
+                source_samples=25,
+                selection_mode="random",
+                size_limited=False,
+            ),
         ):
             page._train_model("numeric", base_model=base_model)
 
@@ -2562,7 +2637,9 @@ class CaptchaLearningTests(unittest.TestCase):
         session.access_token = lambda: next(issued_tokens)
         upload_tokens = []
         session.api.admin_export_captcha_dataset = (
-            lambda _token, _kind, *, progress_callback=None: b"dataset"
+            lambda _token, _kind, *, sample_limit=None, progress_callback=None: (
+                b"dataset"
+            )
         )
 
         def upload(token, payload):
@@ -2608,7 +2685,13 @@ class CaptchaLearningTests(unittest.TestCase):
             return_value=candidate,
         ), patch(
             "integrated_client.ui.machine_learning_page.inspect_training_dataset",
-            return_value=SimpleNamespace(valid_count=25),
+            return_value=SimpleNamespace(
+                valid_count=25,
+                declared_samples=25,
+                source_samples=25,
+                selection_mode="random",
+                size_limited=False,
+            ),
         ):
             page._train_model("numeric")
 

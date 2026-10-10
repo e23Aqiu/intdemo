@@ -19,7 +19,7 @@ from .model_bundle import (
 
 PROTOCOL_VERSION = 2
 OUTPUT_SCHEMA_VERSION = 1
-COMPONENT_VERSION = "2.1.0"
+COMPONENT_VERSION = "2.2.0"
 ALGORITHM = "captcha-engine-v1"
 TRAINING_MODE = "enhanced"
 

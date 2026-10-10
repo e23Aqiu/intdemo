@@ -10,7 +10,9 @@ UOS 的 PyInstaller 6 `onedir` 产物允许使用仅指向组件目录内普通�
 
 ## 模型与协议
 
-- 当前组件版本：`2.1.0`；训练 protocol 为 v2，稳定模型运行时版本为 `2.0.0`。
+- 当前组件版本：`2.2.0`；训练 protocol 为 v2，稳定模型运行时版本为 `2.0.0`。
+- 组件接受的单次训练数据包上限为 512 MB，最多训练 5000 条有效且不重复样本；
+  超过 100 MB 的数据包需要组件 2.2.0 或更高版本。
 - 服务端可见的算法标识：`captcha-engine-v1`。模型是数据包，不包含需要在普通客户端
   执行的组件程序。
 - 数字验证码：完整原图输入的四位置多头 Tiny CNN，不切成四个等宽字符；输入
@@ -129,7 +131,7 @@ python -m pip install --no-index --find-links WHEELHOUSE \
 python scripts/package-trainer.py `
   --platform windows-x86_64 `
   all --build-root D:\trainer-build `
-  --output D:\release\IntDemo-Trainer-2.1.0-windows-x86_64.inttrainer
+  --output D:\release\IntDemo-Trainer-2.2.0-windows-x86_64.inttrainer
 ```
 
 在 UOS ARM64 上：
@@ -138,7 +140,7 @@ python scripts/package-trainer.py `
 python scripts/package-trainer.py \
   --platform linux-aarch64 \
   all --build-root /tmp/intdemo-trainer-build \
-  --output /release/IntDemo-Trainer-2.1.0-linux-aarch64.inttrainer
+  --output /release/IntDemo-Trainer-2.2.0-linux-aarch64.inttrainer
 ```
 
 外层 `.inttrainer` 是 ZIP 容器，也是管理员安装所需的唯一文件，不需要配套 JSON、

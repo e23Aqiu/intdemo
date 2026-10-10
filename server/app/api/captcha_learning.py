@@ -62,9 +62,11 @@ from ..services import audit
 router = APIRouter(tags=["captcha-learning"])
 
 MAX_IMAGE_BYTES = 1 * 1024 * 1024
-MAX_ARCHIVE_BYTES = 100 * 1024 * 1024
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 MAX_ARCHIVE_FILES = 50_003
 MAX_MANIFEST_BYTES = 10 * 1024 * 1024
+MAX_TRAINING_SAMPLE_COUNT = 5_000
+TRAINING_ARCHIVE_OVERHEAD_BYTES = 16 * 1024 * 1024
 MAX_MODEL_BYTES = MAX_CAPTCHA_MODEL_BYTES
 MAX_MODEL_EXPANDED_BYTES = 128 * 1024 * 1024
 MAX_MODEL_ARCHIVE_FILES = 128
@@ -1767,19 +1769,85 @@ def export_captcha_dataset(
     context: AdminContext,
     db: Db,
     captcha_type: str | None = Query(default=None),
+    sample_limit: int | None = Query(
+        default=None,
+        ge=1,
+        le=MAX_TRAINING_SAMPLE_COUNT,
+    ),
 ) -> Response:
     captcha_type, _ = _validate_captcha_filters(captcha_type, None)
-    statement = select(CaptchaSample).order_by(CaptchaSample.created_at)
+    if sample_limit is not None and captcha_type is None:
+        raise ApiError(
+            "invalid_training_sample_selection",
+            "随机训练样本必须指定验证码类型",
+            status_code=422,
+        )
+    sample_filter = (
+        CaptchaSample.captcha_type == captcha_type if captcha_type else None
+    )
+    count_statement = select(func.count(CaptchaSample.id))
+    if sample_filter is not None:
+        count_statement = count_statement.where(sample_filter)
+    source_sample_count = int(db.scalar(count_statement) or 0)
+
+    random_selection = sample_limit is not None
+    size_limited = False
+    selected_ids: list[uuid.UUID] = []
+    if random_selection:
+        image_budget = MAX_ARCHIVE_BYTES - TRAINING_ARCHIVE_OVERHEAD_BYTES
+        candidate_statement = select(
+            CaptchaSample.id,
+            CaptchaSample.image_size,
+        ).order_by(func.random())
+        if sample_filter is not None:
+            candidate_statement = candidate_statement.where(sample_filter)
+        selected_image_bytes = 0
+        for sample_id, declared_size in db.execute(candidate_statement):
+            try:
+                declared_size = int(declared_size)
+            except (TypeError, ValueError):
+                continue
+            if not 0 < declared_size <= MAX_IMAGE_BYTES:
+                continue
+            if selected_image_bytes + declared_size > image_budget:
+                size_limited = True
+                continue
+            selected_ids.append(sample_id)
+            selected_image_bytes += declared_size
+            if len(selected_ids) >= int(sample_limit):
+                break
+
+    def selected_samples():
+        if not random_selection:
+            statement = select(CaptchaSample).order_by(CaptchaSample.created_at)
+            if sample_filter is not None:
+                statement = statement.where(sample_filter)
+            yield from db.scalars(statement).yield_per(128)
+            return
+        for offset in range(0, len(selected_ids), 250):
+            chunk = selected_ids[offset : offset + 250]
+            rows = db.scalars(
+                select(CaptchaSample).where(CaptchaSample.id.in_(chunk))
+            ).all()
+            indexed = {row.id: row for row in rows}
+            for sample_id in chunk:
+                sample = indexed.get(sample_id)
+                if sample is not None:
+                    yield sample
+
     if captcha_type:
-        statement = statement.where(CaptchaSample.captcha_type == captcha_type)
-    samples = db.scalars(statement).all()
+        suffix = captcha_type
+    else:
+        suffix = "all"
     manifest_samples = []
     category_counts = {kind: 0 for kind in sorted(CAPTCHA_TYPES)}
     output = io.BytesIO()
-    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    compression = zipfile.ZIP_STORED if random_selection else zipfile.ZIP_DEFLATED
+    exported_image_bytes = 0
+    with zipfile.ZipFile(output, "w", compression=compression) as archive:
         for directory in DATASET_DIRECTORY_BY_TYPE.values():
             archive.writestr(f"{directory}/", b"")
-        for sample in samples:
+        for sample in selected_samples():
             if sample.captcha_type not in CAPTCHA_TYPES:
                 continue
             image = bytes(sample.image_data or b"")
@@ -1792,10 +1860,17 @@ def export_captcha_dataset(
                 detected_mime = _image_mime(image)
             except ApiError:
                 continue
+            if random_selection and (
+                exported_image_bytes + len(image)
+                > MAX_ARCHIVE_BYTES - TRAINING_ARCHIVE_OVERHEAD_BYTES
+            ):
+                size_limited = True
+                continue
             extension = ".png" if detected_mime == "image/png" else ".jpg"
             directory = DATASET_DIRECTORY_BY_TYPE[sample.captcha_type]
             image_name = f"{directory}/{sample.id}{extension}"
             archive.writestr(image_name, image)
+            exported_image_bytes += len(image)
             category_counts[sample.captcha_type] += 1
             captured_at = sample.captured_at or sample.created_at or utcnow()
             answer = sample.answer if isinstance(sample.answer, dict) else {}
@@ -1816,8 +1891,8 @@ def export_captcha_dataset(
         manifest = {
             "schema_version": DATASET_SCHEMA_VERSION,
             "captcha_type": captcha_type or "mixed",
-            "source_sample_count": len(samples),
-            "skipped_sample_count": len(samples) - len(manifest_samples),
+            "source_sample_count": source_sample_count,
+            "skipped_sample_count": source_sample_count - len(manifest_samples),
             "categories": {
                 "numeric": {
                     "label": "数字验证码",
@@ -1838,13 +1913,36 @@ def export_captcha_dataset(
             "sample_count": len(manifest_samples),
             "samples": manifest_samples,
         }
+        if random_selection:
+            manifest.update(
+                {
+                    "selection_mode": "random",
+                    "requested_sample_count": int(sample_limit),
+                    "dataset_size_limit": MAX_ARCHIVE_BYTES,
+                    "size_limited": size_limited,
+                }
+            )
+        manifest_bytes = json.dumps(
+            manifest,
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+        if len(manifest_bytes) > MAX_MANIFEST_BYTES:
+            raise ApiError(
+                "dataset_manifest_too_large",
+                "训练数据集清单大小超出限制",
+                status_code=413,
+            )
         archive.writestr(
             "manifest.json",
-            json.dumps(
-                manifest,
-                ensure_ascii=False,
-                indent=2,
-            ).encode("utf-8"),
+            manifest_bytes,
+        )
+    archive_bytes = output.getvalue()
+    if random_selection and len(archive_bytes) > MAX_ARCHIVE_BYTES:
+        raise ApiError(
+            "dataset_archive_too_large",
+            "随机抽取后的训练数据集仍超过 512 MB 限制",
+            status_code=413,
         )
     audit(
         db,
@@ -1856,12 +1954,15 @@ def export_captcha_dataset(
         details={
             "captcha_type": captcha_type,
             "sample_count": len(manifest_samples),
+            "source_sample_count": source_sample_count,
+            "selection_mode": "random" if random_selection else "all",
+            "requested_sample_count": sample_limit,
+            "size_limited": size_limited,
         },
     )
     db.commit()
-    suffix = captcha_type or "all"
     return Response(
-        content=output.getvalue(),
+        content=archive_bytes,
         media_type="application/zip",
         headers={
             "Content-Disposition": (

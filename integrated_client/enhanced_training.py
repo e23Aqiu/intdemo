@@ -32,6 +32,8 @@ from .trainer_component import (
 
 MAX_OUTPUT_JSON_BYTES = 256 * 1024
 MAX_COUNT = 10_000_000
+LEGACY_COMPONENT_DATASET_BYTES = 100 * 1024 * 1024
+LARGE_DATASET_COMPONENT_VERSION = "2.2.0"
 _ALGORITHM = CAPTCHA_ENGINE_ALGORITHM
 _VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
 _TRAINER_VERSION_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.+-]{0,79}$")
@@ -109,6 +111,16 @@ def _emit_progress(
     except Exception:  # noqa: BLE001,S110 - observer callbacks are non-critical
         # Display failures must not affect model training or validation.
         pass
+
+
+def _component_version_key(value: str) -> tuple[int, int, int]:
+    parts = []
+    for piece in str(value or "").split(".")[:3]:
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple((parts + [0, 0, 0])[:3])
 
 
 def _component_progress_event(
@@ -745,6 +757,18 @@ def train_enhanced_candidate(
     archive_bytes = bytes(archive_bytes)
     if not archive_bytes or len(archive_bytes) > MAX_DATASET_BYTES:
         raise EnhancedTrainingError("强化训练数据集为空或大小超过限制")
+    if len(archive_bytes) > LEGACY_COMPONENT_DATASET_BYTES:
+        with component_manager.training_lock():
+            status = component_manager.status(verify_files=False)
+        if (
+            not status.available
+            or _component_version_key(status.version)
+            < _component_version_key(LARGE_DATASET_COMPONENT_VERSION)
+        ):
+            raise EnhancedTrainingError(
+                "超过 100 MB 的训练数据集需要强化训练组件 "
+                f"{LARGE_DATASET_COMPONENT_VERSION} 或更高版本"
+            )
     if base_artifact is not None:
         if not isinstance(base_artifact, (bytes, bytearray, memoryview)):
             raise EnhancedTrainingError("续训基础模型必须是字节数据")

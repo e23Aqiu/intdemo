@@ -9,7 +9,8 @@ from ..config import APP_VERSION
 from .config import OnlineConfig
 
 DATASET_DOWNLOAD_CHUNK_SIZE = 256 * 1024
-MAX_DATASET_DOWNLOAD_BYTES = 100 * 1024 * 1024
+MAX_DATASET_DOWNLOAD_BYTES = 512 * 1024 * 1024
+MAX_TRAINING_SAMPLE_COUNT = 5_000
 MAX_CAPTCHA_MODEL_DOWNLOAD_BYTES = 20 * 1024 * 1024
 DownloadProgressCallback = Callable[
     [int, Optional[int]],  # noqa: UP045 - Python 3.9 runtime alias
@@ -263,13 +264,24 @@ class ApiClient:
         access_token: str,
         captcha_type: str | None = None,
         *,
+        sample_limit: int | None = None,
         progress_callback: DownloadProgressCallback | None = None,
     ) -> bytes:
+        if sample_limit is not None and (
+            type(sample_limit) is not int
+            or not 1 <= sample_limit <= MAX_TRAINING_SAMPLE_COUNT
+        ):
+            raise OnlineApiError(
+                f"训练样本量必须在 1 到 {MAX_TRAINING_SAMPLE_COUNT} 之间"
+            )
+        params = {"captcha_type": captcha_type} if captcha_type else {}
+        if sample_limit is not None:
+            params["sample_limit"] = sample_limit
         response = self._request(
             "GET",
             "/admin/ml/dataset/export",
             token=access_token,
-            params={"captcha_type": captcha_type} if captcha_type else None,
+            params=params or None,
             raw_response=True,
             stream=True,
         )
@@ -280,7 +292,7 @@ class ApiClient:
             total = None
         if total is not None and not 0 <= total <= MAX_DATASET_DOWNLOAD_BYTES:
             response.close()
-            raise OnlineApiError("验证码数据集下载大小超过 100 MB 限制")
+            raise OnlineApiError("验证码数据集下载大小超过 512 MB 限制")
 
         def report(downloaded: int) -> None:
             if progress_callback is None:
@@ -302,7 +314,7 @@ class ApiClient:
                 downloaded += len(block)
                 if downloaded > MAX_DATASET_DOWNLOAD_BYTES:
                     raise OnlineApiError(
-                        "验证码数据集下载大小超过 100 MB 限制"
+                        "验证码数据集下载大小超过 512 MB 限制"
                     )
                 blocks.append(bytes(block))
                 report(downloaded)

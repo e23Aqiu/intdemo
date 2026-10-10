@@ -20,7 +20,7 @@ from .captcha_tensors import cnn_click_tensor
 
 BUILTIN_MODEL_VERSION = "ddddocr-builtin"
 DATASET_SCHEMA_VERSION = 1
-MAX_DATASET_BYTES = 100 * 1024 * 1024
+MAX_DATASET_BYTES = 512 * 1024 * 1024
 MAX_DATASET_FILES = 50_003
 MAX_SAMPLE_IMAGE_BYTES = 1 * 1024 * 1024
 MAX_IMAGE_PIXELS = 4_000_000
@@ -98,6 +98,10 @@ class CaptchaDatasetInspection:
     invalid_answers: int = 0
     invalid_images: int = 0
     duplicate_samples: int = 0
+    source_samples: int = 0
+    selection_mode: str = "all"
+    requested_samples: int = 0
+    size_limited: bool = False
 
     @property
     def valid_count(self) -> int:
@@ -431,7 +435,17 @@ def inspect_training_dataset(
         if isinstance(item, dict) and item.get("captcha_type") == captcha_type
     )
     source_count = manifest.get("source_sample_count")
+    selection_mode = str(manifest.get("selection_mode") or "all").casefold()
+    randomized = selection_mode == "random"
+    requested_count = manifest.get("requested_sample_count")
     if (
+        type(requested_count) is not int
+        or not 1 <= requested_count <= MAX_TRAINING_SAMPLES
+    ):
+        requested_count = 0
+    if randomized:
+        declared = exported
+    elif (
         manifest.get("captcha_type") == captcha_type
         and type(source_count) is int
         and source_count >= exported
@@ -541,6 +555,14 @@ def inspect_training_dataset(
         invalid_answers=invalid_answers,
         invalid_images=invalid_images,
         duplicate_samples=duplicate_samples,
+        source_samples=(
+            source_count
+            if type(source_count) is int and source_count >= exported
+            else exported
+        ),
+        selection_mode="random" if randomized else "all",
+        requested_samples=requested_count if randomized else 0,
+        size_limited=(manifest.get("size_limited") is True),
     )
 
 

@@ -14,6 +14,8 @@ from pathlib import Path
 
 from sqlalchemy import create_engine, text
 
+from app.api import captcha_learning as captcha_learning_api
+
 from .conftest import auth_header, changed_admin, login
 
 PNG_1X1 = base64.b64decode(
@@ -1328,6 +1330,104 @@ def test_retire_knn_migration_archives_only_active_knn_and_is_idempotent(tmp_pat
     assert rows["standard"].status == "current"
     assert rows["legacy"].artifact == b"historical-artifact"
     assert rows["legacy"].metrics == '{"kept":true}'
+
+
+def test_training_dataset_export_randomly_limits_sample_count(client):
+    admin = changed_admin(client)
+    user = _changed_user(client)
+    client.patch(
+        "/api/v1/admin/ml/policy",
+        headers=auth_header(admin),
+        json={"upload_mode": "samples_and_metrics"},
+    )
+    expected_answers = set()
+    for index in range(6):
+        answer = f"{index:04d}"
+        expected_answers.add(answer)
+        payload = _numeric_attempt(success=True)
+        payload["answer"] = {"value": answer}
+        stored = client.post(
+            "/api/v1/captcha/attempts",
+            headers=auth_header(user),
+            json=payload,
+        )
+        assert stored.status_code == 200, stored.text
+        assert stored.json()["sample_stored"] is True
+
+    exported = client.get(
+        "/api/v1/admin/ml/dataset/export",
+        headers=auth_header(admin),
+        params={"captcha_type": "numeric", "sample_limit": 3},
+    )
+
+    assert exported.status_code == 200, exported.text
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["selection_mode"] == "random"
+        assert manifest["requested_sample_count"] == 3
+        assert manifest["source_sample_count"] == 6
+        assert manifest["sample_count"] == 3
+        assert manifest["size_limited"] is False
+        assert {
+            item["answer"]["value"] for item in manifest["samples"]
+        }.issubset(expected_answers)
+
+    missing_type = client.get(
+        "/api/v1/admin/ml/dataset/export",
+        headers=auth_header(admin),
+        params={"sample_limit": 3},
+    )
+    assert missing_type.status_code == 422
+    assert missing_type.json()["code"] == "invalid_training_sample_selection"
+
+
+def test_training_dataset_export_randomly_shrinks_to_byte_limit(
+    client,
+    monkeypatch,
+):
+    monkeypatch.setattr(captcha_learning_api, "MAX_ARCHIVE_BYTES", 10 * 1024)
+    monkeypatch.setattr(
+        captcha_learning_api,
+        "TRAINING_ARCHIVE_OVERHEAD_BYTES",
+        5 * 1024,
+    )
+    admin = changed_admin(client)
+    user = _changed_user(client)
+    client.patch(
+        "/api/v1/admin/ml/policy",
+        headers=auth_header(admin),
+        json={"upload_mode": "samples_and_metrics"},
+    )
+    for index in range(3):
+        image = b"\x89PNG\r\n\x1a\n" + bytes([65 + index]) * 3_000
+        payload = _numeric_attempt(success=True)
+        payload.update(
+            {
+                "image_base64": base64.b64encode(image).decode("ascii"),
+                "answer": {"value": f"{index:04d}"},
+            }
+        )
+        stored = client.post(
+            "/api/v1/captcha/attempts",
+            headers=auth_header(user),
+            json=payload,
+        )
+        assert stored.status_code == 200, stored.text
+
+    exported = client.get(
+        "/api/v1/admin/ml/dataset/export",
+        headers=auth_header(admin),
+        params={"captcha_type": "numeric", "sample_limit": 3},
+    )
+
+    assert exported.status_code == 200, exported.text
+    assert len(exported.content) <= 10 * 1024
+    with zipfile.ZipFile(io.BytesIO(exported.content)) as archive:
+        manifest = json.loads(archive.read("manifest.json"))
+        assert manifest["source_sample_count"] == 3
+        assert manifest["sample_count"] == 1
+        assert manifest["size_limited"] is True
+        assert manifest["dataset_size_limit"] == 10 * 1024
 
 
 def test_empty_dataset_export_keeps_both_category_directories(client):

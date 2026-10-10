@@ -419,6 +419,21 @@ class EnhancedTrainingTests(unittest.TestCase):
                     epochs=invalid,
                 )
 
+    def test_large_dataset_requires_component_2_2_or_newer(self):
+        manager = _FakeComponentManager(trainer_version="2.1.0")
+
+        with patch(
+            "integrated_client.enhanced_training.LEGACY_COMPONENT_DATASET_BYTES",
+            1,
+        ), self.assertRaisesRegex(EnhancedTrainingError, "2.2.0"):
+            train_enhanced_candidate(
+                b"dataset-archive",
+                "numeric",
+                manager,
+            )
+
+        self.assertFalse(manager.locked)
+
     def test_base_model_is_passed_to_component_for_continued_training(self):
         manager = _FakeComponentManager()
         runner = _OutputRunner(manager)

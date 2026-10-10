@@ -52,7 +52,8 @@ from .loading_dialog import LoadingDialog, run_with_loading
 from .table_utils import make_table_columns_resizable
 from .training_terminal_dialog import TrainingTerminalDialog
 
-MAX_IMPORT_BYTES = 100 * 1024 * 1024
+MAX_IMPORT_BYTES = 512 * 1024 * 1024
+MAX_TRAINING_SAMPLE_COUNT = 5_000
 UPLOAD_MODES = (
     ("关闭", "off"),
     ("仅统计", "metrics_only"),
@@ -256,8 +257,8 @@ class MachineLearningPage(QWidget):
         trainer_text.addWidget(self.training_method_label)
         trainer_text.addWidget(self.trainer_status_label)
         trainer_layout.addLayout(trainer_text)
-        trainer_controls = QHBoxLayout()
-        trainer_controls.addStretch()
+        trainer_options = QHBoxLayout()
+        trainer_options.addStretch()
         self.training_mode_combo = QComboBox()
         for label, mode in TRAINING_MODES:
             self.training_mode_combo.addItem(label, mode)
@@ -265,10 +266,26 @@ class MachineLearningPage(QWidget):
         self.training_mode_combo.currentIndexChanged.connect(
             self._change_training_mode
         )
-        trainer_controls.addWidget(self.training_mode_combo)
+        trainer_options.addWidget(self.training_mode_combo)
+        self.training_sample_label = QLabel("本次训练样本")
+        self.training_sample_label.setObjectName("Muted")
+        trainer_options.addWidget(self.training_sample_label)
+        self.training_sample_spin = QSpinBox()
+        self.training_sample_spin.setRange(0, MAX_TRAINING_SAMPLE_COUNT)
+        self.training_sample_spin.setSpecialValueText(
+            f"自动（最多 {MAX_TRAINING_SAMPLE_COUNT} 条）"
+        )
+        self.training_sample_spin.setSuffix(" 条")
+        self.training_sample_spin.setMinimumWidth(154)
+        self.training_sample_spin.setKeyboardTracking(False)
+        self.training_sample_spin.setToolTip(
+            "每次从当前类型的成功样本中重新随机抽取；"
+            "0 表示自动使用最多 5000 条。训练数据包最大 512 MB。"
+        )
+        trainer_options.addWidget(self.training_sample_spin)
         self.training_epochs_label = QLabel("强化训练轮次")
         self.training_epochs_label.setObjectName("Muted")
-        trainer_controls.addWidget(self.training_epochs_label)
+        trainer_options.addWidget(self.training_epochs_label)
         self.training_epochs_spin = QSpinBox()
         self.training_epochs_spin.setRange(
             MIN_TRAINING_EPOCHS,
@@ -288,7 +305,10 @@ class MachineLearningPage(QWidget):
         self.training_epochs_spin.valueChanged.connect(
             self._change_training_epochs
         )
-        trainer_controls.addWidget(self.training_epochs_spin)
+        trainer_options.addWidget(self.training_epochs_spin)
+        trainer_layout.addLayout(trainer_options)
+        trainer_actions = QHBoxLayout()
+        trainer_actions.addStretch()
         self.install_trainer_btn = QPushButton("安装强化组件")
         self.install_trainer_btn.clicked.connect(self._install_trainer_component)
         self.self_test_trainer_btn = QPushButton("组件自检")
@@ -298,10 +318,10 @@ class MachineLearningPage(QWidget):
         self.uninstall_trainer_btn.clicked.connect(
             self._uninstall_trainer_component
         )
-        trainer_controls.addWidget(self.install_trainer_btn)
-        trainer_controls.addWidget(self.self_test_trainer_btn)
-        trainer_controls.addWidget(self.uninstall_trainer_btn)
-        trainer_layout.addLayout(trainer_controls)
+        trainer_actions.addWidget(self.install_trainer_btn)
+        trainer_actions.addWidget(self.self_test_trainer_btn)
+        trainer_actions.addWidget(self.uninstall_trainer_btn)
+        trainer_layout.addLayout(trainer_actions)
         root.addWidget(self.trainer_card)
 
         stats_layout = QGridLayout()
@@ -545,6 +565,7 @@ class MachineLearningPage(QWidget):
     def _set_component_controls_enabled(self, enabled):
         available = bool(enabled) and not self._training_in_progress
         self.training_mode_combo.setEnabled(available)
+        self.training_sample_spin.setEnabled(available)
         enhanced_selected = (
             str(self.training_mode_combo.currentData() or "standard")
             == "enhanced"
@@ -1841,7 +1862,7 @@ class MachineLearningPage(QWidget):
             return
         try:
             if Path(source).stat().st_size > MAX_IMPORT_BYTES:
-                raise OSError("数据集压缩包不能超过 100 MB")
+                raise OSError("数据集压缩包不能超过 512 MB")
         except OSError as exc:
             QMessageBox.warning(self, "无法导入", str(exc))
             return
@@ -1850,7 +1871,7 @@ class MachineLearningPage(QWidget):
         def import_archive():
             archive = Path(source).read_bytes()
             if len(archive) > MAX_IMPORT_BYTES:
-                raise OSError("数据集压缩包不能超过 100 MB")
+                raise OSError("数据集压缩包不能超过 512 MB")
             token = self.session_manager.access_token()
             return self.session_manager.api.admin_import_captcha_dataset(
                 token,
@@ -1883,6 +1904,7 @@ class MachineLearningPage(QWidget):
         mode_name,
         method_name,
         training_epochs=None,
+        training_sample_limit=None,
     ):
         previous = self._training_terminal
         if previous is not None:
@@ -1918,6 +1940,11 @@ class MachineLearningPage(QWidget):
                 "progress": 2,
                 "message": (
                     f"训练任务已启动 · {mode_name} · {method_name}"
+                    + (
+                        f" · 随机抽取 {int(training_sample_limit)} 条"
+                        if training_sample_limit
+                        else f" · 自动抽取最多 {MAX_TRAINING_SAMPLE_COUNT} 条"
+                    )
                     + (
                         f" · 设置 {int(training_epochs)} 轮"
                         if training_epochs is not None
@@ -2003,6 +2030,19 @@ class MachineLearningPage(QWidget):
         training_epochs = (
             self.training_epochs_spin.value() if mode == "enhanced" else None
         )
+        training_sample_limit = int(self.training_sample_spin.value())
+        minimum_samples = 20 if captcha_type == "numeric" else 30
+        if 0 < training_sample_limit < minimum_samples:
+            QMessageBox.warning(
+                self,
+                "训练样本量不足",
+                f"{type_name}至少需要 {minimum_samples} 条样本；"
+                "请增大‘本次训练样本’，或选择自动。",
+            )
+            return
+        requested_sample_limit = (
+            training_sample_limit or MAX_TRAINING_SAMPLE_COUNT
+        )
         if self._server_capabilities_loaded and algorithm not in (
             self._server_model_algorithms.get(captcha_type) or frozenset()
         ):
@@ -2033,6 +2073,12 @@ class MachineLearningPage(QWidget):
                 if training_epochs is not None
                 else "标准模式为一次性训练，不使用训练轮次。\n"
             )
+            + (
+                f"本次将随机抽取最多 {training_sample_limit} 条样本。\n"
+                if training_sample_limit
+                else f"本次将随机抽取最多 {MAX_TRAINING_SAMPLE_COUNT} 条样本。\n"
+            )
+            + "训练包超过 512 MB 时会在服务器继续随机缩减。\n"
             + "\n是否继续？",
             QMessageBox.Yes | QMessageBox.No,
         )
@@ -2059,6 +2105,7 @@ class MachineLearningPage(QWidget):
             mode_name=mode_name,
             method_name=method_name,
             training_epochs=training_epochs,
+            training_sample_limit=(training_sample_limit or None),
         )
 
         def progress(payload):
@@ -2069,7 +2116,10 @@ class MachineLearningPage(QWidget):
                 {
                     "event": "download",
                     "progress": 4,
-                    "message": "正在连接服务器并准备下载原始成功样本",
+                    "message": (
+                        "正在连接服务器并随机抽取"
+                        f"最多 {requested_sample_limit} 条成功样本"
+                    ),
                 }
             )
             token = self.session_manager.access_token()
@@ -2144,6 +2194,7 @@ class MachineLearningPage(QWidget):
             archive = self.session_manager.api.admin_export_captcha_dataset(
                 token,
                 captcha_type,
+                sample_limit=requested_sample_limit,
                 progress_callback=download_progress,
             )
             if cancel_event.is_set():
@@ -2163,6 +2214,13 @@ class MachineLearningPage(QWidget):
                 getattr(inspection, "declared_samples", inspection.valid_count)
                 or 0
             )
+            source_samples = int(
+                getattr(inspection, "source_samples", declared_samples) or 0
+            )
+            random_selection = (
+                getattr(inspection, "selection_mode", "all") == "random"
+            )
+            size_limited = bool(getattr(inspection, "size_limited", False))
             rejection_summary = getattr(inspection, "rejection_summary", None)
             rejection_text = (
                 str(rejection_summary())
@@ -2174,18 +2232,28 @@ class MachineLearningPage(QWidget):
                     "event": "inspection_complete",
                     "progress": 19,
                     "message": (
-                        f"样本检查完成：服务器记录 {declared_samples} 条，"
-                        f"有效且不重复 {inspection.valid_count} 条，"
-                        f"过滤原因：{rejection_text}"
+                        (
+                            f"样本检查完成：服务器可用 {source_samples} 条，"
+                            f"本次随机抽取 {declared_samples} 条，"
+                            if random_selection
+                            else f"样本检查完成：服务器记录 {declared_samples} 条，"
+                        )
+                        + f"有效且不重复 {inspection.valid_count} 条，"
+                        + f"过滤原因：{rejection_text}"
+                        + (" · 已按 512 MB 上限缩减" if size_limited else "")
                     ),
                 }
             )
-            minimum = 20 if captcha_type == "numeric" else 30
-            if inspection.valid_count < minimum:
+            if not random_selection:
                 raise CaptchaTrainingError(
-                    f"服务器记录 {declared_samples} 条，实际有效且不重复的"
+                    "当前在线服务器尚不支持训练样本随机抽取，"
+                    "请先升级服务器后重试"
+                )
+            if inspection.valid_count < minimum_samples:
+                raise CaptchaTrainingError(
+                    f"服务器可用 {source_samples} 条，本次实际有效且不重复的"
                     f"{type_name}样本只有 {inspection.valid_count} 条，"
-                    f"至少需要 {minimum} 条。\n"
+                    f"至少需要 {minimum_samples} 条。\n"
                     f"过滤原因：{rejection_text}"
                 )
             if mode == "enhanced":
