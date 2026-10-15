@@ -63,6 +63,8 @@ from .core import (
     validate_test_environment,
 )
 from .release_tasks import (
+    GITHUB_UNAVAILABLE_EXIT,
+    PUBLISH_CONFIRMATION_PENDING_EXIT,
     ReleaseTaskError,
     detect_uos_delta_base_version,
     detect_uos_result_delta_source,
@@ -1603,12 +1605,30 @@ class ReleasePublisherWindow(QMainWindow):
             return
         if exit_code != 0:
             title = step.title if step is not None else "当前步骤"
-            if step is not None and step.key == "build_windows_github" and exit_code == 20:
+            if (
+                step is not None
+                and step.key == "build_windows_github"
+                and exit_code == GITHUB_UNAVAILABLE_EXIT
+            ):
                 self._finish_pipeline(
                     False,
                     "GitHub 暂不可用，Windows 真机构建任务包已经保留；"
                     "完成真机构建后点击“导入 Windows 构建包”继续",
                     warning=True,
+                )
+                return
+            if (
+                step is not None
+                and step.key == "publish"
+                and exit_code == PUBLISH_CONFIRMATION_PENDING_EXIT
+            ):
+                self._finish_pipeline(
+                    False,
+                    "原子发布命令已经发出，但网络中断导致最终状态暂时无法确认；"
+                    "请保留当前构建结果，网络恢复后再次点击发布，发布器会自动核对并补记结果",
+                    warning=True,
+                    warning_title="发布状态待确认",
+                    outcome_label="待确认",
                 )
                 return
             self._finish_pipeline(False, f"{title}失败，退出码 {exit_code}")
@@ -1672,6 +1692,8 @@ class ReleasePublisherWindow(QMainWindow):
         message: str,
         *,
         warning: bool = False,
+        warning_title: str = "需要 Windows 真机构建",
+        outcome_label: str = "",
     ) -> None:
         self._steps.clear()
         self._current_step = None
@@ -1680,12 +1702,13 @@ class ReleasePublisherWindow(QMainWindow):
         self._refresh_release_readiness()
         self.status_label.setText(message)
         self._append_log(
-            f"\n{'成功' if success else '失败'}：{message}\n" + "=" * 72
+            f"\n{outcome_label or ('成功' if success else '失败')}：{message}\n"
+            + "=" * 72
         )
         if success:
             QMessageBox.information(self, "执行完成", message)
         elif warning and not self._cancel_requested:
-            QMessageBox.warning(self, "需要 Windows 真机构建", message)
+            QMessageBox.warning(self, warning_title, message)
         elif not self._cancel_requested:
             QMessageBox.critical(self, "执行失败", message)
 

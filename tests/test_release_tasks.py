@@ -1376,6 +1376,31 @@ class ReleaseTasksTests(unittest.TestCase):
             )
         )
 
+    def test_pending_manifest_reuses_original_publish_time_for_same_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "test.json"
+            existing = {
+                "version": "1.2.3",
+                "published_at": "2026-10-09T07:27:43Z",
+                "source_commit": COMMIT,
+                "notes": "same release",
+            }
+            candidate = {
+                **existing,
+                "published_at": "2026-10-09T08:00:00Z",
+            }
+            tasks.write_json(path, existing)
+
+            with patch("builtins.print"):
+                reused = tasks.reuse_pending_update_manifest(path, candidate)
+
+            self.assertEqual(reused, existing)
+            changed = {**candidate, "notes": "different release"}
+            self.assertIs(
+                tasks.reuse_pending_update_manifest(path, changed),
+                changed,
+            )
+
     def test_ssh_options_enable_keepalive_and_optional_identity(self):
         identity = Path("release-key.pem")
 
@@ -1406,6 +1431,23 @@ class ReleaseTasksTests(unittest.TestCase):
                 capture=True,
                 timeout=3,
             )
+
+    def test_only_ambiguous_ssh_failures_enter_publish_reconciliation(self):
+        self.assertTrue(
+            tasks.ssh_publish_result_is_ambiguous(
+                tasks.CommandFailure(["ssh", "release-server"], 255)
+            )
+        )
+        self.assertTrue(
+            tasks.ssh_publish_result_is_ambiguous(
+                tasks.ReleaseTaskError("命令执行超时（60 秒）：ssh release-server")
+            )
+        )
+        self.assertFalse(
+            tasks.ssh_publish_result_is_ambiguous(
+                tasks.CommandFailure(["ssh", "release-server"], 1)
+            )
+        )
 
     def test_remote_queries_use_operation_specific_timeouts(self):
         with patch.object(tasks, "capture_command", return_value="123") as capture:
@@ -1933,7 +1975,13 @@ class ReleaseTasksTests(unittest.TestCase):
                 patch.object(
                     tasks,
                     "remote_hash",
-                    side_effect=["", "", "", manifest_hash],
+                    side_effect=[
+                        "",
+                        "",
+                        "",
+                        manifest_hash,
+                        descriptor["sha256"],
+                    ],
                 ),
                 patch.object(tasks, "upload_file_resumable") as upload,
                 patch.object(tasks, "load_remote_json", return_value=manifest),
@@ -1961,6 +2009,147 @@ class ReleaseTasksTests(unittest.TestCase):
         self.assertFalse(
             any(call.args[0][0] == "scp" for call in run_command.call_args_list)
         )
+
+    def test_remote_publish_retries_final_confirmation_after_disconnect(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"new installer")
+            manifest = {"version": "1.2.3"}
+            manifest_path = root / "stable.json"
+            tasks.write_json(manifest_path, manifest)
+            descriptor = {
+                "name": artifact.name,
+                "path": artifact,
+                "size": artifact.stat().st_size,
+                "sha256": tasks.sha256(artifact),
+            }
+            manifest_hash = tasks.sha256(manifest_path)
+            with (
+                patch.object(tasks, "run_command"),
+                patch.object(tasks, "ssh_capture", return_value=""),
+                patch.object(
+                    tasks,
+                    "remote_hash",
+                    side_effect=[
+                        "",
+                        "",
+                        "",
+                        tasks.ReleaseTaskError("connection timed out"),
+                        manifest_hash,
+                        descriptor["sha256"],
+                    ],
+                ),
+                patch.object(tasks, "upload_file_resumable"),
+                patch.object(tasks, "load_remote_json", return_value=manifest),
+                patch.object(tasks.time, "sleep") as sleep,
+                patch("builtins.print"),
+            ):
+                paused = tasks.publish_remote(
+                    root,
+                    version="1.2.3",
+                    source_commit=COMMIT,
+                    channel="stable",
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                    artifacts={"windows_installer": descriptor},
+                    host="release-server",
+                    remote_path="/opt/intdemo/updates",
+                    identity_file=None,
+                )
+
+        self.assertFalse(paused)
+        sleep.assert_called_once_with(
+            tasks.PUBLISH_CONFIRM_RETRY_DELAYS_SECONDS[0]
+        )
+
+    def test_remote_publish_recovers_an_identical_already_published_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            artifact = root / "setup.exe"
+            artifact.write_bytes(b"new installer")
+            manifest = {"version": "1.2.3", "source_commit": COMMIT}
+            manifest_path = root / "stable.json"
+            tasks.write_json(manifest_path, manifest)
+            descriptor = {
+                "name": artifact.name,
+                "path": artifact,
+                "size": artifact.stat().st_size,
+                "sha256": tasks.sha256(artifact),
+            }
+            manifest_hash = tasks.sha256(manifest_path)
+            with (
+                patch.object(tasks, "run_command") as run_command,
+                patch.object(
+                    tasks,
+                    "ssh_capture",
+                    return_value=json.dumps(manifest),
+                ),
+                patch.object(
+                    tasks,
+                    "remote_hash",
+                    side_effect=[
+                        manifest_hash,
+                        manifest_hash,
+                        manifest_hash,
+                        descriptor["sha256"],
+                    ],
+                ),
+                patch.object(tasks, "load_remote_json", return_value=manifest),
+                patch.object(tasks, "upload_file_resumable") as upload,
+                patch("builtins.print"),
+            ):
+                paused = tasks.publish_remote(
+                    root,
+                    version="1.2.3",
+                    source_commit=COMMIT,
+                    channel="stable",
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                    artifacts={"windows_installer": descriptor},
+                    host="release-server",
+                    remote_path="/opt/intdemo/updates",
+                    identity_file=None,
+                )
+
+        self.assertFalse(paused)
+        upload.assert_not_called()
+        self.assertEqual(run_command.call_count, 1)
+
+    def test_final_confirmation_reports_pending_after_all_retries_fail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = {"version": "1.2.3"}
+            manifest_path = root / "stable.json"
+            tasks.write_json(manifest_path, manifest)
+            with (
+                patch.object(
+                    tasks,
+                    "remote_hash",
+                    side_effect=tasks.ReleaseTaskError("connection timed out"),
+                ) as remote_hash,
+                patch.object(tasks.time, "sleep") as sleep,
+                patch("builtins.print"),
+                self.assertRaisesRegex(
+                    tasks.PublishConfirmationPending,
+                    "当前状态不能安全判定为失败",
+                ),
+            ):
+                tasks.confirm_remote_publish(
+                    root,
+                    manifest_path=manifest_path,
+                    manifest=manifest,
+                    artifacts={},
+                    host="release-server",
+                    remote_path="/opt/intdemo/updates",
+                    channel="stable",
+                    identity_file=None,
+                    pending_context="服务器已完成原子发布命令",
+                    retry_delays=(0, 0),
+                )
+
+        self.assertEqual(remote_hash.call_count, 3)
+        self.assertEqual(sleep.call_count, 2)
 
     def test_github_run_can_be_identified_by_tag_display_title(self):
         tag = "intdemo-windows/v1.2.3-request"
@@ -2015,6 +2204,7 @@ class ReleaseTasksTests(unittest.TestCase):
 
     def test_github_fallback_exit_and_build_scripts_do_not_call_app_server(self):
         self.assertEqual(tasks.GITHUB_UNAVAILABLE_EXIT, 20)
+        self.assertEqual(tasks.PUBLISH_CONFIRMATION_PENDING_EXIT, 21)
         workflow = (REPO_ROOT / ".github/workflows/windows-release.yml").read_text(
             encoding="utf-8"
         )
@@ -2042,6 +2232,35 @@ class ReleaseTasksTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("windows-github", result.stdout)
+
+    def test_publish_confirmation_pending_has_a_distinct_exit_code(self):
+        arguments = [
+            "publish",
+            "--version",
+            "1.2.3",
+            "--base-url",
+            "https://api.example.com",
+            "--notes",
+            "release notes",
+            "--remote-host",
+            "release-server",
+            "--remote-path",
+            "/opt/intdemo/updates",
+            "--confirm-version",
+            "1.2.3",
+        ]
+        with (
+            patch.object(
+                tasks,
+                "publish_release",
+                side_effect=tasks.PublishConfirmationPending("network lost"),
+            ),
+            patch("builtins.print") as output,
+        ):
+            exit_code = tasks.main(arguments)
+
+        self.assertEqual(exit_code, tasks.PUBLISH_CONFIRMATION_PENDING_EXIT)
+        self.assertIn("发布状态待确认", output.call_args.args[0])
 
 
 if __name__ == "__main__":

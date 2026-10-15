@@ -47,6 +47,7 @@ MAX_ELIGIBLE_CLIENT_VERSIONS = 32
 WINDOWS_WORKFLOW_NAME = "Windows release build"
 WINDOWS_TAG_PREFIX = "intdemo-windows/v"
 GITHUB_UNAVAILABLE_EXIT = 20
+PUBLISH_CONFIRMATION_PENDING_EXIT = 21
 SSH_CONNECTION_OPTIONS = (
     "BatchMode=yes",
     "ConnectTimeout=20",
@@ -62,6 +63,7 @@ SFTP_PROGRESS_INTERVAL_SECONDS = 10.0
 SFTP_STALL_TIMEOUT_SECONDS = 300.0
 SFTP_RETRY_DELAYS_SECONDS = (2, 5, 10, 20, 30)
 UPDATE_HTTP_RETRY_DELAYS_SECONDS = (1, 2, 4)
+PUBLISH_CONFIRM_RETRY_DELAYS_SECONDS = (2, 5, 10, 20)
 
 
 class ReleaseTaskError(RuntimeError):
@@ -69,6 +71,10 @@ class ReleaseTaskError(RuntimeError):
 
 
 class GithubUnavailable(ReleaseTaskError):
+    pass
+
+
+class PublishConfirmationPending(ReleaseTaskError):
     pass
 
 
@@ -2871,6 +2877,38 @@ def load_release_candidates(
     return windows_receipt, windows_paths, uos_receipt, uos_paths
 
 
+def reuse_pending_update_manifest(
+    path: Path,
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        existing = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return candidate
+    if not isinstance(existing, dict):
+        return candidate
+    published_at = str(existing.get("published_at") or "").strip()
+    try:
+        parsed_published_at = datetime.fromisoformat(
+            published_at.replace("Z", "+00:00")
+        )
+    except ValueError:
+        return candidate
+    if parsed_published_at.tzinfo is None:
+        return candidate
+    existing_identity = dict(existing)
+    candidate_identity = dict(candidate)
+    existing_identity.pop("published_at", None)
+    candidate_identity.pop("published_at", None)
+    if existing_identity != candidate_identity:
+        return candidate
+    print(
+        "检测到同一版本的待确认发布清单，复用原发布时间继续核对远程状态",
+        flush=True,
+    )
+    return existing
+
+
 def prepare_update_manifest(
     *,
     version: str,
@@ -3622,6 +3660,85 @@ def assert_platform_server_support(
         raise ReleaseTaskError(f"在线更新服务预检返回 HTTP {status}")
 
 
+def confirm_remote_publish(
+    root: Path,
+    *,
+    manifest_path: Path,
+    manifest: dict[str, Any],
+    artifacts: dict[str, dict[str, Any]],
+    host: str,
+    remote_path: str,
+    channel: str,
+    identity_file: Path | None,
+    pending_context: str,
+    retry_delays: tuple[int, ...] = PUBLISH_CONFIRM_RETRY_DELAYS_SECONDS,
+) -> None:
+    final_manifest = f"{remote_path}/{channel}.json"
+    expected_manifest_hash = sha256(manifest_path)
+    max_attempts = len(retry_delays) + 1
+    last_error: ReleaseTaskError | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            installed_hash = remote_hash(
+                root,
+                host,
+                final_manifest,
+                identity_file,
+            )
+            installed = load_remote_json(
+                root,
+                host,
+                final_manifest,
+                identity_file,
+            )
+            artifact_hashes = {
+                str(descriptor["name"]): remote_hash(
+                    root,
+                    host,
+                    f"{remote_path}/files/{descriptor['name']}",
+                    identity_file,
+                )
+                for descriptor in artifacts.values()
+            }
+        except ReleaseTaskError as exc:
+            last_error = exc
+            if attempt >= max_attempts:
+                break
+            delay = retry_delays[attempt - 1]
+            print(
+                f"最终发布确认连接中断（第 {attempt}/{max_attempts} 次），"
+                f"{delay} 秒后自动重试",
+                flush=True,
+            )
+            time.sleep(delay)
+            continue
+
+        if installed_hash != expected_manifest_hash:
+            raise ReleaseTaskError("发布后的远程清单 SHA-256 不匹配")
+        if installed != manifest:
+            raise ReleaseTaskError("发布后的远程清单与本地清单不一致")
+        for descriptor in artifacts.values():
+            name = str(descriptor["name"])
+            if artifact_hashes[name] != str(descriptor["sha256"]).casefold():
+                raise ReleaseTaskError(f"发布后的远程安装包 SHA-256 不匹配：{name}")
+        if attempt > 1:
+            print("网络恢复，远程发布清单和全部安装包已确认", flush=True)
+        return
+
+    detail = f"；最后错误：{last_error}" if last_error is not None else ""
+    raise PublishConfirmationPending(
+        f"{pending_context}，但连续 {max_attempts} 次无法完成最终回读。"
+        "当前状态不能安全判定为失败；请保留现有构建结果，网络恢复后再次点击发布，"
+        f"发布器会先核对同一清单并补记成功状态{detail}"
+    )
+
+
+def ssh_publish_result_is_ambiguous(error: ReleaseTaskError) -> bool:
+    if isinstance(error, CommandFailure):
+        return error.returncode == 255
+    return "命令执行超时" in str(error)
+
+
 def publish_remote(
     root: Path,
     *,
@@ -3672,6 +3789,24 @@ def publish_remote(
             raise ReleaseTaskError("远程更新清单根节点必须是对象")
     if remote_hash(root, host, final_manifest, identity_file) != current_hash:
         raise ReleaseTaskError("读取期间远程更新清单已变化，请重试")
+    expected_manifest_hash = sha256(manifest_path)
+    if current_hash == expected_manifest_hash and current_manifest == manifest:
+        print(
+            "远程已存在完全一致的目标清单，正在补做发布确认和本地归档",
+            flush=True,
+        )
+        confirm_remote_publish(
+            root,
+            manifest_path=manifest_path,
+            manifest=manifest,
+            artifacts=artifacts,
+            host=host,
+            remote_path=remote_path,
+            channel=channel,
+            identity_file=identity_file,
+            pending_context="服务器已存在完全一致的目标清单",
+        )
+        return False
     was_paused = remote_manifest_guard(current_manifest, version)
 
     moves: list[tuple[str, str]] = []
@@ -3723,16 +3858,48 @@ def publish_remote(
     commands.append(
         f"{{ rmdir {shlex.quote(incoming)} 2>/dev/null || true; }}"
     )
-    run_command(
-        ["ssh", *ssh_options(identity_file), host, " && ".join(commands)],
-        cwd=root,
-        timeout=SSH_COMMAND_TIMEOUT_SECONDS,
+    try:
+        run_command(
+            ["ssh", *ssh_options(identity_file), host, " && ".join(commands)],
+            cwd=root,
+            timeout=SSH_COMMAND_TIMEOUT_SECONDS,
+        )
+    except ReleaseTaskError as exc:
+        if not ssh_publish_result_is_ambiguous(exc):
+            raise
+        print(
+            "原子发布命令的 SSH 连接中断，正在核对服务器是否已经执行完成",
+            flush=True,
+        )
+        try:
+            confirm_remote_publish(
+                root,
+                manifest_path=manifest_path,
+                manifest=manifest,
+                artifacts=artifacts,
+                host=host,
+                remote_path=remote_path,
+                channel=channel,
+                identity_file=identity_file,
+                pending_context="原子发布命令已发出但 SSH 连接中断",
+            )
+        except PublishConfirmationPending:
+            raise
+        except ReleaseTaskError:
+            raise exc
+        print("已确认服务器完成原子发布，继续保存本地发布记录", flush=True)
+        return was_paused
+    confirm_remote_publish(
+        root,
+        manifest_path=manifest_path,
+        manifest=manifest,
+        artifacts=artifacts,
+        host=host,
+        remote_path=remote_path,
+        channel=channel,
+        identity_file=identity_file,
+        pending_context="服务器已完成原子发布命令",
     )
-    if remote_hash(root, host, final_manifest, identity_file) != sha256(manifest_path):
-        raise ReleaseTaskError("发布后的远程清单 SHA-256 不匹配")
-    installed = load_remote_json(root, host, final_manifest, identity_file)
-    if installed != manifest:
-        raise ReleaseTaskError("发布后的远程清单与本地清单不一致")
     return was_paused
 
 
@@ -3933,6 +4100,7 @@ def publish_release(
         eligible_client_versions=eligible_versions,
     )
     manifest_path = root / "dist" / "update-release" / f"{channel}.json"
+    manifest = reuse_pending_update_manifest(manifest_path, manifest)
     write_json(manifest_path, manifest)
     was_paused = publish_remote(
         root,
@@ -4608,6 +4776,9 @@ def main(argv: list[str] | None = None) -> int:
             )
         else:
             parser.error(f"未知命令：{args.command}")
+    except PublishConfirmationPending as exc:
+        print(f"发布状态待确认：{exc}", file=sys.stderr)
+        return PUBLISH_CONFIRMATION_PENDING_EXIT
     except GithubUnavailable as exc:
         print(f"GitHub 暂不可用：{exc}", file=sys.stderr)
         if getattr(args, "fallback_on_unavailable", False):

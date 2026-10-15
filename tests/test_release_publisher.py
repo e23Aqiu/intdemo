@@ -1727,6 +1727,42 @@ class ReleasePublisherUiTests(unittest.TestCase):
         self.assertTrue(finish_pipeline.call_args.kwargs["warning"])
         window.deleteLater()
 
+    def test_publish_confirmation_pending_is_shown_as_warning(self):
+        window = ReleasePublisherWindow(REPO_ROOT)
+        process = Mock()
+        window.process = process
+        window._current_step = CommandStep(
+            key="publish",
+            title="发布双端版本 1.4.2",
+            program="python",
+            arguments=(),
+            working_directory=REPO_ROOT,
+        )
+
+        with (
+            patch.object(window, "sender", return_value=process),
+            patch.object(window, "_read_process_output"),
+            patch.object(window, "_finish_pipeline") as finish_pipeline,
+        ):
+            window._process_finished(
+                release_tasks.PUBLISH_CONFIRMATION_PENDING_EXIT,
+                Mock(),
+            )
+
+        finish_pipeline.assert_called_once()
+        self.assertFalse(finish_pipeline.call_args.args[0])
+        self.assertIn("状态暂时无法确认", finish_pipeline.call_args.args[1])
+        self.assertTrue(finish_pipeline.call_args.kwargs["warning"])
+        self.assertEqual(
+            finish_pipeline.call_args.kwargs["warning_title"],
+            "发布状态待确认",
+        )
+        self.assertEqual(
+            finish_pipeline.call_args.kwargs["outcome_label"],
+            "待确认",
+        )
+        window.deleteLater()
+
     def test_pause_distribution_button_confirms_and_runs_remote_pause(self):
         window = ReleasePublisherWindow(REPO_ROOT)
         window.remote_host_edit.setText("intdemo-test")
