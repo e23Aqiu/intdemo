@@ -369,13 +369,17 @@ class UnreadMessageBubble(QWidget):
     def text(self):
         return self._text
 
-    def set_unread_count(self, count):
+    def set_unread_count(self, count, *, text=None, tooltip=None):
         self._unread_count = max(0, int(count or 0))
         self._text = (
-            f"有 {self._unread_count} 条新消息" if self._unread_count else ""
+            str(text or f"有 {self._unread_count} 条新消息")
+            if self._unread_count
+            else ""
         )
         self.setToolTip(
-            f"{self._unread_count} 条未读消息" if self._unread_count else ""
+            str(tooltip or f"{self._unread_count} 条未读消息")
+            if self._unread_count
+            else ""
         )
         self.resize(self.sizeHint())
         self.reposition()
@@ -504,6 +508,8 @@ class UnreadBadgeButton(QPushButton):
         super().__init__(text, parent)
         self._base_text = str(text or "")
         self._unread_count = 0
+        self._unread_bubble_text = ""
+        self._unread_bubble_tooltip = ""
         self._unread_bubble = None
         self._unread_overlay_parent = None
         self.setProperty("hasUnread", False)
@@ -539,11 +545,20 @@ class UnreadBadgeButton(QPushButton):
                 self,
                 overlay_parent,
             )
-        self._unread_bubble.set_unread_count(self._unread_count)
+        self._unread_bubble.set_unread_count(
+            self._unread_count,
+            text=self._unread_bubble_text,
+            tooltip=self._unread_bubble_tooltip,
+        )
 
     def set_unread_count(self, count):
+        self._set_unread_state(count)
+
+    def _set_unread_state(self, count, *, bubble_text="", bubble_tooltip=""):
         count = max(0, int(count or 0))
         self._unread_count = count
+        self._unread_bubble_text = str(bubble_text or "")
+        self._unread_bubble_tooltip = str(bubble_tooltip or "")
         self.setProperty("hasUnread", bool(count))
         self.setText(self._base_text)
         self.style().unpolish(self)
@@ -561,9 +576,45 @@ class UnreadBadgeButton(QPushButton):
 class AnnouncementHornButton(UnreadBadgeButton):
     """Fixed-size announcement shortcut with an independent unread bubble."""
 
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self._announcement_unread_count = 0
+        self._message_unread_count = 0
+
+    @property
+    def announcement_unread_count(self):
+        return self._announcement_unread_count
+
     @property
     def message_unread_count(self):
-        return self._unread_count
+        return self._message_unread_count
+
+    def set_announcement_unread_count(self, count):
+        self._announcement_unread_count = max(0, int(count or 0))
+        self._refresh_unread_summary()
+
+    def set_message_unread_count(self, count):
+        self._message_unread_count = max(0, int(count or 0))
+        self._refresh_unread_summary()
+
+    def _refresh_unread_summary(self):
+        announcement_count = self._announcement_unread_count
+        message_count = self._message_unread_count
+        parts = []
+        if announcement_count:
+            parts.append(f"有 {announcement_count} 条未读公告")
+        if message_count:
+            parts.append(
+                f"{message_count} 条管理员新消息"
+                if parts
+                else f"有 {message_count} 条管理员新消息"
+            )
+        summary = " · ".join(parts)
+        self._set_unread_state(
+            announcement_count + message_count,
+            bubble_text=summary,
+            bubble_tooltip=summary,
+        )
 
 
 class AnnouncementTickerButton(QPushButton):

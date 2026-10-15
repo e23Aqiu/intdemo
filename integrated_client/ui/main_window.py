@@ -930,11 +930,18 @@ class MainWindow(FramelessMainWindow):
             if self.account.is_admin
             else max(0, int(self._announcement_message_unread_count or 0))
         )
-        if not has_announcements:
-            self.announcement_horn_button.setProperty(
-                "hasUnread",
-                bool(message_unread),
+        announcement_unread_count = (
+            0
+            if self.account.is_admin
+            else sum(
+                not announcement.get("read_at")
+                for announcement in self.announcements
             )
+        )
+        self.announcement_horn_button.set_announcement_unread_count(
+            announcement_unread_count
+        )
+        if not has_announcements:
             self.announcement_horn_button.setToolTip(
                 (
                     f"有 {message_unread} 条管理员未读回复，点击查看历史会话"
@@ -955,15 +962,7 @@ class MainWindow(FramelessMainWindow):
                 or announcement.get("title")
                 or "查看公告"
             )
-            unread_announcements = bool(
-                not self.account.is_admin
-                and any(
-                    not announcement.get("read_at")
-                    for announcement in self.announcements
-                )
-            )
-            unread = bool(unread_announcements or message_unread)
-            self.announcement_horn_button.setProperty("hasUnread", unread)
+            unread_announcements = bool(announcement_unread_count)
             self.announcement_horn_button.setToolTip(
                 (
                     f"有 {message_unread} 条管理员未读回复"

@@ -348,6 +348,9 @@ class AnnouncementUiTests(unittest.TestCase):
             "收到 3 条未读用户消息",
         )
         self.assertFalse(window.announcement_horn_button.property("hasUnread"))
+        self.assertEqual(window.announcement_horn_button.unread_count, 0)
+        self.assertEqual(window.announcement_horn_button.announcement_unread_count, 0)
+        self.assertTrue(window.announcement_horn_button.unread_bubble.isHidden())
         self.assertEqual(
             window.announcement_horn_button.toolTip(),
             "点击查看全部公告",
@@ -404,6 +407,12 @@ class AnnouncementUiTests(unittest.TestCase):
         )
         window.show()
         self.assertTrue(self._wait_until(lambda: len(window.announcements) == 2))
+        self.assertEqual(window.announcement_horn_button.announcement_unread_count, 1)
+        self.assertEqual(
+            window.announcement_horn_button.unread_bubble.text(),
+            "有 1 条未读公告",
+        )
+        self.assertTrue(window.announcement_horn_button.unread_bubble.isVisible())
 
         window.announcement_horn_button.click()
         self.app.processEvents()
@@ -572,7 +581,7 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(window.announcement_horn_button.width(), 38)
         self.assertEqual(
             window.announcement_horn_button.unread_bubble.text(),
-            "有 2 条新消息",
+            "有 2 条管理员新消息",
         )
         self.assertTrue(window.announcement_horn_button.unread_bubble.isVisible())
 
@@ -609,6 +618,50 @@ class AnnouncementUiTests(unittest.TestCase):
         self.assertEqual(window.announcement_horn_button.text(), "")
         self.assertEqual(window.announcement_horn_button.width(), 38)
         self.assertTrue(window.announcement_horn_button.unread_bubble.isHidden())
+
+    def test_horn_bubble_distinguishes_announcements_from_admin_messages(self):
+        api = FakeAnnouncementApi()
+        api.visible_announcements = [self._announcement()]
+        api.conversations = [
+            {
+                "id": "conversation-unread",
+                "announcement_id": "announcement-1",
+                "announcement_title": "系统维护公告",
+                "status": "open",
+                "user_unread_count": 2,
+                "updated_at": "2026-08-19T10:05:00",
+                "last_message": {"message": "请查看管理员回复"},
+                "messages": [],
+            }
+        ]
+        user = self.database.create_account(
+            "combined_badge_user",
+            "CombinedBadge@123",
+            "user",
+            self.admin.id,
+            display_name="组合气泡用户",
+        )
+        window = MainWindow(
+            self.database,
+            user,
+            session_manager=FakeSession(api),
+        )
+        window.show()
+
+        self.assertTrue(
+            self._wait_until(
+                lambda: (
+                    window.announcement_horn_button.announcement_unread_count == 1
+                    and window.announcement_horn_button.message_unread_count == 2
+                )
+            )
+        )
+        self.assertEqual(window.announcement_horn_button.unread_count, 3)
+        self.assertEqual(
+            window.announcement_horn_button.unread_bubble.text(),
+            "有 1 条未读公告 · 2 条管理员新消息",
+        )
+        self.assertTrue(window.announcement_horn_button.unread_bubble.isVisible())
 
     def test_image_preview_supports_fit_zoom_and_actual_size(self):
         pixmap = QPixmap(1600, 1000)
