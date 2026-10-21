@@ -521,7 +521,7 @@ class TrainerComponentTests(unittest.TestCase):
         orphan.mkdir()
         (orphan / "orphan.bin").write_bytes(b"orphan")
 
-        status = manager.status(verify_files=False)
+        status = manager.status(verify_files=False, recover=True)
 
         self.assertEqual(status.code, STATUS_AVAILABLE)
         self.assertFalse(status.maintenance_required)
@@ -540,14 +540,16 @@ class TrainerComponentTests(unittest.TestCase):
         (installing / "partial.bin").write_bytes(b"partial")
 
         with manager.training_lock():
-            status = manager.status(verify_files=False)
+            status = manager.status(verify_files=False, recover=True)
 
         self.assertTrue(installing.exists())
         self.assertTrue(status.maintenance_required)
         self.assertTrue(status.cleanup_available)
         self.assertIn("本次未清理", status.maintenance_message)
         self.assertGreaterEqual(status.installed_size, len(b"partial"))
-        self.assertFalse(manager.status(verify_files=False).maintenance_required)
+        self.assertFalse(
+            manager.status(verify_files=False, recover=True).maintenance_required
+        )
         self.assertFalse(installing.exists())
 
     def test_status_lock_error_without_residual_does_not_request_maintenance(self):
@@ -559,7 +561,7 @@ class TrainerComponentTests(unittest.TestCase):
             "_operation_lock",
             side_effect=PermissionError("lock directory is read-only"),
         ):
-            status = manager.status(verify_files=False)
+            status = manager.status(verify_files=False, recover=True)
 
         self.assertEqual(status.code, STATUS_AVAILABLE)
         self.assertFalse(status.maintenance_required)
@@ -581,13 +583,15 @@ class TrainerComponentTests(unittest.TestCase):
             "integrated_client.trainer_component.shutil.rmtree",
             side_effect=deny_target,
         ):
-            status = manager.status(verify_files=False)
+            status = manager.status(verify_files=False, recover=True)
 
         self.assertTrue(installing.exists())
         self.assertTrue(status.maintenance_required)
         self.assertTrue(status.cleanup_available)
         self.assertIn("directory busy", status.maintenance_message)
-        self.assertFalse(manager.status(verify_files=False).maintenance_required)
+        self.assertFalse(
+            manager.status(verify_files=False, recover=True).maintenance_required
+        )
         self.assertFalse(installing.exists())
 
     def test_status_recovers_confirmed_interrupted_uninstall(self):
@@ -608,7 +612,7 @@ class TrainerComponentTests(unittest.TestCase):
         )
         os.replace(manager.component_root, removal)
 
-        status = manager.status(verify_files=False)
+        status = manager.status(verify_files=False, recover=True)
 
         self.assertEqual(status.code, STATUS_NOT_INSTALLED)
         self.assertFalse(status.maintenance_required)
@@ -635,7 +639,7 @@ class TrainerComponentTests(unittest.TestCase):
         os.replace(manager.component_root, removal)
 
         with manager.training_lock():
-            status = manager.status(verify_files=False)
+            status = manager.status(verify_files=False, recover=True)
 
         self.assertEqual(status.code, STATUS_NOT_INSTALLED)
         self.assertTrue(status.maintenance_required)
@@ -684,6 +688,87 @@ class TrainerComponentTests(unittest.TestCase):
         self.assertTrue(status.maintenance_required)
         self.assertFalse(status.cleanup_available)
         self.assertEqual(sentinel.read_bytes(), b"keep")
+
+    def test_status_and_preference_queries_do_not_block_training(self):
+        manager = self.manager()
+        manager.install(self.package())
+        manager.set_preferred_mode("enhanced")
+        training_manager = self.manager()
+        original_status = manager._get_status_read_only
+        queries = (
+            ("status", lambda: manager.status(verify_files=False)),
+            ("get_status", manager.get_status),
+            ("preferred_mode", manager.preferred_mode),
+        )
+
+        for name, query in queries:
+            with self.subTest(query=name):
+                started = threading.Event()
+                release = threading.Event()
+                results = []
+                errors = []
+
+                def blocking_status(**kwargs):
+                    started.set()
+                    if not release.wait(10):
+                        raise TimeoutError("测试未释放组件状态查询")
+                    return original_status(**kwargs)
+
+                def read_status():
+                    try:
+                        results.append(query())
+                    except BaseException as exc:  # noqa: BLE001 - thread test boundary
+                        errors.append(exc)
+
+                with patch.object(
+                    manager,
+                    "_get_status_read_only",
+                    side_effect=blocking_status,
+                ):
+                    worker = threading.Thread(target=read_status)
+                    worker.start()
+                    try:
+                        self.assertTrue(started.wait(10), "状态查询未按时开始")
+                        with training_manager.training_lock():
+                            command = training_manager.command_for(
+                                self.root / "dataset.zip",
+                                "numeric",
+                                self.root / "output",
+                            )
+                            self.assertIn("train", command)
+                    finally:
+                        release.set()
+                        worker.join(timeout=10)
+
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 1)
+                if name == "preferred_mode":
+                    self.assertEqual(results[0], "enhanced")
+                else:
+                    self.assertEqual(results[0].code, STATUS_AVAILABLE)
+
+    def test_status_reports_residuals_without_taking_lock_or_cleaning(self):
+        manager = self.manager()
+        manager.install(self.package())
+        installing = manager.component_root / ".installing-AbCdEf12"
+        installing.mkdir()
+        partial = installing / "partial.bin"
+        partial.write_bytes(b"partial")
+
+        with patch.object(
+            manager,
+            "_operation_lock",
+            side_effect=AssertionError("日常状态查询不应申请组件操作锁"),
+        ):
+            status = manager.status(verify_files=False)
+
+        self.assertEqual(status.code, STATUS_AVAILABLE)
+        self.assertTrue(status.maintenance_required)
+        self.assertTrue(status.cleanup_available)
+        self.assertEqual(partial.read_bytes(), b"partial")
+        self.assertFalse(manager.get_status(recover=True).maintenance_required)
+        self.assertFalse(installing.exists())
 
     def test_training_lock_blocks_install_uninstall_and_self_test(self):
         manager = self.manager()
@@ -889,7 +974,7 @@ class TrainerComponentTests(unittest.TestCase):
                 manager.uninstall()
 
         self.assertFalse(manager.component_root.exists())
-        status = manager.status(verify_files=False)
+        status = manager.status(verify_files=False, recover=True)
         self.assertEqual(status.code, STATUS_NOT_INSTALLED)
         self.assertFalse(status.maintenance_required)
         residuals = list(manager.component_root.parent.glob(".trainer-removing-*"))

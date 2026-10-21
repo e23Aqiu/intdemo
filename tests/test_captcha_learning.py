@@ -2247,6 +2247,37 @@ class CaptchaLearningTests(unittest.TestCase):
         self.assertTrue(page.uninstall_trainer_btn.isEnabled())
         page.deleteLater()
 
+    def test_training_disables_component_actions_without_querying_status(self):
+        manager = _FakeTrainerManager(available=True, mode="enhanced")
+        with patch.object(MachineLearningPage, "refresh"):
+            page = MachineLearningPage(_FakeSession(), trainer_manager=manager)
+        page.refresh_timer.stop()
+        model = {
+            "id": "numeric-model",
+            "algorithm": "captcha-engine-v1",
+            "captcha_type": "numeric",
+        }
+        try:
+            for flag in ("_training_in_progress", "_component_task_running"):
+                with self.subTest(flag=flag):
+                    setattr(page, flag, True)
+                    try:
+                        with patch.object(
+                            manager,
+                            "status",
+                            side_effect=AssertionError("训练期间不应查询组件状态"),
+                        ):
+                            page._set_component_controls_enabled(False)
+                            reason = page._model_continuation_block_reason(model)
+                        self.assertIn("正在运行", reason)
+                        self.assertFalse(page.install_trainer_btn.isEnabled())
+                        self.assertFalse(page.self_test_trainer_btn.isEnabled())
+                        self.assertFalse(page.uninstall_trainer_btn.isEnabled())
+                    finally:
+                        setattr(page, flag, False)
+        finally:
+            page.deleteLater()
+
     def test_training_terminal_hides_while_running_and_closes_when_finished(self):
         dialog = TrainingTerminalDialog(
             captcha_name="数字验证码",

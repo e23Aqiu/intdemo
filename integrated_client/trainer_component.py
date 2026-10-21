@@ -809,8 +809,17 @@ class TrainerComponentManager:
             maintenance_message="；".join(descriptions),
         )
 
-    def get_status(self, *, verify_files: bool = True) -> TrainerComponentStatus:
-        """Return status after a best-effort, exclusively locked recovery pass."""
+    def get_status(
+        self,
+        *,
+        verify_files: bool = True,
+        recover: bool = False,
+    ) -> TrainerComponentStatus:
+        """Read status without taking the operation lock unless recovery is requested."""
+
+        if not recover:
+            status = self._get_status_read_only(verify_files=verify_files)
+            return self._status_with_residuals(status, self._scan_lifecycle_residuals())
 
         try:
             with self._operation_lock(
@@ -1122,10 +1131,15 @@ class TrainerComponentManager:
         except (OSError, UnicodeError, ValueError, TypeError):
             return "", ""
 
-    def status(self, *, verify_files: bool = True) -> TrainerComponentStatus:
-        """Return component state; short alias intended for UI callers."""
+    def status(
+        self,
+        *,
+        verify_files: bool = True,
+        recover: bool = False,
+    ) -> TrainerComponentStatus:
+        """Return component state; UI polling is read-only by default."""
 
-        return self.get_status(verify_files=verify_files)
+        return self.get_status(verify_files=verify_files, recover=recover)
 
     def preferred_mode(self) -> str:
         """Return ``standard`` or ``enhanced`` for the next training job.

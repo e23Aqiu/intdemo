@@ -572,6 +572,11 @@ class MachineLearningPage(QWidget):
         )
         self.training_epochs_spin.setEnabled(available and enhanced_selected)
         self.install_trainer_btn.setEnabled(available)
+        if not available:
+            self.self_test_trainer_btn.setEnabled(False)
+            self.uninstall_trainer_btn.setEnabled(False)
+            self._update_continue_model_button()
+            return
         status = self.trainer_manager.status(verify_files=False)
         self.self_test_trainer_btn.setEnabled(available and status.available)
         self.uninstall_trainer_btn.setEnabled(
@@ -1263,6 +1268,8 @@ class MachineLearningPage(QWidget):
             return "只有组件训练生成的 captcha-engine-v1 模型支持继续训练。"
         if not model.get("id"):
             return "该模型缺少有效标识，不能继续训练。"
+        if self._training_in_progress or self._component_task_running:
+            return "当前已有训练或组件维护任务正在运行。"
         api_method = getattr(
             getattr(self.session_manager, "api", None),
             "admin_download_captcha_model",
@@ -1280,8 +1287,6 @@ class MachineLearningPage(QWidget):
                 "继续训练需要强化组件 "
                 f"{CONTINUATION_COMPONENT_VERSION} 或更高版本。"
             )
-        if self._training_in_progress or self._component_task_running:
-            return "当前已有训练或组件维护任务正在运行。"
         return ""
 
     def _update_continue_model_button(self):
